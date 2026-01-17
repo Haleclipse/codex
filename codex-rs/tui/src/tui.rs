@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 
 use crossterm::Command;
 use crossterm::SynchronizedUpdate;
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
@@ -57,6 +58,9 @@ pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
 
 pub fn set_modes() -> Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
+
+    // 设置稳定块状光标（不闪烁），避免闪烁时反色导致文字不可见
+    let _ = execute!(stdout(), SetCursorStyle::SteadyBlock);
 
     enable_raw_mode()?;
     // Enable keyboard enhancement flags so modifiers for keys like Enter are disambiguated.
@@ -128,6 +132,8 @@ fn restore_common(should_disable_raw_mode: bool) -> Result<()> {
     if should_disable_raw_mode {
         disable_raw_mode()?;
     }
+    // 恢复默认光标样式
+    let _ = execute!(stdout(), SetCursorStyle::DefaultUserShape);
     let _ = execute!(stdout(), crossterm::cursor::Show);
     Ok(())
 }

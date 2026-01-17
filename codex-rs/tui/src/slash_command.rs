@@ -17,6 +17,7 @@ pub enum SlashCommand {
     #[strum(serialize = "setup-elevated-sandbox")]
     ElevateSandbox,
     Experimental,
+    Cxline,
     Skills,
     Review,
     New,
@@ -60,6 +61,7 @@ impl SlashCommand {
             SlashCommand::Approvals => "choose what Codex can do without approval",
             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
             SlashCommand::Experimental => "toggle beta features",
+            SlashCommand::Cxline => "configure statusline appearance",
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Logout => "log out of Codex",
             SlashCommand::Rollout => "print the rollout file path",
@@ -86,6 +88,7 @@ impl SlashCommand {
             | SlashCommand::Approvals
             | SlashCommand::ElevateSandbox
             | SlashCommand::Experimental
+            | SlashCommand::Cxline
             | SlashCommand::Review
             | SlashCommand::Logout => false,
             SlashCommand::Diff

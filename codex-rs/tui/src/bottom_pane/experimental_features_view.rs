@@ -82,7 +82,7 @@ impl ExperimentalFeaturesView {
         let selected_idx = self.state.selected_idx;
         for (idx, item) in self.features.iter().enumerate() {
             let prefix = if selected_idx == Some(idx) {
-                '›'
+                '❯'
             } else {
                 ' '
             };

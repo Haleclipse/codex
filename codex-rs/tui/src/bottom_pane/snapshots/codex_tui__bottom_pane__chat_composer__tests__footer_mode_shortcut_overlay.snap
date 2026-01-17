@@ -2,14 +2,14 @@
 source: tui/src/bottom_pane/chat_composer.rs
 expression: terminal.backend()
 ---
-"                                                                                                    "
-"› Ask Codex to do anything                                                                          "
-"                                                                                                    "
-"                                                                                                    "
+"────────────────────────────────────────────────────────────────────────────────────────────────────"
+"❯ Ask Codex to do anything                                                                          "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
+"────────────────────────────────────────────────────────────────────────────────────────────────────"
+"   - · - tokens                                                                                    "
 "  / for commands                             ! for shell commands                                   "
 "  shift + enter for newline                  tab to queue message                                   "
 "  @ for file paths                           ctrl + v to paste images                               "

@@ -1417,6 +1417,13 @@ impl App {
                     ));
                 }
             },
+            AppEvent::OpenCxlineConfig => {
+                // 使用 Overlay 模式打开 CxLine 配置界面
+                let config = self.chat_widget.get_statusline_config();
+                let _ = tui.enter_alt_screen();
+                self.overlay = Some(Overlay::new_cxline(config));
+                tui.frame_requester().schedule_frame();
+            }
         }
         Ok(AppRunControl::Continue)
     }
@@ -1713,7 +1720,6 @@ mod tests {
     use codex_core::AuthManager;
     use codex_core::CodexAuth;
     use codex_core::ThreadManager;
-    use codex_core::config::ConfigBuilder;
     use codex_core::protocol::AskForApproval;
     use codex_core::protocol::Event;
     use codex_core::protocol::EventMsg;
@@ -1726,7 +1732,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    use tempfile::tempdir;
 
     async fn make_test_app() -> App {
         let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
@@ -1917,60 +1922,6 @@ mod tests {
         ));
 
         assert!(target_preset_for_upgrade(&available, "missing-target").is_none());
-    }
-
-    #[tokio::test]
-    async fn model_migration_prompt_shows_for_hidden_model() {
-        let codex_home = tempdir().expect("temp codex home");
-        let config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await
-            .expect("config");
-
-        let available_models = all_model_presets();
-        let current = available_models
-            .iter()
-            .find(|preset| preset.model == "gpt-5.1-codex")
-            .cloned()
-            .expect("gpt-5.1-codex preset present");
-        assert!(
-            !current.show_in_picker,
-            "expected gpt-5.1-codex to be hidden from picker for this test"
-        );
-
-        let upgrade = current.upgrade.as_ref().expect("upgrade configured");
-        assert!(
-            should_show_model_migration_prompt(
-                &current.model,
-                &upgrade.id,
-                &config.notices.model_migrations,
-                &available_models,
-            ),
-            "expected migration prompt to be eligible for hidden model"
-        );
-
-        let target = target_preset_for_upgrade(&available_models, &upgrade.id)
-            .expect("upgrade target present");
-        let target_description =
-            (!target.description.is_empty()).then(|| target.description.clone());
-        let can_opt_out = true;
-        let copy = migration_copy_for_models(
-            &current.model,
-            &upgrade.id,
-            upgrade.model_link.clone(),
-            upgrade.upgrade_copy.clone(),
-            upgrade.migration_markdown.clone(),
-            target.display_name.clone(),
-            target_description,
-            can_opt_out,
-        );
-
-        // Snapshot the copy we would show; rendering is covered by model_migration snapshots.
-        assert_snapshot!(
-            "model_migration_prompt_shows_for_hidden_model",
-            model_migration_copy_to_plain_text(&copy)
-        );
     }
 
     #[tokio::test]

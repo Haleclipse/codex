@@ -5,7 +5,8 @@ expression: "render_snapshot(&pane, area)"
   ↳ Queued follow-up question                   
     ⌥ + ↑ edit                                  
                                                 
-                                                
-› Ask Codex to do anything                      
-                                                
+────────────────────────────────────────────────
+❯ Ask Codex to do anything                      
+────────────────────────────────────────────────
+   - · - tokens                                
   100% context left · ? for shortcuts

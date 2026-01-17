@@ -781,25 +781,36 @@ impl ChatWidget {
     }
 
     fn apply_token_info(&mut self, info: TokenUsageInfo) {
-        let percent = self.context_remaining_percent(&info);
-        let used_tokens = self.context_used_tokens(&info, percent.is_some());
-        self.bottom_pane.set_context_window(percent, used_tokens);
+        // 使用 last_token_usage 而非 total_token_usage
+        // last_token_usage 反映模型当前"看到"的 context 大小
+        // total_token_usage 是会话累计消耗，不反映实际 context 占用
+        let used_tokens = Some(info.last_token_usage.tokens_in_context_window());
+        let window_size = info.model_context_window;
+        self.bottom_pane
+            .set_context_window(used_tokens, window_size);
         self.token_info = Some(info);
     }
 
-    fn context_remaining_percent(&self, info: &TokenUsageInfo) -> Option<i64> {
-        info.model_context_window.map(|window| {
-            info.last_token_usage
-                .percent_of_context_window_remaining(window)
-        })
-    }
+    /// 更新状态栏数据
+    fn update_statusline_data(&mut self) {
+        // 获取 rate limit 使用率
+        let (rate_limit_percent, rate_limit_resets_at) =
+            if let Some(ref snapshot) = self.rate_limit_snapshot {
+                if let Some(ref primary) = snapshot.primary {
+                    (Some(primary.used_percent), primary.resets_at.clone())
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
 
-    fn context_used_tokens(&self, info: &TokenUsageInfo, percent_known: bool) -> Option<i64> {
-        if percent_known {
-            return None;
-        }
-
-        Some(info.total_token_usage.tokens_in_context_window())
+        self.bottom_pane.set_statusline_data(
+            self.model.as_deref().unwrap_or(""),
+            &self.config.cwd,
+            rate_limit_percent,
+            rate_limit_resets_at,
+        );
     }
 
     fn restore_pre_review_token_info(&mut self) {
@@ -870,6 +881,9 @@ impl ChatWidget {
 
             let display = crate::status::rate_limit_snapshot_display(&snapshot, Local::now());
             self.rate_limit_snapshot = Some(display);
+
+            // 更新 statusline 数据
+            self.update_statusline_data();
 
             if !warnings.is_empty() {
                 for warning in warnings {
@@ -1718,6 +1732,9 @@ impl ChatWidget {
             external_editor_state: ExternalEditorState::Closed,
         };
 
+        // 初始化状态栏数据
+        widget.update_statusline_data();
+
         widget.prefetch_rate_limits();
         widget
             .bottom_pane
@@ -1816,6 +1833,9 @@ impl ChatWidget {
             current_rollout_path: None,
             external_editor_state: ExternalEditorState::Closed,
         };
+
+        // 初始化状态栏数据
+        widget.update_statusline_data();
 
         widget.prefetch_rate_limits();
         widget
@@ -2066,6 +2086,9 @@ impl ChatWidget {
             }
             SlashCommand::Experimental => {
                 self.open_experimental_popup();
+            }
+            SlashCommand::Cxline => {
+                self.app_event_tx.send(AppEvent::OpenCxlineConfig);
             }
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.request_quit_without_confirmation();
@@ -3866,6 +3889,19 @@ impl ChatWidget {
         if let Err(err) = self.config.approval_policy.set(policy) {
             tracing::warn!(%err, "failed to set approval_policy on chat config");
         }
+    }
+
+    /// Get the current statusline config.
+    pub(crate) fn get_statusline_config(&self) -> crate::statusline::config::CxLineConfig {
+        self.bottom_pane.get_statusline_config()
+    }
+
+    /// Set the statusline config.
+    pub(crate) fn set_statusline_config(
+        &mut self,
+        config: crate::statusline::config::CxLineConfig,
+    ) {
+        self.bottom_pane.set_statusline_config(config);
     }
 
     /// Set the sandbox policy in the widget's config copy.

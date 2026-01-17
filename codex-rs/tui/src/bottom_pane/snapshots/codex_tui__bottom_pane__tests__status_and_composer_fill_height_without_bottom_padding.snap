@@ -4,7 +4,8 @@ expression: "render_snapshot(&pane, area)"
 ---
 • Working (0s • esc to interru
                               
-                              
-› Ask Codex to do anything    
-                              
+──────────────────────────────
+❯ Ask Codex to do anything    
+──────────────────────────────
+   - · - tokens              
   100% context left · ? for sh

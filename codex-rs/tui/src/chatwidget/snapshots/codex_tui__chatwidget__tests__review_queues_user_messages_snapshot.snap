@@ -1,9 +1,7 @@
 ---
 source: tui/src/chatwidget/tests.rs
-assertion_line: 3840
 expression: term.backend().vt100().screen().contents()
 ---
-
 
 
 
@@ -17,7 +15,8 @@ expression: term.backend().vt100().screen().contents()
   ↳ Queued while /review is running.
     ⌥ + ↑ edit
 
-
-› Ask Codex to do anything
-
+────────────────────────────────────────────────────────────────────────────────
+❯ Ask Codex to do anything
+────────────────────────────────────────────────────────────────────────────────
+   - · - tokens
   100% context left · ? for shortcuts

@@ -13,7 +13,7 @@ expression: terminal.backend().vt100().screen().contents()
     1 +hello
     2 +world
 
-› 1. Yes, proceed (y)
+❯ 1. Yes, proceed (y)
   2. Yes, and don't ask again for these files (a)
   3. No, and tell Codex what to do differently (esc)
 
