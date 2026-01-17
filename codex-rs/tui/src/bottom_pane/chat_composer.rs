@@ -1,4 +1,5 @@
 use crate::key_hint::has_ctrl_or_alt;
+use crate::statusline::{CxLineConfig, StatusLineContext, StatusLineWidget, build_statusline};
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -12,7 +13,6 @@ use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
-use ratatui::widgets::Block;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
 
@@ -42,7 +42,6 @@ use crate::render::RectExt;
 use crate::render::renderable::Renderable;
 use crate::slash_command::SlashCommand;
 use crate::slash_command::built_in_slash_commands;
-use crate::style::user_message_style;
 use codex_common::fuzzy_match::fuzzy_match;
 use codex_protocol::custom_prompts::CustomPrompt;
 use codex_protocol::custom_prompts::PROMPTS_CMD_PREFIX;
@@ -127,10 +126,16 @@ pub(crate) struct ChatComposer {
     custom_prompts: Vec<CustomPrompt>,
     footer_mode: FooterMode,
     footer_hint_override: Option<Vec<(String, String)>>,
-    context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
+    context_window_size: Option<i64>,
     skills: Option<Vec<SkillMetadata>>,
     dismissed_skill_popup_token: Option<String>,
+    // 状态栏相关数据
+    statusline_config: CxLineConfig,
+    statusline_model: String,
+    statusline_cwd: PathBuf,
+    statusline_rate_limit_percent: Option<f64>,
+    statusline_rate_limit_resets_at: Option<String>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -177,10 +182,16 @@ impl ChatComposer {
             custom_prompts: Vec::new(),
             footer_mode: FooterMode::ShortcutSummary,
             footer_hint_override: None,
-            context_window_percent: None,
             context_window_used_tokens: None,
+            context_window_size: None,
             skills: None,
             dismissed_skill_popup_token: None,
+            // 状态栏初始化
+            statusline_config: CxLineConfig::load(),
+            statusline_model: String::new(),
+            statusline_cwd: PathBuf::new(),
+            statusline_rate_limit_percent: None,
+            statusline_rate_limit_resets_at: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -191,13 +202,41 @@ impl ChatComposer {
         self.skills = skills;
     }
 
-    fn layout_areas(&self, area: Rect) -> [Rect; 3] {
+    /// 设置状态栏数据
+    pub fn set_statusline_data(
+        &mut self,
+        model: &str,
+        cwd: &Path,
+        rate_limit_percent: Option<f64>,
+        rate_limit_resets_at: Option<String>,
+    ) {
+        self.statusline_model = model.to_string();
+        self.statusline_cwd = cwd.to_path_buf();
+        self.statusline_rate_limit_percent = rate_limit_percent;
+        self.statusline_rate_limit_resets_at = rate_limit_resets_at;
+    }
+
+    /// 获取当前状态栏配置
+    pub fn get_statusline_config(&self) -> CxLineConfig {
+        self.statusline_config.clone()
+    }
+
+    /// 设置状态栏配置
+    pub fn set_statusline_config(&mut self, config: CxLineConfig) {
+        self.statusline_config = config;
+    }
+
+    fn layout_areas(&self, area: Rect) -> [Rect; 4] {
         let footer_props = self.footer_props();
         let footer_hint_height = self
             .custom_footer_height()
             .unwrap_or_else(|| footer_height(footer_props));
         let footer_spacing = Self::footer_spacing(footer_hint_height);
         let footer_total_height = footer_hint_height + footer_spacing;
+
+        // 状态栏高度（启用时为 1，禁用时为 0）
+        let statusline_height = if self.statusline_config.enabled { 1 } else { 0 };
+
         let popup_constraint = match &self.active_popup {
             ActivePopup::Command(popup) => {
                 Constraint::Max(popup.calculate_required_height(area.width))
@@ -208,10 +247,14 @@ impl ChatComposer {
             }
             ActivePopup::None => Constraint::Max(footer_total_height),
         };
-        let [composer_rect, popup_rect] =
-            Layout::vertical([Constraint::Min(3), popup_constraint]).areas(area);
+        let [composer_rect, statusline_rect, popup_rect] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(statusline_height),
+            popup_constraint,
+        ])
+        .areas(area);
         let textarea_rect = composer_rect.inset(Insets::tlbr(1, LIVE_PREFIX_COLS, 1, 1));
-        [composer_rect, textarea_rect, popup_rect]
+        [composer_rect, textarea_rect, statusline_rect, popup_rect]
     }
 
     fn footer_spacing(footer_hint_height: u16) -> u16 {
@@ -1697,8 +1740,6 @@ impl ChatComposer {
             esc_backtrack_hint: self.esc_backtrack_hint,
             use_shift_enter_hint: self.use_shift_enter_hint,
             is_task_running: self.is_task_running,
-            context_window_percent: self.context_window_percent,
-            context_window_used_tokens: self.context_window_used_tokens,
         }
     }
 
@@ -1952,13 +1993,17 @@ impl ChatComposer {
         self.is_task_running = running;
     }
 
-    pub(crate) fn set_context_window(&mut self, percent: Option<i64>, used_tokens: Option<i64>) {
-        if self.context_window_percent == percent && self.context_window_used_tokens == used_tokens
+    pub(crate) fn set_context_window(
+        &mut self,
+        used_tokens: Option<i64>,
+        window_size: Option<i64>,
+    ) {
+        if self.context_window_used_tokens == used_tokens && self.context_window_size == window_size
         {
             return;
         }
-        self.context_window_percent = percent;
         self.context_window_used_tokens = used_tokens;
+        self.context_window_size = window_size;
     }
 
     pub(crate) fn set_esc_backtrack_hint(&mut self, show: bool) {
@@ -1972,14 +2017,9 @@ impl ChatComposer {
 }
 
 impl Renderable for ChatComposer {
-    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        if !self.input_enabled {
-            return None;
-        }
-
-        let [_, textarea_rect, _] = self.layout_areas(area);
-        let state = *self.textarea_state.borrow();
-        self.textarea.cursor_pos_with_state(textarea_rect, state)
+    fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
+        // 返回 None 隐藏终端光标，由 textarea 自己绘制反色光标
+        None
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -1989,10 +2029,13 @@ impl Renderable for ChatComposer {
             .unwrap_or_else(|| footer_height(footer_props));
         let footer_spacing = Self::footer_spacing(footer_hint_height);
         let footer_total_height = footer_hint_height + footer_spacing;
+        // 状态栏高度（启用时为 1，禁用时为 0）
+        let statusline_height = if self.statusline_config.enabled { 1 } else { 0 };
         const COLS_WITH_MARGIN: u16 = LIVE_PREFIX_COLS + 1;
         self.textarea
             .desired_height(width.saturating_sub(COLS_WITH_MARGIN))
             + 2
+            + statusline_height
             + match &self.active_popup {
                 ActivePopup::None => footer_total_height,
                 ActivePopup::Command(c) => c.calculate_required_height(width),
@@ -2002,7 +2045,7 @@ impl Renderable for ChatComposer {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let [composer_rect, textarea_rect, popup_rect] = self.layout_areas(area);
+        let [composer_rect, textarea_rect, statusline_rect, popup_rect] = self.layout_areas(area);
         match &self.active_popup {
             ActivePopup::Command(popup) => {
                 popup.render_ref(popup_rect, buf);
@@ -2052,13 +2095,60 @@ impl Renderable for ChatComposer {
                 }
             }
         }
-        let style = user_message_style();
-        Block::default().style(style).render_ref(composer_rect, buf);
-        if !textarea_rect.is_empty() {
+        // 绘制上边框线（边界检查）
+        if composer_rect.y < area.y + area.height && composer_rect.height > 0 {
+            let top_border_line = "─".repeat(composer_rect.width as usize);
+            buf.set_string(
+                composer_rect.x,
+                composer_rect.y,
+                &top_border_line,
+                Style::default().dim(),
+            );
+        }
+
+        // 绘制下边框线（边界检查）
+        let bottom_y = composer_rect.y + composer_rect.height.saturating_sub(1);
+        if bottom_y < area.y + area.height && composer_rect.height > 1 {
+            let bottom_border_line = "─".repeat(composer_rect.width as usize);
+            buf.set_string(
+                composer_rect.x,
+                bottom_y,
+                &bottom_border_line,
+                Style::default().dim(),
+            );
+        }
+
+        // 渲染状态栏（在输入框下边框之后，footer 之前）
+        // 状态栏内容与输入框的 ❯ 提示符对齐
+        // 边界检查：确保 statusline_rect 在 buffer 范围内
+        if self.statusline_config.enabled
+            && statusline_rect.height > 0
+            && statusline_rect.y < area.y + area.height
+        {
+            let ctx = StatusLineContext::new(&self.statusline_model, &self.statusline_cwd)
+                .with_context(self.context_window_used_tokens, self.context_window_size)
+                .with_rate_limit(
+                    self.statusline_rate_limit_percent,
+                    self.statusline_rate_limit_resets_at.clone(),
+                );
+            let renderer = build_statusline(&self.statusline_config, &ctx);
+            let statusline_widget = StatusLineWidget::from_renderer(&renderer);
+            // 添加左边距，与输入框 ❯ 提示符对齐
+            let aligned_rect = Rect::new(
+                statusline_rect.x + LIVE_PREFIX_COLS,
+                statusline_rect.y,
+                statusline_rect.width.saturating_sub(LIVE_PREFIX_COLS),
+                statusline_rect.height,
+            );
+            statusline_widget.render_ref(aligned_rect, buf);
+        }
+
+        // 边界检查：确保 textarea_rect 在 buffer 范围内
+        if !textarea_rect.is_empty() && textarea_rect.y < area.y + area.height {
             let prompt = if self.input_enabled {
-                "›".bold()
+                "❯".bold()
             } else {
-                "›".dim()
+                "❯".dim()
             };
             buf.set_span(
                 textarea_rect.x - LIVE_PREFIX_COLS,
@@ -2066,11 +2156,15 @@ impl Renderable for ChatComposer {
                 &prompt,
                 textarea_rect.width,
             );
-        }
 
-        let mut state = self.textarea_state.borrow_mut();
-        StatefulWidgetRef::render_ref(&(&self.textarea), textarea_rect, buf, &mut state);
-        if self.textarea.text().is_empty() {
+            let mut state = self.textarea_state.borrow_mut();
+            StatefulWidgetRef::render_ref(&(&self.textarea), textarea_rect, buf, &mut state);
+        }
+        // Placeholder 渲染也需要边界检查
+        if self.textarea.text().is_empty()
+            && !textarea_rect.is_empty()
+            && textarea_rect.y < area.y + area.height
+        {
             let text = if self.input_enabled {
                 self.placeholder_text.as_str().to_string()
             } else {
@@ -2198,11 +2292,14 @@ mod tests {
             "expected a spacing row above the footer hints",
         );
 
+        // 检查 footer hint 上方有内容（状态栏或空白间距），
+        // 而不是直接与 composer 下边框相邻。
+        // 状态栏启用时上方会有状态栏内容，禁用时会有空白行。
         let spacing_row = row_to_string(hint_row_idx - 1);
-        assert_eq!(
-            spacing_row.trim(),
-            "",
-            "expected blank spacing row above hints but saw: {spacing_row:?}",
+        // 不应该是 composer 的边框线
+        assert!(
+            !spacing_row.trim().chars().all(|c| c == '─'),
+            "expected spacing (blank or statusline) above hints, not border: {spacing_row:?}",
         );
     }
 

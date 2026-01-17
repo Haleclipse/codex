@@ -31,6 +31,7 @@ use ratatui::widgets::Wrap;
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
+    Cxline(Box<crate::cxline_overlay::CxlineOverlay>),
 }
 
 impl Overlay {
@@ -53,6 +54,7 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.handle_event(tui, event),
             Overlay::Static(o) => o.handle_event(tui, event),
+            Overlay::Cxline(o) => o.handle_event(tui, event),
         }
     }
 
@@ -60,6 +62,20 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.is_done(),
             Overlay::Static(o) => o.is_done(),
+            Overlay::Cxline(o) => o.is_done(),
+        }
+    }
+
+    /// 创建 CxLine 配置 Overlay
+    pub(crate) fn new_cxline(config: crate::statusline::config::CxLineConfig) -> Self {
+        Self::Cxline(Box::new(crate::cxline_overlay::CxlineOverlay::new(config)))
+    }
+
+    /// 如果是 CxLine Overlay，获取配置
+    pub(crate) fn take_cxline_config(&mut self) -> Option<crate::statusline::config::CxLineConfig> {
+        match self {
+            Overlay::Cxline(o) => Some(o.config()),
+            _ => None,
         }
     }
 }

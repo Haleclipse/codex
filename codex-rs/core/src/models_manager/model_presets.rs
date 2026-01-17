@@ -201,7 +201,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             ],
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
-            show_in_picker: false,
+            show_in_picker: true,
             supported_in_api: true,
         },
         ModelPreset {
@@ -222,7 +222,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             ],
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
-            show_in_picker: false,
+            show_in_picker: true,
             supported_in_api: true,
         },
         ModelPreset {
@@ -248,7 +248,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             ],
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
-            show_in_picker: false,
+            show_in_picker: true,
             supported_in_api: true,
         },
         ModelPreset {
@@ -277,7 +277,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             ],
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
-            show_in_picker: false,
+            show_in_picker: true,
             supported_in_api: true,
         },
         ModelPreset {
@@ -302,7 +302,7 @@ static PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
             ],
             is_default: false,
             upgrade: Some(gpt_52_codex_upgrade()),
-            show_in_picker: false,
+            show_in_picker: true,
             supported_in_api: true,
         },
     ]

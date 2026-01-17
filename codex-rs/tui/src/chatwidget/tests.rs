@@ -226,7 +226,11 @@ async fn review_restores_context_window_indicator() {
             rate_limits: None,
         }),
     });
-    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert_eq!(chat.bottom_pane.context_window_size(), Some(context_window));
+    assert_eq!(
+        chat.bottom_pane.context_window_used_tokens(),
+        Some(pre_review_tokens)
+    );
 
     chat.handle_codex_event(Event {
         id: "review-start".into(),
@@ -245,7 +249,11 @@ async fn review_restores_context_window_indicator() {
             rate_limits: None,
         }),
     });
-    assert_eq!(chat.bottom_pane.context_window_percent(), Some(97));
+    assert_eq!(chat.bottom_pane.context_window_size(), Some(context_window));
+    assert_eq!(
+        chat.bottom_pane.context_window_used_tokens(),
+        Some(review_tokens)
+    );
 
     chat.handle_codex_event(Event {
         id: "review-end".into(),
@@ -255,7 +263,11 @@ async fn review_restores_context_window_indicator() {
     });
     let _ = drain_insert_history(&mut rx);
 
-    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert_eq!(chat.bottom_pane.context_window_size(), Some(context_window));
+    assert_eq!(
+        chat.bottom_pane.context_window_used_tokens(),
+        Some(pre_review_tokens)
+    );
     assert!(!chat.is_review_mode);
 }
 
@@ -274,7 +286,11 @@ async fn token_count_none_resets_context_indicator() {
             rate_limits: None,
         }),
     });
-    assert_eq!(chat.bottom_pane.context_window_percent(), Some(30));
+    assert_eq!(chat.bottom_pane.context_window_size(), Some(context_window));
+    assert_eq!(
+        chat.bottom_pane.context_window_used_tokens(),
+        Some(pre_compact_tokens)
+    );
 
     chat.handle_codex_event(Event {
         id: "token-cleared".into(),
@@ -283,7 +299,8 @@ async fn token_count_none_resets_context_indicator() {
             rate_limits: None,
         }),
     });
-    assert_eq!(chat.bottom_pane.context_window_percent(), None);
+    assert_eq!(chat.bottom_pane.context_window_size(), None);
+    assert_eq!(chat.bottom_pane.context_window_used_tokens(), None);
 }
 
 #[tokio::test]
@@ -314,7 +331,8 @@ async fn context_indicator_shows_used_tokens_when_window_unknown() {
         }),
     });
 
-    assert_eq!(chat.bottom_pane.context_window_percent(), None);
+    // Window size unknown, but tokens used should be available
+    assert_eq!(chat.bottom_pane.context_window_size(), None);
     assert_eq!(
         chat.bottom_pane.context_window_used_tokens(),
         Some(total_tokens)

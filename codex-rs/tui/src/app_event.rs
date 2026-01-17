@@ -211,6 +211,9 @@ pub(crate) enum AppEvent {
 
     /// Launch the external editor after a normal draw has completed.
     LaunchExternalEditor,
+
+    /// Open the CxLine configuration screen (full-screen).
+    OpenCxlineConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

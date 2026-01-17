@@ -5,6 +5,7 @@ use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
@@ -1052,6 +1053,18 @@ impl TextArea {
                 let x_off = self.text[line_range.start..overlap_start].width() as u16;
                 let style = Style::default().fg(Color::Cyan);
                 buf.set_string(area.x + x_off, y, styled, style);
+            }
+
+            // Apply reverse style to the character at cursor position.
+            if self.cursor_pos >= line_range.start && self.cursor_pos <= line_range.end {
+                let cursor_x = self.text[line_range.start..self.cursor_pos].width() as u16;
+                let cursor_screen_x = area.x + cursor_x;
+                if cursor_screen_x < area.x + area.width {
+                    let cell = buf.cell_mut((cursor_screen_x, y));
+                    if let Some(cell) = cell {
+                        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                    }
+                }
             }
         }
     }

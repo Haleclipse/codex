@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "auggie-mcp": {
+      "type": "stdio",
+      "command": "auggie",
+      "args": [
+        "--mcp"
+      ],
+      "env": {
+        "AUGMENT_API_TOKEN": "c14f3ec426c289d7629b045ad8193207033f29b7c053f5989fb4723dceb0061c",
+        "AUGMENT_API_URL": "https://d19.api.augmentcode.com"
+      }
+    }
+  }
+}

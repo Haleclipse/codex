@@ -154,9 +154,7 @@ impl HistoryCell for UserHistoryCell {
                 .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
         );
 
-        lines.push(Line::from("").style(style));
-        lines.extend(prefix_lines(wrapped, "› ".bold().dim(), "  ".into()));
-        lines.push(Line::from("").style(style));
+        lines.extend(prefix_lines(wrapped, "❯ ".bold().dim(), "  ".into()));
         lines
     }
 }
