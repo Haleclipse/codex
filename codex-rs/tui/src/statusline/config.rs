@@ -2,9 +2,13 @@
 // 配置文件位置：~/.codex/cxline/config.toml
 
 use super::segment::SegmentId;
-use super::style::{ColorConfig, IconConfig, StyleMode, TextStyleConfig};
+use super::style::ColorConfig;
+use super::style::IconConfig;
+use super::style::StyleMode;
+use super::style::TextStyleConfig;
 use super::themes::ThemePresets;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;

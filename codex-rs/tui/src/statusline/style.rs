@@ -2,7 +2,8 @@
 // 参考 CCometixLine 的颜色和样式系统
 
 use ratatui::style::Color;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// 样式模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

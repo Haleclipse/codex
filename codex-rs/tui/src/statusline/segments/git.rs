@@ -1,8 +1,12 @@
 // Git Segment - 显示 Git 分支和状态
 // 搬迁自 CCometixLine
 
+use crate::statusline::GitPreviewData;
 use crate::statusline::StatusLineContext;
-use crate::statusline::segment::{Segment, SegmentData, SegmentId};
+use crate::statusline::segment::Segment;
+use crate::statusline::segment::SegmentData;
+use crate::statusline::segment::SegmentId;
+use std::path::Path;
 use std::process::Command;
 
 /// Git 状态
@@ -25,7 +29,7 @@ pub struct GitInfo {
 pub struct GitSegment;
 
 impl GitSegment {
-    fn get_git_info(&self, working_dir: &std::path::Path) -> Option<GitInfo> {
+    fn get_git_info(&self, working_dir: &Path) -> Option<GitInfo> {
         let working_dir = working_dir.to_string_lossy();
 
         if !self.is_git_repository(&working_dir) {
@@ -133,12 +137,31 @@ impl GitSegment {
             _ => 0,
         }
     }
+
+    pub(crate) fn collect_preview(&self, cwd: &Path) -> Option<GitPreviewData> {
+        let git_info = self.get_git_info(cwd)?;
+        let status = match git_info.status {
+            GitStatus::Clean => "✓",
+            GitStatus::Dirty => "●",
+            GitStatus::Conflicts => "⚠",
+        };
+
+        Some(GitPreviewData {
+            branch: git_info.branch,
+            status: status.to_string(),
+            ahead: git_info.ahead,
+            behind: git_info.behind,
+        })
+    }
 }
 
 impl Segment for GitSegment {
     fn collect(&self, ctx: &StatusLineContext) -> Option<SegmentData> {
         // 如果有预览数据，使用预览数据
         if let Some(preview) = &ctx.git_preview {
+            if preview.branch.is_empty() && preview.status.is_empty() {
+                return None;
+            }
             let primary = preview.branch.clone();
             let mut status_parts = Vec::new();
             status_parts.push(preview.status.clone());

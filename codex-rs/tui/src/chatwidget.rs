@@ -158,6 +158,8 @@ use crate::render::renderable::RenderableExt;
 use crate::render::renderable::RenderableItem;
 use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
+use crate::statusline::GitPreviewData;
+use crate::statusline::collect_git_preview;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 mod interrupts;
@@ -252,6 +254,7 @@ fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
 const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
 const NUDGE_MODEL_SLUG: &str = "gpt-5.1-codex-mini";
 const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
+const STATUSLINE_GIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 struct RateLimitWarningState {
@@ -410,6 +413,7 @@ pub(crate) struct ChatWidget {
     rate_limit_warnings: RateLimitWarningState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
     rate_limit_poller: Option<JoinHandle<()>>,
+    statusline_git_poller: Option<JoinHandle<()>>,
     // Stream lifecycle controller
     stream_controller: Option<StreamController>,
     running_commands: HashMap<String, RunningCommand>,
@@ -811,6 +815,48 @@ impl ChatWidget {
             rate_limit_percent,
             rate_limit_resets_at,
         );
+    }
+
+    fn start_statusline_git_poller(&mut self) {
+        if self.statusline_git_poller.is_some() {
+            return;
+        }
+
+        let app_event_tx = self.app_event_tx.clone();
+        let cwd = self.config.cwd.clone();
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        let poller = Some(handle.spawn(async move {
+            let mut interval = tokio::time::interval(STATUSLINE_GIT_POLL_INTERVAL);
+            let mut last_preview: Option<GitPreviewData> = None;
+
+            loop {
+                interval.tick().await;
+                let cwd_clone = cwd.clone();
+                let preview = tokio::task::spawn_blocking(move || collect_git_preview(&cwd_clone))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(GitPreviewData::empty);
+
+                if last_preview.as_ref() == Some(&preview) {
+                    continue;
+                }
+                app_event_tx.send(AppEvent::StatuslineGitPreviewUpdated(preview.clone()));
+                last_preview = Some(preview);
+            }
+        }));
+
+        self.statusline_git_poller = poller;
+    }
+
+    fn stop_statusline_git_poller(&mut self) {
+        if let Some(handle) = self.statusline_git_poller.take() {
+            handle.abort();
+        }
     }
 
     fn restore_pre_review_token_info(&mut self) {
@@ -1700,6 +1746,7 @@ impl ChatWidget {
             rate_limit_warnings: RateLimitWarningState::default(),
             rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
             rate_limit_poller: None,
+            statusline_git_poller: None,
             stream_controller: None,
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
@@ -1734,6 +1781,7 @@ impl ChatWidget {
 
         // 初始化状态栏数据
         widget.update_statusline_data();
+        widget.start_statusline_git_poller();
 
         widget.prefetch_rate_limits();
         widget
@@ -1802,6 +1850,7 @@ impl ChatWidget {
             rate_limit_warnings: RateLimitWarningState::default(),
             rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
             rate_limit_poller: None,
+            statusline_git_poller: None,
             stream_controller: None,
             running_commands: HashMap::new(),
             suppressed_exec_calls: HashSet::new(),
@@ -1836,6 +1885,7 @@ impl ChatWidget {
 
         // 初始化状态栏数据
         widget.update_statusline_data();
+        widget.start_statusline_git_poller();
 
         widget.prefetch_rate_limits();
         widget
@@ -3904,6 +3954,10 @@ impl ChatWidget {
         self.bottom_pane.set_statusline_config(config);
     }
 
+    pub(crate) fn set_statusline_git_preview(&mut self, preview: GitPreviewData) {
+        self.bottom_pane.set_statusline_git_preview(preview);
+    }
+
     /// Set the sandbox policy in the widget's config copy.
     pub(crate) fn set_sandbox_policy(&mut self, policy: SandboxPolicy) -> ConstraintResult<()> {
         #[cfg(target_os = "windows")]
@@ -4443,6 +4497,7 @@ impl ChatWidget {
 impl Drop for ChatWidget {
     fn drop(&mut self) {
         self.stop_rate_limit_poller();
+        self.stop_statusline_git_poller();
     }
 }
 

@@ -2,12 +2,16 @@
 // 参考 CCometixLine 的 statusline.rs
 
 use super::config::CxLineConfig;
-use super::segment::{SegmentData, SegmentId};
-use super::style::{StyleMode, separators};
+use super::segment::SegmentData;
+use super::segment::SegmentId;
+use super::style::StyleMode;
+use super::style::separators;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Style, Stylize};
-use ratatui::text::{Line, Span};
+use ratatui::style::Style;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::WidgetRef;
 
 /// Powerline 箭头字符

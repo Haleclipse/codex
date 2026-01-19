@@ -60,7 +60,11 @@
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::has_ctrl_or_alt;
-use crate::statusline::{CxLineConfig, StatusLineContext, StatusLineWidget, build_statusline};
+use crate::statusline::CxLineConfig;
+use crate::statusline::GitPreviewData;
+use crate::statusline::StatusLineContext;
+use crate::statusline::StatusLineWidget;
+use crate::statusline::build_statusline;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -204,6 +208,7 @@ pub(crate) struct ChatComposer {
     statusline_cwd: PathBuf,
     statusline_rate_limit_percent: Option<f64>,
     statusline_rate_limit_resets_at: Option<String>,
+    statusline_git_preview: Option<GitPreviewData>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -263,6 +268,7 @@ impl ChatComposer {
             statusline_cwd: PathBuf::new(),
             statusline_rate_limit_percent: None,
             statusline_rate_limit_resets_at: None,
+            statusline_git_preview: Some(GitPreviewData::empty()),
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -305,6 +311,14 @@ impl ChatComposer {
     /// 设置状态栏配置
     pub fn set_statusline_config(&mut self, config: CxLineConfig) {
         self.statusline_config = config;
+    }
+
+    /// 设置状态栏 Git 预览数据
+    pub fn set_statusline_git_preview(&mut self, preview: GitPreviewData) {
+        if self.statusline_git_preview.as_ref() == Some(&preview) {
+            return;
+        }
+        self.statusline_git_preview = Some(preview);
     }
 
     fn layout_areas(&self, area: Rect) -> [Rect; 4] {
@@ -2281,12 +2295,20 @@ impl Renderable for ChatComposer {
             && statusline_rect.height > 0
             && statusline_rect.y < area.y + area.height
         {
-            let ctx = StatusLineContext::new(&self.statusline_model, &self.statusline_cwd)
+            let mut ctx = StatusLineContext::new(&self.statusline_model, &self.statusline_cwd)
                 .with_context(self.context_window_used_tokens, self.context_window_size)
                 .with_rate_limit(
                     self.statusline_rate_limit_percent,
                     self.statusline_rate_limit_resets_at.clone(),
                 );
+            if let Some(preview) = &self.statusline_git_preview {
+                ctx = ctx.with_git_preview(
+                    &preview.branch,
+                    &preview.status,
+                    preview.ahead,
+                    preview.behind,
+                );
+            }
             let renderer = build_statusline(&self.statusline_config, &ctx);
             let statusline_widget = StatusLineWidget::from_renderer(&renderer);
             // 添加左边距，与输入框 ❯ 提示符对齐

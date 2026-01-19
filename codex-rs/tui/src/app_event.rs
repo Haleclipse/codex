@@ -19,6 +19,7 @@ use codex_protocol::openai_models::ModelPreset;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::history_cell::HistoryCell;
+use crate::statusline::GitPreviewData;
 
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
@@ -86,6 +87,9 @@ pub(crate) enum AppEvent {
 
     /// Result of refreshing rate limits
     RateLimitSnapshotFetched(RateLimitSnapshot),
+
+    /// Result of refreshing statusline Git info
+    StatuslineGitPreviewUpdated(GitPreviewData),
 
     /// Result of computing a `/diff` command.
     DiffResult(String),

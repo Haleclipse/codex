@@ -81,7 +81,10 @@ mod tests {
         );
         // 测试模型名称映射
         assert_eq!(simplify_model_name("gpt-5.2-codex"), "GPT 5.2 Codex");
-        assert_eq!(simplify_model_name("gpt-5.1-codex-max"), "GPT 5.1 Codex Max");
+        assert_eq!(
+            simplify_model_name("gpt-5.1-codex-max"),
+            "GPT 5.1 Codex Max"
+        );
         assert_eq!(simplify_model_name("gpt-5"), "GPT 5");
         // 测试无映射的模型
         assert_eq!(simplify_model_name("custom-model"), "custom-model");

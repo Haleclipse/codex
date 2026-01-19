@@ -500,6 +500,15 @@ impl BottomPane {
         self.composer.set_statusline_config(config);
     }
 
+    /// 设置状态栏 Git 预览数据
+    pub(crate) fn set_statusline_git_preview(
+        &mut self,
+        preview: crate::statusline::GitPreviewData,
+    ) {
+        self.composer.set_statusline_git_preview(preview);
+        self.request_redraw();
+    }
+
     /// 设置状态栏数据
     pub(crate) fn set_statusline_data(
         &mut self,

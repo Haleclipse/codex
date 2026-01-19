@@ -973,6 +973,9 @@ impl App {
             AppEvent::RateLimitSnapshotFetched(snapshot) => {
                 self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
             }
+            AppEvent::StatuslineGitPreviewUpdated(preview) => {
+                self.chat_widget.set_statusline_git_preview(preview);
+            }
             AppEvent::UpdateReasoningEffort(effort) => {
                 self.on_update_reasoning_effort(effort);
             }

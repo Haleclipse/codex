@@ -1,7 +1,14 @@
 // 主题预设系统
 
-use super::config::{CxLineConfig, SegmentItemConfig, SegmentsConfig};
-use super::style::{AnsiColor, ColorConfig, IconConfig, StyleMode, TextStyleConfig, ansi16};
+use super::config::CxLineConfig;
+use super::config::SegmentItemConfig;
+use super::config::SegmentsConfig;
+use super::style::AnsiColor;
+use super::style::ColorConfig;
+use super::style::IconConfig;
+use super::style::StyleMode;
+use super::style::TextStyleConfig;
+use super::style::ansi16;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;

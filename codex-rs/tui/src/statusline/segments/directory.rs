@@ -1,7 +1,9 @@
 // Directory Segment - 显示当前工作目录名称
 
 use crate::statusline::StatusLineContext;
-use crate::statusline::segment::{Segment, SegmentData, SegmentId};
+use crate::statusline::segment::Segment;
+use crate::statusline::segment::SegmentData;
+use crate::statusline::segment::SegmentId;
 
 pub struct DirectorySegment;
 

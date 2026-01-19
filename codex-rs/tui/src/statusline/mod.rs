@@ -14,17 +14,22 @@ pub mod themes;
 
 use std::path::Path;
 
-pub use color_picker::{ColorPicker, ColorTarget};
+pub use color_picker::ColorPicker;
+pub use color_picker::ColorTarget;
 pub use config::CxLineConfig;
 pub use icon_selector::IconSelector;
 pub use name_input::NameInputDialog;
-pub use renderer::{StatusLineRenderer, StatusLineWidget};
-pub use segment::{Segment, SegmentData, SegmentId, SegmentStyle};
+pub use renderer::StatusLineRenderer;
+pub use renderer::StatusLineWidget;
+pub use segment::Segment;
+pub use segment::SegmentData;
+pub use segment::SegmentId;
+pub use segment::SegmentStyle;
 pub use separator_editor::SeparatorEditor;
 pub use style::StyleMode;
 
 /// Git 预览数据（用于配置页预览）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitPreviewData {
     pub branch: String,
     pub status: String,
@@ -94,6 +99,17 @@ impl<'a> StatusLineContext<'a> {
     }
 }
 
+impl GitPreviewData {
+    pub fn empty() -> Self {
+        Self {
+            branch: String::new(),
+            status: String::new(),
+            ahead: 0,
+            behind: 0,
+        }
+    }
+}
+
 /// 构建状态栏
 /// 收集所有 segment 数据并返回渲染器
 pub fn build_statusline<'a>(
@@ -145,4 +161,10 @@ pub fn build_statusline<'a>(
     }
 
     renderer
+}
+
+/// 异步更新用的 Git 预览数据收集（避免在 render 中执行 git 命令）
+pub(crate) fn collect_git_preview(cwd: &Path) -> Option<GitPreviewData> {
+    let segment = segments::GitSegment;
+    segment.collect_preview(cwd)
 }

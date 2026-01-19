@@ -1,7 +1,9 @@
 // Usage Segment - 显示 Rate Limit 使用情况
 
 use crate::statusline::StatusLineContext;
-use crate::statusline::segment::{Segment, SegmentData, SegmentId};
+use crate::statusline::segment::Segment;
+use crate::statusline::segment::SegmentData;
+use crate::statusline::segment::SegmentId;
 
 pub struct UsageSegment;
 
