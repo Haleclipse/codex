@@ -195,7 +195,9 @@ use self::skills::find_skill_mentions;
 use crate::streaming::controller::StreamController;
 use std::path::Path;
 
+use chrono::DateTime;
 use chrono::Local;
+use chrono::Utc;
 use codex_common::approval_presets::ApprovalPreset;
 use codex_common::approval_presets::builtin_approval_presets;
 use codex_core::AuthManager;
@@ -1010,22 +1012,36 @@ impl ChatWidget {
     /// 更新状态栏数据
     fn update_statusline_data(&mut self) {
         // 获取 rate limit 使用率
-        let (rate_limit_percent, rate_limit_resets_at) =
+        // - hourly (primary): 用于百分比数字显示
+        // - weekly (secondary): 用于圆圈进度和重置时间
+        let (hourly_percent, weekly_percent, weekly_resets_at) =
             if let Some(ref snapshot) = self.rate_limit_snapshot {
-                if let Some(ref primary) = snapshot.primary {
-                    (Some(primary.used_percent), primary.resets_at.clone())
-                } else {
-                    (None, None)
-                }
+                let hourly = snapshot.primary.as_ref().map(|p| p.used_percent);
+                let weekly = snapshot.secondary.as_ref().map(|s| s.used_percent);
+                // Format reset time as "M-D-H" for StatusLine
+                let resets_at = snapshot
+                    .secondary
+                    .as_ref()
+                    .and_then(|s| s.resets_at_timestamp)
+                    .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+                    .map(|dt| dt.with_timezone(&Local))
+                    .map(|dt| dt.format("%-m-%-d-%-H").to_string());
+                (hourly, weekly, resets_at)
             } else {
-                (None, None)
+                (None, None, None)
             };
 
+        // Get current model and reasoning effort from effective collaboration mode
+        let reasoning_effort = self.effective_reasoning_effort();
+        let current_model = self.current_model().to_string();
+
         self.bottom_pane.set_statusline_data(
-            self.config.model.as_deref().unwrap_or(""),
+            &current_model,
+            reasoning_effort,
             &self.config.cwd,
-            rate_limit_percent,
-            rate_limit_resets_at,
+            hourly_percent,
+            weekly_percent,
+            weekly_resets_at,
         );
     }
 
@@ -4853,6 +4869,8 @@ impl ChatWidget {
         {
             mask.reasoning_effort = Some(effort);
         }
+        // Update statusline to reflect reasoning effort changes
+        self.update_statusline_data();
     }
 
     /// Set the personality in the widget's config copy.
@@ -4975,6 +4993,8 @@ impl ChatWidget {
     fn refresh_model_display(&mut self) {
         let effective = self.effective_collaboration_mode();
         self.session_header.set_model(effective.model());
+        // Also update statusline to reflect model/reasoning effort changes
+        self.update_statusline_data();
     }
 
     fn model_display_name(&self) -> &str {

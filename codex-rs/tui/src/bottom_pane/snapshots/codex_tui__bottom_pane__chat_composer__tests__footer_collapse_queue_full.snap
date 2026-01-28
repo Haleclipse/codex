@@ -2,12 +2,12 @@
 source: tui/src/bottom_pane/chat_composer.rs
 expression: terminal.backend()
 ---
-"                                                                                                                        "
-"› Test                                                                                                                  "
-"                                                                                                                        "
-"                                                                                                                        "
+"────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+"❯ Test                                                                                                                  "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
 "                                                                                                                        "
-"  tab to queue message · Code mode                                                                    98% context left  "
+"────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+"   98 tokens                                                                                                           "
+"  tab to queue message · Code mode                                                                                      "

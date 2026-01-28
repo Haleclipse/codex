@@ -274,6 +274,20 @@ impl ModelsManager {
         let chatgpt_mode = self.auth_manager.get_auth_mode() == Some(AuthMode::ChatGPT);
         merged_presets = ModelPreset::filter_by_auth(merged_presets, chatgpt_mode);
 
+        // Preserve local show_in_picker: true settings after merge.
+        // This allows deprecated models to remain selectable even if remote hides them.
+        let local_show_models: std::collections::HashSet<&str> = self
+            .local_models
+            .iter()
+            .filter(|p| p.show_in_picker)
+            .map(|p| p.model.as_str())
+            .collect();
+        for preset in &mut merged_presets {
+            if local_show_models.contains(preset.model.as_str()) {
+                preset.show_in_picker = true;
+            }
+        }
+
         for preset in &mut merged_presets {
             preset.is_default = false;
         }

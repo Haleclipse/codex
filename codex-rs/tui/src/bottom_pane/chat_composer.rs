@@ -137,6 +137,7 @@ use codex_common::fuzzy_match::fuzzy_match;
 use codex_protocol::custom_prompts::CustomPrompt;
 use codex_protocol::custom_prompts::PROMPTS_CMD_PREFIX;
 use codex_protocol::models::local_image_label_text;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 
@@ -284,9 +285,11 @@ pub(crate) struct ChatComposer {
     // 状态栏相关数据
     statusline_config: CxLineConfig,
     statusline_model: String,
+    statusline_reasoning_effort: Option<ReasoningEffort>,
     statusline_cwd: PathBuf,
-    statusline_rate_limit_percent: Option<f64>,
-    statusline_rate_limit_resets_at: Option<String>,
+    statusline_hourly_rate_limit_percent: Option<f64>,
+    statusline_weekly_rate_limit_percent: Option<f64>,
+    statusline_weekly_rate_limit_resets_at: Option<String>,
     statusline_git_preview: Option<GitPreviewData>,
 }
 
@@ -378,9 +381,11 @@ impl ChatComposer {
             // 状态栏初始化
             statusline_config: CxLineConfig::load(),
             statusline_model: String::new(),
+            statusline_reasoning_effort: None,
             statusline_cwd: PathBuf::new(),
-            statusline_rate_limit_percent: None,
-            statusline_rate_limit_resets_at: None,
+            statusline_hourly_rate_limit_percent: None,
+            statusline_weekly_rate_limit_percent: None,
+            statusline_weekly_rate_limit_resets_at: None,
             statusline_git_preview: Some(GitPreviewData::empty()),
         };
         // Apply configuration via the setter to keep side-effects centralized.
@@ -439,14 +444,18 @@ impl ChatComposer {
     pub fn set_statusline_data(
         &mut self,
         model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
         cwd: &Path,
-        rate_limit_percent: Option<f64>,
-        rate_limit_resets_at: Option<String>,
+        hourly_rate_limit_percent: Option<f64>,
+        weekly_rate_limit_percent: Option<f64>,
+        weekly_rate_limit_resets_at: Option<String>,
     ) {
         self.statusline_model = model.to_string();
+        self.statusline_reasoning_effort = reasoning_effort;
         self.statusline_cwd = cwd.to_path_buf();
-        self.statusline_rate_limit_percent = rate_limit_percent;
-        self.statusline_rate_limit_resets_at = rate_limit_resets_at;
+        self.statusline_hourly_rate_limit_percent = hourly_rate_limit_percent;
+        self.statusline_weekly_rate_limit_percent = weekly_rate_limit_percent;
+        self.statusline_weekly_rate_limit_resets_at = weekly_rate_limit_resets_at;
     }
 
     /// 获取当前状态栏配置
@@ -2748,7 +2757,7 @@ impl Renderable for ChatComposer {
                         show_queue_hint,
                     )
                 };
-                let can_show_left_and_context =
+                let _can_show_left_and_context =
                     can_show_left_with_context(hint_rect, left_width, context_width);
                 let has_override =
                     self.footer_flash_visible() || self.footer_hint_override.is_some();
@@ -2775,19 +2784,8 @@ impl Renderable for ChatComposer {
                         | FooterMode::ShortcutOverlay => None,
                     }
                 };
-                let show_context = if matches!(
-                    footer_props.mode,
-                    FooterMode::EscHint
-                        | FooterMode::QuitShortcutReminder
-                        | FooterMode::ShortcutOverlay
-                ) {
-                    false
-                } else {
-                    single_line_layout
-                        .as_ref()
-                        .map(|(_, show_context)| *show_context)
-                        .unwrap_or(can_show_left_and_context)
-                };
+                // StatusLine (CxLine) shows context info, disable duplicate footer display
+                let show_context = false;
 
                 if let Some((summary_left, _)) = single_line_layout {
                     match summary_left {
@@ -2861,10 +2859,12 @@ impl Renderable for ChatComposer {
             && statusline_rect.y < area.y + area.height
         {
             let mut ctx = StatusLineContext::new(&self.statusline_model, &self.statusline_cwd)
+                .with_reasoning_effort(self.statusline_reasoning_effort)
                 .with_context(self.context_window_used_tokens, self.context_window_size)
                 .with_rate_limit(
-                    self.statusline_rate_limit_percent,
-                    self.statusline_rate_limit_resets_at.clone(),
+                    self.statusline_hourly_rate_limit_percent,
+                    self.statusline_weekly_rate_limit_percent,
+                    self.statusline_weekly_rate_limit_resets_at.clone(),
                 );
             if let Some(preview) = &self.statusline_git_preview {
                 ctx = ctx.with_git_preview(

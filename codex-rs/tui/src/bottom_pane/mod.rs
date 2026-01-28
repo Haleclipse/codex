@@ -28,6 +28,7 @@ use bottom_pane_view::BottomPaneView;
 use codex_core::features::Features;
 use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::user_input::TextElement;
 use crossterm::event::KeyCode;
@@ -596,12 +597,20 @@ impl BottomPane {
     pub(crate) fn set_statusline_data(
         &mut self,
         model: &str,
+        reasoning_effort: Option<ReasoningEffort>,
         cwd: &std::path::Path,
-        rate_limit_percent: Option<f64>,
-        rate_limit_resets_at: Option<String>,
+        hourly_rate_limit_percent: Option<f64>,
+        weekly_rate_limit_percent: Option<f64>,
+        weekly_rate_limit_resets_at: Option<String>,
     ) {
-        self.composer
-            .set_statusline_data(model, cwd, rate_limit_percent, rate_limit_resets_at);
+        self.composer.set_statusline_data(
+            model,
+            reasoning_effort,
+            cwd,
+            hourly_rate_limit_percent,
+            weekly_rate_limit_percent,
+            weekly_rate_limit_resets_at,
+        );
         self.request_redraw();
     }
 

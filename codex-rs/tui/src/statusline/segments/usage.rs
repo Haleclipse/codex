@@ -9,20 +9,24 @@ pub struct UsageSegment;
 
 impl Segment for UsageSegment {
     fn collect(&self, ctx: &StatusLineContext) -> Option<SegmentData> {
-        let percent = ctx.rate_limit_percent?;
+        // 5h limit 用于百分比显示
+        let hourly_percent = ctx.hourly_rate_limit_percent?;
+        // Weekly limit 用于圆圈进度
+        let weekly_percent = ctx.weekly_rate_limit_percent.unwrap_or(hourly_percent);
 
-        // 格式化百分比
-        let display = format!("{percent:.0}%");
+        // 格式化百分比 (显示 5h limit)
+        let display = format!("{hourly_percent:.0}%");
 
-        // 动态图标：根据使用率选择不同的圆形切片图标
-        let dynamic_icon = get_circle_icon(percent / 100.0);
+        // 动态图标：根据周限使用率选择不同的圆形切片图标
+        let dynamic_icon = get_circle_icon(weekly_percent / 100.0);
 
         let mut data = SegmentData::new(display)
-            .with_metadata("percent", format!("{percent:.1}"))
+            .with_metadata("hourly_percent", format!("{hourly_percent:.1}"))
+            .with_metadata("weekly_percent", format!("{weekly_percent:.1}"))
             .with_metadata("dynamic_icon", dynamic_icon);
 
-        // 添加重置时间
-        if let Some(ref resets_at) = ctx.rate_limit_resets_at {
+        // 添加周限重置时间
+        if let Some(ref resets_at) = ctx.weekly_rate_limit_resets_at {
             data = data
                 .with_secondary(format!("· {resets_at}"))
                 .with_metadata("resets_at", resets_at);

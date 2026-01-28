@@ -713,11 +713,13 @@ impl CxlineOverlay {
         use crate::statusline::renderer::StatusLineRenderer;
         use crate::statusline::segment::Segment;
         use crate::statusline::segments::*;
+        use codex_protocol::openai_models::ReasoningEffort;
 
         let ctx =
             StatusLineContext::new("gpt-5.2-codex", std::path::Path::new("/home/user/Cxline"))
+                .with_reasoning_effort(Some(ReasoningEffort::Medium))
                 .with_context(Some(50000), Some(128000))
-                .with_rate_limit(Some(25.0), Some("12:00".to_string()))
+                .with_rate_limit(Some(25.0), Some(15.0), Some("1-28-14".to_string()))
                 .with_git_preview("main", "✓", 0, 0);
 
         // 按 segment_order 顺序构建预览

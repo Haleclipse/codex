@@ -4,6 +4,7 @@ use crate::statusline::StatusLineContext;
 use crate::statusline::segment::Segment;
 use crate::statusline::segment::SegmentData;
 use crate::statusline::segment::SegmentId;
+use codex_protocol::openai_models::ReasoningEffort;
 
 pub struct ModelSegment;
 
@@ -17,11 +18,35 @@ impl Segment for ModelSegment {
         // 简化模型名称显示
         let display_name = simplify_model_name(model_name);
 
+        // Append reasoning effort suffix if present
+        let display_name = if let Some(effort) = ctx.reasoning_effort {
+            let effort_suffix = reasoning_effort_suffix(effort);
+            if effort_suffix.is_empty() {
+                display_name
+            } else {
+                format!("{display_name} {effort_suffix}")
+            }
+        } else {
+            display_name
+        };
+
         Some(SegmentData::new(display_name).with_metadata("model_id", model_name))
     }
 
     fn id(&self) -> SegmentId {
         SegmentId::Model
+    }
+}
+
+/// Get short suffix for reasoning effort level
+fn reasoning_effort_suffix(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::None => "",
+        ReasoningEffort::Minimal => "·min",
+        ReasoningEffort::Low => "·lo",
+        ReasoningEffort::Medium => "·med",
+        ReasoningEffort::High => "·hi",
+        ReasoningEffort::XHigh => "·xhi",
     }
 }
 

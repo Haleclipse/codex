@@ -14,6 +14,8 @@ pub mod themes;
 
 use std::path::Path;
 
+use codex_protocol::openai_models::ReasoningEffort;
+
 pub use color_picker::ColorPicker;
 pub use color_picker::ColorTarget;
 pub use config::CxLineConfig;
@@ -43,6 +45,9 @@ pub struct StatusLineContext<'a> {
     /// 当前模型名称
     pub model_name: &'a str,
 
+    /// Reasoning effort level
+    pub reasoning_effort: Option<ReasoningEffort>,
+
     /// 当前工作目录
     pub cwd: &'a Path,
 
@@ -52,11 +57,14 @@ pub struct StatusLineContext<'a> {
     /// 上下文窗口大小（用于计算使用占比）
     pub context_window_size: Option<i64>,
 
-    /// Rate limit 使用百分比
-    pub rate_limit_percent: Option<f64>,
+    /// 5h Rate limit 使用百分比 (用于百分比数字显示)
+    pub hourly_rate_limit_percent: Option<f64>,
 
-    /// Rate limit 重置时间
-    pub rate_limit_resets_at: Option<String>,
+    /// Weekly Rate limit 使用百分比 (用于圆圈进度条)
+    pub weekly_rate_limit_percent: Option<f64>,
+
+    /// Weekly Rate limit 重置时间
+    pub weekly_rate_limit_resets_at: Option<String>,
 
     /// Git 预览数据（用于配置页预览，覆盖实际 git 检测）
     pub git_preview: Option<GitPreviewData>,
@@ -66,13 +74,20 @@ impl<'a> StatusLineContext<'a> {
     pub fn new(model_name: &'a str, cwd: &'a Path) -> Self {
         Self {
             model_name,
+            reasoning_effort: None,
             cwd,
             context_used_tokens: None,
             context_window_size: None,
-            rate_limit_percent: None,
-            rate_limit_resets_at: None,
+            hourly_rate_limit_percent: None,
+            weekly_rate_limit_percent: None,
+            weekly_rate_limit_resets_at: None,
             git_preview: None,
         }
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
     }
 
     pub fn with_context(mut self, used_tokens: Option<i64>, window_size: Option<i64>) -> Self {
@@ -81,9 +96,15 @@ impl<'a> StatusLineContext<'a> {
         self
     }
 
-    pub fn with_rate_limit(mut self, percent: Option<f64>, resets_at: Option<String>) -> Self {
-        self.rate_limit_percent = percent;
-        self.rate_limit_resets_at = resets_at;
+    pub fn with_rate_limit(
+        mut self,
+        hourly_percent: Option<f64>,
+        weekly_percent: Option<f64>,
+        weekly_resets_at: Option<String>,
+    ) -> Self {
+        self.hourly_rate_limit_percent = hourly_percent;
+        self.weekly_rate_limit_percent = weekly_percent;
+        self.weekly_rate_limit_resets_at = weekly_resets_at;
         self
     }
 
