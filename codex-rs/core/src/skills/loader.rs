@@ -35,7 +35,7 @@ struct SkillFrontmatterMetadata {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct SkillToml {
+struct SkillMetadataFile {
     #[serde(default)]
     interface: Option<Interface>,
 }
@@ -51,7 +51,7 @@ struct Interface {
 }
 
 const SKILLS_FILENAME: &str = "SKILL.md";
-const SKILLS_TOML_FILENAME: &str = "SKILL.toml";
+const SKILLS_JSON_FILENAME: &str = "SKILL.json";
 const SKILLS_DIR_NAME: &str = "skills";
 const MAX_NAME_LEN: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 1024;
@@ -370,9 +370,9 @@ fn parse_skill_file(path: &Path, scope: SkillScope) -> Result<SkillMetadata, Ski
 }
 
 fn load_skill_interface(skill_path: &Path) -> Option<SkillInterface> {
-    // Fail open: optional SKILL.toml metadata should not block loading SKILL.md.
+    // Fail open: optional interface metadata should not block loading SKILL.md.
     let skill_dir = skill_path.parent()?;
-    let interface_path = skill_dir.join(SKILLS_TOML_FILENAME);
+    let interface_path = skill_dir.join(SKILLS_JSON_FILENAME);
     if !interface_path.exists() {
         return None;
     }
@@ -381,17 +381,17 @@ fn load_skill_interface(skill_path: &Path) -> Option<SkillInterface> {
         Ok(contents) => contents,
         Err(error) => {
             tracing::warn!(
-                "ignoring {path}: failed to read SKILL.toml: {error}",
+                "ignoring {path}: failed to read SKILL.json: {error}",
                 path = interface_path.display()
             );
             return None;
         }
     };
-    let parsed: SkillToml = match toml::from_str(&contents) {
+    let parsed: SkillMetadataFile = match serde_json::from_str(&contents) {
         Ok(parsed) => parsed,
         Err(error) => {
             tracing::warn!(
-                "ignoring {path}: invalid TOML: {error}",
+                "ignoring {path}: invalid JSON: {error}",
                 path = interface_path.display()
             );
             return None;
@@ -756,7 +756,7 @@ mod tests {
     }
 
     fn write_skill_interface_at(skill_dir: &Path, contents: &str) -> PathBuf {
-        let path = skill_dir.join(SKILLS_TOML_FILENAME);
+        let path = skill_dir.join(SKILLS_JSON_FILENAME);
         fs::write(&path, contents).unwrap();
         path
     }
@@ -764,20 +764,23 @@ mod tests {
     #[tokio::test]
     async fn loads_skill_interface_metadata_happy_path() {
         let codex_home = tempfile::tempdir().expect("tempdir");
-        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from toml");
+        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from json");
         let skill_dir = skill_path.parent().expect("skill dir");
         let normalized_skill_dir = normalized(skill_dir);
 
         write_skill_interface_at(
             skill_dir,
             r##"
-[interface]
-display_name = "UI Skill"
-short_description = "  short    desc   "
-icon_small = "./assets/small-400px.png"
-icon_large = "./assets/large-logo.svg"
-brand_color = "#3B82F6"
-default_prompt = "  default   prompt   "
+{
+  "interface": {
+    "display_name": "UI Skill",
+    "short_description": "  short    desc   ",
+    "icon_small": "./assets/small-400px.png",
+    "icon_large": "./assets/large-logo.svg",
+    "brand_color": "#3B82F6",
+    "default_prompt": "  default   prompt   "
+  }
+}
 "##,
         );
 
@@ -793,7 +796,7 @@ default_prompt = "  default   prompt   "
             outcome.skills,
             vec![SkillMetadata {
                 name: "ui-skill".to_string(),
-                description: "from toml".to_string(),
+                description: "from json".to_string(),
                 short_description: None,
                 interface: Some(SkillInterface {
                     display_name: Some("UI Skill".to_string()),
@@ -803,7 +806,7 @@ default_prompt = "  default   prompt   "
                     brand_color: Some("#3B82F6".to_string()),
                     default_prompt: Some("default prompt".to_string()),
                 }),
-                path: normalized(&skill_path),
+                path: normalized(skill_path.as_path()),
                 scope: SkillScope::User,
             }]
         );
@@ -812,17 +815,20 @@ default_prompt = "  default   prompt   "
     #[tokio::test]
     async fn accepts_icon_paths_under_assets_dir() {
         let codex_home = tempfile::tempdir().expect("tempdir");
-        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from toml");
+        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from json");
         let skill_dir = skill_path.parent().expect("skill dir");
         let normalized_skill_dir = normalized(skill_dir);
 
         write_skill_interface_at(
             skill_dir,
             r#"
-[interface]
-display_name = "UI Skill"
-icon_small = "assets/icon.png"
-icon_large = "./assets/logo.svg"
+{
+  "interface": {
+    "display_name": "UI Skill",
+    "icon_small": "assets/icon.png",
+    "icon_large": "./assets/logo.svg"
+  }
+}
 "#,
         );
 
@@ -838,7 +844,7 @@ icon_large = "./assets/logo.svg"
             outcome.skills,
             vec![SkillMetadata {
                 name: "ui-skill".to_string(),
-                description: "from toml".to_string(),
+                description: "from json".to_string(),
                 short_description: None,
                 interface: Some(SkillInterface {
                     display_name: Some("UI Skill".to_string()),
@@ -857,14 +863,17 @@ icon_large = "./assets/logo.svg"
     #[tokio::test]
     async fn ignores_invalid_brand_color() {
         let codex_home = tempfile::tempdir().expect("tempdir");
-        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from toml");
+        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from json");
         let skill_dir = skill_path.parent().expect("skill dir");
 
         write_skill_interface_at(
             skill_dir,
             r#"
-[interface]
-brand_color = "blue"
+{
+  "interface": {
+    "brand_color": "blue"
+  }
+}
 "#,
         );
 
@@ -880,7 +889,7 @@ brand_color = "blue"
             outcome.skills,
             vec![SkillMetadata {
                 name: "ui-skill".to_string(),
-                description: "from toml".to_string(),
+                description: "from json".to_string(),
                 short_description: None,
                 interface: None,
                 path: normalized(&skill_path),
@@ -892,7 +901,7 @@ brand_color = "blue"
     #[tokio::test]
     async fn ignores_default_prompt_over_max_length() {
         let codex_home = tempfile::tempdir().expect("tempdir");
-        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from toml");
+        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from json");
         let skill_dir = skill_path.parent().expect("skill dir");
         let normalized_skill_dir = normalized(skill_dir);
         let too_long = "x".repeat(MAX_DEFAULT_PROMPT_LEN + 1);
@@ -901,10 +910,13 @@ brand_color = "blue"
             skill_dir,
             &format!(
                 r##"
-[interface]
-display_name = "UI Skill"
-icon_small = "./assets/small-400px.png"
-default_prompt = "{too_long}"
+{{
+  "interface": {{
+    "display_name": "UI Skill",
+    "icon_small": "./assets/small-400px.png",
+    "default_prompt": "{too_long}"
+  }}
+}}
 "##
             ),
         );
@@ -921,7 +933,7 @@ default_prompt = "{too_long}"
             outcome.skills,
             vec![SkillMetadata {
                 name: "ui-skill".to_string(),
-                description: "from toml".to_string(),
+                description: "from json".to_string(),
                 short_description: None,
                 interface: Some(SkillInterface {
                     display_name: Some("UI Skill".to_string()),
@@ -940,15 +952,18 @@ default_prompt = "{too_long}"
     #[tokio::test]
     async fn drops_interface_when_icons_are_invalid() {
         let codex_home = tempfile::tempdir().expect("tempdir");
-        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from toml");
+        let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from json");
         let skill_dir = skill_path.parent().expect("skill dir");
 
         write_skill_interface_at(
             skill_dir,
             r#"
-[interface]
-icon_small = "icon.png"
-icon_large = "./assets/../logo.svg"
+{
+  "interface": {
+    "icon_small": "icon.png",
+    "icon_large": "./assets/../logo.svg"
+  }
+}
 "#,
         );
 
@@ -964,7 +979,7 @@ icon_large = "./assets/../logo.svg"
             outcome.skills,
             vec![SkillMetadata {
                 name: "ui-skill".to_string(),
-                description: "from toml".to_string(),
+                description: "from json".to_string(),
                 short_description: None,
                 interface: None,
                 path: normalized(&skill_path),
