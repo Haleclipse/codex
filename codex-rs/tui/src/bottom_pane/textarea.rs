@@ -1176,13 +1176,32 @@ impl TextArea {
             }
 
             // Apply reverse style to the character at cursor position.
+            // For wide characters (CJK, emoji), we need to apply the style to all cells
+            // that the character occupies.
             if self.cursor_pos >= line_range.start && self.cursor_pos <= line_range.end {
                 let cursor_x = self.text[line_range.start..self.cursor_pos].width() as u16;
                 let cursor_screen_x = area.x + cursor_x;
-                if cursor_screen_x < area.x + area.width {
-                    let cell = buf.cell_mut((cursor_screen_x, y));
-                    if let Some(cell) = cell {
-                        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+
+                // Determine the width of the character at cursor position
+                let char_width = if self.cursor_pos < line_range.end {
+                    // Get the grapheme at cursor position and calculate its width
+                    self.text[self.cursor_pos..]
+                        .graphemes(true)
+                        .next()
+                        .map(|g| g.width())
+                        .unwrap_or(1)
+                } else {
+                    // Cursor is at end of line, use width 1 for block cursor
+                    1
+                };
+
+                // Apply reverse style to all cells occupied by this character
+                for offset in 0..char_width {
+                    let x = cursor_screen_x + offset as u16;
+                    if x < area.x + area.width {
+                        if let Some(cell) = buf.cell_mut((x, y)) {
+                            cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                        }
                     }
                 }
             }
