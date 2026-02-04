@@ -5322,17 +5322,8 @@ impl ChatWidget {
     }
 
     fn current_model_supports_personality(&self) -> bool {
-        let model = self.current_model();
-        self.models_manager
-            .try_list_models(&self.config)
-            .ok()
-            .and_then(|models| {
-                models
-                    .into_iter()
-                    .find(|preset| preset.model == model)
-                    .map(|preset| preset.supports_personality)
-            })
-            .unwrap_or(false)
+        // @cometix: Enable personality for all models regardless of remote API response.
+        true
     }
 
     #[allow(dead_code)] // Used in tests
