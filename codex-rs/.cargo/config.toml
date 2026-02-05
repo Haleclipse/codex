@@ -1,4 +1,5 @@
 [target.'cfg(all(windows, target_env = "msvc"))']
+linker = "lld-link"
 rustflags = ["-C", "link-arg=/STACK:8388608"]
 
 [target.'cfg(all(windows, target_env = "gnu"))']

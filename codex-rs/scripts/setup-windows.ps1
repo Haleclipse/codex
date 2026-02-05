@@ -214,6 +214,22 @@ Write-Host "-- Installing LLVM/Clang" -ForegroundColor DarkCyan
 winget install @WingetArgs --id LLVM.LLVM | Out-Host
 Add-LLVMToPath
 
+# Ensure `lld-link` is available (Cargo is configured to use it for faster linking on Windows/MSVC).
+if (-not (Ensure-Command 'lld-link')) {
+  Write-Host "-- lld-link not found; installing a fallback from rustup (rust-lld -> lld-link)" -ForegroundColor DarkCyan
+  $sysroot = (& rustc --print sysroot)
+  $triple = (& rustc -vV | Select-String '^host: ' | ForEach-Object { $_.Line.Split(' ')[1] })
+  $rustLld = Join-Path $sysroot "lib\\rustlib\\$triple\\bin\\rust-lld.exe"
+  $cargoBin = Join-Path $env:USERPROFILE ".cargo\\bin"
+  if (Test-Path $rustLld) {
+    New-Item -ItemType Directory -Force -Path $cargoBin | Out-Null
+    Copy-Item -Force $rustLld (Join-Path $cargoBin "lld-link.exe")
+    Add-CargoBinToPath
+  } else {
+    Write-Host "-- rust-lld not found at $rustLld; you may need LLVM.LLVM in PATH for lld-link" -ForegroundColor Yellow
+  }
+}
+
 # 7) cargo-insta (used by snapshot tests)
 # Ensure MSVC linker is available before building/cargo-install by entering VS dev shell
 Enter-VsDevShell
