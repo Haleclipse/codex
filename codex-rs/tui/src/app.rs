@@ -1220,6 +1220,15 @@ impl App {
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        if matches!(event, TuiEvent::Draw) {
+            let result = self.chat_widget.translation_draw_tick_result();
+            if let Some(status_header) = result.status_header_update {
+                self.chat_widget.set_status_header(status_header);
+            }
+            if result.needs_redraw {
+                self.chat_widget.request_redraw();
+            }
+        }
         if self.overlay.is_some() {
             let _ = self.handle_backtrack_overlay_event(tui, event).await?;
         } else {

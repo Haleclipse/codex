@@ -283,6 +283,12 @@
         "personality": {
           "$ref": "#/definitions/Personality"
         },
+        "plugins": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Generic plugin namespace (no schema coupling to specific plugins).",
+          "type": "object"
+        },
         "sandbox_mode": {
           "$ref": "#/definitions/SandboxMode"
         },
@@ -1446,6 +1452,12 @@
         }
       ],
       "description": "Optionally specify a personality for the model"
+    },
+    "plugins": {
+      "additionalProperties": true,
+      "default": {},
+      "description": "Generic plugin namespace.",
+      "type": "object"
     },
     "profile": {
       "description": "Profile to use from the `profiles` map.",

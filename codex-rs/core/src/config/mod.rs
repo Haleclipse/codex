@@ -1,6 +1,7 @@
 use crate::auth::AuthCredentialsStoreMode;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
+use crate::config::types::AgentReasoningTranslationConfig;
 use crate::config::types::DEFAULT_OTEL_ENVIRONMENT;
 use crate::config::types::History;
 use crate::config::types::McpServerConfig;
@@ -16,6 +17,7 @@ use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
 use crate::config::types::SkillsConfig;
+use crate::config::types::TranslationToml;
 use crate::config::types::Tui;
 use crate::config::types::UriBasedFileOpener;
 use crate::config_loader::CloudRequirementsLoader;
@@ -77,6 +79,7 @@ use toml_edit::DocumentMut;
 
 mod constraint;
 pub mod edit;
+mod plugins_validation;
 pub mod profile;
 pub mod schema;
 pub mod service;
@@ -165,6 +168,11 @@ pub struct Config {
     /// When set to `true`, `AgentReasoningRawContentEvent` events will be shown in the UI/output.
     /// Defaults to `false`.
     pub show_raw_agent_reasoning: bool,
+
+    /// Optional `AgentReasoning` translation configuration (external command hook).
+    ///
+    /// When `None`, behavior matches upstream (no translation).
+    pub agent_reasoning_translation: Option<AgentReasoningTranslationConfig>,
 
     /// User-provided instructions from AGENTS.md.
     pub user_instructions: Option<String>,
@@ -918,6 +926,17 @@ pub struct ConfigToml {
     /// Defaults to `false`.
     pub show_raw_agent_reasoning: Option<bool>,
 
+    /// Generic plugin namespace.
+    #[serde(default)]
+    #[schemars(schema_with = "crate::config::schema::plugins_schema")]
+    pub plugins: HashMap<String, TomlValue>,
+
+    /// Legacy translation settings (deprecated; prefer `[plugins.translation]`).
+    ///
+    /// Kept out of the schema fixture to minimize churn.
+    #[schemars(skip)]
+    pub translation: Option<TranslationToml>,
+
     pub model_reasoning_effort: Option<ReasoningEffort>,
     pub model_reasoning_summary: Option<ReasoningSummary>,
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
@@ -1094,6 +1113,10 @@ pub struct SandboxPolicyResolution {
 }
 
 impl ConfigToml {
+    fn validate_plugins(&self) -> std::io::Result<()> {
+        plugins_validation::validate_plugins(self)
+    }
+
     /// Derive the effective sandbox policy from the configuration.
     fn derive_sandbox_policy(
         &self,
@@ -1361,6 +1384,8 @@ impl Config {
             None => ConfigProfile::default(),
         };
 
+        cfg.validate_plugins()?;
+
         let feature_overrides = FeatureOverrides {
             include_apply_patch_tool: include_apply_patch_tool_override,
             web_search_request: override_tools_web_search_request,
@@ -1524,6 +1549,17 @@ impl Config {
 
         let model = model.or(config_profile.model).or(cfg.model);
 
+        let agent_reasoning_translation =
+            crate::translation::resolve_agent_reasoning_translation_config(
+                crate::translation::AgentReasoningTranslationConfigSources {
+                    active_profile_name: active_profile_name.as_deref(),
+                    global_plugins_translation: cfg.plugins.get("translation"),
+                    global_legacy_translation: cfg.translation.as_ref(),
+                    profile_plugins_translation: config_profile.plugins.get("translation"),
+                    profile_legacy_translation: config_profile.translation.as_ref(),
+                },
+            )?;
+
         let compact_prompt = compact_prompt.or(cfg.compact_prompt).and_then(|value| {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -1655,6 +1691,7 @@ impl Config {
                 .show_raw_agent_reasoning
                 .or(show_raw_agent_reasoning)
                 .unwrap_or(false),
+            agent_reasoning_translation,
             model_reasoning_effort: config_profile
                 .model_reasoning_effort
                 .or(cfg.model_reasoning_effort),
@@ -3866,6 +3903,7 @@ model_verbosity = "high"
                 codex_linux_sandbox_exe: None,
                 hide_agent_reasoning: false,
                 show_raw_agent_reasoning: false,
+                agent_reasoning_translation: None,
                 model_reasoning_effort: Some(ReasoningEffort::High),
                 model_reasoning_summary: ReasoningSummary::Detailed,
                 model_supports_reasoning_summaries: None,
@@ -3952,6 +3990,7 @@ model_verbosity = "high"
             codex_linux_sandbox_exe: None,
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
+            agent_reasoning_translation: None,
             model_reasoning_effort: None,
             model_reasoning_summary: ReasoningSummary::default(),
             model_supports_reasoning_summaries: None,
@@ -4053,6 +4092,7 @@ model_verbosity = "high"
             codex_linux_sandbox_exe: None,
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
+            agent_reasoning_translation: None,
             model_reasoning_effort: None,
             model_reasoning_summary: ReasoningSummary::default(),
             model_supports_reasoning_summaries: None,
@@ -4140,6 +4180,7 @@ model_verbosity = "high"
             codex_linux_sandbox_exe: None,
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
+            agent_reasoning_translation: None,
             model_reasoning_effort: Some(ReasoningEffort::High),
             model_reasoning_summary: ReasoningSummary::Detailed,
             model_supports_reasoning_summaries: None,

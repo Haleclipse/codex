@@ -315,6 +315,50 @@ pub enum HistoryPersistence {
     None,
 }
 
+// ===== Translation configuration =====
+
+/// Translation configuration (external command plugin).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct TranslationToml {
+    /// `AgentReasoning` translation settings.
+    pub agent_reasoning: Option<AgentReasoningTranslationToml>,
+}
+
+/// `AgentReasoning` translation settings using an external command (argv).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AgentReasoningTranslationToml {
+    /// External translator command (argv).
+    ///
+    /// - Unset: translation disabled (default upstream behavior)
+    /// - Empty array: explicitly disabled (useful to override in a profile)
+    pub command: Option<Vec<String>>,
+
+    /// Translator process timeout (milliseconds).
+    pub timeout_ms: Option<u64>,
+
+    /// UI "adjacent translation" barrier max wait (milliseconds).
+    ///
+    /// This only affects the TUI alignment strategy; it does not control the
+    /// external process timeout.
+    pub ui_max_wait_ms: Option<u64>,
+}
+
+/// Default translator timeout (milliseconds).
+pub const DEFAULT_AGENT_REASONING_TRANSLATION_TIMEOUT_MS: u64 = 2_000;
+
+/// Default UI barrier max wait (milliseconds).
+pub const DEFAULT_AGENT_REASONING_TRANSLATION_UI_MAX_WAIT_MS: u64 = 5_000;
+
+/// Effective runtime translation configuration after defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentReasoningTranslationConfig {
+    pub command: Vec<String>,
+    pub timeout: Duration,
+    pub ui_max_wait: Duration,
+}
+
 // ===== Analytics configuration =====
 
 /// Analytics settings loaded from config.toml. Fields are optional so we can apply defaults.

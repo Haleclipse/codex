@@ -193,6 +193,8 @@ mod agent;
 use self::agent::spawn_agent;
 use self::agent::spawn_agent_from_existing;
 pub(crate) use self::agent::spawn_op_forwarder;
+mod agent_reasoning_translation;
+use self::agent_reasoning_translation::AgentReasoningTranslationOrchestrator;
 mod session_header;
 use self::session_header::SessionHeader;
 mod skills;
@@ -526,6 +528,7 @@ pub(crate) struct ChatWidget {
     reasoning_buffer: String,
     // Accumulates full reasoning content for transcript-only recording
     full_reasoning_buffer: String,
+    agent_reasoning_translation: AgentReasoningTranslationOrchestrator,
     // Current status header shown in the status indicator.
     current_status_header: String,
     // Previous status header to restore after a transient stream retry.
@@ -769,8 +772,7 @@ impl ChatWidget {
         };
         self.needs_final_message_separator = true;
         let cell = history_cell::new_unified_exec_interaction(wait.command_display, String::new());
-        self.app_event_tx
-            .send(AppEvent::InsertHistoryCell(Box::new(cell)));
+        self.emit_history_cell(Box::new(cell));
         self.restore_reasoning_status_header();
     }
 
@@ -793,7 +795,7 @@ impl ChatWidget {
 
     /// Convenience wrapper around [`Self::set_status`];
     /// updates the status indicator header and clears any existing details.
-    fn set_status_header(&mut self, header: String) {
+    pub(crate) fn set_status_header(&mut self, header: String) {
         self.set_status(header, None);
     }
 
@@ -996,11 +998,11 @@ impl ChatWidget {
             return;
         }
 
-        if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
-            // Update the shimmer header to the extracted reasoning chunk header.
+        if let Some(header) = self
+            .agent_reasoning_translation
+            .maybe_status_header_from_reasoning_buffer(&self.reasoning_buffer)
+        {
             self.set_status_header(header);
-        } else {
-            // Fallback while we don't yet have a bold header: leave existing header as-is.
         }
         self.request_redraw();
     }
@@ -2343,6 +2345,10 @@ impl ChatWidget {
 
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
 
+        let translation_enabled = config.agent_reasoning_translation.is_some();
+        let agent_reasoning_translation =
+            AgentReasoningTranslationOrchestrator::new(translation_enabled);
+
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -2391,6 +2397,7 @@ impl ChatWidget {
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
+            agent_reasoning_translation,
             current_status_header: String::from("Working"),
             retry_status_header: None,
             thread_id: None,
@@ -2494,6 +2501,10 @@ impl ChatWidget {
 
         let active_cell = Some(Self::placeholder_session_header_cell(&config));
 
+        let translation_enabled = config.agent_reasoning_translation.is_some();
+        let agent_reasoning_translation =
+            AgentReasoningTranslationOrchestrator::new(translation_enabled);
+
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -2541,6 +2552,7 @@ impl ChatWidget {
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
+            agent_reasoning_translation,
             current_status_header: String::from("Working"),
             retry_status_header: None,
             thread_id: None,
@@ -2630,6 +2642,10 @@ impl ChatWidget {
             settings: fallback_default,
         };
 
+        let translation_enabled = config.agent_reasoning_translation.is_some();
+        let agent_reasoning_translation =
+            AgentReasoningTranslationOrchestrator::new(translation_enabled);
+
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -2678,6 +2694,7 @@ impl ChatWidget {
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
+            agent_reasoning_translation,
             current_status_header: String::from("Working"),
             retry_status_header: None,
             thread_id: None,
@@ -3308,10 +3325,32 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn translation_draw_tick_result(
+        &mut self,
+    ) -> agent_reasoning_translation::OnBodyTranslatedResult {
+        self.agent_reasoning_translation.on_draw_tick(
+            self.thread_id,
+            self.config.agent_reasoning_translation.as_ref(),
+            &self.app_event_tx,
+            self.frame_requester.clone(),
+        )
+    }
+
+    fn emit_history_cell(&mut self, cell: Box<dyn HistoryCell>) {
+        self.agent_reasoning_translation
+            .emit_history_cell_with_translation_hook(
+                &self.app_event_tx,
+                self.config.agent_reasoning_translation.as_ref(),
+                self.thread_id,
+                self.frame_requester.clone(),
+                cell,
+            );
+    }
+
     fn flush_active_cell(&mut self) {
         if let Some(active) = self.active_cell.take() {
             self.needs_final_message_separator = true;
-            self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
+            self.emit_history_cell(active);
         }
     }
 
@@ -3333,7 +3372,7 @@ impl ChatWidget {
             self.flush_active_cell();
             self.needs_final_message_separator = true;
         }
-        self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
+        self.emit_history_cell(cell);
     }
 
     fn queue_user_message(&mut self, user_message: UserMessage) {
@@ -3791,7 +3830,7 @@ impl ChatWidget {
             .send(AppEvent::Exit(ExitMode::ShutdownFirst));
     }
 
-    fn request_redraw(&mut self) {
+    pub(crate) fn request_redraw(&mut self) {
         self.frame_requester.schedule_frame();
     }
 

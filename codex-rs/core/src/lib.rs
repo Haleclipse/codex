@@ -58,6 +58,7 @@ mod stream_events_utils;
 mod tagged_block_parser;
 mod text_encoding;
 pub mod token_data;
+pub mod translation;
 mod truncate;
 mod unified_exec;
 pub mod windows_sandbox;

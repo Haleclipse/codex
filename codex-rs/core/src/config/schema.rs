@@ -52,6 +52,25 @@ pub(crate) fn mcp_servers_schema(schema_gen: &mut SchemaGenerator) -> Schema {
     Schema::Object(object)
 }
 
+/// Schema for the generic `[plugins]` namespace.
+///
+/// Keep this intentionally permissive to avoid coupling the core config schema
+/// to any particular plugin's internal structure.
+pub(crate) fn plugins_schema(_schema_gen: &mut SchemaGenerator) -> Schema {
+    let mut object = SchemaObject {
+        instance_type: Some(InstanceType::Object.into()),
+        ..Default::default()
+    };
+
+    let validation = ObjectValidation {
+        additional_properties: Some(Box::new(Schema::Bool(true))),
+        ..Default::default()
+    };
+    object.object = Some(Box::new(validation));
+
+    Schema::Object(object)
+}
+
 /// Build the config schema for `config.toml`.
 pub fn config_schema() -> RootSchema {
     SchemaSettings::draft07()

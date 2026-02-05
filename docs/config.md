@@ -28,6 +28,12 @@ Codex can run a notification hook when the agent finishes a turn. See the config
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.
 
+## Agent Reasoning Translation (fork)
+
+This fork supports translating the TUI “Agent Reasoning / Thinking” blocks via an external command hook.
+
+See `docs/agent-reasoning-translation.md`.
+
 ## Notices
 
 Codex stores "do not show again" flags for some UI prompts under the `[notice]` table.
