@@ -296,6 +296,11 @@ impl ReasoningTranslator {
             );
         } else {
             let reason = error.unwrap_or_else(|| "unknown error".to_string());
+            tracing::warn!(
+                title = title.as_deref().unwrap_or("unknown"),
+                error = %reason,
+                "translation failed"
+            );
             self.emit_history_cell(
                 app_event_tx,
                 history_cell::new_agent_reasoning_translation_error_block(title, reason),
@@ -329,6 +334,13 @@ impl ReasoningTranslator {
 
         // Release barrier
         self.translation_barrier = None;
+
+        // Log timeout
+        tracing::warn!(
+            title = title.as_deref().unwrap_or("unknown"),
+            max_wait_ms = %max_wait_ms,
+            "translation timeout, barrier released"
+        );
 
         // Insert error block with title
         self.emit_history_cell(
@@ -453,7 +465,7 @@ impl ReasoningTranslator {
         let request_id = self.translation_seq;
         self.translation_seq = self.translation_seq.saturating_add(1);
 
-        let max_wait = self.max_wait_from_env();
+        let max_wait = self.resolve_max_wait();
         let deadline = Instant::now()
             .checked_add(max_wait)
             .unwrap_or_else(Instant::now);
@@ -471,14 +483,23 @@ impl ReasoningTranslator {
         Some(request_id)
     }
 
-    fn max_wait_from_env(&self) -> Duration {
-        match std::env::var(TRANSLATION_MAX_WAIT_ENV) {
-            Ok(raw) => match raw.trim().parse::<u64>() {
-                Ok(ms) => Duration::from_millis(ms),
-                Err(_) => Duration::from_millis(DEFAULT_TRANSLATION_MAX_WAIT_MS),
-            },
-            Err(_) => Duration::from_millis(DEFAULT_TRANSLATION_MAX_WAIT_MS),
+    /// Resolve max wait duration.
+    /// Priority: config.timeout_ms > env var > default (5000ms).
+    fn resolve_max_wait(&self) -> Duration {
+        // 1. Config file value
+        if let Some(ms) = self.config.timeout_ms {
+            if ms > 0 {
+                return Duration::from_millis(ms);
+            }
         }
+        // 2. Environment variable
+        if let Ok(raw) = std::env::var(TRANSLATION_MAX_WAIT_ENV) {
+            if let Ok(ms) = raw.trim().parse::<u64>() {
+                return Duration::from_millis(ms);
+            }
+        }
+        // 3. Default
+        Duration::from_millis(DEFAULT_TRANSLATION_MAX_WAIT_MS)
     }
 }
 

@@ -122,6 +122,7 @@ enum Selection {
     Model,
     Language,
     BaseUrl,
+    Timeout,
 }
 
 impl Selection {
@@ -132,6 +133,7 @@ impl Selection {
         Self::Model,
         Self::Language,
         Self::BaseUrl,
+        Self::Timeout,
     ];
 
     fn next(self) -> Self {
@@ -168,6 +170,8 @@ pub(crate) struct TranslateOverlay {
     model: String,
     /// Custom base URL.
     base_url: String,
+    /// Timeout in milliseconds (as string for editing).
+    timeout_ms: String,
     /// Selected target language.
     language: TargetLanguage,
     /// Language selection index.
@@ -207,6 +211,10 @@ impl TranslateOverlay {
         let api_key = config.api_key.clone().unwrap_or_default();
         let model = config.model.clone().unwrap_or_default();
         let base_url = config.base_url.clone().unwrap_or_default();
+        let timeout_ms = config
+            .timeout_ms
+            .map(|ms| ms.to_string())
+            .unwrap_or_default();
 
         Self {
             enabled,
@@ -215,6 +223,7 @@ impl TranslateOverlay {
             api_key,
             model,
             base_url,
+            timeout_ms,
             language,
             language_index,
             selection: Selection::Enabled,
@@ -247,7 +256,12 @@ impl TranslateOverlay {
             } else {
                 Some(self.base_url.clone())
             },
-            timeout_ms: None,
+            timeout_ms: self
+                .timeout_ms
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|&ms| ms > 0),
         }
     }
 
@@ -389,7 +403,7 @@ impl TranslateOverlay {
 
     fn enter_edit_mode(&mut self) {
         match self.selection {
-            Selection::ApiKey | Selection::Model | Selection::BaseUrl => {
+            Selection::ApiKey | Selection::Model | Selection::BaseUrl | Selection::Timeout => {
                 self.input_mode = InputMode::Editing;
                 let text = self.current_text();
                 self.cursor_position = text.len();
@@ -407,6 +421,7 @@ impl TranslateOverlay {
             Selection::ApiKey => &self.api_key,
             Selection::Model => &self.model,
             Selection::BaseUrl => &self.base_url,
+            Selection::Timeout => &self.timeout_ms,
             _ => "",
         }
     }
@@ -416,6 +431,7 @@ impl TranslateOverlay {
             Selection::ApiKey => &mut self.api_key,
             Selection::Model => &mut self.model,
             Selection::BaseUrl => &mut self.base_url,
+            Selection::Timeout => &mut self.timeout_ms,
             _ => unreachable!(),
         }
     }
@@ -530,20 +546,22 @@ impl TranslateOverlay {
 
         // Layout with spacing for all options
         let chunks = Layout::vertical([
-            Constraint::Length(1), // Top padding
-            Constraint::Length(3), // Enabled toggle
-            Constraint::Length(1), // Spacing
-            Constraint::Length(3), // Provider
-            Constraint::Length(1), // Spacing
-            Constraint::Length(3), // API Key
-            Constraint::Length(1), // Spacing
-            Constraint::Length(3), // Model
-            Constraint::Length(1), // Spacing
-            Constraint::Length(3), // Language
-            Constraint::Length(1), // Spacing
-            Constraint::Length(3), // Base URL
-            Constraint::Length(2), // Status
-            Constraint::Min(1),    // Help (at bottom)
+            Constraint::Length(1), // [0]  Top padding
+            Constraint::Length(3), // [1]  Enabled toggle
+            Constraint::Length(1), // [2]  Spacing
+            Constraint::Length(3), // [3]  Provider
+            Constraint::Length(1), // [4]  Spacing
+            Constraint::Length(3), // [5]  API Key
+            Constraint::Length(1), // [6]  Spacing
+            Constraint::Length(3), // [7]  Model
+            Constraint::Length(1), // [8]  Spacing
+            Constraint::Length(3), // [9]  Language
+            Constraint::Length(1), // [10] Spacing
+            Constraint::Length(3), // [11] Base URL
+            Constraint::Length(1), // [12] Spacing
+            Constraint::Length(3), // [13] Timeout
+            Constraint::Length(2), // [14] Status
+            Constraint::Min(1),    // [15] Help (at bottom)
         ])
         .split(inner);
 
@@ -619,13 +637,25 @@ impl TranslateOverlay {
             &format!("Default: {}", provider_def.default_base_url),
         );
 
+        // Timeout input
+        self.render_text_input(
+            chunks[13],
+            buf,
+            "Timeout (ms)",
+            &self.timeout_ms,
+            false,
+            self.selection == Selection::Timeout,
+            self.input_mode == InputMode::Editing && self.selection == Selection::Timeout,
+            "Default: 5000",
+        );
+
         // Status message
         if let Some(msg) = &self.status_message {
             let status = Paragraph::new(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(msg, Style::default().fg(Color::Green)),
             ]));
-            status.render(chunks[12], buf);
+            status.render(chunks[14], buf);
         }
 
         // Help text at bottom
@@ -660,7 +690,7 @@ impl TranslateOverlay {
                 .dim(),
             ])
         };
-        help.render(chunks[13], buf);
+        help.render(chunks[15], buf);
     }
 
     fn api_key_status(&self) -> Option<(&'static str, Color)> {
