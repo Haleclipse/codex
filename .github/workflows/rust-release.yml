@@ -543,9 +543,9 @@ jobs:
           NPM_TAG: ${{ needs.release.outputs.npm_tag }}
         run: |
           set -euo pipefail
-          prefix=""
+          tag_args=()
           if [[ -n "${NPM_TAG}" ]]; then
-            prefix="${NPM_TAG}-"
+            tag_args+=(--tag "${NPM_TAG}")
           fi
           npm publish "${GITHUB_WORKSPACE}/dist/npm/codex-npm-${VERSION}.tgz" "${tag_args[@]}"
 
