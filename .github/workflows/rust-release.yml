@@ -226,47 +226,6 @@ jobs:
           if-no-files-found: warn
 
 
-      - if: ${{ runner.os == 'macOS' }}
-        name: Build macOS dmg
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          target="${{ matrix.target }}"
-          release_dir="target/${target}/release"
-          dmg_root="${RUNNER_TEMP}/codex-dmg-root"
-          volname="Codex (${target})"
-          dmg_path="${release_dir}/codex-${target}.dmg"
-
-          # The previous "MacOS code signing (binaries)" step signs + notarizes the
-          # built artifacts in `${release_dir}`. This step packages *those same*
-          # signed binaries into a dmg.
-          codex_binary_path="${release_dir}/codex"
-
-          rm -rf "$dmg_root"
-          mkdir -p "$dmg_root"
-
-          if [[ ! -f "$codex_binary_path" ]]; then
-            echo "Binary $codex_binary_path not found"
-            exit 1
-          fi
-
-          ditto "$codex_binary_path" "${dmg_root}/codex"
-
-          rm -f "$dmg_path"
-          hdiutil create \
-            -volname "$volname" \
-            -srcfolder "$dmg_root" \
-            -format UDZO \
-            -ov \
-            "$dmg_path"
-
-          if [[ ! -f "$dmg_path" ]]; then
-            echo "dmg $dmg_path not found after build"
-            exit 1
-          fi
-
-
       - name: Stage artifacts
         shell: bash
         run: |
@@ -277,11 +236,6 @@ jobs:
             cp target/${{ matrix.target }}/release/codex.exe "$dest/codex-${{ matrix.target }}.exe"
           else
             cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
-          fi
-
-
-          if [[ "${{ matrix.target }}" == *apple-darwin ]]; then
-            cp target/${{ matrix.target }}/release/codex-${{ matrix.target }}.dmg "$dest/codex-${{ matrix.target }}.dmg"
           fi
 
       - name: Compress artifacts
