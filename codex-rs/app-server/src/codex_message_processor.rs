@@ -621,11 +621,10 @@ impl CodexMessageProcessor {
             ClientRequest::ModelList { request_id, params } => {
                 let outgoing = self.outgoing.clone();
                 let thread_manager = self.thread_manager.clone();
-                let config = self.config.clone();
                 let request_id = to_connection_request_id(request_id);
 
                 tokio::spawn(async move {
-                    Self::list_models(outgoing, thread_manager, config, request_id, params).await;
+                    Self::list_models(outgoing, thread_manager, request_id, params).await;
                 });
             }
             ClientRequest::ExperimentalFeatureList { request_id, params } => {
@@ -3621,7 +3620,6 @@ impl CodexMessageProcessor {
     async fn list_models(
         outgoing: Arc<OutgoingMessageSender>,
         thread_manager: Arc<ThreadManager>,
-        config: Arc<Config>,
         request_id: ConnectionRequestId,
         params: ModelListParams,
     ) {
@@ -3630,10 +3628,7 @@ impl CodexMessageProcessor {
             cursor,
             include_hidden,
         } = params;
-        let mut config = (*config).clone();
-        config.features.enable(Feature::RemoteModels);
-        let models =
-            supported_models(thread_manager, &config, include_hidden.unwrap_or(false)).await;
+        let models = supported_models(thread_manager, include_hidden.unwrap_or(false)).await;
         let total = models.len();
 
         if total == 0 {
