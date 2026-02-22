@@ -360,7 +360,7 @@ FROM threads
         }
 
         let mut builder = QueryBuilder::<Sqlite>::new(
-            "INSERT INTO logs (ts, ts_nanos, level, target, message, thread_id, module_path, file, line) ",
+            "INSERT INTO logs (ts, ts_nanos, level, target, message, thread_id, process_uuid, module_path, file, line) ",
         );
         builder.push_values(entries, |mut row, entry| {
             row.push_bind(entry.ts)
@@ -369,6 +369,7 @@ FROM threads
                 .push_bind(&entry.target)
                 .push_bind(&entry.message)
                 .push_bind(&entry.thread_id)
+                .push_bind(&entry.process_uuid)
                 .push_bind(&entry.module_path)
                 .push_bind(&entry.file)
                 .push_bind(entry.line);
@@ -388,7 +389,7 @@ FROM threads
     /// Query logs with optional filters.
     pub async fn query_logs(&self, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
         let mut builder = QueryBuilder::<Sqlite>::new(
-            "SELECT id, ts, ts_nanos, level, target, message, thread_id, file, line FROM logs WHERE 1 = 1",
+            "SELECT id, ts, ts_nanos, level, target, message, thread_id, process_uuid, file, line FROM logs WHERE 1 = 1",
         );
         push_log_filters(&mut builder, query);
         if query.descending {
@@ -710,6 +711,11 @@ fn push_log_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a LogQu
     if let Some(after_id) = query.after_id {
         builder.push(" AND id > ").push_bind(after_id);
     }
+    if let Some(search) = query.search.as_ref() {
+        builder.push(" AND INSTR(message, ");
+        builder.push_bind(search.as_str());
+        builder.push(") > 0");
+    }
 }
 
 fn push_like_filters<'a>(
@@ -905,6 +911,8 @@ mod tests {
     use super::StateRuntime;
     use super::ThreadMetadata;
     use super::state_db_filename;
+    use crate::LogEntry;
+    use crate::LogQuery;
     use crate::STATE_DB_FILENAME;
     use crate::STATE_DB_VERSION;
     use crate::model::Phase2JobClaimOutcome;
@@ -1143,7 +1151,14 @@ WHERE id = 1
 
         assert!(
             runtime
-                .mark_stage1_job_succeeded(thread_id, ownership_token.as_str(), 100, "raw", "sum")
+                .mark_stage1_job_succeeded(
+                    thread_id,
+                    ownership_token.as_str(),
+                    100,
+                    "raw",
+                    "sum",
+                    None,
+                )
                 .await
                 .expect("mark stage1 succeeded"),
             "stage1 success should finalize for current token"
@@ -1492,6 +1507,7 @@ WHERE id = 1
                     up_to_date.updated_at.timestamp(),
                     "raw",
                     "summary",
+                    None,
                 )
                 .await
                 .expect("mark up-to-date thread succeeded"),
@@ -1715,6 +1731,7 @@ WHERE kind = 'memory_stage1'
                         claim.thread.updated_at.timestamp(),
                         "raw",
                         "summary",
+                        None,
                     )
                     .await
                     .expect("mark first-batch stage1 success"),
@@ -1766,7 +1783,14 @@ WHERE kind = 'memory_stage1'
         };
         assert!(
             runtime
-                .mark_stage1_job_succeeded(thread_id, ownership_token.as_str(), 100, "raw", "sum")
+                .mark_stage1_job_succeeded(
+                    thread_id,
+                    ownership_token.as_str(),
+                    100,
+                    "raw",
+                    "sum",
+                    None,
+                )
                 .await
                 .expect("mark stage1 succeeded"),
             "mark stage1 succeeded should write stage1_outputs"
@@ -2058,6 +2082,7 @@ WHERE kind = 'memory_stage1'
                     100,
                     "raw memory a",
                     "summary a",
+                    None,
                 )
                 .await
                 .expect("mark stage1 succeeded a"),
@@ -2080,6 +2105,7 @@ WHERE kind = 'memory_stage1'
                     101,
                     "raw memory b",
                     "summary b",
+                    Some("rollout-b"),
                 )
                 .await
                 .expect("mark stage1 succeeded b"),
@@ -2093,9 +2119,11 @@ WHERE kind = 'memory_stage1'
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].thread_id, thread_id_b);
         assert_eq!(outputs[0].rollout_summary, "summary b");
+        assert_eq!(outputs[0].rollout_slug.as_deref(), Some("rollout-b"));
         assert_eq!(outputs[0].cwd, codex_home.join("workspace-b"));
         assert_eq!(outputs[1].thread_id, thread_id_a);
         assert_eq!(outputs[1].rollout_summary, "summary a");
+        assert_eq!(outputs[1].rollout_slug, None);
         assert_eq!(outputs[1].cwd, codex_home.join("workspace-a"));
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
@@ -2208,7 +2236,14 @@ VALUES (?, ?, ?, ?, ?)
         };
         assert!(
             runtime
-                .mark_stage1_job_succeeded(thread_a, token_a.as_str(), 100, "raw-a", "summary-a")
+                .mark_stage1_job_succeeded(
+                    thread_a,
+                    token_a.as_str(),
+                    100,
+                    "raw-a",
+                    "summary-a",
+                    None,
+                )
                 .await
                 .expect("mark stage1 succeeded a"),
             "stage1 success should persist output for thread a"
@@ -2224,7 +2259,14 @@ VALUES (?, ?, ?, ?, ?)
         };
         assert!(
             runtime
-                .mark_stage1_job_succeeded(thread_b, token_b.as_str(), 101, "raw-b", "summary-b")
+                .mark_stage1_job_succeeded(
+                    thread_b,
+                    token_b.as_str(),
+                    101,
+                    "raw-b",
+                    "summary-b",
+                    None,
+                )
                 .await
                 .expect("mark stage1 succeeded b"),
             "stage1 success should persist output for thread b"
@@ -2456,6 +2498,57 @@ VALUES (?, ?, ?, ?, ?)
             .await
             .expect("claim after fallback failure");
         assert_eq!(claim, Phase2JobClaimOutcome::SkippedNotDirty);
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn query_logs_with_search_matches_substring() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+            .await
+            .expect("initialize runtime");
+
+        runtime
+            .insert_logs(&[
+                LogEntry {
+                    ts: 1_700_000_001,
+                    ts_nanos: 0,
+                    level: "INFO".to_string(),
+                    target: "cli".to_string(),
+                    message: Some("alpha".to_string()),
+                    thread_id: Some("thread-1".to_string()),
+                    process_uuid: None,
+                    file: Some("main.rs".to_string()),
+                    line: Some(42),
+                    module_path: None,
+                },
+                LogEntry {
+                    ts: 1_700_000_002,
+                    ts_nanos: 0,
+                    level: "INFO".to_string(),
+                    target: "cli".to_string(),
+                    message: Some("alphabet".to_string()),
+                    thread_id: Some("thread-1".to_string()),
+                    process_uuid: None,
+                    file: Some("main.rs".to_string()),
+                    line: Some(43),
+                    module_path: None,
+                },
+            ])
+            .await
+            .expect("insert test logs");
+
+        let rows = runtime
+            .query_logs(&LogQuery {
+                search: Some("alphab".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("query matching logs");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message.as_deref(), Some("alphabet"));
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }

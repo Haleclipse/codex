@@ -144,9 +144,6 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         vec!["exec_command", "write_stdin"]
     };
     expected_tools_names.extend([
-        "list_mcp_resources",
-        "list_mcp_resource_templates",
-        "read_mcp_resource",
         "update_plan",
         "request_user_input",
         "apply_patch",
@@ -733,8 +730,8 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
         .await?;
 
     let default_cwd = config.cwd.clone();
-    let default_approval_policy = config.approval_policy.value();
-    let default_sandbox_policy = config.sandbox_policy.get();
+    let default_approval_policy = config.permissions.approval_policy.value();
+    let default_sandbox_policy = config.permissions.sandbox_policy.get();
     let default_model = session_configured.model;
     let default_effort = config.model_reasoning_effort;
     let default_summary = config.model_reasoning_summary;
@@ -841,8 +838,8 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
         .await?;
 
     let default_cwd = config.cwd.clone();
-    let default_approval_policy = config.approval_policy.value();
-    let default_sandbox_policy = config.sandbox_policy.get();
+    let default_approval_policy = config.permissions.approval_policy.value();
+    let default_sandbox_policy = config.permissions.sandbox_policy.get();
     let default_model = session_configured.model;
     let default_effort = config.model_reasoning_effort;
     let default_summary = config.model_reasoning_summary;

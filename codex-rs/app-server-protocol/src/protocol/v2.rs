@@ -29,7 +29,10 @@ use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::CreditsSnapshot as CoreCreditsSnapshot;
+use codex_protocol::protocol::ExecCommandStatus as CoreExecCommandStatus;
+use codex_protocol::protocol::ModelRerouteReason as CoreModelRerouteReason;
 use codex_protocol::protocol::NetworkAccess as CoreNetworkAccess;
+use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow as CoreRateLimitWindow;
 use codex_protocol::protocol::ReadOnlyAccess as CoreReadOnlyAccess;
@@ -224,6 +227,12 @@ v2_enum_from_core!(
         NotLoggedIn,
         BearerToken,
         OAuth
+    }
+);
+
+v2_enum_from_core!(
+    pub enum ModelRerouteReason from CoreModelRerouteReason {
+        HighRiskCyberActivity
     }
 );
 
@@ -1108,6 +1117,9 @@ pub struct ModelListParams {
     /// Optional page size; defaults to a reasonable server-side value.
     #[ts(optional = nullable)]
     pub limit: Option<u32>,
+    /// When true, include models that are hidden from the default picker list.
+    #[ts(optional = nullable)]
+    pub include_hidden: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1119,6 +1131,7 @@ pub struct Model {
     pub upgrade: Option<String>,
     pub display_name: String,
     pub description: String,
+    pub hidden: bool,
     pub supported_reasoning_efforts: Vec<ReasoningEffortOption>,
     pub default_reasoning_effort: ReasoningEffort,
     #[serde(default = "default_input_modalities")]
@@ -1288,6 +1301,14 @@ pub struct AppInfo {
     pub install_url: Option<String>,
     #[serde(default)]
     pub is_accessible: bool,
+    /// Whether this app is enabled in config.toml.
+    /// Example:
+    /// ```toml
+    /// [apps.bad_app]
+    /// enabled = false
+    /// ```
+    #[serde(default = "default_enabled")]
+    pub is_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1422,6 +1443,11 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.experimentalRawEvents")]
     #[serde(default)]
     pub experimental_raw_events: bool,
+    /// If true, persist additional rollout EventMsg variants required to
+    /// reconstruct a richer thread history on resume/fork/read.
+    #[experimental("thread/start.persistFullHistory")]
+    #[serde(default)]
+    pub persist_extended_history: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
@@ -1503,6 +1529,11 @@ pub struct ThreadResumeParams {
     pub developer_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    /// If true, persist additional rollout EventMsg variants required to
+    /// reconstruct a richer thread history on subsequent resume/fork/read.
+    #[experimental("thread/resume.persistFullHistory")]
+    #[serde(default)]
+    pub persist_extended_history: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1556,6 +1587,11 @@ pub struct ThreadForkParams {
     pub base_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub developer_instructions: Option<String>,
+    /// If true, persist additional rollout EventMsg variants required to
+    /// reconstruct a richer thread history on subsequent resume/fork/read.
+    #[experimental("thread/fork.persistFullHistory")]
+    #[serde(default)]
+    pub persist_extended_history: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1683,6 +1719,10 @@ pub struct ThreadListParams {
     /// If false or null, only non-archived threads are returned.
     #[ts(optional = nullable)]
     pub archived: Option<bool>,
+    /// Optional cwd filter; when set, only threads whose session cwd exactly
+    /// matches this path are returned.
+    #[ts(optional = nullable)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -1797,7 +1837,38 @@ pub struct SkillsListResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct SkillsRemoteReadParams {}
+pub struct SkillsRemoteReadParams {
+    #[serde(default)]
+    pub hazelnut_scope: HazelnutScope,
+    #[serde(default)]
+    pub product_surface: ProductSurface,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS, Default)]
+#[serde(rename_all = "kebab-case")]
+#[ts(rename_all = "kebab-case")]
+#[ts(export_to = "v2/")]
+pub enum HazelnutScope {
+    #[default]
+    Example,
+    WorkspaceShared,
+    AllShared,
+    Personal,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS, Default)]
+#[serde(rename_all = "lowercase")]
+#[ts(rename_all = "lowercase")]
+#[ts(export_to = "v2/")]
+pub enum ProductSurface {
+    Chatgpt,
+    #[default]
+    Codex,
+    Api,
+    Atlas,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1820,7 +1891,6 @@ pub struct SkillsRemoteReadResponse {
 #[ts(export_to = "v2/")]
 pub struct SkillsRemoteWriteParams {
     pub hazelnut_id: String,
-    pub is_preload: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1828,7 +1898,6 @@ pub struct SkillsRemoteWriteParams {
 #[ts(export_to = "v2/")]
 pub struct SkillsRemoteWriteResponse {
     pub id: String,
-    pub name: String,
     pub path: PathBuf,
 }
 
@@ -2622,6 +2691,22 @@ pub enum CommandExecutionStatus {
     Declined,
 }
 
+impl From<CoreExecCommandStatus> for CommandExecutionStatus {
+    fn from(value: CoreExecCommandStatus) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&CoreExecCommandStatus> for CommandExecutionStatus {
+    fn from(value: &CoreExecCommandStatus) -> Self {
+        match value {
+            CoreExecCommandStatus::Completed => CommandExecutionStatus::Completed,
+            CoreExecCommandStatus::Failed => CommandExecutionStatus::Failed,
+            CoreExecCommandStatus::Declined => CommandExecutionStatus::Declined,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -2660,6 +2745,22 @@ pub enum PatchApplyStatus {
     Completed,
     Failed,
     Declined,
+}
+
+impl From<CorePatchApplyStatus> for PatchApplyStatus {
+    fn from(value: CorePatchApplyStatus) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&CorePatchApplyStatus> for PatchApplyStatus {
+    fn from(value: &CorePatchApplyStatus) -> Self {
+        match value {
+            CorePatchApplyStatus::Completed => PatchApplyStatus::Completed,
+            CorePatchApplyStatus::Failed => PatchApplyStatus::Failed,
+            CorePatchApplyStatus::Declined => PatchApplyStatus::Declined,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -3238,6 +3339,17 @@ pub struct AccountLoginCompletedNotification {
     pub login_id: Option<String>,
     pub success: bool,
     pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ModelReroutedNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub from_model: String,
+    pub to_model: String,
+    pub reason: ModelRerouteReason,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

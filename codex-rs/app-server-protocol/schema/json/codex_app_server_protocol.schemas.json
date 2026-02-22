@@ -208,7 +208,7 @@
           "type": "string"
         },
         {
-          "description": "*All* commands are auto‑approved, but they are expected to run inside a sandbox where network access is disabled and writes are confined to a specific set of paths. If the command fails, it will be escalated to the user to approve execution without a sandbox.",
+          "description": "DEPRECATED: *All* commands are auto‑approved, but they are expected to run inside a sandbox where network access is disabled and writes are confined to a specific set of paths. If the command fails, it will be escalated to the user to approve execution without a sandbox. Prefer `OnRequest` for interactive runs or `Never` for non-interactive runs.",
           "enum": [
             "on-failure"
           ],
@@ -755,9 +755,9 @@
             },
             "method": {
               "enum": [
-                "skills/remote/read"
+                "skills/remote/list"
               ],
-              "title": "Skills/remote/readRequestMethod",
+              "title": "Skills/remote/listRequestMethod",
               "type": "string"
             },
             "params": {
@@ -769,7 +769,7 @@
             "method",
             "params"
           ],
-          "title": "Skills/remote/readRequest",
+          "title": "Skills/remote/listRequest",
           "type": "object"
         },
         {
@@ -779,9 +779,9 @@
             },
             "method": {
               "enum": [
-                "skills/remote/write"
+                "skills/remote/export"
               ],
-              "title": "Skills/remote/writeRequestMethod",
+              "title": "Skills/remote/exportRequestMethod",
               "type": "string"
             },
             "params": {
@@ -793,7 +793,7 @@
             "method",
             "params"
           ],
-          "title": "Skills/remote/writeRequest",
+          "title": "Skills/remote/exportRequest",
           "type": "object"
         },
         {
@@ -2487,6 +2487,35 @@
           "type": "object"
         },
         {
+          "description": "Model routing changed from the requested model to a different model.",
+          "properties": {
+            "from_model": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/definitions/v2/ModelRerouteReason"
+            },
+            "to_model": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "model_reroute"
+              ],
+              "title": "ModelRerouteEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "from_model",
+            "reason",
+            "to_model",
+            "type"
+          ],
+          "title": "ModelRerouteEventMsg",
+          "type": "object"
+        },
+        {
           "description": "Conversation history was compacted (either automatically or manually).",
           "properties": {
             "type": {
@@ -3362,6 +3391,14 @@
               "default": "agent",
               "description": "Where the command originated. Defaults to Agent for backward compatibility."
             },
+            "status": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ExecCommandStatus"
+                }
+              ],
+              "description": "Completion status for this command execution."
+            },
             "stderr": {
               "description": "Captured stderr",
               "type": "string"
@@ -3390,6 +3427,7 @@
             "exit_code",
             "formatted_output",
             "parsed_cmd",
+            "status",
             "stderr",
             "stdout",
             "turn_id",
@@ -3441,6 +3479,17 @@
             "cwd": {
               "description": "The command's working directory.",
               "type": "string"
+            },
+            "network_approval_context": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/NetworkApprovalContext"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional network context for a blocked request that can be approved."
             },
             "parsed_cmd": {
               "items": {
@@ -3818,6 +3867,14 @@
               "description": "The changes that were applied (mirrors PatchApplyBeginEvent::changes).",
               "type": "object"
             },
+            "status": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/v2/PatchApplyStatus"
+                }
+              ],
+              "description": "Completion status for this patch application."
+            },
             "stderr": {
               "description": "Captured stderr (parser errors, IO failures, etc.).",
               "type": "string"
@@ -3845,6 +3902,7 @@
           },
           "required": [
             "call_id",
+            "status",
             "stderr",
             "stdout",
             "success",
@@ -4942,6 +5000,14 @@
       ],
       "type": "string"
     },
+    "ExecCommandStatus": {
+      "enum": [
+        "completed",
+        "failed",
+        "declined"
+      ],
+      "type": "string"
+    },
     "ExecOneOffCommandParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -5384,6 +5450,43 @@
         "root",
         "score"
       ],
+      "type": "object"
+    },
+    "FuzzyFileSearchSessionCompletedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "title": "FuzzyFileSearchSessionCompletedNotification",
+      "type": "object"
+    },
+    "FuzzyFileSearchSessionUpdatedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "files": {
+          "items": {
+            "$ref": "#/definitions/FuzzyFileSearchResult"
+          },
+          "type": "array"
+        },
+        "query": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "files",
+        "query",
+        "sessionId"
+      ],
+      "title": "FuzzyFileSearchSessionUpdatedNotification",
       "type": "object"
     },
     "GetAuthStatusParams": {
@@ -6192,11 +6295,41 @@
       ],
       "type": "string"
     },
+    "ModelRerouteReason": {
+      "enum": [
+        "high_risk_cyber_activity"
+      ],
+      "type": "string"
+    },
     "NetworkAccess": {
       "description": "Represents whether outbound network access is available to the agent.",
       "enum": [
         "restricted",
         "enabled"
+      ],
+      "type": "string"
+    },
+    "NetworkApprovalContext": {
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "protocol": {
+          "$ref": "#/definitions/NetworkApprovalProtocol"
+        }
+      },
+      "required": [
+        "host",
+        "protocol"
+      ],
+      "type": "object"
+    },
+    "NetworkApprovalProtocol": {
+      "enum": [
+        "http",
+        "https",
+        "socks5_tcp",
+        "socks5_udp"
       ],
       "type": "string"
     },
@@ -6421,6 +6554,14 @@
           "type": "object"
         }
       ]
+    },
+    "PatchApplyStatus": {
+      "enum": [
+        "completed",
+        "failed",
+        "declined"
+      ],
+      "type": "string"
     },
     "PlanItemArg": {
       "additionalProperties": false,
@@ -8389,6 +8530,26 @@
           "properties": {
             "method": {
               "enum": [
+                "model/rerouted"
+              ],
+              "title": "Model/reroutedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ModelReroutedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Model/reroutedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "deprecationNotice"
               ],
               "title": "DeprecationNoticeNotificationMethod",
@@ -8423,6 +8584,46 @@
             "params"
           ],
           "title": "ConfigWarningNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "fuzzyFileSearch/sessionUpdated"
+              ],
+              "title": "FuzzyFileSearch/sessionUpdatedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/FuzzyFileSearchSessionUpdatedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "FuzzyFileSearch/sessionUpdatedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "fuzzyFileSearch/sessionCompleted"
+              ],
+              "title": "FuzzyFileSearch/sessionCompletedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/FuzzyFileSearchSessionCompletedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "FuzzyFileSearch/sessionCompletedNotification",
           "type": "object"
         },
         {
@@ -9048,7 +9249,8 @@
         {
           "enum": [
             "review",
-            "compact"
+            "compact",
+            "memory_consolidation"
           ],
           "type": "string"
         },
@@ -10121,6 +10323,11 @@
           },
           "isAccessible": {
             "default": false,
+            "type": "boolean"
+          },
+          "isEnabled": {
+            "default": true,
+            "description": "Whether this app is enabled in config.toml. Example: ```toml [apps.bad_app] enabled = false ```",
             "type": "boolean"
           },
           "logoUrl": {
@@ -11962,6 +12169,15 @@
         },
         "type": "object"
       },
+      "HazelnutScope": {
+        "enum": [
+          "example",
+          "workspace-shared",
+          "all-shared",
+          "personal"
+        ],
+        "type": "string"
+      },
       "InputModality": {
         "description": "Canonical user-input modality tags advertised by a model.",
         "oneOf": [
@@ -12494,6 +12710,9 @@
           "displayName": {
             "type": "string"
           },
+          "hidden": {
+            "type": "boolean"
+          },
           "id": {
             "type": "string"
           },
@@ -12534,6 +12753,7 @@
           "defaultReasoningEffort",
           "description",
           "displayName",
+          "hidden",
           "id",
           "isDefault",
           "model",
@@ -12548,6 +12768,13 @@
             "description": "Opaque pagination cursor returned by a previous call.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "includeHidden": {
+            "description": "When true, include models that are hidden from the default picker list.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -12585,6 +12812,41 @@
           "data"
         ],
         "title": "ModelListResponse",
+        "type": "object"
+      },
+      "ModelRerouteReason": {
+        "enum": [
+          "highRiskCyberActivity"
+        ],
+        "type": "string"
+      },
+      "ModelReroutedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "fromModel": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/definitions/v2/ModelRerouteReason"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "toModel": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "fromModel",
+          "reason",
+          "threadId",
+          "toModel",
+          "turnId"
+        ],
+        "title": "ModelReroutedNotification",
         "type": "object"
       },
       "NetworkAccess": {
@@ -12801,6 +13063,15 @@
           "enterprise",
           "edu",
           "unknown"
+        ],
+        "type": "string"
+      },
+      "ProductSurface": {
+        "enum": [
+          "chatgpt",
+          "codex",
+          "api",
+          "atlas"
         ],
         "type": "string"
       },
@@ -14335,6 +14606,28 @@
       },
       "SkillsRemoteReadParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "enabled": {
+            "default": false,
+            "type": "boolean"
+          },
+          "hazelnutScope": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/HazelnutScope"
+              }
+            ],
+            "default": "example"
+          },
+          "productSurface": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/ProductSurface"
+              }
+            ],
+            "default": "codex"
+          }
+        },
         "title": "SkillsRemoteReadParams",
         "type": "object"
       },
@@ -14359,14 +14652,10 @@
         "properties": {
           "hazelnutId": {
             "type": "string"
-          },
-          "isPreload": {
-            "type": "boolean"
           }
         },
         "required": [
-          "hazelnutId",
-          "isPreload"
+          "hazelnutId"
         ],
         "title": "SkillsRemoteWriteParams",
         "type": "object"
@@ -14377,16 +14666,12 @@
           "id": {
             "type": "string"
           },
-          "name": {
-            "type": "string"
-          },
           "path": {
             "type": "string"
           }
         },
         "required": [
           "id",
-          "name",
           "path"
         ],
         "title": "SkillsRemoteWriteResponse",
@@ -14397,7 +14682,8 @@
           {
             "enum": [
               "review",
-              "compact"
+              "compact",
+              "memory_consolidation"
             ],
             "type": "string"
           },
@@ -15246,6 +15532,13 @@
           },
           "cursor": {
             "description": "Opaque pagination cursor returned by a previous call.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cwd": {
+            "description": "Optional cwd filter; when set, only threads whose session cwd exactly matches this path are returned.",
             "type": [
               "string",
               "null"

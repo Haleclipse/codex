@@ -448,9 +448,7 @@ impl TranslateOverlay {
     fn handle_paste(&mut self, pasted: &str) {
         // Normalize line endings and filter control characters
         let clean: String = pasted
-            .replace("\r\n", "")
-            .replace('\r', "")
-            .replace('\n', "")
+            .replace(['\r', '\n'], "")
             .chars()
             .filter(|c| !c.is_control())
             .collect();

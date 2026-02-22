@@ -732,6 +732,42 @@ fn scenarios() -> Vec<ScenarioSpec> {
             },
         },
         ScenarioSpec {
+            name: "cat_redirect_unless_trusted_requires_approval",
+            approval_policy: UnlessTrusted,
+            sandbox_policy: workspace_write(false),
+            action: ActionKind::RunCommand {
+                command: r#"cat < "hello" > /var/test.txt"#,
+            },
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            features: vec![],
+            model_override: Some("gpt-5"),
+            outcome: Outcome::ExecApproval {
+                decision: ReviewDecision::Denied,
+                expected_reason: None,
+            },
+            expectation: Expectation::CommandFailure {
+                output_contains: "rejected by user",
+            },
+        },
+        ScenarioSpec {
+            name: "cat_redirect_on_request_requires_approval",
+            approval_policy: OnRequest,
+            sandbox_policy: workspace_write(false),
+            action: ActionKind::RunCommand {
+                command: r#"cat < "hello" > /var/test.txt"#,
+            },
+            sandbox_permissions: SandboxPermissions::RequireEscalated,
+            features: vec![],
+            model_override: Some("gpt-5"),
+            outcome: Outcome::ExecApproval {
+                decision: ReviewDecision::Denied,
+                expected_reason: None,
+            },
+            expectation: Expectation::CommandFailure {
+                output_contains: "rejected by user",
+            },
+        },
+        ScenarioSpec {
             name: "danger_full_access_on_failure_allows_outside_write",
             approval_policy: OnFailure,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
@@ -1443,6 +1479,44 @@ fn scenarios() -> Vec<ScenarioSpec> {
                 output_contains: "rejected by user",
             },
         },
+        ScenarioSpec {
+            name: "safe command with heredoc and redirect still requires approval",
+            approval_policy: AskForApproval::OnRequest,
+            sandbox_policy: workspace_write(false),
+            action: ActionKind::RunUnifiedExecCommand {
+                command: "cat <<'EOF' > /tmp/out.txt \nhello\nEOF",
+                justification: None,
+            },
+            sandbox_permissions: SandboxPermissions::RequireEscalated,
+            features: vec![Feature::UnifiedExec],
+            model_override: None,
+            outcome: Outcome::ExecApproval {
+                decision: ReviewDecision::Denied,
+                expected_reason: None,
+            },
+            expectation: Expectation::CommandFailure {
+                output_contains: "rejected by user",
+            },
+        },
+        ScenarioSpec {
+            name: "compound command with one safe command still requires approval",
+            approval_policy: AskForApproval::OnRequest,
+            sandbox_policy: workspace_write(false),
+            action: ActionKind::RunUnifiedExecCommand {
+                command: "cat ./one.txt && touch ./two.txt",
+                justification: None,
+            },
+            sandbox_permissions: SandboxPermissions::RequireEscalated,
+            features: vec![Feature::UnifiedExec],
+            model_override: None,
+            outcome: Outcome::ExecApproval {
+                decision: ReviewDecision::Denied,
+                expected_reason: None,
+            },
+            expectation: Expectation::CommandFailure {
+                output_contains: "rejected by user",
+            },
+        },
     ]
 }
 
@@ -1467,8 +1541,8 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
     let model = model_override.unwrap_or("gpt-5.1");
 
     let mut builder = test_codex().with_model(model).with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(approval_policy);
-        config.sandbox_policy = Constrained::allow_any(sandbox_policy.clone());
+        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy.clone());
         for feature in features {
             config.features.enable(feature);
         }
@@ -1585,8 +1659,8 @@ async fn approving_apply_patch_for_session_skips_future_prompts_for_same_file() 
     let mut builder = test_codex()
         .with_model("gpt-5.1-codex")
         .with_config(move |config| {
-            config.approval_policy = Constrained::allow_any(approval_policy);
-            config.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+            config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+            config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
         });
     let test = builder.build(&server).await?;
 
@@ -1692,8 +1766,8 @@ async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts
     let sandbox_policy = SandboxPolicy::new_read_only_policy();
     let sandbox_policy_for_config = sandbox_policy.clone();
     let mut builder = test_codex().with_config(move |config| {
-        config.approval_policy = Constrained::allow_any(approval_policy);
-        config.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
     });
     let test = builder.build(&server).await?;
     let allow_prefix_path = test.cwd.path().join("allow-prefix.txt");
@@ -1850,6 +1924,76 @@ async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts
         "",
         "unexpected file contents after second run"
     );
+
+    Ok(())
+}
+
+// todo(dylan) add ScenarioSpec support for rules
+#[tokio::test(flavor = "current_thread")]
+#[cfg(unix)]
+async fn compound_command_with_one_safe_command_still_requires_approval() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let approval_policy = AskForApproval::UnlessTrusted;
+    let sandbox_policy = SandboxPolicy::new_workspace_write_policy();
+    let sandbox_policy_for_config = sandbox_policy.clone();
+    let mut builder = test_codex().with_config(move |config| {
+        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
+    });
+    let test = builder.build(&server).await?;
+
+    let rules_dir = test.home.path().join("rules");
+    fs::create_dir_all(&rules_dir)?;
+    fs::write(
+        rules_dir.join("default.rules"),
+        r#"prefix_rule(pattern=["touch", "allow-prefix.txt"], decision="allow")"#,
+    )?;
+
+    let call_id = "heredoc-with-chained-prefix";
+    let command = "touch ./test.txt && rm ./test.txt";
+    let (event, expected_command) = ActionKind::RunCommand { command }
+        .prepare(&test, &server, call_id, SandboxPermissions::UseDefault)
+        .await?;
+    let expected_command =
+        expected_command.expect("compound command should produce a shell command");
+
+    let _ = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-heredoc-prefix-1"),
+            event,
+            ev_completed("resp-heredoc-prefix-1"),
+        ]),
+    )
+    .await;
+    let _ = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-heredoc-prefix-1", "done"),
+            ev_completed("resp-heredoc-prefix-2"),
+        ]),
+    )
+    .await;
+
+    submit_turn(
+        &test,
+        "compound command",
+        approval_policy,
+        sandbox_policy.clone(),
+    )
+    .await?;
+
+    let approval = expect_exec_approval(&test, expected_command.as_str()).await;
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.call_id,
+            turn_id: None,
+            decision: ReviewDecision::Denied,
+        })
+        .await?;
+    wait_for_completion(&test).await;
 
     Ok(())
 }

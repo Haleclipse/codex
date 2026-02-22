@@ -193,6 +193,11 @@
           "default": false,
           "type": "boolean"
         },
+        "isEnabled": {
+          "default": true,
+          "description": "Whether this app is enabled in config.toml. Example: ```toml [apps.bad_app] enabled = false ```",
+          "type": "boolean"
+        },
         "logoUrl": {
           "type": [
             "string",
@@ -241,7 +246,7 @@
           "type": "string"
         },
         {
-          "description": "*All* commands are auto‑approved, but they are expected to run inside a sandbox where network access is disabled and writes are confined to a specific set of paths. If the command fails, it will be escalated to the user to approve execution without a sandbox.",
+          "description": "DEPRECATED: *All* commands are auto‑approved, but they are expected to run inside a sandbox where network access is disabled and writes are confined to a specific set of paths. If the command fails, it will be escalated to the user to approve execution without a sandbox. Prefer `OnRequest` for interactive runs or `Never` for non-interactive runs.",
           "enum": [
             "on-failure"
           ],
@@ -1087,6 +1092,35 @@
             "type"
           ],
           "title": "WarningEventMsg",
+          "type": "object"
+        },
+        {
+          "description": "Model routing changed from the requested model to a different model.",
+          "properties": {
+            "from_model": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/definitions/ModelRerouteReason2"
+            },
+            "to_model": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "model_reroute"
+              ],
+              "title": "ModelRerouteEventMsgType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "from_model",
+            "reason",
+            "to_model",
+            "type"
+          ],
+          "title": "ModelRerouteEventMsg",
           "type": "object"
         },
         {
@@ -1965,6 +1999,14 @@
               "default": "agent",
               "description": "Where the command originated. Defaults to Agent for backward compatibility."
             },
+            "status": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ExecCommandStatus"
+                }
+              ],
+              "description": "Completion status for this command execution."
+            },
             "stderr": {
               "description": "Captured stderr",
               "type": "string"
@@ -1993,6 +2035,7 @@
             "exit_code",
             "formatted_output",
             "parsed_cmd",
+            "status",
             "stderr",
             "stdout",
             "turn_id",
@@ -2044,6 +2087,17 @@
             "cwd": {
               "description": "The command's working directory.",
               "type": "string"
+            },
+            "network_approval_context": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/NetworkApprovalContext"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional network context for a blocked request that can be approved."
             },
             "parsed_cmd": {
               "items": {
@@ -2421,6 +2475,14 @@
               "description": "The changes that were applied (mirrors PatchApplyBeginEvent::changes).",
               "type": "object"
             },
+            "status": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PatchApplyStatus2"
+                }
+              ],
+              "description": "Completion status for this patch application."
+            },
             "stderr": {
               "description": "Captured stderr (parser errors, IO failures, etc.).",
               "type": "string"
@@ -2448,6 +2510,7 @@
           },
           "required": [
             "call_id",
+            "status",
             "stderr",
             "stdout",
             "success",
@@ -3489,6 +3552,14 @@
       ],
       "type": "string"
     },
+    "ExecCommandStatus": {
+      "enum": [
+        "completed",
+        "failed",
+        "declined"
+      ],
+      "type": "string"
+    },
     "ExecOutputStream": {
       "enum": [
         "stdout",
@@ -3681,6 +3752,76 @@
       },
       "required": [
         "body"
+      ],
+      "type": "object"
+    },
+    "FuzzyFileSearchResult": {
+      "description": "Superset of [`codex_file_search::FileMatch`]",
+      "properties": {
+        "file_name": {
+          "type": "string"
+        },
+        "indices": {
+          "items": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        },
+        "score": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_name",
+        "path",
+        "root",
+        "score"
+      ],
+      "type": "object"
+    },
+    "FuzzyFileSearchSessionCompletedNotification": {
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "FuzzyFileSearchSessionUpdatedNotification": {
+      "properties": {
+        "files": {
+          "items": {
+            "$ref": "#/definitions/FuzzyFileSearchResult"
+          },
+          "type": "array"
+        },
+        "query": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "files",
+        "query",
+        "sessionId"
       ],
       "type": "object"
     },
@@ -4098,11 +4239,74 @@
       ],
       "type": "string"
     },
+    "ModelRerouteReason": {
+      "enum": [
+        "highRiskCyberActivity"
+      ],
+      "type": "string"
+    },
+    "ModelRerouteReason2": {
+      "enum": [
+        "high_risk_cyber_activity"
+      ],
+      "type": "string"
+    },
+    "ModelReroutedNotification": {
+      "properties": {
+        "fromModel": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/definitions/ModelRerouteReason"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "toModel": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fromModel",
+        "reason",
+        "threadId",
+        "toModel",
+        "turnId"
+      ],
+      "type": "object"
+    },
     "NetworkAccess": {
       "description": "Represents whether outbound network access is available to the agent.",
       "enum": [
         "restricted",
         "enabled"
+      ],
+      "type": "string"
+    },
+    "NetworkApprovalContext": {
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "protocol": {
+          "$ref": "#/definitions/NetworkApprovalProtocol"
+        }
+      },
+      "required": [
+        "host",
+        "protocol"
+      ],
+      "type": "object"
+    },
+    "NetworkApprovalProtocol": {
+      "enum": [
+        "http",
+        "https",
+        "socks5_tcp",
+        "socks5_udp"
       ],
       "type": "string"
     },
@@ -4220,6 +4424,14 @@
     "PatchApplyStatus": {
       "enum": [
         "inProgress",
+        "completed",
+        "failed",
+        "declined"
+      ],
+      "type": "string"
+    },
+    "PatchApplyStatus2": {
+      "enum": [
         "completed",
         "failed",
         "declined"
@@ -5899,7 +6111,8 @@
         {
           "enum": [
             "review",
-            "compact"
+            "compact",
+            "memory_consolidation"
           ],
           "type": "string"
         },
@@ -8135,6 +8348,26 @@
       "properties": {
         "method": {
           "enum": [
+            "model/rerouted"
+          ],
+          "title": "Model/reroutedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ModelReroutedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Model/reroutedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
             "deprecationNotice"
           ],
           "title": "DeprecationNoticeNotificationMethod",
@@ -8169,6 +8402,46 @@
         "params"
       ],
       "title": "ConfigWarningNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "fuzzyFileSearch/sessionUpdated"
+          ],
+          "title": "FuzzyFileSearch/sessionUpdatedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/FuzzyFileSearchSessionUpdatedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "FuzzyFileSearch/sessionUpdatedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "fuzzyFileSearch/sessionCompleted"
+          ],
+          "title": "FuzzyFileSearch/sessionCompletedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/FuzzyFileSearchSessionCompletedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "FuzzyFileSearch/sessionCompletedNotification",
       "type": "object"
     },
     {

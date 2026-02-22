@@ -30,6 +30,7 @@ pub(crate) struct SessionState {
     /// Startup regular task pre-created during session initialization.
     pub(crate) startup_regular_task: Option<RegularTask>,
     pub(crate) active_mcp_tool_selection: Option<Vec<String>>,
+    pub(crate) active_connector_selection: HashSet<String>,
 }
 
 impl SessionState {
@@ -47,6 +48,7 @@ impl SessionState {
             previous_model: None,
             startup_regular_task: None,
             active_mcp_tool_selection: None,
+            active_connector_selection: HashSet::new(),
         }
     }
 
@@ -168,12 +170,52 @@ impl SessionState {
         merged
     }
 
+    pub(crate) fn set_mcp_tool_selection(&mut self, tool_names: Vec<String>) {
+        if tool_names.is_empty() {
+            self.active_mcp_tool_selection = None;
+            return;
+        }
+
+        let mut selected = Vec::new();
+        let mut seen = HashSet::new();
+        for tool_name in tool_names {
+            if seen.insert(tool_name.clone()) {
+                selected.push(tool_name);
+            }
+        }
+
+        self.active_mcp_tool_selection = if selected.is_empty() {
+            None
+        } else {
+            Some(selected)
+        };
+    }
+
     pub(crate) fn get_mcp_tool_selection(&self) -> Option<Vec<String>> {
         self.active_mcp_tool_selection.clone()
     }
 
     pub(crate) fn clear_mcp_tool_selection(&mut self) {
         self.active_mcp_tool_selection = None;
+    }
+
+    // Adds connector IDs to the active set and returns the merged selection.
+    pub(crate) fn merge_connector_selection<I>(&mut self, connector_ids: I) -> HashSet<String>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.active_connector_selection.extend(connector_ids);
+        self.active_connector_selection.clone()
+    }
+
+    // Returns the current connector selection tracked on session state.
+    pub(crate) fn get_connector_selection(&self) -> HashSet<String> {
+        self.active_connector_selection.clone()
+    }
+
+    // Removes all currently tracked connector selections.
+    pub(crate) fn clear_connector_selection(&mut self) {
+        self.active_connector_selection.clear();
     }
 }
 
@@ -270,6 +312,69 @@ mod tests {
         state.clear_mcp_tool_selection();
 
         assert_eq!(state.get_mcp_tool_selection(), None);
+    }
+
+    #[tokio::test]
+    async fn set_mcp_tool_selection_deduplicates_and_preserves_order() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+        state.merge_mcp_tool_selection(vec!["mcp__rmcp__old".to_string()]);
+
+        state.set_mcp_tool_selection(vec![
+            "mcp__rmcp__echo".to_string(),
+            "mcp__rmcp__image".to_string(),
+            "mcp__rmcp__echo".to_string(),
+            "mcp__rmcp__search".to_string(),
+        ]);
+
+        assert_eq!(
+            state.get_mcp_tool_selection(),
+            Some(vec![
+                "mcp__rmcp__echo".to_string(),
+                "mcp__rmcp__image".to_string(),
+                "mcp__rmcp__search".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn set_mcp_tool_selection_empty_input_clears_selection() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+        state.merge_mcp_tool_selection(vec!["mcp__rmcp__echo".to_string()]);
+
+        state.set_mcp_tool_selection(Vec::new());
+
+        assert_eq!(state.get_mcp_tool_selection(), None);
+    }
+
+    #[tokio::test]
+    // Verifies connector merging deduplicates repeated IDs.
+    async fn merge_connector_selection_deduplicates_entries() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+        let merged = state.merge_connector_selection([
+            "calendar".to_string(),
+            "calendar".to_string(),
+            "drive".to_string(),
+        ]);
+
+        assert_eq!(
+            merged,
+            HashSet::from(["calendar".to_string(), "drive".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    // Verifies clearing connector selection removes all saved IDs.
+    async fn clear_connector_selection_removes_entries() {
+        let session_configuration = make_session_configuration_for_tests().await;
+        let mut state = SessionState::new(session_configuration);
+        state.merge_connector_selection(["calendar".to_string()]);
+
+        state.clear_connector_selection();
+
+        assert_eq!(state.get_connector_selection(), HashSet::new());
     }
 
     #[tokio::test]

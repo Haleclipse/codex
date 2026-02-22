@@ -487,16 +487,16 @@ impl ReasoningTranslator {
     /// Priority: config.timeout_ms > env var > default (5000ms).
     fn resolve_max_wait(&self) -> Duration {
         // 1. Config file value
-        if let Some(ms) = self.config.timeout_ms {
-            if ms > 0 {
-                return Duration::from_millis(ms);
-            }
+        if let Some(ms) = self.config.timeout_ms
+            && ms > 0
+        {
+            return Duration::from_millis(ms);
         }
         // 2. Environment variable
-        if let Ok(raw) = std::env::var(TRANSLATION_MAX_WAIT_ENV) {
-            if let Ok(ms) = raw.trim().parse::<u64>() {
-                return Duration::from_millis(ms);
-            }
+        if let Ok(raw) = std::env::var(TRANSLATION_MAX_WAIT_ENV)
+            && let Ok(ms) = raw.trim().parse::<u64>()
+        {
+            return Duration::from_millis(ms);
         }
         // 3. Default
         Duration::from_millis(DEFAULT_TRANSLATION_MAX_WAIT_MS)

@@ -85,6 +85,8 @@ pub(crate) struct BacktrackSelection {
     pub(crate) text_elements: Vec<TextElement>,
     /// Local image paths associated with the selected user message.
     pub(crate) local_image_paths: Vec<PathBuf>,
+    /// Remote image URLs associated with the selected user message.
+    pub(crate) remote_image_urls: Vec<String>,
 }
 
 /// An in-flight rollback requested from core.
@@ -216,12 +218,19 @@ impl App {
         let prefill = selection.prefill.clone();
         let text_elements = selection.text_elements.clone();
         let local_image_paths = selection.local_image_paths.clone();
+        let remote_image_urls = selection.remote_image_urls.clone();
+        let has_remote_image_urls = !remote_image_urls.is_empty();
         self.backtrack.pending_rollback = Some(PendingBacktrackRollback {
             selection,
             thread_id: self.chat_widget.thread_id(),
         });
         self.chat_widget.submit_op(Op::ThreadRollback { num_turns });
-        if !prefill.is_empty() || !text_elements.is_empty() || !local_image_paths.is_empty() {
+        self.chat_widget.set_remote_image_urls(remote_image_urls);
+        if !prefill.is_empty()
+            || !text_elements.is_empty()
+            || !local_image_paths.is_empty()
+            || has_remote_image_urls
+        {
             self.chat_widget
                 .set_composer_text(prefill, text_elements, local_image_paths);
         }
@@ -540,7 +549,7 @@ impl App {
             return None;
         }
 
-        let (prefill, text_elements, local_image_paths) =
+        let (prefill, text_elements, local_image_paths, remote_image_urls) =
             nth_user_position(&self.transcript_cells, nth_user_message)
                 .and_then(|idx| self.transcript_cells.get(idx))
                 .and_then(|cell| cell.as_any().downcast_ref::<UserHistoryCell>())
@@ -549,15 +558,17 @@ impl App {
                         cell.message.clone(),
                         cell.text_elements.clone(),
                         cell.local_image_paths.clone(),
+                        cell.remote_image_urls.clone(),
                     )
                 })
-                .unwrap_or_else(|| (String::new(), Vec::new(), Vec::new()));
+                .unwrap_or_else(|| (String::new(), Vec::new(), Vec::new(), Vec::new()));
 
         Some(BacktrackSelection {
             nth_user_message,
             prefill,
             text_elements,
             local_image_paths,
+            remote_image_urls,
         })
     }
 
@@ -676,6 +687,7 @@ mod tests {
                 message: "first user".to_string(),
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
             }) as Arc<dyn HistoryCell>,
             Arc::new(AgentMessageCell::new(vec![Line::from("assistant")], true))
                 as Arc<dyn HistoryCell>,
@@ -694,6 +706,7 @@ mod tests {
                 message: "first".to_string(),
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
             }) as Arc<dyn HistoryCell>,
             Arc::new(AgentMessageCell::new(vec![Line::from("after")], false))
                 as Arc<dyn HistoryCell>,
@@ -724,6 +737,7 @@ mod tests {
                 message: "first".to_string(),
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
             }) as Arc<dyn HistoryCell>,
             Arc::new(AgentMessageCell::new(vec![Line::from("between")], false))
                 as Arc<dyn HistoryCell>,
@@ -731,6 +745,7 @@ mod tests {
                 message: "second".to_string(),
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
             }) as Arc<dyn HistoryCell>,
             Arc::new(AgentMessageCell::new(vec![Line::from("tail")], false))
                 as Arc<dyn HistoryCell>,
@@ -776,6 +791,7 @@ mod tests {
                 message: "first".to_string(),
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
             }) as Arc<dyn HistoryCell>,
             Arc::new(AgentMessageCell::new(
                 vec![Line::from("after first")],
@@ -785,6 +801,7 @@ mod tests {
                 message: "second".to_string(),
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
             }) as Arc<dyn HistoryCell>,
             Arc::new(AgentMessageCell::new(
                 vec![Line::from("after second")],
@@ -812,6 +829,7 @@ mod tests {
                 message: "first".to_string(),
                 text_elements: Vec::new(),
                 local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
             }) as Arc<dyn HistoryCell>,
             Arc::new(AgentMessageCell::new(vec![Line::from("after")], false))
                 as Arc<dyn HistoryCell>,
