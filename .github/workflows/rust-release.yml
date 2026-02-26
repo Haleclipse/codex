@@ -519,4 +519,3 @@ jobs:
             tag_args+=(--tag "${NPM_TAG}")
           fi
           npm publish "${GITHUB_WORKSPACE}/dist/npm/codex-npm-${VERSION}.tgz" "${tag_args[@]}"
-
