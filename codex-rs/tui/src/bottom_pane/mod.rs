@@ -176,6 +176,7 @@ pub(crate) struct BottomPane {
     queued_user_messages: QueuedUserMessages,
     /// Inactive threads with pending approval requests.
     pending_thread_approvals: PendingThreadApprovals,
+    #[allow(dead_code)] // Upstream field; cometix statusline calculates percent from used_tokens + window_size.
     context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
     context_window_size: Option<i64>,

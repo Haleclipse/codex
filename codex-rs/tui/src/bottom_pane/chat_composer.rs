@@ -160,6 +160,7 @@ use super::footer::FooterMode;
 use super::footer::FooterProps;
 use super::footer::SummaryLeft;
 use super::footer::can_show_left_with_context;
+#[allow(unused_imports)] // Upstream import; cometix context display handled by statusline.
 use super::footer::context_window_line;
 use super::footer::esc_hint_mode;
 use super::footer::footer_height;
@@ -4274,10 +4275,8 @@ impl ChatComposer {
                         compact
                     }
                 } else {
-                    Some(context_window_line(
-                        footer_props.context_window_percent,
-                        footer_props.context_window_used_tokens,
-                    ))
+                    // Cometix: context display handled by statusline; disable upstream footer fallback.
+                    None
                 };
                 let right_width = right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
                 if status_line_active

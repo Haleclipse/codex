@@ -66,7 +66,9 @@ pub(crate) struct FooterProps {
     ///
     /// This is rendered when `mode` is `FooterMode::QuitShortcutReminder`.
     pub(crate) quit_shortcut_key: KeyBinding,
+    #[allow(dead_code)] // Upstream field; cometix context display handled by statusline.
     pub(crate) context_window_percent: Option<i64>,
+    #[allow(dead_code)] // Upstream field; cometix context display handled by statusline.
     pub(crate) context_window_used_tokens: Option<i64>,
     pub(crate) status_line_value: Option<Line<'static>>,
     pub(crate) status_line_enabled: bool,
@@ -776,6 +778,7 @@ fn build_columns(entries: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
+#[allow(dead_code)] // Upstream function; cometix context display handled by statusline.
 pub(crate) fn context_window_line(percent: Option<i64>, used_tokens: Option<i64>) -> Line<'static> {
     if let Some(percent) = percent {
         let percent = percent.clamp(0, 100);
@@ -1069,10 +1072,8 @@ mod tests {
                         compact
                     }
                 } else {
-                    Some(context_window_line(
-                        props.context_window_percent,
-                        props.context_window_used_tokens,
-                    ))
+                    // Cometix: context display handled by statusline; disable upstream footer fallback.
+                    None
                 };
                 let right_width = right_line
                     .as_ref()
