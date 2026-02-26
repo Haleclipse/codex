@@ -160,6 +160,7 @@ fn sanitize_rollout_item_for_persistence(
 
 impl RolloutRecorder {
     /// List threads (rollout files) under the provided Codex home directory.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_threads(
         config: &Config,
         page_size: usize,
@@ -168,6 +169,7 @@ impl RolloutRecorder {
         allowed_sources: &[SessionSource],
         model_providers: Option<&[String]>,
         default_provider: &str,
+        search_term: Option<&str>,
     ) -> std::io::Result<ThreadsPage> {
         Self::list_threads_with_db_fallback(
             config,
@@ -178,11 +180,13 @@ impl RolloutRecorder {
             model_providers,
             default_provider,
             false,
+            search_term,
         )
         .await
     }
 
     /// List archived threads (rollout files) under the archived sessions directory.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_archived_threads(
         config: &Config,
         page_size: usize,
@@ -191,6 +195,7 @@ impl RolloutRecorder {
         allowed_sources: &[SessionSource],
         model_providers: Option<&[String]>,
         default_provider: &str,
+        search_term: Option<&str>,
     ) -> std::io::Result<ThreadsPage> {
         Self::list_threads_with_db_fallback(
             config,
@@ -201,6 +206,7 @@ impl RolloutRecorder {
             model_providers,
             default_provider,
             true,
+            search_term,
         )
         .await
     }
@@ -215,6 +221,7 @@ impl RolloutRecorder {
         model_providers: Option<&[String]>,
         default_provider: &str,
         archived: bool,
+        search_term: Option<&str>,
     ) -> std::io::Result<ThreadsPage> {
         let codex_home = config.codex_home.as_path();
         // Filesystem-first listing intentionally overfetches so we can repair stale/missing
@@ -275,6 +282,7 @@ impl RolloutRecorder {
             allowed_sources,
             model_providers,
             archived,
+            search_term,
         )
         .await
         {
@@ -312,6 +320,7 @@ impl RolloutRecorder {
                     allowed_sources,
                     model_providers,
                     false,
+                    None,
                 )
                 .await
                 else {
@@ -391,6 +400,8 @@ impl RolloutRecorder {
                         cwd: config.cwd.clone(),
                         originator: originator().value,
                         cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                        agent_nickname: source.get_nickname(),
+                        agent_role: source.get_agent_role(),
                         source,
                         model_provider: Some(config.model_provider_id.clone()),
                         base_instructions: Some(base_instructions),
@@ -929,9 +940,12 @@ impl From<codex_state::ThreadsPage> for ThreadsPage {
                 git_sha: item.git_sha,
                 git_origin_url: item.git_origin_url,
                 source: Some(
-                    serde_json::from_value(Value::String(item.source))
+                    serde_json::from_str(item.source.as_str())
+                        .or_else(|_| serde_json::from_value(Value::String(item.source)))
                         .unwrap_or(SessionSource::Unknown),
                 ),
+                agent_nickname: item.agent_nickname,
+                agent_role: item.agent_role,
                 model_provider: Some(item.model_provider),
                 cli_version: Some(item.cli_version),
                 created_at: Some(item.created_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
@@ -1073,6 +1087,7 @@ mod tests {
             .record_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
                 AgentMessageEvent {
                     message: "buffered-event".to_string(),
+                    phase: None,
                 },
             ))])
             .await?;
@@ -1148,6 +1163,7 @@ mod tests {
             &[],
             None,
             default_provider.as_str(),
+            None,
         )
         .await?;
         assert_eq!(page1.items.len(), 1);
@@ -1162,6 +1178,7 @@ mod tests {
             &[],
             None,
             default_provider.as_str(),
+            None,
         )
         .await?;
         assert_eq!(page2.items.len(), 1);
@@ -1223,6 +1240,7 @@ mod tests {
             &[],
             None,
             default_provider.as_str(),
+            None,
         )
         .await?;
         assert_eq!(page.items.len(), 0);
@@ -1289,6 +1307,7 @@ mod tests {
             &[],
             None,
             default_provider.as_str(),
+            None,
         )
         .await?;
         assert_eq!(page.items.len(), 1);

@@ -49,6 +49,43 @@ WHERE kind = ? OR kind = ?
         Ok(())
     }
 
+    /// Record usage for cited stage-1 outputs.
+    ///
+    /// Each thread id increments `usage_count` by one and sets `last_usage` to
+    /// the current Unix timestamp. Missing rows are ignored.
+    pub async fn record_stage1_output_usage(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> anyhow::Result<usize> {
+        if thread_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().timestamp();
+        let mut tx = self.pool.begin().await?;
+        let mut updated_rows = 0;
+
+        for thread_id in thread_ids {
+            updated_rows += sqlx::query(
+                r#"
+UPDATE stage1_outputs
+SET
+    usage_count = COALESCE(usage_count, 0) + 1,
+    last_usage = ?
+WHERE thread_id = ?
+                "#,
+            )
+            .bind(now)
+            .bind(thread_id.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected() as usize;
+        }
+
+        tx.commit().await?;
+        Ok(updated_rows)
+    }
+
     /// Selects and claims stage-1 startup jobs for stale threads.
     ///
     /// Query behavior:
@@ -95,6 +132,8 @@ SELECT
     created_at,
     updated_at,
     source,
+    agent_nickname,
+    agent_role,
     model_provider,
     cwd,
     cli_version,
@@ -127,6 +166,7 @@ LEFT JOIN jobs
             None,
             None,
             SortKey::UpdatedAt,
+            None,
         );
         builder
             .push(" AND id != ")
@@ -496,7 +536,7 @@ WHERE excluded.source_updated_at >= stage1_outputs.source_updated_at
     /// - sets `status='done'` and `last_success_watermark = input_watermark`
     /// - deletes any existing `stage1_outputs` row for the thread
     /// - enqueues/advances the global phase-2 job watermark using the claimed
-    ///   `input_watermark`
+    ///   `input_watermark` only when deleting an existing `stage1_outputs` row
     pub async fn mark_stage1_job_succeeded_no_output(
         &self,
         thread_id: ThreadId,
@@ -546,7 +586,7 @@ WHERE kind = ? AND job_key = ? AND ownership_token = ?
         .await?
         .try_get::<i64, _>("input_watermark")?;
 
-        sqlx::query(
+        let deleted_rows = sqlx::query(
             r#"
 DELETE FROM stage1_outputs
 WHERE thread_id = ?
@@ -554,9 +594,12 @@ WHERE thread_id = ?
         )
         .bind(thread_id.as_str())
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
 
-        enqueue_global_consolidation_with_executor(&mut *tx, source_updated_at).await?;
+        if deleted_rows > 0 {
+            enqueue_global_consolidation_with_executor(&mut *tx, source_updated_at).await?;
+        }
 
         tx.commit().await?;
         Ok(true)

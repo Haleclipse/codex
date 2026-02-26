@@ -21,6 +21,7 @@ use crate::skills::SkillsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
@@ -141,6 +142,7 @@ impl ThreadManager {
         codex_home: PathBuf,
         auth_manager: Arc<AuthManager>,
         session_source: SessionSource,
+        model_catalog: Option<ModelsResponse>,
     ) -> Self {
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let skills_manager = Arc::new(SkillsManager::new(codex_home.clone()));
@@ -149,7 +151,11 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
-                models_manager: Arc::new(ModelsManager::new(codex_home, auth_manager.clone())),
+                models_manager: Arc::new(ModelsManager::new(
+                    codex_home,
+                    auth_manager.clone(),
+                    model_catalog,
+                )),
                 skills_manager,
                 file_watcher,
                 auth_manager,
@@ -286,6 +292,22 @@ impl ThreadManager {
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
     ) -> CodexResult<NewThread> {
+        self.start_thread_with_tools_and_service_name(
+            config,
+            dynamic_tools,
+            persist_extended_history,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_thread_with_tools_and_service_name(
+        &self,
+        config: Config,
+        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+        persist_extended_history: bool,
+        metrics_service_name: Option<String>,
+    ) -> CodexResult<NewThread> {
         self.state
             .spawn_thread(
                 config,
@@ -294,6 +316,7 @@ impl ThreadManager {
                 self.agent_control(),
                 dynamic_tools,
                 persist_extended_history,
+                metrics_service_name,
             )
             .await
     }
@@ -324,6 +347,7 @@ impl ThreadManager {
                 self.agent_control(),
                 Vec::new(),
                 persist_extended_history,
+                None,
             )
             .await
     }
@@ -365,6 +389,7 @@ impl ThreadManager {
                 self.agent_control(),
                 Vec::new(),
                 persist_extended_history,
+                None,
             )
             .await
     }
@@ -415,8 +440,14 @@ impl ThreadManagerState {
         config: Config,
         agent_control: AgentControl,
     ) -> CodexResult<NewThread> {
-        self.spawn_new_thread_with_source(config, agent_control, self.session_source.clone(), false)
-            .await
+        self.spawn_new_thread_with_source(
+            config,
+            agent_control,
+            self.session_source.clone(),
+            false,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn spawn_new_thread_with_source(
@@ -425,6 +456,7 @@ impl ThreadManagerState {
         agent_control: AgentControl,
         session_source: SessionSource,
         persist_extended_history: bool,
+        metrics_service_name: Option<String>,
     ) -> CodexResult<NewThread> {
         self.spawn_thread_with_source(
             config,
@@ -434,6 +466,7 @@ impl ThreadManagerState {
             session_source,
             Vec::new(),
             persist_extended_history,
+            metrics_service_name,
         )
         .await
     }
@@ -454,11 +487,13 @@ impl ThreadManagerState {
             session_source,
             Vec::new(),
             false,
+            None,
         )
         .await
     }
 
     /// Spawn a new thread with optional history and register it with the manager.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_thread(
         &self,
         config: Config,
@@ -467,6 +502,7 @@ impl ThreadManagerState {
         agent_control: AgentControl,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
+        metrics_service_name: Option<String>,
     ) -> CodexResult<NewThread> {
         self.spawn_thread_with_source(
             config,
@@ -476,6 +512,7 @@ impl ThreadManagerState {
             self.session_source.clone(),
             dynamic_tools,
             persist_extended_history,
+            metrics_service_name,
         )
         .await
     }
@@ -490,8 +527,9 @@ impl ThreadManagerState {
         session_source: SessionSource,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
+        metrics_service_name: Option<String>,
     ) -> CodexResult<NewThread> {
-        self.file_watcher.register_config(&config);
+        let watch_registration = self.file_watcher.register_config(&config);
         let CodexSpawnOk {
             codex, thread_id, ..
         } = Codex::spawn(
@@ -505,15 +543,18 @@ impl ThreadManagerState {
             agent_control,
             dynamic_tools,
             persist_extended_history,
+            metrics_service_name,
         )
         .await?;
-        self.finalize_thread_spawn(codex, thread_id).await
+        self.finalize_thread_spawn(codex, thread_id, watch_registration)
+            .await
     }
 
     async fn finalize_thread_spawn(
         &self,
         codex: Codex,
         thread_id: ThreadId,
+        watch_registration: crate::file_watcher::WatchRegistration,
     ) -> CodexResult<NewThread> {
         let event = codex.next_event().await?;
         let session_configured = match event {
@@ -529,6 +570,7 @@ impl ThreadManagerState {
         let thread = Arc::new(CodexThread::new(
             codex,
             session_configured.rollout_path.clone(),
+            watch_registration,
         ));
         let mut threads = self.threads.write().await;
         threads.insert(thread_id, thread.clone());

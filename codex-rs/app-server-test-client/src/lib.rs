@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::BufRead;
@@ -29,6 +30,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::DynamicToolSpec;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
@@ -55,6 +57,10 @@ use codex_app_server_protocol::SendUserMessageParams;
 use codex_app_server_protocol::SendUserMessageResponse;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::SkillApprovalDecision;
+use codex_app_server_protocol::SkillRequestApprovalParams;
+use codex_app_server_protocol::SkillRequestApprovalResponse;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadResumeParams;
@@ -77,6 +83,30 @@ use tungstenite::connect;
 use tungstenite::stream::MaybeTlsStream;
 use url::Url;
 use uuid::Uuid;
+
+const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
+    // Legacy codex/event (v1-style) deltas.
+    "codex/event/agent_message_content_delta",
+    "codex/event/agent_message_delta",
+    "codex/event/agent_reasoning_delta",
+    "codex/event/reasoning_content_delta",
+    "codex/event/reasoning_raw_content_delta",
+    "codex/event/exec_command_output_delta",
+    // Other legacy events.
+    "codex/event/exec_approval_request",
+    "codex/event/exec_command_begin",
+    "codex/event/exec_command_end",
+    "codex/event/exec_output",
+    "codex/event/item_started",
+    "codex/event/item_completed",
+    // v2 item deltas.
+    "item/agentMessage/delta",
+    "item/plan/delta",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/textDelta",
+];
 
 /// Minimal launcher that initializes the Codex app-server and logs the handshake.
 #[derive(Parser)]
@@ -141,6 +171,9 @@ enum CliCommand {
     },
     /// Send a user message through the app-server V2 thread/turn APIs.
     SendMessageV2 {
+        /// Opt into experimental app-server methods and fields.
+        #[arg(long)]
+        experimental_api: bool,
         /// User message to send to Codex.
         user_message: String,
     },
@@ -180,6 +213,18 @@ enum CliCommand {
         /// Follow-up user message for the second turn.
         follow_up_message: String,
     },
+    /// Trigger zsh-fork multi-subcommand approvals and assert expected approval behavior.
+    #[command(name = "trigger-zsh-fork-multi-cmd-approval")]
+    TriggerZshForkMultiCmdApproval {
+        /// Optional prompt; defaults to an explicit `/usr/bin/true && /usr/bin/true` command.
+        user_message: Option<String>,
+        /// Minimum number of command-approval callbacks expected in the turn.
+        #[arg(long, default_value_t = 2)]
+        min_approvals: usize,
+        /// One-based approval index to abort (e.g. --abort-on 2 aborts the second approval).
+        #[arg(long)]
+        abort_on: Option<usize>,
+    },
     /// Trigger the ChatGPT login flow and wait for completion.
     TestLogin,
     /// Fetch the current account rate limits from the Codex app-server.
@@ -218,9 +263,18 @@ pub fn run() -> Result<()> {
             let endpoint = resolve_endpoint(codex_bin, url)?;
             send_message(&endpoint, &config_overrides, user_message)
         }
-        CliCommand::SendMessageV2 { user_message } => {
+        CliCommand::SendMessageV2 {
+            experimental_api,
+            user_message,
+        } => {
             let endpoint = resolve_endpoint(codex_bin, url)?;
-            send_message_v2_endpoint(&endpoint, &config_overrides, user_message, &dynamic_tools)
+            send_message_v2_endpoint(
+                &endpoint,
+                &config_overrides,
+                user_message,
+                experimental_api,
+                &dynamic_tools,
+            )
         }
         CliCommand::ResumeMessageV2 {
             thread_id,
@@ -262,6 +316,21 @@ pub fn run() -> Result<()> {
                 &config_overrides,
                 first_message,
                 follow_up_message,
+                &dynamic_tools,
+            )
+        }
+        CliCommand::TriggerZshForkMultiCmdApproval {
+            user_message,
+            min_approvals,
+            abort_on,
+        } => {
+            let endpoint = resolve_endpoint(codex_bin, url)?;
+            trigger_zsh_fork_multi_cmd_approval(
+                &endpoint,
+                &config_overrides,
+                user_message,
+                min_approvals,
+                abort_on,
                 &dynamic_tools,
             )
         }
@@ -451,23 +520,130 @@ pub fn send_message_v2(
     dynamic_tools: &Option<Vec<DynamicToolSpec>>,
 ) -> Result<()> {
     let endpoint = Endpoint::SpawnCodex(codex_bin.to_path_buf());
-    send_message_v2_endpoint(&endpoint, config_overrides, user_message, dynamic_tools)
+    send_message_v2_endpoint(
+        &endpoint,
+        config_overrides,
+        user_message,
+        true,
+        dynamic_tools,
+    )
 }
 
 fn send_message_v2_endpoint(
     endpoint: &Endpoint,
     config_overrides: &[String],
     user_message: String,
+    experimental_api: bool,
     dynamic_tools: &Option<Vec<DynamicToolSpec>>,
 ) -> Result<()> {
+    if dynamic_tools.is_some() && !experimental_api {
+        bail!("--dynamic-tools requires --experimental-api for send-message-v2");
+    }
+
     send_message_v2_with_policies(
         endpoint,
         config_overrides,
         user_message,
+        experimental_api,
         None,
         None,
         dynamic_tools,
     )
+}
+
+fn trigger_zsh_fork_multi_cmd_approval(
+    endpoint: &Endpoint,
+    config_overrides: &[String],
+    user_message: Option<String>,
+    min_approvals: usize,
+    abort_on: Option<usize>,
+    dynamic_tools: &Option<Vec<DynamicToolSpec>>,
+) -> Result<()> {
+    if let Some(abort_on) = abort_on
+        && abort_on == 0
+    {
+        bail!("--abort-on must be >= 1 when provided");
+    }
+
+    let default_prompt = "Run this exact command using shell command execution without rewriting or splitting it: /usr/bin/true && /usr/bin/true";
+    let message = user_message.unwrap_or_else(|| default_prompt.to_string());
+
+    let mut client = CodexClient::connect(endpoint, config_overrides)?;
+    let initialize = client.initialize()?;
+    println!("< initialize response: {initialize:?}");
+
+    let thread_response = client.thread_start(ThreadStartParams {
+        dynamic_tools: dynamic_tools.clone(),
+        ..Default::default()
+    })?;
+    println!("< thread/start response: {thread_response:?}");
+
+    client.command_approval_behavior = match abort_on {
+        Some(index) => CommandApprovalBehavior::AbortOn(index),
+        None => CommandApprovalBehavior::AlwaysAccept,
+    };
+    client.command_approval_count = 0;
+    client.command_approval_item_ids.clear();
+    client.command_execution_statuses.clear();
+    client.last_turn_status = None;
+
+    let mut turn_params = TurnStartParams {
+        thread_id: thread_response.thread.id.clone(),
+        input: vec![V2UserInput::Text {
+            text: message,
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    turn_params.approval_policy = Some(AskForApproval::OnRequest);
+    turn_params.sandbox_policy = Some(SandboxPolicy::ReadOnly {
+        access: ReadOnlyAccess::FullAccess,
+    });
+
+    let turn_response = client.turn_start(turn_params)?;
+    println!("< turn/start response: {turn_response:?}");
+    client.stream_turn(&thread_response.thread.id, &turn_response.turn.id)?;
+
+    if client.command_approval_count < min_approvals {
+        bail!(
+            "expected at least {min_approvals} command approvals, got {}",
+            client.command_approval_count
+        );
+    }
+    let mut approvals_per_item = std::collections::BTreeMap::new();
+    for item_id in &client.command_approval_item_ids {
+        *approvals_per_item.entry(item_id.clone()).or_insert(0usize) += 1;
+    }
+    let max_approvals_for_one_item = approvals_per_item.values().copied().max().unwrap_or(0);
+    if max_approvals_for_one_item < min_approvals {
+        bail!(
+            "expected at least {min_approvals} approvals for one command item, got max {max_approvals_for_one_item} with map {approvals_per_item:?}"
+        );
+    }
+
+    let last_command_status = client.command_execution_statuses.last();
+    if abort_on.is_none() {
+        if last_command_status != Some(&CommandExecutionStatus::Completed) {
+            bail!("expected completed command execution, got {last_command_status:?}");
+        }
+        if client.last_turn_status != Some(TurnStatus::Completed) {
+            bail!(
+                "expected completed turn in all-accept flow, got {:?}",
+                client.last_turn_status
+            );
+        }
+    } else if last_command_status == Some(&CommandExecutionStatus::Completed) {
+        bail!(
+            "expected non-completed command execution in mixed approval/decline flow, got {last_command_status:?}"
+        );
+    }
+
+    println!(
+        "[zsh-fork multi-approval summary] approvals={}, approvals_per_item={approvals_per_item:?}, command_statuses={:?}, turn_status={:?}",
+        client.command_approval_count, client.command_execution_statuses, client.last_turn_status
+    );
+
+    Ok(())
 }
 
 fn resume_message_v2(
@@ -538,6 +714,7 @@ fn trigger_cmd_approval(
         endpoint,
         config_overrides,
         message,
+        true,
         Some(AskForApproval::OnRequest),
         Some(SandboxPolicy::ReadOnly {
             access: ReadOnlyAccess::FullAccess,
@@ -559,6 +736,7 @@ fn trigger_patch_approval(
         endpoint,
         config_overrides,
         message,
+        true,
         Some(AskForApproval::OnRequest),
         Some(SandboxPolicy::ReadOnly {
             access: ReadOnlyAccess::FullAccess,
@@ -577,6 +755,7 @@ fn no_trigger_cmd_approval(
         endpoint,
         config_overrides,
         prompt.to_string(),
+        true,
         None,
         None,
         dynamic_tools,
@@ -587,13 +766,14 @@ fn send_message_v2_with_policies(
     endpoint: &Endpoint,
     config_overrides: &[String],
     user_message: String,
+    experimental_api: bool,
     approval_policy: Option<AskForApproval>,
     sandbox_policy: Option<SandboxPolicy>,
     dynamic_tools: &Option<Vec<DynamicToolSpec>>,
 ) -> Result<()> {
     let mut client = CodexClient::connect(endpoint, config_overrides)?;
 
-    let initialize = client.initialize()?;
+    let initialize = client.initialize_with_experimental_api(experimental_api)?;
     println!("< initialize response: {initialize:?}");
 
     let thread_response = client.thread_start(ThreadStartParams {
@@ -736,6 +916,7 @@ fn thread_list(endpoint: &Endpoint, config_overrides: &[String], limit: u32) -> 
         source_kinds: None,
         archived: None,
         cwd: None,
+        search_term: None,
     })?;
     println!("< thread/list response: {response:?}");
 
@@ -791,6 +972,17 @@ enum ClientTransport {
 struct CodexClient {
     transport: ClientTransport,
     pending_notifications: VecDeque<JSONRPCNotification>,
+    command_approval_behavior: CommandApprovalBehavior,
+    command_approval_count: usize,
+    command_approval_item_ids: Vec<String>,
+    command_execution_statuses: Vec<CommandExecutionStatus>,
+    last_turn_status: Option<TurnStatus>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CommandApprovalBehavior {
+    AlwaysAccept,
+    AbortOn(usize),
 }
 
 impl CodexClient {
@@ -804,6 +996,14 @@ impl CodexClient {
     fn spawn_stdio(codex_bin: &Path, config_overrides: &[String]) -> Result<Self> {
         let codex_bin_display = codex_bin.display();
         let mut cmd = Command::new(codex_bin);
+        if let Some(codex_bin_parent) = codex_bin.parent() {
+            let mut path = OsString::from(codex_bin_parent.as_os_str());
+            if let Some(existing_path) = std::env::var_os("PATH") {
+                path.push(":");
+                path.push(existing_path);
+            }
+            cmd.env("PATH", path);
+        }
         for override_kv in config_overrides {
             cmd.arg("--config").arg(override_kv);
         }
@@ -831,6 +1031,11 @@ impl CodexClient {
                 stdout: BufReader::new(stdout),
             },
             pending_notifications: VecDeque::new(),
+            command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            last_turn_status: None,
         })
     }
 
@@ -847,10 +1052,22 @@ impl CodexClient {
                 socket: Box::new(socket),
             },
             pending_notifications: VecDeque::new(),
+            command_approval_behavior: CommandApprovalBehavior::AlwaysAccept,
+            command_approval_count: 0,
+            command_approval_item_ids: Vec::new(),
+            command_execution_statuses: Vec::new(),
+            last_turn_status: None,
         })
     }
 
     fn initialize(&mut self) -> Result<InitializeResponse> {
+        self.initialize_with_experimental_api(true)
+    }
+
+    fn initialize_with_experimental_api(
+        &mut self,
+        experimental_api: bool,
+    ) -> Result<InitializeResponse> {
         let request_id = self.request_id();
         let request = ClientRequest::Initialize {
             request_id: request_id.clone(),
@@ -861,8 +1078,13 @@ impl CodexClient {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                 },
                 capabilities: Some(InitializeCapabilities {
-                    experimental_api: true,
-                    opt_out_notification_methods: None,
+                    experimental_api,
+                    opt_out_notification_methods: Some(
+                        NOTIFICATIONS_TO_OPT_OUT
+                            .iter()
+                            .map(|method| (*method).to_string())
+                            .collect(),
+                    ),
                 }),
             },
         };
@@ -1121,10 +1343,14 @@ impl CodexClient {
                     println!("\n< item started: {:?}", payload.item);
                 }
                 ServerNotification::ItemCompleted(payload) => {
+                    if let ThreadItem::CommandExecution { status, .. } = payload.item.clone() {
+                        self.command_execution_statuses.push(status);
+                    }
                     println!("< item completed: {:?}", payload.item);
                 }
                 ServerNotification::TurnCompleted(payload) => {
                     if payload.turn.id == turn_id {
+                        self.last_turn_status = Some(payload.turn.status.clone());
                         println!("\n< turn/completed notification: {:?}", payload.turn.status);
                         if payload.turn.status == TurnStatus::Failed
                             && let Some(error) = payload.turn.error
@@ -1285,6 +1511,9 @@ impl CodexClient {
             ServerRequest::FileChangeRequestApproval { request_id, params } => {
                 self.approve_file_change_request(request_id, params)?;
             }
+            ServerRequest::SkillRequestApproval { request_id, params } => {
+                self.approve_skill_request(request_id, params)?;
+            }
             other => {
                 bail!("received unsupported server request: {other:?}");
             }
@@ -1304,18 +1533,26 @@ impl CodexClient {
             item_id,
             approval_id,
             reason,
+            network_approval_context,
             command,
             cwd,
             command_actions,
+            additional_permissions,
             proposed_execpolicy_amendment,
+            proposed_network_policy_amendments,
         } = params;
 
         println!(
             "\n< commandExecution approval requested for thread {thread_id}, turn {turn_id}, item {item_id}, approval {}",
             approval_id.as_deref().unwrap_or("<none>")
         );
+        self.command_approval_count += 1;
+        self.command_approval_item_ids.push(item_id.clone());
         if let Some(reason) = reason.as_deref() {
             println!("< reason: {reason}");
+        }
+        if let Some(network_approval_context) = network_approval_context.as_ref() {
+            println!("< network approval context: {network_approval_context:?}");
         }
         if let Some(command) = command.as_deref() {
             println!("< command: {command}");
@@ -1328,15 +1565,47 @@ impl CodexClient {
         {
             println!("< command actions: {command_actions:?}");
         }
+        if let Some(additional_permissions) = additional_permissions.as_ref() {
+            println!("< additional permissions: {additional_permissions:?}");
+        }
         if let Some(execpolicy_amendment) = proposed_execpolicy_amendment.as_ref() {
             println!("< proposed execpolicy amendment: {execpolicy_amendment:?}");
         }
+        if let Some(network_policy_amendments) = proposed_network_policy_amendments.as_ref() {
+            println!("< proposed network policy amendments: {network_policy_amendments:?}");
+        }
 
+        let decision = match self.command_approval_behavior {
+            CommandApprovalBehavior::AlwaysAccept => CommandExecutionApprovalDecision::Accept,
+            CommandApprovalBehavior::AbortOn(index) if self.command_approval_count == index => {
+                CommandExecutionApprovalDecision::Cancel
+            }
+            CommandApprovalBehavior::AbortOn(_) => CommandExecutionApprovalDecision::Accept,
+        };
         let response = CommandExecutionRequestApprovalResponse {
-            decision: CommandExecutionApprovalDecision::Accept,
+            decision: decision.clone(),
         };
         self.send_server_request_response(request_id, &response)?;
-        println!("< approved commandExecution request for item {item_id}");
+        println!(
+            "< commandExecution decision for approval #{} on item {item_id}: {:?}",
+            self.command_approval_count, decision
+        );
+        Ok(())
+    }
+
+    fn approve_skill_request(
+        &mut self,
+        request_id: RequestId,
+        params: SkillRequestApprovalParams,
+    ) -> Result<()> {
+        println!(
+            "\n< skill approval requested for item {}, skill {}",
+            params.item_id, params.skill_name
+        );
+        let response = SkillRequestApprovalResponse {
+            decision: SkillApprovalDecision::Approve,
+        };
+        self.send_server_request_response(request_id, &response)?;
         Ok(())
     }
 
