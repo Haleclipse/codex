@@ -1,6 +1,5 @@
 ---
 source: tui/src/bottom_pane/approval_overlay.rs
-assertion_line: 821
 expression: "format!(\"{buf:?}\")"
 ---
 Buffer {
@@ -12,7 +11,7 @@ Buffer {
         "  Reason: network request blocked                                                                   ",
         "                                                                                                    ",
         "                                                                                                    ",
-        "› 1. Yes, just this once (y)                                                                        ",
+        "❯ 1. Yes, just this once (y)                                                                        ",
         "  2. Yes, and allow this host for this conversation (a)                                             ",
         "  3. Yes, and allow this host in the future (p)                                                     ",
         "  4. No, and tell Codex what to do differently (esc)                                                ",

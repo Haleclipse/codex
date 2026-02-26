@@ -298,6 +298,10 @@ impl ModelsManager {
     }
 
     /// Replace the cached remote models and rebuild the derived presets list.
+    ///
+    /// Bundled `models.json` is the authority for `visibility`: when a remote/cached model
+    /// overwrites a bundled entry, the bundled visibility is preserved so that cometix
+    /// visibility overrides are never lost to upstream server refreshes.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
         let mut existing_models = Self::load_remote_models_from_file().unwrap_or_default();
         for model in models {
@@ -305,7 +309,9 @@ impl ModelsManager {
                 .iter()
                 .position(|existing| existing.slug == model.slug)
             {
+                let bundled_visibility = existing_models[existing_index].visibility;
                 existing_models[existing_index] = model;
+                existing_models[existing_index].visibility = bundled_visibility;
             } else {
                 existing_models.push(model);
             }

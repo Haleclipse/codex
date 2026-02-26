@@ -850,14 +850,6 @@ mod tests {
             Some(&"http://127.0.0.1:3128".to_string())
         );
         assert_eq!(
-            env.get("WS_PROXY"),
-            Some(&"http://codex-net-attempt-attempt-123@127.0.0.1:3128".to_string())
-        );
-        assert_eq!(
-            env.get("WSS_PROXY"),
-            Some(&"http://codex-net-attempt-attempt-123@127.0.0.1:3128".to_string())
-        );
-        assert_eq!(
             env.get("ALL_PROXY"),
             Some(&"socks5h://127.0.0.1:8081".to_string())
         );

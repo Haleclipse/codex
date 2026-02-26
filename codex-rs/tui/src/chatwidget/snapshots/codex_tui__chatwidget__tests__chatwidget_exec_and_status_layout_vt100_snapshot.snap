@@ -40,5 +40,5 @@ expression: term.backend().vt100().screen().contents()
 ────────────────────────────────────────────────────────────────────────────────
 ❯ Summarize recent commits 
 ────────────────────────────────────────────────────────────────────────────────
-   GPT 5.2 Codex │ 󰉋 tui
-  tab to queue message                                       100% context left
+   GPT 5.3 Codex │ 󰉋 tui │  - · - tokens
+  tab to queue message

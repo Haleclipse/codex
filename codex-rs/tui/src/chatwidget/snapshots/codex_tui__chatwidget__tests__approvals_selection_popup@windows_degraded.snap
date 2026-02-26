@@ -5,7 +5,7 @@ expression: popup
 ---
   Update Model Permissions
 
-› 1. Read Only (current)             Codex can read files in the current
+❯ 1. Read Only (current)             Codex can read files in the current
                                      workspace. Approval is required to edit
                                      files or access the internet.
   2. Default (non-admin sandbox)  Codex can read and edit files in the

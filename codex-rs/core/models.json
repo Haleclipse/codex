@@ -553,7 +553,7 @@
         }
       ],
       "shell_type": "default",
-      "visibility": "list",
+      "visibility": "hide",
       "minimal_client_version": "0.0.1",
       "supported_in_api": true,
       "upgrade": null,
@@ -610,7 +610,7 @@
         }
       ],
       "shell_type": "default",
-      "visibility": "list",
+      "visibility": "hide",
       "minimal_client_version": "0.0.1",
       "supported_in_api": true,
       "upgrade": null,
