@@ -112,7 +112,6 @@
 use crate::bottom_pane::footer::mode_indicator_line;
 use crate::bottom_pane::selection_popup_common::truncate_line_with_ellipsis_if_overflow;
 use crate::key_hint;
-use crate::style::user_message_style;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::has_ctrl_or_alt;
 use crate::statusline::CxLineConfig;
@@ -120,6 +119,7 @@ use crate::statusline::GitPreviewData;
 use crate::statusline::StatusLineContext;
 use crate::statusline::StatusLineWidget;
 use crate::statusline::build_statusline;
+use crate::style::user_message_style;
 use crate::ui_consts::FOOTER_INDENT_COLS;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -632,7 +632,13 @@ impl ChatComposer {
         };
         textarea_rect.y = textarea_rect.y.saturating_add(consumed);
         textarea_rect.height = textarea_rect.height.saturating_sub(consumed);
-        [composer_rect, remote_images_rect, textarea_rect, statusline_rect, popup_rect]
+        [
+            composer_rect,
+            remote_images_rect,
+            textarea_rect,
+            statusline_rect,
+            popup_rect,
+        ]
     }
 
     fn footer_spacing(footer_hint_height: u16) -> u16 {
@@ -3542,8 +3548,13 @@ impl Renderable for ChatComposer {
 
 impl ChatComposer {
     pub(crate) fn render_with_mask(&self, area: Rect, buf: &mut Buffer, mask_char: Option<char>) {
-        let [composer_rect, remote_images_rect, textarea_rect, statusline_rect, popup_rect] =
-            self.layout_areas(area);
+        let [
+            composer_rect,
+            remote_images_rect,
+            textarea_rect,
+            statusline_rect,
+            popup_rect,
+        ] = self.layout_areas(area);
         match &self.active_popup {
             ActivePopup::Command(popup) => {
                 popup.render_ref(popup_rect, buf);

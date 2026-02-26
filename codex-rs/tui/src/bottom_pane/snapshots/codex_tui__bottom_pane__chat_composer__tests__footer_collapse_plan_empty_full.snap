@@ -10,4 +10,4 @@ expression: terminal.backend()
 "                                                                                                                        "
 "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 "   100 tokens                                                                                                          "
-"  Plan mode (shift+tab to cycle)                                                                                        "
+"  Plan mode (shift+tab to cycle)                                                                              100 used  "

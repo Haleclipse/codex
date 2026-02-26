@@ -42,13 +42,8 @@ impl Segment for ContextSegment {
                 )
             }
             _ => {
-                // 没有数据时显示占位符
-                Some(
-                    SegmentData::new("- · - tokens".to_string())
-                        .with_metadata("percent", "-".to_string())
-                        .with_metadata("tokens", "-".to_string())
-                        .with_metadata("type", "placeholder"),
-                )
+                // 没有数据时不显示，与其他 segment 保持一致
+                None
             }
         }
     }

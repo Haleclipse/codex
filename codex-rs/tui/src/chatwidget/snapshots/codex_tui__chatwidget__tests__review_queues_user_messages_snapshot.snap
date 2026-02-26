@@ -18,4 +18,5 @@ expression: term.backend().vt100().screen().contents()
 ────────────────────────────────────────────────────────────────────────────────
 ❯ Ask Codex to do anything
 ────────────────────────────────────────────────────────────────────────────────
-   GPT 5.2 Codex │ 󰉋 tui │  - · - tokens
+   GPT 5.2 Codex │ 󰉋 tui
+                                                             100% context left
