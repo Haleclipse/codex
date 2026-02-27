@@ -58,6 +58,7 @@ jobs:
         working-directory: codex-rs
     env:
       CARGO_PROFILE_RELEASE_LTO: ${{ (contains(github.ref_name, '-alpha') || contains(github.ref_name, '-cometix')) && 'thin' || 'fat' }}
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ contains(github.ref_name, '-cometix') && 's' || '3' }}
 
     strategy:
       fail-fast: false
