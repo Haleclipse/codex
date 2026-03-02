@@ -136,14 +136,10 @@ async fn list_models_pagination_works() -> Result<()> {
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let expected_models = expected_visible_models();
-    let total = expected_models.len();
-    assert!(total >= 2, "need at least 2 models to test pagination");
+    let mut cursor = None;
+    let mut items = Vec::new();
 
-    // Paginate through all models one at a time.
-    let mut cursor: Option<String> = None;
-    let mut collected = Vec::new();
-
-    loop {
+    for _ in 0..expected_models.len() {
         let request_id = mcp
             .send_list_models_request(ModelListParams {
                 limit: Some(1),
@@ -159,24 +155,25 @@ async fn list_models_pagination_works() -> Result<()> {
         .await??;
 
         let ModelListResponse {
-            data: items,
+            data: page_items,
             next_cursor,
         } = to_response::<ModelListResponse>(response)?;
 
-        assert_eq!(items.len(), 1);
-        collected.push(items.into_iter().next().unwrap());
+        assert_eq!(page_items.len(), 1);
+        items.extend(page_items);
 
-        match next_cursor {
-            Some(c) => cursor = Some(c),
-            None => break,
+        if let Some(next_cursor) = next_cursor {
+            cursor = Some(next_cursor);
+        } else {
+            assert_eq!(items, expected_models);
+            return Ok(());
         }
     }
 
-    assert_eq!(collected.len(), total);
-    for (i, model) in collected.iter().enumerate() {
-        assert_eq!(model.id, expected_models[i].id);
-    }
-    Ok(())
+    panic!(
+        "model pagination did not terminate after {} pages",
+        expected_models.len()
+    );
 }
 
 #[tokio::test]

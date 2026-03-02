@@ -328,6 +328,9 @@
             "connectors": {
               "type": "boolean"
             },
+            "default_mode_request_user_input": {
+              "type": "boolean"
+            },
             "elevated_windows_sandbox": {
               "type": "boolean"
             },
@@ -404,9 +407,6 @@
               "type": "boolean"
             },
             "shell_zsh_fork": {
-              "type": "boolean"
-            },
-            "skill_approval": {
               "type": "boolean"
             },
             "skill_env_var_dependency_prompt": {
@@ -628,6 +628,11 @@
           "description": "Maximum number of rollout candidates processed per pass.",
           "format": "uint",
           "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_unused_days": {
+          "description": "Maximum number of days since a memory was last used before it becomes ineligible for phase 2 selection.",
+          "format": "int64",
           "type": "integer"
         },
         "min_rollout_idle_hours": {
@@ -1621,6 +1626,9 @@
         "connectors": {
           "type": "boolean"
         },
+        "default_mode_request_user_input": {
+          "type": "boolean"
+        },
         "elevated_windows_sandbox": {
           "type": "boolean"
         },
@@ -1697,9 +1705,6 @@
           "type": "boolean"
         },
         "shell_zsh_fork": {
-          "type": "boolean"
-        },
-        "skill_approval": {
           "type": "boolean"
         },
         "skill_env_var_dependency_prompt": {

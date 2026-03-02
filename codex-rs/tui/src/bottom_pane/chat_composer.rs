@@ -31,8 +31,8 @@
 //!
 //! # Submission and Prompt Expansion
 //!
-//! When steer is enabled, `Enter` submits immediately. `Tab` requests queuing while a task is
-//! running; if no task is running, `Tab` submits just like Enter so input is never dropped.
+//! `Enter` submits immediately. `Tab` requests queuing while a task is running; if no task is
+//! running, `Tab` submits just like Enter so input is never dropped.
 //! `Tab` does not submit when entering a `!` shell command.
 //!
 //! On submit/queue paths, the composer:
@@ -196,6 +196,7 @@ use codex_protocol::custom_prompts::PROMPTS_CMD_PREFIX;
 use codex_protocol::models::local_image_label_text;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::user_input::ByteRange;
+use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_protocol::user_input::TextElement;
 use codex_utils_fuzzy_match::fuzzy_match;
 
@@ -236,6 +237,12 @@ use tokio::runtime::Handle;
 /// If the pasted content exceeds this number of characters, replace it with a
 /// placeholder in the UI.
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
+
+fn user_input_too_large_message(actual_chars: usize) -> String {
+    format!(
+        "Message exceeds the maximum length of {MAX_USER_INPUT_TEXT_CHARS} characters ({actual_chars} provided)."
+    )
+}
 
 /// Result returned when the user interacts with the text area.
 #[derive(Debug, PartialEq)]
@@ -391,8 +398,6 @@ pub(crate) struct ChatComposer {
     dismissed_mention_popup_token: Option<String>,
     mention_bindings: HashMap<u64, ComposerMentionBinding>,
     recent_submission_mention_bindings: Vec<MentionBinding>,
-    /// When enabled, `Enter` submits immediately and `Tab` requests queuing behavior.
-    steer_enabled: bool,
     collaboration_modes_enabled: bool,
     config: ChatComposerConfig,
     collaboration_mode_indicator: Option<CollaborationModeIndicator>,
@@ -509,7 +514,6 @@ impl ChatComposer {
             dismissed_mention_popup_token: None,
             mention_bindings: HashMap::new(),
             recent_submission_mention_bindings: Vec::new(),
-            steer_enabled: false,
             collaboration_modes_enabled: false,
             config,
             collaboration_mode_indicator: None,
@@ -579,17 +583,6 @@ impl ChatComposer {
         ordered
     }
 
-    /// Enables or disables "Steer" behavior for submission keys.
-    ///
-    /// When steer is enabled, `Enter` produces [`InputResult::Submitted`] (send immediately) and
-    /// `Tab` produces [`InputResult::Queued`] when a task is running; otherwise it submits
-    /// immediately. `Tab` does not submit when the input is a `!` shell command.
-    /// When steer is disabled, `Enter` produces [`InputResult::Queued`], preserving the default
-    /// "queue while a task is running" behavior.
-    pub fn set_steer_enabled(&mut self, enabled: bool) {
-        self.steer_enabled = enabled;
-    }
-
     pub fn set_collaboration_modes_enabled(&mut self, enabled: bool) {
         self.collaboration_modes_enabled = enabled;
     }
@@ -612,6 +605,10 @@ impl ChatComposer {
     pub fn set_realtime_conversation_enabled(&mut self, enabled: bool) {
         self.realtime_conversation_enabled = enabled;
     }
+
+    /// Compatibility shim for tests that still toggle the removed steer mode flag.
+    #[cfg(test)]
+    pub fn set_steer_enabled(&mut self, _enabled: bool) {}
 
     pub fn set_voice_transcription_enabled(&mut self, enabled: bool) {
         self.voice_state.transcription_enabled = enabled;
@@ -2404,6 +2401,22 @@ impl ChatComposer {
                 text_elements = expanded.text_elements;
             }
         }
+        let actual_chars = text.chars().count();
+        if actual_chars > MAX_USER_INPUT_TEXT_CHARS {
+            let message = user_input_too_large_message(actual_chars);
+            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                history_cell::new_error_event(message),
+            )));
+            self.set_text_content_with_mention_bindings(
+                original_input.clone(),
+                original_text_elements,
+                original_local_image_paths,
+                original_mention_bindings,
+            );
+            self.pending_pastes.clone_from(&original_pending_pastes);
+            self.textarea.set_cursor(original_input.len());
+            return None;
+        }
         // Custom prompt expansion can remove or rewrite image placeholders, so prune any
         // attachments that no longer have a corresponding placeholder in the expanded text.
         self.prune_attached_images_for_submission(&text, &text_elements);
@@ -2816,25 +2829,12 @@ impl ChatComposer {
                 modifiers: KeyModifiers::NONE,
                 kind: KeyEventKind::Press,
                 ..
-            } if self.steer_enabled && !self.is_bang_shell_command() => {
-                self.handle_submission(self.is_task_running)
-            }
-            KeyEvent {
-                code: KeyCode::Tab,
-                modifiers: KeyModifiers::NONE,
-                kind: KeyEventKind::Press,
-                ..
-            } if self.is_task_running && !self.is_bang_shell_command() => {
-                self.handle_submission(true)
-            }
+            } if !self.is_bang_shell_command() => self.handle_submission(self.is_task_running),
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => {
-                let should_queue = !self.steer_enabled;
-                self.handle_submission(should_queue)
-            }
+            } => self.handle_submission(false),
             input => self.handle_input_basic(input),
         }
     }
@@ -3234,7 +3234,6 @@ impl ChatComposer {
             use_shift_enter_hint: self.use_shift_enter_hint,
             is_task_running: self.is_task_running,
             quit_shortcut_key: self.quit_shortcut_key,
-            steer_enabled: self.steer_enabled,
             collaboration_modes_enabled: self.collaboration_modes_enabled,
             is_wsl,
             context_window_percent: self.context_window_percent,
@@ -4197,9 +4196,7 @@ impl ChatComposer {
                     | FooterMode::ComposerHasDraft => false,
                 };
                 let show_queue_hint = match footer_props.mode {
-                    FooterMode::ComposerHasDraft => {
-                        footer_props.is_task_running && footer_props.steer_enabled
-                    }
+                    FooterMode::ComposerHasDraft => footer_props.is_task_running,
                     FooterMode::QuitShortcutReminder
                     | FooterMode::ComposerEmpty
                     | FooterMode::ShortcutOverlay
@@ -4876,10 +4873,9 @@ mod tests {
             },
         );
 
-        // Textarea has content, agent running, steer enabled: queue hint is shown.
+        // Textarea has content, agent running: queue hint is shown.
         snapshot_composer_state_with_width("footer_collapse_queue_full", 120, true, |composer| {
             setup_collab_footer(composer, 98, None);
-            composer.set_steer_enabled(true);
             composer.set_task_running(true);
             composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
         });
@@ -4889,7 +4885,6 @@ mod tests {
             true,
             |composer| {
                 setup_collab_footer(composer, 98, None);
-                composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
@@ -4900,7 +4895,6 @@ mod tests {
             true,
             |composer| {
                 setup_collab_footer(composer, 98, None);
-                composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
@@ -4911,7 +4905,6 @@ mod tests {
             true,
             |composer| {
                 setup_collab_footer(composer, 98, None);
-                composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
@@ -4922,20 +4915,18 @@ mod tests {
             true,
             |composer| {
                 setup_collab_footer(composer, 98, None);
-                composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
         );
 
-        // Textarea has content, plan mode active, agent running, steer enabled: queue hint + mode.
+        // Textarea has content, plan mode active, agent running: queue hint + mode.
         snapshot_composer_state_with_width(
             "footer_collapse_plan_queue_full",
             120,
             true,
             |composer| {
                 setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Plan));
-                composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
@@ -4946,7 +4937,6 @@ mod tests {
             true,
             |composer| {
                 setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Plan));
-                composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
@@ -4957,7 +4947,6 @@ mod tests {
             true,
             |composer| {
                 setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Plan));
-                composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
@@ -4968,7 +4957,6 @@ mod tests {
             true,
             |composer| {
                 setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Plan));
-                composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
@@ -4979,7 +4967,6 @@ mod tests {
             true,
             |composer| {
                 setup_collab_footer(composer, 98, Some(CollaborationModeIndicator::Plan));
-                composer.set_steer_enabled(true);
                 composer.set_task_running(true);
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
@@ -5051,11 +5038,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
 
         composer.set_text_content("draft text".to_string(), Vec::new(), Vec::new());
         assert_eq!(composer.clear_for_ctrl_c(), Some("draft text".to_string()));
@@ -5119,7 +5101,6 @@ mod tests {
         assert_eq!(composer.pending_pastes, vec![(placeholder.clone(), large)]);
         assert_eq!(composer.textarea.element_payloads(), vec![placeholder]);
 
-        composer.set_steer_enabled(true);
         let (result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match result {
@@ -5273,13 +5254,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
 
         let (result, needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
@@ -5322,10 +5296,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
 
         // Force an active paste burst so this test doesn't depend on tight timing.
         composer
@@ -5433,10 +5403,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
         assert_eq!(composer.footer_mode, FooterMode::ShortcutOverlay);
@@ -5687,7 +5653,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         let input = "npx -y @kaeawc/auto-mobile@latest";
         composer.textarea.insert_str(input);
@@ -5723,10 +5688,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(composer.is_in_paste_burst());
@@ -5758,10 +5719,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('あ'), KeyModifiers::NONE));
 
@@ -5904,9 +5861,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
 
         let mut now = Instant::now();
         let step = Duration::from_millis(1);
@@ -5922,7 +5876,7 @@ mod tests {
         );
         now += step;
 
-        let (result, _) = composer.handle_submission_with_time(!composer.steer_enabled, now);
+        let (result, _) = composer.handle_submission_with_time(false, now);
         assert!(
             matches!(result, InputResult::None),
             "Enter during a burst should insert newline, not submit"
@@ -6058,9 +6012,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
 
         let needs_redraw = composer.handle_paste("hello".to_string());
         assert!(needs_redraw);
@@ -6090,9 +6041,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
-        composer.set_steer_enabled(true);
 
         // Ensure composer is empty and press Enter.
         assert!(composer.textarea.text().is_empty());
@@ -6122,7 +6070,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         let large = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 10);
         let needs_redraw = composer.handle_paste(large.clone());
@@ -6140,6 +6087,118 @@ mod tests {
             _ => panic!("expected Submitted"),
         }
         assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn submit_at_character_limit_succeeds() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_steer_enabled(true);
+        let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS);
+        composer.textarea.set_text_clearing_elements(&input);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            result,
+            InputResult::Submitted { text, .. } if text == input
+        ));
+    }
+
+    #[test]
+    fn oversized_submit_reports_error_and_restores_draft() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_steer_enabled(true);
+        let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS + 1);
+        composer.textarea.set_text_clearing_elements(&input);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(InputResult::None, result);
+        assert_eq!(composer.textarea.text(), input);
+
+        let mut found_error = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                let message = cell
+                    .display_lines(80)
+                    .into_iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(message.contains(&user_input_too_large_message(input.chars().count())));
+                found_error = true;
+                break;
+            }
+        }
+        assert!(found_error, "expected oversized-input error history cell");
+    }
+
+    #[test]
+    fn oversized_queued_submission_reports_error_and_restores_draft() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_steer_enabled(false);
+        let input = "x".repeat(MAX_USER_INPUT_TEXT_CHARS + 1);
+        composer.textarea.set_text_clearing_elements(&input);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(InputResult::None, result);
+        assert_eq!(composer.textarea.text(), input);
+
+        let mut found_error = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                let message = cell
+                    .display_lines(80)
+                    .into_iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(message.contains(&user_input_too_large_message(input.chars().count())));
+                found_error = true;
+                break;
+            }
+        }
+        assert!(found_error, "expected oversized-input error history cell");
     }
 
     /// Behavior: editing that removes a paste placeholder should also clear the associated
@@ -6160,7 +6219,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.handle_paste(large);
         assert_eq!(composer.pending_pastes.len(), 1);
@@ -6294,7 +6352,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         // Type "/mo" humanlike so paste-burst doesn’t interfere.
         type_chars_humanlike(&mut composer, &['/', 'm', 'o']);
@@ -6323,7 +6380,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
         type_chars_humanlike(&mut composer, &['/', 'm', 'o']);
 
         match &composer.active_popup {
@@ -6355,7 +6411,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         // Type "/res" humanlike so paste-burst doesn’t interfere.
         type_chars_humanlike(&mut composer, &['/', 'r', 'e', 's']);
@@ -6870,7 +6925,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_submits_when_no_task_running_in_steer_mode() {
+    fn tab_submits_when_no_task_running() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -6884,7 +6939,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         type_chars_humanlike(&mut composer, &['h', 'i']);
 
@@ -6899,7 +6953,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_does_not_submit_for_bang_shell_command_in_steer_mode() {
+    fn tab_does_not_submit_for_bang_shell_command() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -6913,7 +6967,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
         composer.set_task_running(false);
 
         type_chars_humanlike(&mut composer, &['!', 'l', 's']);
@@ -7024,7 +7077,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         // Define test cases: (paste content, is_large)
         let test_cases = [
@@ -7305,7 +7357,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
         let path = PathBuf::from("/tmp/image1.png");
         composer.attach_image(path.clone());
         composer.handle_paste(" hi".into());
@@ -7344,7 +7395,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         let mention_bindings = vec![MentionBinding {
             mention: "figma".to_string(),
@@ -7378,7 +7428,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
         let remote_image_url = "https://example.com/remote.png".to_string();
         composer.set_remote_image_urls(vec![remote_image_url.clone()]);
         let path = PathBuf::from("/tmp/image1.png");
@@ -7445,7 +7494,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         type_chars_humanlike(&mut composer, &['f', 'i', 'r', 's', 't']);
         let (result, _needs_redraw) =
@@ -7511,7 +7559,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         let large_content = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5);
         composer.handle_paste(large_content.clone());
@@ -7555,7 +7602,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         let large_content = format!("  {}", "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5));
         composer.handle_paste(large_content.clone());
@@ -7599,7 +7645,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         let pasted = "line1\r\nline2\r\n".to_string();
         composer.handle_paste(pasted);
@@ -7643,7 +7688,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.textarea.set_text_clearing_elements("/unknown ");
         composer.textarea.set_cursor("/unknown ".len());
@@ -7690,7 +7734,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
         let path = PathBuf::from("/tmp/image2.png");
         composer.attach_image(path.clone());
         let (result, _) =
@@ -8002,7 +8045,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         // Inject prompts as if received via event.
         composer.set_custom_prompts(vec![CustomPrompt {
@@ -8042,7 +8084,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8078,7 +8119,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8118,7 +8158,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8174,7 +8213,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8231,7 +8269,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8280,7 +8317,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         // Create a custom prompt with positional args (no named args like $USER)
         composer.set_custom_prompts(vec![CustomPrompt {
@@ -8345,7 +8381,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8404,7 +8439,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer
             .textarea
@@ -8441,7 +8475,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer
             .textarea
@@ -8579,7 +8612,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8618,7 +8650,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8657,7 +8688,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8701,7 +8731,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8742,7 +8771,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(false);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "my-prompt".to_string(),
@@ -8757,9 +8785,10 @@ mod tests {
             .set_text_clearing_elements("/prompts:my-prompt foo ");
         composer.textarea.set_cursor(composer.textarea.text().len());
         composer.attach_image(PathBuf::from("/tmp/unused.png"));
+        composer.set_task_running(true);
 
         let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         assert!(matches!(
             result,
@@ -8770,6 +8799,57 @@ mod tests {
                 .take_recent_submission_images_with_placeholders()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn prompt_expansion_over_character_limit_reports_error_and_restores_draft() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        composer.set_steer_enabled(true);
+
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "my-prompt".to_string(),
+            path: "/tmp/my-prompt.md".to_string().into(),
+            content: "Echo: $1".to_string(),
+            description: None,
+            argument_hint: None,
+        }]);
+
+        let oversized_arg = "x".repeat(MAX_USER_INPUT_TEXT_CHARS);
+        let original_input = format!("/prompts:my-prompt {oversized_arg}");
+        composer
+            .textarea
+            .set_text_clearing_elements(&original_input);
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(InputResult::None, result);
+        assert_eq!(composer.textarea.text(), original_input);
+
+        let actual_chars = format!("Echo: {oversized_arg}").chars().count();
+        let mut found_error = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                let message = cell
+                    .display_lines(80)
+                    .into_iter()
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(message.contains(&user_input_too_large_message(actual_chars)));
+                found_error = true;
+                break;
+            }
+        }
+        assert!(found_error, "expected oversized-input error history cell");
     }
 
     #[test]
@@ -8815,7 +8895,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "elegant".to_string(),
@@ -8888,7 +8967,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "price".to_string(),
@@ -8927,7 +9005,6 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             false,
         );
-        composer.set_steer_enabled(true);
 
         composer.set_custom_prompts(vec![CustomPrompt {
             name: "repeat".to_string(),
