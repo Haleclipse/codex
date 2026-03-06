@@ -4,6 +4,12 @@ expression: rendered
 ---
 ▌ Tell us more (safety check)
 ▌
+▌ Connectivity diagnostics
+▌   - Proxy environment variables are set and may affect
+▌     connectivity.
+▌     - HTTP_PROXY = http://127.0.0.1:7890
+▌     - HTTPS_PROXY = http://127.0.0.1:7890
+▌
 ▌ (optional) Share what was refused and why it should have b
 
 Press enter to confirm or esc to go back
