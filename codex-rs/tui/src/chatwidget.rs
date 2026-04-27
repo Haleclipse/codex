@@ -1330,6 +1330,7 @@ impl ChatWidget {
         let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
         self.config.tui_status_line = Some(ids);
         self.refresh_status_surfaces();
+        self.refresh_status_line();
     }
 
     /// Applies a temporary terminal-title selection while the setup UI is open.
@@ -1382,6 +1383,12 @@ impl ChatWidget {
         self.status_line_branch = branch;
         self.status_line_branch_pending = false;
         self.status_line_branch_lookup_complete = true;
+    }
+
+    // cometix: delegates to upstream's refresh_status_surfaces + cometix statusline data update
+    pub(crate) fn refresh_status_line(&mut self) {
+        self.refresh_status_surfaces();
+        self.update_statusline_data();
     }
 
     fn collect_runtime_metrics_delta(&mut self) {
@@ -7959,6 +7966,11 @@ impl ChatWidget {
         if let Err(err) = self.config.permissions.approval_policy.set(policy) {
             tracing::warn!(%err, "failed to set approval_policy on chat config");
         }
+    }
+
+    /// Get the current statusline config.
+    pub(crate) fn get_statusline_config(&self) -> crate::statusline::config::CxLineConfig {
+        self.bottom_pane.get_statusline_config()
     }
 
     /// Set the statusline config.

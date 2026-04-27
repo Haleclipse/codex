@@ -2121,6 +2121,17 @@ impl Session {
         state.token_info().map(|info| info.total_token_usage)
     }
 
+    // @cometix: expose token info for app-server to send after resume
+    pub async fn token_info_and_rate_limits(
+        &self,
+    ) -> (
+        Option<crate::protocol::TokenUsageInfo>,
+        Option<codex_protocol::protocol::RateLimitSnapshot>,
+    ) {
+        let state = self.state.lock().await;
+        state.token_info_and_rate_limits()
+    }
+
     pub(crate) async fn get_estimated_token_count(
         &self,
         turn_context: &TurnContext,

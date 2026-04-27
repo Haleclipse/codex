@@ -559,6 +559,12 @@ pub(crate) enum AppEvent {
     /// Dismiss the terminal-title setup UI without changing config.
     TerminalTitleSetupCancelled,
 
+    // @cometix: statusline and translation overlay events
+    #[allow(dead_code)]
+    StatuslineGitPreviewUpdated(crate::statusline::GitPreviewData),
+    OpenCxlineConfig,
+    OpenTranslateConfig,
+
     /// Apply a user-confirmed syntax theme selection.
     SyntaxThemeSelected {
         name: String,

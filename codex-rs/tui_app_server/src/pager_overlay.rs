@@ -48,6 +48,9 @@ use ratatui::widgets::Wrap;
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
     Static(StaticOverlay),
+    // @cometix: statusline and translation config overlays
+    Cxline(Box<crate::cxline_overlay::CxlineOverlay>),
+    Translate(Box<crate::translate_overlay::TranslateOverlay>),
 }
 
 impl Overlay {
@@ -66,10 +69,40 @@ impl Overlay {
         Self::Static(StaticOverlay::with_renderables(renderables, title))
     }
 
+    // @cometix: create cxline config overlay
+    pub(crate) fn new_cxline(config: crate::statusline::config::CxLineConfig) -> Self {
+        Self::Cxline(Box::new(crate::cxline_overlay::CxlineOverlay::new(config)))
+    }
+
+    // @cometix: extract config from cxline overlay before close
+    pub(crate) fn take_cxline_config(&self) -> Option<crate::statusline::config::CxLineConfig> {
+        match self {
+            Overlay::Cxline(o) => Some(o.config()),
+            _ => None,
+        }
+    }
+
+    // @cometix: create translation config overlay
+    pub(crate) fn new_translate(config: &crate::translation::TranslationConfig) -> Self {
+        Self::Translate(Box::new(crate::translate_overlay::TranslateOverlay::new(
+            config,
+        )))
+    }
+
+    // @cometix: extract config from translate overlay before close
+    pub(crate) fn take_translate_config(&self) -> Option<crate::translation::TranslationConfig> {
+        match self {
+            Overlay::Translate(o) => Some(o.config()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
         match self {
             Overlay::Transcript(o) => o.handle_event(tui, event),
             Overlay::Static(o) => o.handle_event(tui, event),
+            Overlay::Cxline(o) => o.handle_event(tui, event),
+            Overlay::Translate(o) => o.handle_event(tui, event),
         }
     }
 
@@ -77,6 +110,8 @@ impl Overlay {
         match self {
             Overlay::Transcript(o) => o.is_done(),
             Overlay::Static(o) => o.is_done(),
+            Overlay::Cxline(o) => o.is_done(),
+            Overlay::Translate(o) => o.is_done(),
         }
     }
 }

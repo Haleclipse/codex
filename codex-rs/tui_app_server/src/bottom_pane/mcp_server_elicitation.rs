@@ -926,8 +926,9 @@ impl McpServerElicitationOverlay {
             .iter()
             .enumerate()
             .map(|(idx, option)| {
+                // @cometix: use ❯ instead of upstream ›
                 let prefix = if selected_idx.is_some_and(|selected| selected == idx) {
-                    '›'
+                    '❯'
                 } else {
                     ' '
                 };

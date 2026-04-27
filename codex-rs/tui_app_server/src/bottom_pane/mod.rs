@@ -786,6 +786,53 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    // @cometix: proxy statusline data to chat_composer
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn set_statusline_data(
+        &mut self,
+        model: String,
+        cwd: std::path::PathBuf,
+        reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+        context_used_tokens: Option<i64>,
+        context_window_size: Option<i64>,
+        hourly_rate_limit_percent: Option<f64>,
+        weekly_rate_limit_percent: Option<f64>,
+        weekly_rate_limit_resets_at: Option<String>,
+    ) {
+        self.composer.set_statusline_data(
+            model,
+            cwd,
+            reasoning_effort,
+            context_used_tokens,
+            context_window_size,
+            hourly_rate_limit_percent,
+            weekly_rate_limit_percent,
+            weekly_rate_limit_resets_at,
+        );
+        self.request_redraw();
+    }
+
+    // @cometix: proxy git preview to chat_composer for cxline
+    pub(crate) fn set_statusline_git_preview(
+        &mut self,
+        preview: crate::statusline::GitPreviewData,
+    ) {
+        self.composer.set_statusline_git_preview(preview);
+        self.request_redraw();
+    }
+
+    // @cometix: proxy cxline config accessors to chat_composer
+    pub(crate) fn get_statusline_config(&self) -> crate::statusline::config::CxLineConfig {
+        self.composer.get_statusline_config()
+    }
+
+    pub(crate) fn set_statusline_config(
+        &mut self,
+        config: crate::statusline::config::CxLineConfig,
+    ) {
+        self.composer.set_statusline_config(config);
+    }
+
     /// Show a generic list selection view with the provided items.
     pub(crate) fn show_selection_view(&mut self, params: list_selection_view::SelectionViewParams) {
         let view = list_selection_view::ListSelectionView::new(params, self.app_event_tx.clone());

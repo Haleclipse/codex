@@ -3550,6 +3550,10 @@ impl App {
                     self.chat_widget.handle_paste(pasted);
                 }
                 TuiEvent::Draw => {
+                    // @cometix: process translation results and timeouts
+                    if self.chat_widget.translation_draw_tick() {
+                        tui.frame_requester().schedule_frame();
+                    }
                     if self.backtrack_render_pending {
                         self.backtrack_render_pending = false;
                         self.render_transcript_once(tui);
@@ -5052,6 +5056,24 @@ impl App {
             }
             AppEvent::TerminalTitleSetupCancelled => {
                 self.chat_widget.cancel_terminal_title_setup();
+            }
+            // @cometix: statusline and translation overlay events
+            AppEvent::StatuslineGitPreviewUpdated(preview) => {
+                // @cometix: forward git preview to cxline
+                self.chat_widget.set_statusline_git_preview(preview);
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::OpenCxlineConfig => {
+                let config = self.chat_widget.get_statusline_config();
+                let _ = tui.enter_alt_screen();
+                self.overlay = Some(Overlay::new_cxline(config));
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::OpenTranslateConfig => {
+                let config = self.chat_widget.get_translation_config();
+                let _ = tui.enter_alt_screen();
+                self.overlay = Some(Overlay::new_translate(&config));
+                tui.frame_requester().schedule_frame();
             }
             AppEvent::SyntaxThemeSelected { name } => {
                 let edit = codex_core::config::edit::syntax_theme_edit(&name);

@@ -128,6 +128,9 @@ mod notifications;
 pub mod onboarding;
 mod oss_selection;
 mod pager_overlay;
+// @cometix: statusline, translation, and overlay modules
+#[allow(dead_code, unused_imports, clippy::all)]
+mod cxline_overlay;
 pub mod public_widgets;
 mod render;
 mod resume_picker;
@@ -138,6 +141,8 @@ mod skills_helpers;
 mod slash_command;
 mod status;
 mod status_indicator_widget;
+#[allow(dead_code, unused_imports, clippy::all)]
+mod statusline;
 mod streaming;
 mod style;
 mod terminal_palette;
@@ -145,6 +150,10 @@ mod terminal_title;
 mod text_formatting;
 mod theme_picker;
 mod tooltips;
+#[allow(dead_code, unused_imports, clippy::all)]
+mod translate_overlay;
+#[allow(dead_code, unused_imports, clippy::all)]
+mod translation;
 mod tui;
 mod ui_consts;
 pub mod update_action;

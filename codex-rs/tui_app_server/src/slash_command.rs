@@ -40,6 +40,9 @@ pub enum SlashCommand {
     DebugConfig,
     Title,
     Statusline,
+    // @cometix: configure statusline and translation overlays
+    Cxline,
+    Translate,
     Theme,
     Mcp,
     Apps,
@@ -89,6 +92,8 @@ impl SlashCommand {
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Title => "configure which items appear in the terminal title",
             SlashCommand::Statusline => "configure which items appear in the status line",
+            SlashCommand::Cxline => "configure statusline appearance",
+            SlashCommand::Translate => "configure reasoning translation",
             SlashCommand::Theme => "choose a syntax highlighting theme",
             SlashCommand::Ps => "list background terminals",
             SlashCommand::Stop => "stop all background terminals",
@@ -181,6 +186,8 @@ impl SlashCommand {
             SlashCommand::Collab => true,
             SlashCommand::Agent | SlashCommand::MultiAgents => true,
             SlashCommand::Statusline => false,
+            SlashCommand::Cxline => false,
+            SlashCommand::Translate => false,
             SlashCommand::Theme => false,
             SlashCommand::Title => false,
         }

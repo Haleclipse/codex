@@ -57,7 +57,8 @@ struct VersionInfo {
 const VERSION_FILENAME: &str = "version.json";
 // We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+// @cometix: point to fork releases
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Haleclipse/codex/releases/latest";
 
 #[derive(Deserialize, Debug, Clone)]
 struct ReleaseInfo {
@@ -170,7 +171,9 @@ pub async fn dismiss_version(config: &Config, version: &str) -> anyhow::Result<(
 }
 
 fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
-    let mut iter = v.trim().split('.');
+    // @cometix: strip any suffix like "-cometix" before parsing
+    let v = v.trim().split('-').next().unwrap_or(v.trim());
+    let mut iter = v.split('.');
     let maj = iter.next()?.parse::<u64>().ok()?;
     let min = iter.next()?.parse::<u64>().ok()?;
     let pat = iter.next()?.parse::<u64>().ok()?;

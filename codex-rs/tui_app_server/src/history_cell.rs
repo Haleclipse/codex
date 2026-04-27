@@ -353,7 +353,9 @@ impl HistoryCell for UserHistoryCell {
             return Vec::new();
         }
 
-        let mut lines: Vec<Line<'static>> = vec![Line::from("").style(style)];
+        // @cometix: removed top/bottom blank lines with background color fill
+        // (upstream uses `vec![Line::from("").style(style)]` and `lines.push(Line::from("").style(style))`)
+        let mut lines: Vec<Line<'static>> = Vec::new();
 
         if let Some(wrapped_remote_images) = wrapped_remote_images {
             lines.extend(prefix_lines(
@@ -369,12 +371,12 @@ impl HistoryCell for UserHistoryCell {
         if let Some(wrapped_message) = wrapped_message {
             lines.extend(prefix_lines(
                 wrapped_message,
-                "› ".bold().dim(),
+                "❯ ".bold().dim(),
                 "  ".into(),
             ));
         }
 
-        lines.push(Line::from("").style(style));
+        // @cometix: bottom blank line with background color removed (see comment above)
         lines
     }
 }
@@ -398,6 +400,14 @@ impl ReasoningSummaryCell {
             cwd: cwd.to_path_buf(),
             transcript_only,
         }
+    }
+
+    // @cometix: returns header + content for translation
+    pub(crate) fn full_markdown_for_translation(&self) -> Option<String> {
+        if self._header.trim().is_empty() {
+            return None;
+        }
+        Some(format!("{}{}", self._header, self.content))
     }
 
     fn lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -2761,6 +2771,90 @@ fn format_mcp_invocation<'a>(invocation: McpInvocation) -> Line<'a> {
         ")".into(),
     ];
     invocation_spans.into()
+}
+
+// @cometix: translation cell for displaying translated reasoning content
+pub(crate) fn new_agent_reasoning_translation_block(
+    title: Option<String>,
+    translated: String,
+) -> Box<dyn HistoryCell> {
+    Box::new(AgentReasoningTranslationCell::new(title, translated, false))
+}
+
+pub(crate) fn new_agent_reasoning_translation_error_block(
+    title: Option<String>,
+    reason: String,
+) -> Box<dyn HistoryCell> {
+    Box::new(AgentReasoningTranslationCell::new(title, reason, true))
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentReasoningTranslationCell {
+    title: Option<String>,
+    content: String,
+    is_error: bool,
+}
+
+impl AgentReasoningTranslationCell {
+    pub(crate) fn new(title: Option<String>, content: String, is_error: bool) -> Self {
+        Self {
+            title,
+            content,
+            is_error,
+        }
+    }
+
+    fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut md_lines: Vec<Line<'static>> = Vec::new();
+        append_markdown(
+            &self.content,
+            Some((width as usize).saturating_sub(4).max(1)),
+            None,
+            &mut md_lines,
+        );
+        let translation_style = Style::default().dim();
+        let styled_md_lines = md_lines
+            .into_iter()
+            .map(|mut line| {
+                line.spans = line
+                    .spans
+                    .into_iter()
+                    .map(|span| span.patch_style(translation_style))
+                    .collect();
+                line
+            })
+            .collect::<Vec<_>>();
+
+        if self.is_error {
+            let mut out: Vec<Line<'static>> = Vec::new();
+            let mut header: Vec<Span<'static>> = Vec::new();
+            header.push("  └ ".dim());
+            header.push("Translation failed".red().bold());
+            if let Some(title) = &self.title {
+                header.push(" ".into());
+                header.push(format!("({title})").dim());
+            }
+            out.push(Line::from(header));
+            out.extend(prefix_lines(styled_md_lines, "    ".into(), "    ".into()));
+            return out;
+        }
+        prefix_lines(styled_md_lines, "  └ ".dim(), "    ".into())
+    }
+}
+
+impl HistoryCell for AgentReasoningTranslationCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.lines(width)
+    }
+    fn desired_height(&self, width: u16) -> u16 {
+        self.lines(width).len() as u16
+    }
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.lines(width)
+    }
+    fn desired_transcript_height(&self, width: u16) -> u16 {
+        self.lines(width).len() as u16
+    }
 }
 
 #[cfg(test)]

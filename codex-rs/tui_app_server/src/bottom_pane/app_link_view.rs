@@ -347,8 +347,9 @@ impl AppLinkView {
             .into_iter()
             .enumerate()
             .map(|(index, label)| {
+                // @cometix: use ❯ instead of upstream ›
                 let prefix = if self.selected_action == index {
-                    '›'
+                    '❯'
                 } else {
                     ' '
                 };

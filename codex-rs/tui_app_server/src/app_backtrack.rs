@@ -107,6 +107,15 @@ impl App {
         tui: &mut tui::Tui,
         event: TuiEvent,
     ) -> Result<bool> {
+        // @cometix: Cxline and Translate overlays bypass backtrack logic entirely
+        if matches!(
+            &self.overlay,
+            Some(Overlay::Cxline(_)) | Some(Overlay::Translate(_))
+        ) {
+            self.overlay_forward_event(tui, event)?;
+            return Ok(true);
+        }
+
         if self.backtrack.overlay_preview_active {
             match event {
                 TuiEvent::Key(KeyEvent {
@@ -391,6 +400,13 @@ impl App {
         if let Some(overlay) = &mut self.overlay {
             overlay.handle_event(tui, event)?;
             if overlay.is_done() {
+                // @cometix: save config from cxline/translate overlays before closing
+                if let Some(config) = overlay.take_cxline_config() {
+                    self.chat_widget.set_statusline_config(config);
+                }
+                if let Some(config) = overlay.take_translate_config() {
+                    self.chat_widget.set_translation_config(config);
+                }
                 self.close_transcript_overlay(tui);
                 tui.frame_requester().schedule_frame();
             }

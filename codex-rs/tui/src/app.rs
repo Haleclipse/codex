@@ -2773,6 +2773,10 @@ impl App {
                     self.chat_widget.handle_paste(pasted);
                 }
                 TuiEvent::Draw => {
+                    // cometix: process translation results and timeouts
+                    if self.chat_widget.translation_draw_tick() {
+                        tui.frame_requester().schedule_frame();
+                    }
                     if self.backtrack_render_pending {
                         self.backtrack_render_pending = false;
                         self.render_transcript_once(tui);
@@ -3155,6 +3159,10 @@ impl App {
             }
             AppEvent::RateLimitSnapshotFetched(snapshot) => {
                 self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
+            }
+            // cometix: statusline git preview from background poller
+            AppEvent::StatuslineGitPreviewUpdated(preview) => {
+                self.chat_widget.set_statusline_git_preview(preview);
             }
             AppEvent::ConnectorsLoaded { result, is_final } => {
                 self.chat_widget.on_connectors_loaded(result, is_final);
@@ -4255,6 +4263,19 @@ impl App {
             AppEvent::TerminalTitleSetupCancelled => {
                 self.chat_widget.cancel_terminal_title_setup();
             }
+            // cometix: open statusline/translation configuration overlays
+            AppEvent::OpenCxlineConfig => {
+                let config = self.chat_widget.get_statusline_config();
+                let _ = tui.enter_alt_screen();
+                self.overlay = Some(Overlay::new_cxline(config));
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::OpenTranslateConfig => {
+                let config = self.chat_widget.get_translation_config();
+                let _ = tui.enter_alt_screen();
+                self.overlay = Some(Overlay::new_translate(config));
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::SyntaxThemeSelected { name } => {
                 let edit = codex_core::config::edit::syntax_theme_edit(&name);
                 let apply_result = ConfigEditsBuilder::new(&self.config.codex_home)
@@ -4282,15 +4303,6 @@ impl App {
                             .add_error_message(format!("Failed to save theme: {err}"));
                     }
                 }
-            }
-            AppEvent::StatuslineGitPreviewUpdated(preview) => {
-                self.chat_widget.set_statusline_git_preview(preview);
-            }
-            AppEvent::OpenCxlineConfig => {
-                // Handled via overlay in app_backtrack
-            }
-            AppEvent::OpenTranslateConfig => {
-                // Handled via overlay in app_backtrack
             }
         }
         Ok(AppRunControl::Continue)
@@ -4721,6 +4733,8 @@ impl App {
 
     fn refresh_status_surfaces(&mut self) {
         self.chat_widget.refresh_status_surfaces();
+        // cometix: also refresh statusline data (model, rate limits, context window)
+        self.chat_widget.refresh_status_line();
     }
 
     #[cfg(target_os = "windows")]

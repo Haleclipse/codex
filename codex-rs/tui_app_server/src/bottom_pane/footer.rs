@@ -74,7 +74,9 @@ pub(crate) struct FooterProps {
     ///
     /// This is rendered when `mode` is `FooterMode::QuitShortcutReminder`.
     pub(crate) quit_shortcut_key: KeyBinding,
+    #[allow(dead_code)] // @cometix: upstream field; context display handled by CxLine statusline.
     pub(crate) context_window_percent: Option<i64>,
+    #[allow(dead_code)] // @cometix: upstream field; context display handled by CxLine statusline.
     pub(crate) context_window_used_tokens: Option<i64>,
     pub(crate) status_line_value: Option<Line<'static>>,
     pub(crate) status_line_enabled: bool,

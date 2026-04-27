@@ -10547,7 +10547,7 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
     assert!(
         popup
             .lines()
-            .any(|line| line.contains("(current)") && line.contains('›')),
+            .any(|line| line.contains("(current)") && line.contains('❯')),
         "expected permissions popup to open with the current preset selected: {popup}"
     );
 
@@ -10556,7 +10556,7 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
     assert!(
         popup
             .lines()
-            .any(|line| line.contains("Guardian Approvals") && line.contains('›')),
+            .any(|line| line.contains("Guardian Approvals") && line.contains('❯')),
         "expected one Down from Default to select Guardian Approvals: {popup}"
     );
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));

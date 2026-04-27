@@ -192,7 +192,6 @@ pub(crate) struct BottomPane {
     // Upstream field; cometix statusline calculates percent from used_tokens + window_size.
     context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
-    context_window_size: Option<i64>,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -244,7 +243,6 @@ impl BottomPane {
             animations_enabled,
             context_window_percent: None,
             context_window_used_tokens: None,
-            context_window_size: None,
         }
     }
 
@@ -367,11 +365,6 @@ impl BottomPane {
     #[cfg(test)]
     pub(crate) fn context_window_used_tokens(&self) -> Option<i64> {
         self.context_window_used_tokens
-    }
-
-    #[cfg(test)]
-    pub(crate) fn context_window_size(&self) -> Option<i64> {
-        self.context_window_size
     }
 
     fn active_view(&self) -> Option<&dyn BottomPaneView> {

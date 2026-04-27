@@ -278,7 +278,7 @@ impl RequestUserInputOverlay {
                     .enumerate()
                     .map(|(idx, opt)| {
                         let selected = selected_idx.is_some_and(|sel| sel == idx);
-                        let prefix = if selected { '›' } else { ' ' };
+                        let prefix = if selected { '❯' } else { ' ' };
                         let label = opt.label.as_str();
                         let number = idx + 1;
                         let prefix_label = format!("{prefix} {number}. ");
@@ -295,7 +295,7 @@ impl RequestUserInputOverlay {
                 if Self::other_option_enabled_for_question(question) {
                     let idx = options.len();
                     let selected = selected_idx.is_some_and(|sel| sel == idx);
-                    let prefix = if selected { '›' } else { ' ' };
+                    let prefix = if selected { '❯' } else { ' ' };
                     let number = idx + 1;
                     let prefix_label = format!("{prefix} {number}. ");
                     let wrap_indent = UnicodeWidthStr::width(prefix_label.as_str());
@@ -823,7 +823,7 @@ impl RequestUserInputOverlay {
             .iter()
             .enumerate()
             .map(|(idx, (label, description))| {
-                let prefix = if idx == selected { '›' } else { ' ' };
+                let prefix = if idx == selected { '❯' } else { ' ' };
                 let number = idx + 1;
                 GenericDisplayRow {
                     name: format!("{prefix} {number}. {label}"),

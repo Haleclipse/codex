@@ -143,7 +143,6 @@ use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
-use ratatui::widgets::Block;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
@@ -411,6 +410,17 @@ pub(crate) struct ChatComposer {
     windows_degraded_sandbox_active: bool,
     status_line_value: Option<Line<'static>>,
     status_line_enabled: bool,
+    // @cometix: statusline (CxLine) config and runtime data
+    statusline_config: crate::statusline::config::CxLineConfig,
+    statusline_git_preview: Option<crate::statusline::GitPreviewData>,
+    statusline_model: String,
+    statusline_cwd: std::path::PathBuf,
+    statusline_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    statusline_context_used_tokens: Option<i64>,
+    statusline_context_window_size: Option<i64>,
+    statusline_hourly_rate_limit_percent: Option<f64>,
+    statusline_weekly_rate_limit_percent: Option<f64>,
+    statusline_weekly_rate_limit_resets_at: Option<String>,
     // Agent label injected into the footer's contextual row when multi-agent mode is active.
     active_agent_label: Option<String>,
 }
@@ -535,6 +545,17 @@ impl ChatComposer {
             windows_degraded_sandbox_active: false,
             status_line_value: None,
             status_line_enabled: false,
+            // @cometix: init statusline config and runtime data
+            statusline_config: crate::statusline::config::CxLineConfig::load(),
+            statusline_git_preview: Some(crate::statusline::GitPreviewData::empty()),
+            statusline_model: String::new(),
+            statusline_cwd: std::path::PathBuf::new(),
+            statusline_reasoning_effort: None,
+            statusline_context_used_tokens: None,
+            statusline_context_window_size: None,
+            statusline_hourly_rate_limit_percent: None,
+            statusline_weekly_rate_limit_percent: None,
+            statusline_weekly_rate_limit_resets_at: None,
             active_agent_label: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
@@ -3218,10 +3239,25 @@ impl ChatComposer {
             quit_shortcut_key: self.quit_shortcut_key,
             collaboration_modes_enabled: self.collaboration_modes_enabled,
             is_wsl,
-            context_window_percent: self.context_window_percent,
-            context_window_used_tokens: self.context_window_used_tokens,
-            status_line_value: self.status_line_value.clone(),
-            status_line_enabled: self.status_line_enabled,
+            // @cometix: when cxline is enabled, hide upstream context display (mutual exclusion)
+            context_window_percent: if self.statusline_config.enabled {
+                None
+            } else {
+                self.context_window_percent
+            },
+            context_window_used_tokens: if self.statusline_config.enabled {
+                None
+            } else {
+                self.context_window_used_tokens
+            },
+            // @cometix: when cxline is enabled, render cxline content as status_line_value
+            // (mutually exclusive with upstream status_line)
+            status_line_value: if self.statusline_config.enabled {
+                Some(self.build_cxline_line())
+            } else {
+                self.status_line_value.clone()
+            },
+            status_line_enabled: self.statusline_config.enabled || self.status_line_enabled,
             active_agent_label: self.active_agent_label.clone(),
         }
     }
@@ -3797,6 +3833,69 @@ impl ChatComposer {
         true
     }
 
+    // @cometix: cxline config accessors (used when overlay saves config at runtime)
+    pub fn get_statusline_config(&self) -> crate::statusline::config::CxLineConfig {
+        self.statusline_config.clone()
+    }
+
+    pub fn set_statusline_config(&mut self, config: crate::statusline::config::CxLineConfig) {
+        self.statusline_config = config;
+    }
+
+    pub fn set_statusline_git_preview(&mut self, preview: crate::statusline::GitPreviewData) {
+        self.statusline_git_preview = Some(preview);
+    }
+
+    // @cometix: build a Line from cxline renderer for use in status_line_value
+    fn build_cxline_line(&self) -> ratatui::text::Line<'static> {
+        use crate::statusline::StatusLineContext;
+        use crate::statusline::build_statusline;
+        let mut ctx = StatusLineContext::new(&self.statusline_model, &self.statusline_cwd)
+            .with_reasoning_effort(self.statusline_reasoning_effort)
+            .with_context(
+                self.statusline_context_used_tokens,
+                self.statusline_context_window_size,
+            )
+            .with_rate_limit(
+                self.statusline_hourly_rate_limit_percent,
+                self.statusline_weekly_rate_limit_percent,
+                self.statusline_weekly_rate_limit_resets_at.clone(),
+            );
+        if let Some(preview) = &self.statusline_git_preview {
+            ctx = ctx.with_git_preview(
+                &preview.branch,
+                &preview.status,
+                preview.ahead,
+                preview.behind,
+            );
+        }
+        let renderer = build_statusline(&self.statusline_config, &ctx);
+        renderer.render_line()
+    }
+
+    // @cometix: push runtime data for CxLine rendering
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_statusline_data(
+        &mut self,
+        model: String,
+        cwd: std::path::PathBuf,
+        reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+        context_used_tokens: Option<i64>,
+        context_window_size: Option<i64>,
+        hourly_rate_limit_percent: Option<f64>,
+        weekly_rate_limit_percent: Option<f64>,
+        weekly_rate_limit_resets_at: Option<String>,
+    ) {
+        self.statusline_model = model;
+        self.statusline_cwd = cwd;
+        self.statusline_reasoning_effort = reasoning_effort;
+        self.statusline_context_used_tokens = context_used_tokens;
+        self.statusline_context_window_size = context_window_size;
+        self.statusline_hourly_rate_limit_percent = hourly_rate_limit_percent;
+        self.statusline_weekly_rate_limit_percent = weekly_rate_limit_percent;
+        self.statusline_weekly_rate_limit_resets_at = weekly_rate_limit_resets_at;
+    }
+
     /// Replaces the contextual footer label for the currently viewed agent.
     ///
     /// Returning `false` means the value was unchanged, so callers can skip redraw work. This
@@ -4152,14 +4251,15 @@ fn find_next_mention_token_range(text: &str, token: &str, from: usize) -> Option
 }
 
 impl Renderable for ChatComposer {
-    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+    fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
         if !self.input_enabled || self.selected_remote_image_index.is_some() {
             return None;
         }
 
-        let [_, _, textarea_rect, _] = self.layout_areas(area);
-        let state = *self.textarea_state.borrow();
-        self.textarea.cursor_pos_with_state(textarea_rect, state)
+        // @cometix: hide native terminal cursor — cursor is shown via REVERSED
+        // modifier in textarea render_lines() instead, which preserves the
+        // character glyph under the cursor block.
+        None
     }
 
     fn desired_height(&self, width: u16) -> u16 {
@@ -4244,7 +4344,13 @@ impl ChatComposer {
                     hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
                 let status_line_active = uses_passive_footer_status_layout(&footer_props);
                 let combined_status_line = if status_line_active {
-                    passive_footer_status_line(&footer_props).map(ratatui::prelude::Stylize::dim)
+                    // @cometix: skip .dim() when cxline is active — cxline has its own colors
+                    if self.statusline_config.enabled {
+                        passive_footer_status_line(&footer_props)
+                    } else {
+                        passive_footer_status_line(&footer_props)
+                            .map(ratatui::prelude::Stylize::dim)
+                    }
                 } else {
                     None
                 };
@@ -4408,23 +4514,46 @@ impl ChatComposer {
                     );
                 }
 
-                if show_right && let Some(line) = &right_line {
+                // @cometix: skip right-side context display when CxLine is enabled
+                if show_right && !self.statusline_config.enabled && let Some(line) = &right_line {
                     render_context_right(hint_rect, buf, line);
                 }
             }
         }
         let style = user_message_style();
-        Block::default().style(style).render_ref(composer_rect, buf);
+        // @cometix: removed upstream Block::default().style(style) background fill
+        // replaced with dim border lines only
+        // @cometix: draw dim top/bottom border lines for the input box
+        if composer_rect.y < area.y + area.height && composer_rect.height > 0 {
+            let top_border = "─".repeat(composer_rect.width as usize);
+            buf.set_string(
+                composer_rect.x,
+                composer_rect.y,
+                &top_border,
+                ratatui::style::Style::default().dim(),
+            );
+        }
+        let bottom_y = composer_rect.y + composer_rect.height.saturating_sub(1);
+        if bottom_y < area.y + area.height && composer_rect.height > 1 {
+            let bottom_border = "─".repeat(composer_rect.width as usize);
+            buf.set_string(
+                composer_rect.x,
+                bottom_y,
+                &bottom_border,
+                ratatui::style::Style::default().dim(),
+            );
+        }
         if !remote_images_rect.is_empty() {
             Paragraph::new(self.remote_images_lines(remote_images_rect.width))
                 .style(style)
                 .render_ref(remote_images_rect, buf);
         }
         if !textarea_rect.is_empty() {
+            // @cometix: use ❯ instead of upstream ›
             let prompt = if self.input_enabled {
-                "›".bold()
+                "❯".bold()
             } else {
-                "›".dim()
+                "❯".dim()
             };
             buf.set_span(
                 textarea_rect.x - LIVE_PREFIX_COLS,
@@ -4456,6 +4585,7 @@ impl ChatComposer {
                     .render_ref(textarea_rect.inner(Margin::new(0, 0)), buf);
             }
         }
+
     }
 }
 

@@ -409,7 +409,20 @@ impl ChatWidget {
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let branch = current_branch_name(&cwd).await;
-            tx.send(AppEvent::StatusLineBranchUpdated { cwd, branch });
+            tx.send(AppEvent::StatusLineBranchUpdated {
+                cwd: cwd.clone(),
+                branch,
+            });
+            // @cometix: also collect full git preview (status/ahead/behind) for cxline
+            let cwd_for_preview = cwd;
+            let preview = tokio::task::spawn_blocking(move || {
+                crate::statusline::collect_git_preview(&cwd_for_preview)
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(crate::statusline::GitPreviewData::empty);
+            tx.send(AppEvent::StatuslineGitPreviewUpdated(preview));
         });
     }
 

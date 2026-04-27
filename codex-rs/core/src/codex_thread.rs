@@ -120,6 +120,16 @@ impl CodexThread {
         self.codex.session.total_token_usage().await
     }
 
+    // @cometix: expose token info for app-server to send after resume
+    pub async fn token_info_and_rate_limits(
+        &self,
+    ) -> (
+        Option<crate::protocol::TokenUsageInfo>,
+        Option<codex_protocol::protocol::RateLimitSnapshot>,
+    ) {
+        self.codex.session.token_info_and_rate_limits().await
+    }
+
     /// Records a user-role session-prefix message without creating a new user turn boundary.
     pub(crate) async fn inject_user_message_without_turn(&self, message: String) {
         let message = ResponseItem::Message {

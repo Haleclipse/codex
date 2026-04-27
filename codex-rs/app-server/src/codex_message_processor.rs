@@ -144,6 +144,9 @@ use codex_app_server_protocol::ThreadRealtimeStopParams;
 use codex_app_server_protocol::ThreadRealtimeStopResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
+// @cometix: import for post-resume token usage notification
+use codex_app_server_protocol::ThreadTokenUsage;
+use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
 use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadSetNameParams;
 use codex_app_server_protocol::ThreadSetNameResponse;
@@ -3639,6 +3642,40 @@ impl CodexMessageProcessor {
                 };
 
                 self.outgoing.send_response(request_id, response).await;
+
+                // @cometix: after resume, send accumulated token usage so TUI can
+                // display context window data immediately (TokenCount events are not
+                // included in ThreadItem replay).
+                if let Ok(thread_ref) = self.thread_manager.get_thread(thread_id).await {
+                    let (token_info, rate_limits) =
+                        thread_ref.token_info_and_rate_limits().await;
+                    if let Some(info) = token_info {
+                        let notification = ThreadTokenUsageUpdatedNotification {
+                            thread_id: thread_id.to_string(),
+                            turn_id: String::new(),
+                            token_usage: ThreadTokenUsage::from(info),
+                        };
+                        self.outgoing
+                            .send_server_notification(
+                                ServerNotification::ThreadTokenUsageUpdated(notification),
+                            )
+                            .await;
+                    }
+                    // @cometix: also send rate limit snapshot so cxline shows
+                    // usage percent and reset time immediately after resume
+                    if let Some(snapshot) = rate_limits {
+                        use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
+                        self.outgoing
+                            .send_server_notification(
+                                ServerNotification::AccountRateLimitsUpdated(
+                                    AccountRateLimitsUpdatedNotification {
+                                        rate_limits: snapshot.into(),
+                                    },
+                                ),
+                            )
+                            .await;
+                    }
+                }
             }
             Err(err) => {
                 let error = JSONRPCErrorError {

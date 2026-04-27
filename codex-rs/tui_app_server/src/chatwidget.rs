@@ -760,6 +760,10 @@ pub(crate) struct ChatWidget {
     status_account_display: Option<StatusAccountDisplay>,
     token_info: Option<TokenUsageInfo>,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+    // @cometix: raw weekly resets_at timestamp for cxline "M-D-H" formatting
+    cxline_weekly_resets_at_ts: Option<i64>,
+    // @cometix: debounce flag for git preview requests
+    cxline_git_preview_pending: bool,
     plan_type: Option<PlanType>,
     rate_limit_warnings: RateLimitWarningState,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
@@ -806,6 +810,8 @@ pub(crate) struct ChatWidget {
     reasoning_buffer: String,
     // Accumulates full reasoning content for transcript-only recording
     full_reasoning_buffer: String,
+    // @cometix: reasoning translation orchestrator
+    agent_reasoning_translation: crate::translation::ReasoningTranslator,
     // The currently rendered footer state. We keep the already-formatted
     // details here so transient stream interruptions can restore the footer
     // exactly as it was shown.
@@ -1751,6 +1757,99 @@ impl ChatWidget {
         self.bottom_pane.set_status_line(status_line);
     }
 
+    // @cometix: statusline config accessors — read from composer, write to composer + disk
+    pub(crate) fn get_statusline_config(&self) -> crate::statusline::config::CxLineConfig {
+        self.bottom_pane.get_statusline_config()
+    }
+
+    // @cometix: forward git preview to cxline and refresh
+    pub(crate) fn set_statusline_git_preview(
+        &mut self,
+        preview: crate::statusline::GitPreviewData,
+    ) {
+        self.cxline_git_preview_pending = false;
+        self.bottom_pane.set_statusline_git_preview(preview);
+        self.update_cxline_data();
+    }
+
+    pub(crate) fn set_statusline_config(
+        &mut self,
+        config: crate::statusline::config::CxLineConfig,
+    ) {
+        if let Err(err) = config.save() {
+            tracing::warn!(error = %err, "failed to save statusline config");
+        }
+        // @cometix: apply to current instance so UI updates immediately
+        self.bottom_pane.set_statusline_config(config);
+    }
+
+    // @cometix: push runtime data to cxline statusline in bottom_pane
+    fn update_cxline_data(&mut self) {
+        let model = self.current_model().to_string();
+        let cwd = self.config.cwd.to_path_buf();
+        let reasoning_effort = self.effective_reasoning_effort();
+        let (used_tokens, window_size) = if let Some(info) = &self.token_info {
+            (
+                Some(info.last_token_usage.tokens_in_context_window()),
+                info.model_context_window,
+            )
+        } else {
+            (None, self.config.model_context_window)
+        };
+
+        // Extract rate limit data from snapshots (primary = hourly, secondary = weekly)
+        let snapshot = self
+            .rate_limit_snapshots_by_limit_id
+            .get("codex")
+            .or_else(|| self.rate_limit_snapshots_by_limit_id.values().next());
+        let (hourly_percent, weekly_percent, weekly_resets_at) = if let Some(snapshot) = snapshot {
+            let hourly = snapshot.primary.as_ref().map(|p| p.used_percent);
+            let weekly = snapshot.secondary.as_ref().map(|s| s.used_percent);
+            // @cometix: format reset time as "M-D-H" from raw timestamp
+            let resets_at = self
+                .cxline_weekly_resets_at_ts
+                .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
+                .map(|dt| dt.with_timezone(&chrono::Local))
+                .map(|dt| dt.format("%-m-%-d-%-H").to_string());
+            (hourly, weekly, resets_at)
+        } else {
+            (None, None, None)
+        };
+
+        self.bottom_pane.set_statusline_data(
+            model,
+            cwd,
+            reasoning_effort,
+            used_tokens,
+            window_size,
+            hourly_percent,
+            weekly_percent,
+            weekly_resets_at,
+        );
+    }
+
+    // @cometix: translation config accessors — load from / save to disk
+    pub(crate) fn get_translation_config(&self) -> crate::translation::TranslationConfig {
+        crate::translation::TranslationConfig::load()
+    }
+
+    pub(crate) fn set_translation_config(&mut self, config: crate::translation::TranslationConfig) {
+        if let Err(err) = config.save() {
+            tracing::warn!(error = %err, "failed to save translation config");
+        }
+        self.agent_reasoning_translation.update_config(config);
+    }
+
+    // @cometix: process translation results and timeouts on each draw tick
+    pub(crate) fn translation_draw_tick(&mut self) -> bool {
+        let result = self.agent_reasoning_translation.on_draw_tick(
+            self.thread_id,
+            &self.app_event_tx,
+            self.frame_requester.clone(),
+        );
+        result.needs_redraw
+    }
+
     /// Forwards the contextual active-agent label into the bottom-pane footer pipeline.
     ///
     /// `ChatWidget` stays a pass-through here so `App` remains the owner of "which thread is the
@@ -1771,6 +1870,31 @@ impl ChatWidget {
     /// placeholders so the line remains compact and stable.
     pub(crate) fn refresh_status_line(&mut self) {
         self.refresh_status_surfaces();
+        // @cometix: also push cxline data on every status refresh
+        self.update_cxline_data();
+        // @cometix: trigger git preview for cxline even when upstream statusline
+        // doesn't include GitBranch in its configured items
+        self.request_cxline_git_preview();
+    }
+
+    // @cometix: async git preview request for cxline, debounced by pending flag
+    fn request_cxline_git_preview(&mut self) {
+        if self.cxline_git_preview_pending {
+            return;
+        }
+        self.cxline_git_preview_pending = true;
+        let cwd = self.config.cwd.to_path_buf();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let preview = tokio::task::spawn_blocking(move || {
+                crate::statusline::collect_git_preview(&cwd)
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(crate::statusline::GitPreviewData::empty);
+            tx.send(AppEvent::StatuslineGitPreviewUpdated(preview));
+        });
     }
 
     /// Records that status-line setup was canceled.
@@ -1843,7 +1967,7 @@ impl ChatWidget {
         self.status_line_branch = branch;
         self.status_line_branch_pending = false;
         self.status_line_branch_lookup_complete = true;
-        self.refresh_status_surfaces();
+        self.refresh_status_line();
     }
 
     fn collect_runtime_metrics_delta(&mut self) {
@@ -1931,7 +2055,7 @@ impl ChatWidget {
             mask.reasoning_effort = Some(event.reasoning_effort);
         }
         self.refresh_model_display();
-        self.refresh_status_surfaces();
+        self.refresh_status_line();
         self.sync_fast_command_enabled();
         self.sync_personality_command_enabled();
         self.sync_plugins_command_enabled();
@@ -2205,6 +2329,14 @@ impl ChatWidget {
     }
 
     fn on_agent_reasoning_final(&mut self) {
+        self.on_agent_reasoning_final_inner(/*from_replay*/ false);
+    }
+
+    fn on_agent_reasoning_final_from_replay(&mut self) {
+        self.on_agent_reasoning_final_inner(/*from_replay*/ true);
+    }
+
+    fn on_agent_reasoning_final_inner(&mut self, from_replay: bool) {
         // At the end of a reasoning block, record transcript-only content.
         self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
         if !self.full_reasoning_buffer.is_empty() {
@@ -2212,7 +2344,19 @@ impl ChatWidget {
                 self.full_reasoning_buffer.clone(),
                 &self.config.cwd,
             );
-            self.add_boxed_history(cell);
+            if from_replay {
+                // @cometix: skip translation during replay — only emit the cell
+                self.add_boxed_history(cell);
+            } else {
+                // @cometix: use translation orchestrator for live reasoning
+                self.agent_reasoning_translation
+                    .emit_history_cell_with_translation_hook(
+                        &self.app_event_tx,
+                        self.thread_id,
+                        self.frame_requester.clone(),
+                        cell,
+                    );
+            }
         }
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
@@ -2528,6 +2672,8 @@ impl ChatWidget {
         let used_tokens = self.context_used_tokens(&info, percent.is_some());
         self.bottom_pane.set_context_window(percent, used_tokens);
         self.token_info = Some(info);
+        // @cometix: push data to cxline statusline
+        self.update_cxline_data();
     }
 
     fn context_remaining_percent(&self, info: &TokenUsageInfo) -> Option<i64> {
@@ -2581,6 +2727,14 @@ impl ChatWidget {
             }
 
             self.plan_type = snapshot.plan_type.or(self.plan_type);
+
+            // @cometix: save raw resets_at timestamp for cxline "M-D-H" format
+            // Try secondary first (typical), fallback to primary (Free Tier)
+            self.cxline_weekly_resets_at_ts = snapshot
+                .secondary
+                .as_ref()
+                .and_then(|w| w.resets_at)
+                .or_else(|| snapshot.primary.as_ref().and_then(|w| w.resets_at));
 
             let is_codex_limit = limit_id.eq_ignore_ascii_case("codex");
             let warnings = if is_codex_limit {
@@ -4474,6 +4628,8 @@ impl ChatWidget {
             status_account_display,
             token_info: None,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+            cxline_weekly_resets_at_ts: None,
+            cxline_git_preview_pending: false,
             plan_type: initial_plan_type,
             rate_limit_warnings: RateLimitWarningState::default(),
             rate_limit_switch_prompt: RateLimitSwitchPromptState::default(),
@@ -4503,6 +4659,8 @@ impl ChatWidget {
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
+            // @cometix: init reasoning translation orchestrator
+            agent_reasoning_translation: crate::translation::ReasoningTranslator::default(),
             current_status: StatusIndicatorState::working(),
             pending_guardian_review_status: PendingGuardianReviewStatus::default(),
             terminal_title_status_kind: TerminalTitleStatusKind::Working,
@@ -4591,7 +4749,12 @@ impl ChatWidget {
         widget
             .bottom_pane
             .set_connectors_enabled(widget.connectors_enabled());
-        widget.refresh_status_surfaces();
+        widget.refresh_status_line();
+        // @cometix: sync translation orchestrator with loaded config
+        let translation_config = crate::translation::TranslationConfig::load();
+        widget
+            .agent_reasoning_translation
+            .update_config(translation_config);
 
         widget
     }
@@ -5106,6 +5269,13 @@ impl ChatWidget {
             SlashCommand::Statusline => {
                 self.open_status_line_setup();
             }
+            // @cometix: open statusline/translation config overlays
+            SlashCommand::Cxline => {
+                self.app_event_tx.send(AppEvent::OpenCxlineConfig);
+            }
+            SlashCommand::Translate => {
+                self.app_event_tx.send(AppEvent::OpenTranslateConfig);
+            }
             SlashCommand::Theme => {
                 self.open_theme_picker();
             }
@@ -5385,7 +5555,10 @@ impl ChatWidget {
             self.flush_active_cell();
             self.needs_final_message_separator = true;
         }
-        self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
+        // @cometix: route through translation barrier so cells are deferred
+        // while a reasoning translation is in flight (matches classic tui behavior).
+        self.agent_reasoning_translation
+            .emit_history_cell(&self.app_event_tx, cell);
     }
 
     fn queue_user_message(&mut self, user_message: UserMessage) {
@@ -5746,6 +5919,9 @@ impl ChatWidget {
                 );
             }
         }
+        // @cometix: refresh cxline after resume replay
+        // (actual token data arrives via ThreadTokenUsageUpdated from app-server)
+        self.refresh_status_line();
     }
 
     pub(crate) fn replay_thread_item(
@@ -5858,8 +6034,11 @@ impl ChatWidget {
                             self.on_agent_reasoning_delta(delta);
                         }
                     }
+                    // @cometix: skip translation during replay
+                    self.on_agent_reasoning_final_from_replay();
+                } else {
+                    self.on_agent_reasoning_final();
                 }
-                self.on_agent_reasoning_final();
             }
             ThreadItem::CommandExecution {
                 id,
@@ -6341,9 +6520,30 @@ impl ChatWidget {
                     );
                 }
             }
+            // @cometix: handle rate limit notification for cxline
+            // Manual conversion from app-server-protocol to codex-protocol types
+            ServerNotification::AccountRateLimitsUpdated(notification) => {
+                let rl = notification.rate_limits;
+                let convert_window =
+                    |w: codex_app_server_protocol::RateLimitWindow| -> codex_protocol::protocol::RateLimitWindow {
+                        codex_protocol::protocol::RateLimitWindow {
+                            used_percent: w.used_percent as f64,
+                            window_minutes: w.window_duration_mins,
+                            resets_at: w.resets_at,
+                        }
+                    };
+                let snapshot = RateLimitSnapshot {
+                    limit_id: rl.limit_id,
+                    limit_name: rl.limit_name,
+                    primary: rl.primary.map(&convert_window),
+                    secondary: rl.secondary.map(&convert_window),
+                    credits: None,
+                    plan_type: rl.plan_type,
+                };
+                self.on_rate_limit_snapshot(Some(snapshot));
+            }
             ServerNotification::ServerRequestResolved(_)
             | ServerNotification::AccountUpdated(_)
-            | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)
             | ServerNotification::ThreadStatusChanged(_)
             | ServerNotification::ThreadArchived(_)
@@ -9224,6 +9424,8 @@ impl ChatWidget {
             // Plan reasoning is controlled by the Plan preset and Plan-only override updates.
             mask.reasoning_effort = Some(effort);
         }
+        // @cometix: refresh cxline with new effort
+        self.update_cxline_data();
     }
 
     /// Set the personality in the widget's config copy.
@@ -9313,6 +9515,8 @@ impl ChatWidget {
             mask.model = Some(model.to_string());
         }
         self.refresh_model_display();
+        // @cometix: refresh cxline with new model
+        self.update_cxline_data();
     }
 
     fn set_service_tier_selection(&mut self, service_tier: Option<ServiceTier>) {
@@ -9379,17 +9583,8 @@ impl ChatWidget {
     }
 
     fn current_model_supports_personality(&self) -> bool {
-        let model = self.current_model();
-        self.model_catalog
-            .try_list_models()
-            .ok()
-            .and_then(|models| {
-                models
-                    .into_iter()
-                    .find(|preset| preset.model == model)
-                    .map(|preset| preset.supports_personality)
-            })
-            .unwrap_or(false)
+        // @cometix: Enable personality for all models regardless of remote API response.
+        true
     }
 
     /// Return whether the effective model currently advertises image-input support.

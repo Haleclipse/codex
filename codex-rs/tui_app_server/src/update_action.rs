@@ -1,9 +1,9 @@
 /// Update action the CLI should perform after the TUI exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
-    /// Update via `npm install -g @openai/codex@latest`.
+    /// Update via `npm install -g @cometix/codex`.
     NpmGlobalLatest,
-    /// Update via `bun install -g @openai/codex@latest`.
+    /// Update via `bun install -g @cometix/codex`.
     BunGlobalLatest,
     /// Update via `brew upgrade codex`.
     BrewUpgrade,
@@ -13,8 +13,8 @@ impl UpdateAction {
     /// Returns the list of command-line arguments for invoking the update.
     pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
-            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
+            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@cometix/codex"]),
+            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@cometix/codex"]),
             UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
         }
     }
@@ -57,7 +57,8 @@ fn detect_update_action(
     {
         Some(UpdateAction::BrewUpgrade)
     } else {
-        None
+        // @cometix: default to npm if no specific manager is detected
+        Some(UpdateAction::NpmGlobalLatest)
     }
 }
 
@@ -67,9 +68,10 @@ mod tests {
 
     #[test]
     fn detects_update_action_without_env_mutation() {
+        // @cometix: default to npm when no manager is detected
         assert_eq!(
             detect_update_action(false, std::path::Path::new("/any/path"), false, false),
-            None
+            Some(UpdateAction::NpmGlobalLatest)
         );
         assert_eq!(
             detect_update_action(false, std::path::Path::new("/any/path"), true, false),
@@ -96,6 +98,16 @@ mod tests {
                 false
             ),
             Some(UpdateAction::BrewUpgrade)
+        );
+        // npm takes precedence over brew
+        assert_eq!(
+            detect_update_action(
+                true,
+                std::path::Path::new("/opt/homebrew/bin/codex"),
+                true,
+                false
+            ),
+            Some(UpdateAction::NpmGlobalLatest)
         );
     }
 }

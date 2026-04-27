@@ -1386,6 +1386,33 @@ impl TextArea {
                 let style = Style::default().fg(Color::Cyan);
                 buf.set_string(area.x + x_off, y, styled, style);
             }
+
+            // @cometix: apply reverse style to character at cursor position
+            // For wide characters (CJK, emoji), apply to all cells the character occupies.
+            if self.cursor_pos >= line_range.start && self.cursor_pos <= line_range.end {
+                let cursor_x = self.text[line_range.start..self.cursor_pos].width() as u16;
+                let cursor_screen_x = area.x + cursor_x;
+                let char_width = if self.cursor_pos < line_range.end {
+                    self.text[self.cursor_pos..]
+                        .graphemes(true)
+                        .next()
+                        .map(unicode_width::UnicodeWidthStr::width)
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
+                for offset in 0..char_width {
+                    let x = cursor_screen_x + offset as u16;
+                    if x < area.x + area.width
+                        && let Some(cell) = buf.cell_mut((x, y))
+                    {
+                        cell.set_style(
+                            cell.style()
+                                .add_modifier(ratatui::style::Modifier::REVERSED),
+                        );
+                    }
+                }
+            }
         }
     }
 
