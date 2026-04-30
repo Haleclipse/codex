@@ -449,7 +449,7 @@ jobs:
       - name: Setup Node.js for npm packaging
         uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: latest
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -513,13 +513,9 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: latest
           registry-url: "https://registry.npmjs.org"
           scope: "@cometix"
-
-      # Trusted publishing requires npm CLI version 11.5.1 or later.
-      - name: Update npm
-        run: npm install -g npm@latest
 
       - name: Download npm tarballs from release
         env:
@@ -531,12 +527,31 @@ jobs:
           version="$RELEASE_VERSION"
           tag="$RELEASE_TAG"
           mkdir -p dist/npm
+          # @cometix: download all npm tarballs (main + platform packages)
           gh release download "$tag" \
             --repo "${GITHUB_REPOSITORY}" \
-            --pattern "codex-npm-${version}.tgz" \
+            --pattern "codex-npm-*.tgz" \
             --dir dist/npm
+          ls -la dist/npm/
 
-      - name: Publish to npm
+      - name: Publish platform packages to npm
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          # @cometix: publish platform-specific tarballs first (they use
+          # dist-tag matching the platform, e.g. linux-x64, darwin-arm64).
+          for platform_tgz in dist/npm/codex-npm-*-"${VERSION}".tgz; do
+            [ -f "$platform_tgz" ] || continue
+            # Extract platform tag from filename: codex-npm-{platform}-{version}.tgz
+            basename="$(basename "$platform_tgz" .tgz)"
+            platform_tag="${basename#codex-npm-}"
+            platform_tag="${platform_tag%-"${VERSION}"}"
+            echo "Publishing platform package: $platform_tgz (tag: $platform_tag)"
+            npm publish "$platform_tgz" --tag "$platform_tag"
+          done
+
+      - name: Publish main package to npm
         env:
           VERSION: ${{ needs.release.outputs.version }}
           NPM_TAG: ${{ needs.release.outputs.npm_tag }}
@@ -546,4 +561,6 @@ jobs:
           if [[ -n "${NPM_TAG}" ]]; then
             tag_args+=(--tag "${NPM_TAG}")
           fi
+          # @cometix: publish main package last (it has optionalDependencies
+          # on platform packages, so those must exist first).
           npm publish "${GITHUB_WORKSPACE}/dist/npm/codex-npm-${VERSION}.tgz" "${tag_args[@]}"

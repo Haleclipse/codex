@@ -12,13 +12,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
 
+// @cometix: use @cometix scope for platform packages
 const PLATFORM_PACKAGE_BY_TARGET = {
-  "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
-  "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",
-  "x86_64-apple-darwin": "@openai/codex-darwin-x64",
-  "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
-  "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
-  "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
+  "x86_64-unknown-linux-musl": "@cometix/codex-linux-x64",
+  "aarch64-unknown-linux-musl": "@cometix/codex-linux-arm64",
+  "x86_64-apple-darwin": "@cometix/codex-darwin-x64",
+  "aarch64-apple-darwin": "@cometix/codex-darwin-arm64",
+  "x86_64-pc-windows-msvc": "@cometix/codex-win32-x64",
 };
 
 const { platform, arch } = process;
@@ -95,8 +95,8 @@ try {
     const packageManager = detectPackageManager();
     const updateCommand =
       packageManager === "bun"
-        ? "bun install -g @openai/codex@latest"
-        : "npm install -g @openai/codex@latest";
+        ? "bun install -g @cometix/codex@latest"
+        : "npm install -g @cometix/codex@latest";
     throw new Error(
       `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
     );
@@ -107,8 +107,8 @@ if (!vendorRoot) {
   const packageManager = detectPackageManager();
   const updateCommand =
     packageManager === "bun"
-      ? "bun install -g @openai/codex@latest"
-      : "npm install -g @openai/codex@latest";
+      ? "bun install -g @cometix/codex@latest"
+      : "npm install -g @cometix/codex@latest";
   throw new Error(
     `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
   );

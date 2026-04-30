@@ -2126,6 +2126,10 @@ async fn make_chatwidget_manual(
         realtime_conversation: RealtimeConversationUiState::default(),
         last_rendered_user_message_event: None,
         last_non_retry_error: None,
+        // @cometix: translation orchestrator and cxline state
+        agent_reasoning_translation: crate::translation::ReasoningTranslator::default(),
+        cxline_git_preview_pending: false,
+        cxline_weekly_resets_at_ts: None,
     };
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)

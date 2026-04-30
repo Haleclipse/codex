@@ -4515,7 +4515,10 @@ impl ChatComposer {
                 }
 
                 // @cometix: skip right-side context display when CxLine is enabled
-                if show_right && !self.statusline_config.enabled && let Some(line) = &right_line {
+                if show_right
+                    && !self.statusline_config.enabled
+                    && let Some(line) = &right_line
+                {
                     render_context_right(hint_rect, buf, line);
                 }
             }
@@ -4585,7 +4588,6 @@ impl ChatComposer {
                     .render_ref(textarea_rect.inner(Margin::new(0, 0)), buf);
             }
         }
-
     }
 }
 

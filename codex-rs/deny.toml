@@ -73,20 +73,15 @@ ignore = [
     { id = "RUSTSEC-2024-0388", reason = "derivative is unmaintained; pulled in via starlark v0.13.0 used by execpolicy/cli/core; no fixed release yet" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash is unmaintained; pulled in via starlark_map/starlark v0.13.0 used by execpolicy/cli/core; no fixed release yet" },
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; pulled in via ratatui/rmcp/starlark used by tui/execpolicy; no fixed release yet" },
-    # TODO: remove these exceptions once the workspace updates aws-lc-rs/aws-lc-sys past the affected releases.
-    { id = "RUSTSEC-2026-0044", reason = "aws-lc-rs/aws-lc-sys are pulled in transitively via rustls stack dependencies; upgrade will be handled separately" },
-    { id = "RUSTSEC-2026-0045", reason = "aws-lc-rs/aws-lc-sys are pulled in transitively via rustls stack dependencies; upgrade will be handled separately" },
-    { id = "RUSTSEC-2026-0046", reason = "aws-lc-rs/aws-lc-sys are pulled in transitively via rustls stack dependencies; upgrade will be handled separately" },
-    { id = "RUSTSEC-2026-0047", reason = "aws-lc-rs/aws-lc-sys are pulled in transitively via rustls stack dependencies; upgrade will be handled separately" },
-    { id = "RUSTSEC-2026-0048", reason = "aws-lc-rs/aws-lc-sys are pulled in transitively via rustls stack dependencies; upgrade will be handled separately" },
-    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki CRL DP matching error; pulled in transitively via rustls stack dependencies; upgrade will be handled separately" },
     # TODO(fcoury): remove this exception when syntect drops yaml-rust and bincode, or updates to versions that have fixed the vulnerabilities.
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust is unmaintained; pulled in via syntect v5.3.0 used by codex-tui for syntax highlighting; no fixed release yet" },
     { id = "RUSTSEC-2025-0141", reason = "bincode is unmaintained; pulled in via syntect v5.3.0 used by codex-tui for syntax highlighting; no fixed release yet" },
-    # tar 0.4.44: symlink chmod and PAX size header vulnerabilities.
-    # TODO: remove when tar-rs releases a fix (>0.4.44).
-    { id = "RUSTSEC-2026-0067", reason = "tar unpack_in symlink chmod; indirect dep via codex-package-manager; risk limited to malicious tar archives" },
-    { id = "RUSTSEC-2026-0068", reason = "tar PAX size header ignored; indirect dep via codex-package-manager; risk limited to malicious tar archives" },
+    # rand 0.8/0.9 unsound advisory; pulled in transitively; upgrade will be handled with upstream.
+    { id = "RUSTSEC-2026-0097", reason = "rand unsound advisory; indirect dep pulled in by multiple crates; upgrade tracked with upstream" },
+    # rustls-webpki 0.103.10 security advisories; pulled in transitively via rustls stack.
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki vulnerability; indirect dep via rustls stack; upgrade tracked with upstream" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki vulnerability; indirect dep via rustls stack; upgrade tracked with upstream" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki vulnerability; indirect dep via rustls stack; upgrade tracked with upstream" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

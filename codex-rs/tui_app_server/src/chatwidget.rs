@@ -1886,13 +1886,12 @@ impl ChatWidget {
         let cwd = self.config.cwd.to_path_buf();
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let preview = tokio::task::spawn_blocking(move || {
-                crate::statusline::collect_git_preview(&cwd)
-            })
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(crate::statusline::GitPreviewData::empty);
+            let preview =
+                tokio::task::spawn_blocking(move || crate::statusline::collect_git_preview(&cwd))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(crate::statusline::GitPreviewData::empty);
             tx.send(AppEvent::StatuslineGitPreviewUpdated(preview));
         });
     }
