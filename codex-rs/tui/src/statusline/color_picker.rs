@@ -504,7 +504,7 @@ impl ColorPicker {
 
         let color = self
             .current_color
-            .map(|c| c.to_ratatui_color())
+            .map(super::style::AnsiColor::to_ratatui_color)
             .unwrap_or(Color::White);
 
         Paragraph::new(preview_text)

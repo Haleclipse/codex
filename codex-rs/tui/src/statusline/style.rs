@@ -50,7 +50,7 @@ impl AnsiColor {
 
     /// 转换为 ratatui Color
     #[allow(clippy::disallowed_methods)] // 颜色系统需要支持 256 色和 RGB
-    pub fn to_ratatui_color(&self) -> Color {
+    pub fn to_ratatui_color(self) -> Color {
         match self {
             Self::Color16 { c16 } => match c16 {
                 0 => Color::Black,
@@ -69,10 +69,10 @@ impl AnsiColor {
                 13 => Color::LightMagenta,
                 14 => Color::LightCyan,
                 15 => Color::Gray,
-                _ => Color::Indexed(*c16),
+                _ => Color::Indexed(c16),
             },
-            Self::Color256 { c256 } => Color::Indexed(*c256),
-            Self::Rgb { r, g, b } => Color::Rgb(*r, *g, *b),
+            Self::Color256 { c256 } => Color::Indexed(c256),
+            Self::Rgb { r, g, b } => Color::Rgb(r, g, b),
         }
     }
 }
@@ -155,17 +155,17 @@ impl ColorConfig {
 
     /// 获取图标的 ratatui Color
     pub fn icon_color(&self) -> Option<Color> {
-        self.icon.map(|c| c.to_ratatui_color())
+        self.icon.map(AnsiColor::to_ratatui_color)
     }
 
     /// 获取文本的 ratatui Color
     pub fn text_color(&self) -> Option<Color> {
-        self.text.map(|c| c.to_ratatui_color())
+        self.text.map(AnsiColor::to_ratatui_color)
     }
 
     /// 获取背景的 ratatui Color
     pub fn background_color(&self) -> Option<Color> {
-        self.background.map(|c| c.to_ratatui_color())
+        self.background.map(AnsiColor::to_ratatui_color)
     }
 }
 
