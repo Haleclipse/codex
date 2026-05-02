@@ -2,10 +2,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::Result;
-use codex_core::CodexAuth;
-use codex_core::models_manager::manager::ModelsManager;
-use codex_core::models_manager::manager::RefreshStrategy;
 use codex_features::Feature;
+use codex_login::CodexAuth;
+use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
@@ -67,6 +67,7 @@ fn test_model_info(
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         priority: 1,
+        additional_speed_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,

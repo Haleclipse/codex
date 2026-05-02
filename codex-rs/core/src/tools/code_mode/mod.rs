@@ -14,7 +14,6 @@ use codex_protocol::models::ResponseInputItem;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
-use crate::client_common::tools::ToolSpec;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
@@ -28,7 +27,8 @@ use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouterParams;
 use crate::unified_exec::resolve_max_tokens;
 use codex_features::Feature;
-use codex_tools::tool_spec_to_code_mode_tool_definition;
+use codex_tools::ToolSpec;
+use codex_tools::collect_code_mode_tool_definitions;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
@@ -244,14 +244,8 @@ pub(super) async fn build_enabled_tools(
     exec: &ExecContext,
 ) -> Vec<codex_code_mode::ToolDefinition> {
     let router = build_nested_router(exec).await;
-    let mut out = router
-        .specs()
-        .into_iter()
-        .filter_map(|spec| tool_spec_to_code_mode_tool_definition(&spec))
-        .collect::<Vec<_>>();
-    out.sort_by(|left, right| left.name.cmp(&right.name));
-    out.dedup_by(|left, right| left.name == right.name);
-    out
+    let specs = router.specs();
+    collect_code_mode_tool_definitions(&specs)
 }
 
 async fn build_nested_router(exec: &ExecContext) -> ToolRouter {
@@ -263,16 +257,13 @@ async fn build_nested_router(exec: &ExecContext) -> ToolRouter {
         .read()
         .await
         .list_all_tools()
-        .await
-        .into_iter()
-        .map(|(name, tool_info)| (name, tool_info.tool))
-        .collect();
+        .await;
 
     ToolRouter::from_config(
         &nested_tools_config,
         ToolRouterParams {
+            deferred_mcp_tools: None,
             mcp_tools: Some(mcp_tools),
-            app_tools: None,
             discoverable_tools: None,
             dynamic_tools: exec.turn.dynamic_tools.as_slice(),
         },

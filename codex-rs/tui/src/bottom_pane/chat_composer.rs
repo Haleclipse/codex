@@ -332,6 +332,7 @@ pub(crate) struct ChatComposer {
     realtime_conversation_enabled: bool,
     audio_device_selection_enabled: bool,
     windows_degraded_sandbox_active: bool,
+    is_zellij: bool,
     status_line_value: Option<Line<'static>>,
     status_line_enabled: bool,
     // @cometix: statusline (CxLine) config and runtime data
@@ -464,6 +465,10 @@ impl ChatComposer {
             realtime_conversation_enabled: false,
             audio_device_selection_enabled: false,
             windows_degraded_sandbox_active: false,
+            is_zellij: matches!(
+                codex_terminal_detection::terminal_info().multiplexer,
+                Some(codex_terminal_detection::Multiplexer::Zellij {})
+            ),
             status_line_value: None,
             status_line_enabled: false,
             // @cometix: init statusline config and runtime data
@@ -3772,10 +3777,35 @@ impl ChatComposer {
                 }
             }
         }
+        self.render_textarea(
+            composer_rect,
+            remote_images_rect,
+            textarea_rect,
+            buf,
+            mask_char,
+        );
+    }
+
+    /// Paint the composer's text input area, prompt chevron, and placeholder text.
+    ///
+    /// In Zellij sessions the textarea uses explicit `Color::Reset` foreground styling
+    /// to prevent the multiplexer's pane chrome from bleeding into cell styles, and
+    /// substitutes hardcoded colors for `.bold()` / `.dim()` modifiers that Zellij
+    /// renders inconsistently. The standard path is unchanged.
+    fn render_textarea(
+        &self,
+        composer_rect: Rect,
+        remote_images_rect: Rect,
+        textarea_rect: Rect,
+        buf: &mut Buffer,
+        mask_char: Option<char>,
+    ) {
+        let is_zellij = self.is_zellij;
         let style = user_message_style();
+        let textarea_style = style.fg(ratatui::style::Color::Reset);
         // @cometix: removed upstream Block::default().style(style) background fill
         // @cometix: draw dim top/bottom border lines for the input box
-        if composer_rect.y < area.y + area.height && composer_rect.height > 0 {
+        if composer_rect.height > 0 {
             let top_border = "─".repeat(composer_rect.width as usize);
             buf.set_string(
                 composer_rect.x,
@@ -3785,7 +3815,7 @@ impl ChatComposer {
             );
         }
         let bottom_y = composer_rect.y + composer_rect.height.saturating_sub(1);
-        if bottom_y < area.y + area.height && composer_rect.height > 1 {
+        if composer_rect.height > 1 {
             let bottom_border = "─".repeat(composer_rect.width as usize);
             buf.set_string(
                 composer_rect.x,
@@ -3799,10 +3829,19 @@ impl ChatComposer {
                 .style(style)
                 .render_ref(remote_images_rect, buf);
         }
+        if is_zellij && !textarea_rect.is_empty() {
+            buf.set_style(textarea_rect, textarea_style);
+        }
         if !textarea_rect.is_empty() {
             // @cometix: use ❯ instead of upstream ›
             let prompt = if self.input_enabled {
-                "❯".bold()
+                if is_zellij {
+                    Span::styled("❯", style.fg(ratatui::style::Color::Cyan))
+                } else {
+                    "❯".bold()
+                }
+            } else if is_zellij {
+                Span::styled("❯", style.fg(ratatui::style::Color::DarkGray))
             } else {
                 "❯".dim()
             };
@@ -3815,13 +3854,28 @@ impl ChatComposer {
         }
 
         let mut state = self.textarea_state.borrow_mut();
+        let textarea_is_empty = self.textarea.text().is_empty();
         if let Some(mask_char) = mask_char {
+            self.textarea.render_ref_masked(
+                textarea_rect,
+                buf,
+                &mut state,
+                mask_char,
+                if is_zellij {
+                    textarea_style
+                } else {
+                    ratatui::style::Style::default()
+                },
+            );
+        } else if is_zellij && textarea_is_empty {
+            buf.set_style(textarea_rect, textarea_style);
+        } else if is_zellij {
             self.textarea
-                .render_ref_masked(textarea_rect, buf, &mut state, mask_char);
+                .render_ref_styled(textarea_rect, buf, &mut state, textarea_style);
         } else {
             StatefulWidgetRef::render_ref(&(&self.textarea), textarea_rect, buf, &mut state);
         }
-        if self.textarea.text().is_empty() {
+        if textarea_is_empty {
             let text = if self.input_enabled {
                 self.placeholder_text.as_str().to_string()
             } else {
@@ -3831,9 +3885,18 @@ impl ChatComposer {
                     .to_string()
             };
             if !textarea_rect.is_empty() {
-                let placeholder = Span::from(text).dim();
-                Line::from(vec![placeholder])
-                    .render_ref(textarea_rect.inner(Margin::new(0, 0)), buf);
+                if is_zellij {
+                    buf.set_string(
+                        textarea_rect.x,
+                        textarea_rect.y,
+                        text,
+                        textarea_style.fg(ratatui::style::Color::White).italic(),
+                    );
+                } else {
+                    let placeholder = Span::from(text).dim();
+                    let line = Line::from(vec![placeholder]);
+                    line.render_ref(textarea_rect.inner(Margin::new(0, 0)), buf);
+                }
             }
         }
     }
@@ -4052,6 +4115,35 @@ mod tests {
             enhanced_keys_supported,
             setup,
         );
+    }
+
+    fn snapshot_zellij_composer_state<F>(name: &str, setup: F)
+    where
+        F: FnOnce(&mut ChatComposer),
+    {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ true,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.is_zellij = true;
+        setup(&mut composer);
+        let footer_props = composer.footer_props();
+        let footer_lines = footer_height(&footer_props);
+        let footer_spacing = ChatComposer::footer_spacing(footer_lines);
+        let height = footer_lines + footer_spacing + 8;
+        let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
+        terminal
+            .draw(|f| composer.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        insta::assert_snapshot!(name, terminal.backend());
     }
 
     #[test]
@@ -4380,6 +4472,11 @@ mod tests {
                 composer.set_text_content("Test".to_string(), Vec::new(), Vec::new());
             },
         );
+    }
+
+    #[test]
+    fn zellij_empty_composer_snapshot() {
+        snapshot_zellij_composer_state("zellij_empty_composer", |_composer| {});
     }
 
     #[test]

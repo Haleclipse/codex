@@ -2,10 +2,12 @@ use super::*;
 use crate::shell::default_user_shell;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_workdir_base_path;
-use crate::tools::spec::ZshForkConfig;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
+use codex_tools::UnifiedExecShellMode;
+use codex_tools::ZshForkConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::sync::Arc;
@@ -180,15 +182,15 @@ fn exec_command_args_resolve_relative_additional_permissions_against_workdir() -
             }
         }"#;
 
-    let base_path = resolve_workdir_base_path(json, cwd.path())?;
-    let args: ExecCommandArgs = parse_arguments_with_base_path(json, base_path.as_path())?;
+    let base_path = resolve_workdir_base_path(json, &cwd.path().abs())?;
+    let args: ExecCommandArgs = parse_arguments_with_base_path(json, &base_path)?;
 
     assert_eq!(
         args.additional_permissions,
         Some(PermissionProfile {
             file_system: Some(FileSystemPermissions {
                 read: None,
-                write: Some(vec![AbsolutePathBuf::try_from(expected_write)?]),
+                write: Some(vec![expected_write.abs()]),
             }),
             ..Default::default()
         })

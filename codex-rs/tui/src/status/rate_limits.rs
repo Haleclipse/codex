@@ -50,6 +50,8 @@ pub(crate) enum StatusRateLimitData {
     Available(Vec<StatusRateLimitRow>),
     /// Snapshot data exists but is older than the staleness threshold.
     Stale(Vec<StatusRateLimitRow>),
+    /// The refresh completed, but the response did not include displayable usage data.
+    Unavailable,
     /// No snapshot data is currently available.
     Missing,
 }
@@ -64,8 +66,6 @@ pub(crate) struct RateLimitWindowDisplay {
     pub used_percent: f64,
     /// Human-readable local reset time.
     pub resets_at: Option<String>,
-    /// Original Unix timestamp (seconds since epoch) for resets_at
-    pub resets_at_timestamp: Option<i64>,
     /// Window length in minutes when provided by the server.
     pub window_minutes: Option<i64>,
 }
@@ -81,7 +81,6 @@ impl RateLimitWindowDisplay {
         Self {
             used_percent: window.used_percent,
             resets_at,
-            resets_at_timestamp: window.resets_at,
             window_minutes: window.window_minutes,
         }
     }
@@ -272,7 +271,7 @@ pub(crate) fn compose_rate_limit_data_many(
     }
 
     if rows.is_empty() {
-        StatusRateLimitData::Available(vec![])
+        StatusRateLimitData::Unavailable
     } else if stale {
         StatusRateLimitData::Stale(rows)
     } else {
@@ -359,7 +358,6 @@ mod tests {
         RateLimitWindowDisplay {
             used_percent,
             resets_at: Some("soon".to_string()),
-            resets_at_timestamp: None,
             window_minutes: Some(300),
         }
     }
@@ -417,13 +415,11 @@ mod tests {
             primary: Some(RateLimitWindowDisplay {
                 used_percent: 20.0,
                 resets_at: Some("soon".to_string()),
-                resets_at_timestamp: None,
                 window_minutes: Some(60),
             }),
             secondary: Some(RateLimitWindowDisplay {
                 used_percent: 40.0,
                 resets_at: Some("later".to_string()),
-                resets_at_timestamp: None,
                 window_minutes: None,
             }),
             credits: None,

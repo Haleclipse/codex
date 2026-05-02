@@ -7,7 +7,6 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecParams;
 use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GUARDIAN_REVIEWER_NAME;
-use crate::protocol::AskForApproval;
 use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::FunctionToolOutput;
 use crate::turn_diff_tracker::TurnDiffTracker;
@@ -24,6 +23,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::AskForApproval;
 use core_test_support::PathExt;
 use core_test_support::TempDirExt;
 use core_test_support::codex_linux_sandbox_exe_or_skip;
@@ -55,12 +55,9 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
                 "msg-guardian",
                 &serde_json::json!({
                     "risk_level": "low",
-                    "risk_score": 5,
+                    "user_authorization": "high",
+                    "outcome": "allow",
                     "rationale": "The request only widens permissions for a benign local echo command.",
-                    "evidence": [{
-                        "message": "The planned command is an `echo hi` smoke test.",
-                        "why": "This is low-risk and does not attempt destructive or exfiltrating behavior.",
-                    }],
                 })
                 .to_string(),
             ),
@@ -125,7 +122,7 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
                 "echo hi".to_string(),
             ]
         },
-        cwd: turn_context.cwd.to_path_buf(),
+        cwd: turn_context.cwd.clone(),
         expiration: expiration_ms.into(),
         capture_policy: ExecCapturePolicy::ShellTool,
         env: HashMap::new(),

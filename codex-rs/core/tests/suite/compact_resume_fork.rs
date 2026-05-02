@@ -567,7 +567,7 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
 
     user_turn(&conversation, TURN_ONE_USER).await;
 
-    let override_cwd = config.cwd.join(PRETURN_CONTEXT_DIFF_CWD)?;
+    let override_cwd = config.cwd.join(PRETURN_CONTEXT_DIFF_CWD);
     std::fs::create_dir_all(&override_cwd)?;
     conversation
         .submit(Op::OverrideTurnContext {
@@ -808,6 +808,7 @@ async fn user_turn(conversation: &Arc<CodexThread>, text: &str) {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit user turn");
@@ -843,7 +844,7 @@ async fn resume_conversation(
     path: std::path::PathBuf,
 ) -> Arc<CodexThread> {
     let auth_manager = codex_core::test_support::auth_manager_from_auth(
-        codex_core::CodexAuth::from_api_key("dummy"),
+        codex_login::CodexAuth::from_api_key("dummy"),
     );
     Box::pin(manager.resume_thread_from_rollout(
         config.clone(),

@@ -1,8 +1,8 @@
 use anyhow::Result;
-use codex_core::CodexAuth;
-use codex_core::config::types::Personality;
-use codex_core::models_manager::manager::RefreshStrategy;
+use codex_config::types::Personality;
 use codex_features::Feature;
+use codex_login::CodexAuth;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ConfigShellToolType;
@@ -82,6 +82,7 @@ fn test_model_info(
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         priority: 1,
+        additional_speed_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -898,6 +899,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         priority: 1,
+        additional_speed_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -961,11 +963,11 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         "expected {smaller_model_slug} to be available in remote model list"
     );
     let large_model_info = models_manager
-        .get_model_info(large_model_slug, &test.config)
+        .get_model_info(large_model_slug, &test.config.to_models_manager_config())
         .await;
     assert_eq!(large_model_info.context_window, Some(large_context_window));
     let smaller_model_info = models_manager
-        .get_model_info(smaller_model_slug, &test.config)
+        .get_model_info(smaller_model_slug, &test.config.to_models_manager_config())
         .await;
     assert_eq!(
         smaller_model_info.context_window,

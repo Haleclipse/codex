@@ -32,7 +32,7 @@ use crate::bottom_pane::TerminalTitleItem;
 use crate::history_cell::HistoryCell;
 use crate::statusline::GitPreviewData;
 
-use codex_core::config::types::ApprovalsReviewer;
+use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::Personality;
@@ -40,6 +40,8 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_realtime_webrtc::RealtimeWebrtcEvent;
+use codex_realtime_webrtc::RealtimeWebrtcSessionHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RealtimeAudioDeviceKind {
@@ -76,6 +78,23 @@ pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
 }
 
+/// Distinguishes why a rate-limit refresh was requested so the completion
+/// handler can route the result correctly.
+///
+/// A `StartupPrefetch` fires once, concurrently with the rest of TUI init, and
+/// only updates the cached snapshots (no status card to finalize). A
+/// `StatusCommand` is tied to a specific `/status` invocation and must call
+/// `finish_status_rate_limit_refresh` when done so the card stops showing a
+/// "refreshing" state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RateLimitRefreshOrigin {
+    /// Eagerly fetched after bootstrap so the first `/status` already has data.
+    StartupPrefetch,
+    /// User-initiated via `/status`; the `request_id` correlates with the
+    /// status card that should be updated when the fetch completes.
+    StatusCommand { request_id: u64 },
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -105,6 +124,9 @@ pub(crate) enum AppEvent {
 
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
+
+    /// Resume a thread by UUID or thread name inside the running TUI session.
+    ResumeSessionByIdOrName(String),
 
     /// Fork the current session into a new thread.
     ForkCurrentSession,
@@ -138,9 +160,16 @@ pub(crate) enum AppEvent {
         matches: Vec<FileMatch>,
     },
 
-    /// Result of refreshing rate limits
-    #[allow(dead_code)]
-    RateLimitSnapshotFetched(RateLimitSnapshot),
+    /// Refresh account rate limits in the background.
+    RefreshRateLimits {
+        origin: RateLimitRefreshOrigin,
+    },
+
+    /// Result of refreshing rate limits.
+    RateLimitsLoaded {
+        origin: RateLimitRefreshOrigin,
+        result: Result<Vec<RateLimitSnapshot>, String>,
+    },
 
     /// Result of refreshing statusline Git info
     #[allow(dead_code)]
@@ -311,10 +340,7 @@ pub(crate) enum AppEvent {
     },
 
     /// Persist the selected realtime microphone or speaker to top-level config.
-    #[cfg_attr(
-        any(target_os = "linux", not(feature = "voice-input")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     PersistRealtimeAudioDeviceSelection {
         kind: RealtimeAudioDeviceKind,
         name: Option<String>,
@@ -324,6 +350,17 @@ pub(crate) enum AppEvent {
     RestartRealtimeAudioDevice {
         kind: RealtimeAudioDeviceKind,
     },
+
+    /// Result of creating a TUI-owned realtime WebRTC offer.
+    RealtimeWebrtcOfferCreated {
+        result: Result<RealtimeWebrtcOffer, String>,
+    },
+
+    /// Peer-connection lifecycle event from a TUI-owned realtime WebRTC session.
+    RealtimeWebrtcEvent(RealtimeWebrtcEvent),
+
+    /// Local microphone level from a TUI-owned realtime WebRTC session.
+    RealtimeWebrtcLocalAudioLevel(u16),
 
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
@@ -523,6 +560,21 @@ pub(crate) enum AppEvent {
         category: FeedbackCategory,
     },
 
+    /// Submit feedback for the current thread via the app-server feedback RPC.
+    SubmitFeedback {
+        category: FeedbackCategory,
+        reason: Option<String>,
+        include_logs: bool,
+    },
+
+    /// Result of a feedback upload request initiated by the TUI.
+    FeedbackSubmitted {
+        origin_thread_id: Option<ThreadId>,
+        category: FeedbackCategory,
+        include_logs: bool,
+        result: Result<String, String>,
+    },
+
     /// Launch the external editor after a normal draw has completed.
     LaunchExternalEditor,
 
@@ -559,6 +611,12 @@ pub(crate) enum AppEvent {
     SyntaxThemeSelected {
         name: String,
     },
+}
+
+#[derive(Debug)]
+pub(crate) struct RealtimeWebrtcOffer {
+    pub(crate) offer_sdp: String,
+    pub(crate) handle: RealtimeWebrtcSessionHandle,
 }
 
 /// The exit strategy requested by the UI layer.

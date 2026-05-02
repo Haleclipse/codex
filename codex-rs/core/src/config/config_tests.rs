@@ -1,30 +1,61 @@
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
-use crate::config::types::AppToolApproval;
-use crate::config::types::ApprovalsReviewer;
-use crate::config::types::BundledSkillsConfig;
-use crate::config::types::FeedbackConfigToml;
-use crate::config::types::HistoryPersistence;
-use crate::config::types::McpServerToolConfig;
-use crate::config::types::McpServerTransportConfig;
-use crate::config::types::MemoriesConfig;
-use crate::config::types::MemoriesToml;
-use crate::config::types::ModelAvailabilityNuxConfig;
-use crate::config::types::NotificationMethod;
-use crate::config::types::Notifications;
-use crate::config::types::ToolSuggestDiscoverableType;
 use crate::config_loader::RequirementSource;
+use crate::plugins::PluginsManager;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::config_toml::AgentRoleToml;
+use codex_config::config_toml::AgentsToml;
+use codex_config::config_toml::ConfigToml;
+use codex_config::config_toml::ProjectConfig;
+use codex_config::config_toml::RealtimeAudioConfig;
+use codex_config::config_toml::RealtimeConfig;
+use codex_config::config_toml::RealtimeToml;
+use codex_config::config_toml::RealtimeTransport;
+use codex_config::config_toml::RealtimeWsMode;
+use codex_config::config_toml::RealtimeWsVersion;
+use codex_config::config_toml::ToolsToml;
+use codex_config::permissions_toml::FilesystemPermissionToml;
+use codex_config::permissions_toml::FilesystemPermissionsToml;
+use codex_config::permissions_toml::NetworkDomainPermissionToml;
+use codex_config::permissions_toml::NetworkDomainPermissionsToml;
+use codex_config::permissions_toml::NetworkToml;
+use codex_config::permissions_toml::PermissionProfileToml;
+use codex_config::permissions_toml::PermissionsToml;
+use codex_config::profile_toml::ConfigProfile;
+use codex_config::types::AppToolApproval;
+use codex_config::types::ApprovalsReviewer;
+use codex_config::types::BundledSkillsConfig;
+use codex_config::types::FeedbackConfigToml;
+use codex_config::types::HistoryPersistence;
+use codex_config::types::McpServerToolConfig;
+use codex_config::types::McpServerTransportConfig;
+use codex_config::types::MemoriesConfig;
+use codex_config::types::MemoriesToml;
+use codex_config::types::ModelAvailabilityNuxConfig;
+use codex_config::types::NotificationCondition;
+use codex_config::types::NotificationMethod;
+use codex_config::types::Notifications;
+use codex_config::types::SandboxWorkspaceWrite;
+use codex_config::types::SkillsConfig;
+use codex_config::types::ToolSuggestDiscoverableType;
+use codex_config::types::Tui;
+use codex_config::types::TuiNotificationSettings;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
+use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
+use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+use codex_model_provider_info::WireApi;
+use codex_models_manager::bundled_models_response;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::ReadOnlyAccess;
+use codex_protocol::protocol::RealtimeVoice;
 use serde::Deserialize;
 use tempfile::tempdir;
 
@@ -98,6 +129,56 @@ fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
     )?;
 
     assert_eq!(config.cwd, expected_cwd);
+    Ok(())
+}
+
+#[test]
+fn load_config_records_global_agents_path() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let global_agents_path = codex_home.path().join(DEFAULT_PROJECT_DOC_FILENAME);
+    std::fs::write(&global_agents_path, "\n  global instructions  \n")?;
+
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.abs().into_path_buf(),
+    )?;
+
+    assert_eq!(
+        config.user_instructions.as_deref(),
+        Some("global instructions")
+    );
+    assert_eq!(
+        config.user_instructions_path.as_deref(),
+        Some(global_agents_path.as_path())
+    );
+    Ok(())
+}
+
+#[test]
+fn load_config_records_preferred_global_agents_override_path() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    std::fs::write(
+        codex_home.path().join(DEFAULT_PROJECT_DOC_FILENAME),
+        "global instructions",
+    )?;
+    let global_agents_override_path = codex_home.path().join(LOCAL_PROJECT_DOC_FILENAME);
+    std::fs::write(&global_agents_override_path, "local override instructions")?;
+
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.abs().into_path_buf(),
+    )?;
+
+    assert_eq!(
+        config.user_instructions.as_deref(),
+        Some("local override instructions")
+    );
+    assert_eq!(
+        config.user_instructions_path.as_deref(),
+        Some(global_agents_override_path.as_path())
+    );
     Ok(())
 }
 
@@ -276,8 +357,7 @@ fn config_toml_deserializes_model_availability_nux() {
     assert_eq!(
         cfg.tui.expect("tui config should deserialize"),
         Tui {
-            notifications: Notifications::default(),
-            notification_method: NotificationMethod::default(),
+            notification_settings: TuiNotificationSettings::default(),
             animations: true,
             show_tooltips: true,
             alternate_screen: AltScreenMode::default(),
@@ -973,8 +1053,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
     assert_eq!(
         tui,
         Tui {
-            notifications: Notifications::Enabled(true),
-            notification_method: NotificationMethod::Auto,
+            notification_settings: TuiNotificationSettings::default(),
             animations: true,
             show_tooltips: true,
             alternate_screen: AltScreenMode::Auto,
@@ -1623,7 +1702,7 @@ profile = "project"
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             cwd: Some(workspace.path().to_path_buf()),
@@ -1719,7 +1798,7 @@ fn feature_table_overrides_legacy_flags() -> std::io::Result<()> {
     let mut entries = BTreeMap::new();
     entries.insert("apply_patch_freeform".to_string(), false);
     let cfg = ConfigToml {
-        features: Some(FeaturesToml { entries }),
+        features: Some(FeaturesToml::from(entries)),
         ..Default::default()
     };
 
@@ -1767,7 +1846,7 @@ fn responses_websocket_features_do_not_change_wire_api() -> std::io::Result<()> 
         let mut entries = BTreeMap::new();
         entries.insert(feature_key.to_string(), true);
         let cfg = ConfigToml {
-            features: Some(FeaturesToml { entries }),
+            features: Some(FeaturesToml::from(entries)),
             ..Default::default()
         };
 
@@ -1777,10 +1856,7 @@ fn responses_websocket_features_do_not_change_wire_api() -> std::io::Result<()> 
             codex_home.path().to_path_buf(),
         )?;
 
-        assert_eq!(
-            config.model_provider.wire_api,
-            crate::model_provider_info::WireApi::Responses
-        );
+        assert_eq!(config.model_provider.wire_api, WireApi::Responses);
     }
 
     Ok(())
@@ -1817,12 +1893,7 @@ async fn managed_config_overrides_oauth_store_mode() -> anyhow::Result<()> {
     std::fs::write(&config_path, "mcp_oauth_credentials_store = \"file\"\n")?;
     std::fs::write(&managed_path, "mcp_oauth_credentials_store = \"keyring\"\n")?;
 
-    let overrides = LoaderOverrides {
-        managed_config_path: Some(managed_path.clone()),
-        #[cfg(target_os = "macos")]
-        managed_preferences_base64: None,
-        macos_managed_config_requirements_base64: None,
-    };
+    let overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone());
 
     let cwd = codex_home.path().abs();
     let config_layer_stack = load_config_layers_state(
@@ -1947,12 +2018,7 @@ async fn managed_config_wins_over_cli_overrides() -> anyhow::Result<()> {
     )?;
     std::fs::write(&managed_path, "model = \"managed_config\"\n")?;
 
-    let overrides = LoaderOverrides {
-        managed_config_path: Some(managed_path),
-        #[cfg(target_os = "macos")]
-        managed_preferences_base64: None,
-        macos_managed_config_requirements_base64: None,
-    };
+    let overrides = LoaderOverrides::with_managed_config_path_for_tests(managed_path);
 
     let cwd = codex_home.path().abs();
     let config_layer_stack = load_config_layers_state(
@@ -2065,6 +2131,30 @@ approval_mode = "approve"
             approval_mode: Some(AppToolApproval::Approve),
         }
     );
+}
+
+#[test]
+fn to_mcp_config_preserves_apps_feature_from_config() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+    let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
+
+    let mcp_config = config.to_mcp_config(&plugins_manager);
+    assert!(mcp_config.apps_enabled);
+
+    let _ = config.features.disable(Feature::Apps);
+    let mcp_config = config.to_mcp_config(&plugins_manager);
+    assert!(!mcp_config.apps_enabled);
+
+    let _ = config.features.enable(Feature::Apps);
+    let mcp_config = config.to_mcp_config(&plugins_manager);
+    assert!(mcp_config.apps_enabled);
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -2967,14 +3057,14 @@ async fn set_feature_enabled_updates_profile() -> anyhow::Result<()> {
         profile
             .features
             .as_ref()
-            .and_then(|features| features.entries.get("guardian_approval")),
-        Some(&true),
+            .and_then(|features| features.entries().get("guardian_approval").copied()),
+        Some(true),
     );
     assert_eq!(
         parsed
             .features
             .as_ref()
-            .and_then(|features| features.entries.get("guardian_approval")),
+            .and_then(|features| features.entries().get("guardian_approval").copied()),
         None,
     );
 
@@ -3009,14 +3099,14 @@ async fn set_feature_enabled_persists_default_false_feature_disable_in_profile()
         profile
             .features
             .as_ref()
-            .and_then(|features| features.entries.get("guardian_approval")),
-        Some(&false),
+            .and_then(|features| features.entries().get("guardian_approval").copied()),
+        Some(false),
     );
     assert_eq!(
         parsed
             .features
             .as_ref()
-            .and_then(|features| features.entries.get("guardian_approval")),
+            .and_then(|features| features.entries().get("guardian_approval").copied()),
         None,
     );
 
@@ -3049,15 +3139,15 @@ async fn set_feature_enabled_profile_disable_overrides_root_enable() -> anyhow::
         parsed
             .features
             .as_ref()
-            .and_then(|features| features.entries.get("guardian_approval")),
-        Some(&true),
+            .and_then(|features| features.entries().get("guardian_approval").copied()),
+        Some(true),
     );
     assert_eq!(
         profile
             .features
             .as_ref()
-            .and_then(|features| features.entries.get("guardian_approval")),
-        Some(&false),
+            .and_then(|features| features.entries().get("guardian_approval").copied()),
+        Some(false),
     );
 
     Ok(())
@@ -3142,13 +3232,13 @@ fn loads_compact_prompt_from_file() -> std::io::Result<()> {
 }
 
 #[test]
-fn load_config_uses_requirements_guardian_developer_instructions() -> std::io::Result<()> {
+fn load_config_uses_requirements_guardian_policy_config() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let config_layer_stack = ConfigLayerStack::new(
         Vec::new(),
         Default::default(),
         crate::config_loader::ConfigRequirementsToml {
-            guardian_developer_instructions: Some(
+            guardian_policy_config: Some(
                 "  Use the workspace-managed guardian policy.  ".to_string(),
             ),
             ..Default::default()
@@ -3167,7 +3257,7 @@ fn load_config_uses_requirements_guardian_developer_instructions() -> std::io::R
     )?;
 
     assert_eq!(
-        config.guardian_developer_instructions.as_deref(),
+        config.guardian_policy_config.as_deref(),
         Some("Use the workspace-managed guardian policy.")
     );
 
@@ -3175,13 +3265,13 @@ fn load_config_uses_requirements_guardian_developer_instructions() -> std::io::R
 }
 
 #[test]
-fn load_config_ignores_empty_requirements_guardian_developer_instructions() -> std::io::Result<()> {
+fn load_config_ignores_empty_requirements_guardian_policy_config() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let config_layer_stack = ConfigLayerStack::new(
         Vec::new(),
         Default::default(),
         crate::config_loader::ConfigRequirementsToml {
-            guardian_developer_instructions: Some("   ".to_string()),
+            guardian_policy_config: Some("   ".to_string()),
             ..Default::default()
         },
     )
@@ -3197,7 +3287,7 @@ fn load_config_ignores_empty_requirements_guardian_developer_instructions() -> s
         config_layer_stack,
     )?;
 
-    assert_eq!(config.guardian_developer_instructions, None);
+    assert_eq!(config.guardian_policy_config, None);
 
     Ok(())
 }
@@ -3262,7 +3352,7 @@ nickname_candidates = ["Hypatia", "Noether"]
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -3316,7 +3406,7 @@ nickname_candidates = ["Noether"]
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -3379,7 +3469,7 @@ model = "gpt-5"
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             cwd: Some(nested_cwd),
@@ -3433,7 +3523,7 @@ config_file = "./agents/researcher.toml"
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -3486,7 +3576,7 @@ description = "Review role"
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -3548,7 +3638,7 @@ developer_instructions = "Review carefully"
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             cwd: Some(nested_cwd),
@@ -3603,7 +3693,7 @@ config_file = "./agents/researcher.toml"
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -3655,7 +3745,7 @@ nickname_candidates = ["Atlas"]
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -3789,7 +3879,7 @@ developer_instructions = "Write carefully"
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             cwd: Some(nested_cwd),
@@ -3913,7 +4003,7 @@ model = "gpt-5"
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             cwd: Some(nested_cwd),
@@ -4033,7 +4123,7 @@ model = "gpt-5-mini"
     )
     .await?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(ConfigOverrides {
             cwd: Some(nested_cwd),
@@ -4217,8 +4307,8 @@ fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io::Resul
 fn model_catalog_json_loads_from_path() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let catalog_path = codex_home.path().join("catalog.json");
-    let mut catalog: ModelsResponse =
-        serde_json::from_str(include_str!("../../models.json")).expect("valid models.json");
+    let mut catalog = bundled_models_response()
+        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
     catalog.models = catalog.models.into_iter().take(1).collect();
     std::fs::write(
         &catalog_path,
@@ -4332,7 +4422,7 @@ model_verbosity = "high"
         name: "OpenAI custom".to_string(),
         base_url: Some("https://api.openai.com/v1".to_string()),
         env_key: Some("OPENAI_API_KEY".to_string()),
-        wire_api: crate::WireApi::Responses,
+        wire_api: WireApi::Responses,
         env_key_instructions: None,
         experimental_bearer_token: None,
         auth: None,
@@ -4419,6 +4509,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             approvals_reviewer: ApprovalsReviewer::User,
             enforce_residency: Constrained::allow_any(/*initial_value*/ None),
             user_instructions: None,
+            user_instructions_path: None,
             notify: None,
             cwd: fixture.cwd(),
             cli_auth_credentials_store_mode: Default::default(),
@@ -4468,7 +4559,10 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             experimental_realtime_ws_startup_context: None,
             base_instructions: None,
             developer_instructions: None,
-            guardian_developer_instructions: None,
+            guardian_policy_config: None,
+            include_permissions_instructions: true,
+            include_apps_instructions: true,
+            include_environment_context: true,
             compact_prompt: None,
             commit_attribution: None,
             forced_chatgpt_workspace_id: None,
@@ -4479,6 +4573,7 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             use_experimental_unified_exec_tool: !cfg!(windows),
             background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
             ghost_snapshot: GhostSnapshotConfig::default(),
+            multi_agent_v2: MultiAgentV2Config::default(),
             features: Features::with_defaults().into(),
             suppress_unstable_features_warning: false,
             active_profile: Some("o3".to_string()),
@@ -4488,7 +4583,6 @@ fn test_precedence_fixture_with_o3_profile() -> std::io::Result<()> {
             check_for_update_on_startup: true,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
-            tui_notification_method: Default::default(),
             animations: true,
             show_tooltips: true,
             model_availability_nux: ModelAvailabilityNuxConfig::default(),
@@ -4561,6 +4655,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         approvals_reviewer: ApprovalsReviewer::User,
         enforce_residency: Constrained::allow_any(/*initial_value*/ None),
         user_instructions: None,
+        user_instructions_path: None,
         notify: None,
         cwd: fixture.cwd(),
         cli_auth_credentials_store_mode: Default::default(),
@@ -4610,7 +4705,10 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         experimental_realtime_ws_startup_context: None,
         base_instructions: None,
         developer_instructions: None,
-        guardian_developer_instructions: None,
+        guardian_policy_config: None,
+        include_permissions_instructions: true,
+        include_apps_instructions: true,
+        include_environment_context: true,
         compact_prompt: None,
         commit_attribution: None,
         forced_chatgpt_workspace_id: None,
@@ -4621,6 +4719,7 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         use_experimental_unified_exec_tool: !cfg!(windows),
         background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
         ghost_snapshot: GhostSnapshotConfig::default(),
+        multi_agent_v2: MultiAgentV2Config::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
         active_profile: Some("gpt3".to_string()),
@@ -4630,7 +4729,6 @@ fn test_precedence_fixture_with_gpt3_profile() -> std::io::Result<()> {
         check_for_update_on_startup: true,
         disable_paste_burst: false,
         tui_notifications: Default::default(),
-        tui_notification_method: Default::default(),
         animations: true,
         show_tooltips: true,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
@@ -4701,6 +4799,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         approvals_reviewer: ApprovalsReviewer::User,
         enforce_residency: Constrained::allow_any(/*initial_value*/ None),
         user_instructions: None,
+        user_instructions_path: None,
         notify: None,
         cwd: fixture.cwd(),
         cli_auth_credentials_store_mode: Default::default(),
@@ -4750,7 +4849,10 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         experimental_realtime_ws_startup_context: None,
         base_instructions: None,
         developer_instructions: None,
-        guardian_developer_instructions: None,
+        guardian_policy_config: None,
+        include_permissions_instructions: true,
+        include_apps_instructions: true,
+        include_environment_context: true,
         compact_prompt: None,
         commit_attribution: None,
         forced_chatgpt_workspace_id: None,
@@ -4761,6 +4863,7 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         use_experimental_unified_exec_tool: !cfg!(windows),
         background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
         ghost_snapshot: GhostSnapshotConfig::default(),
+        multi_agent_v2: MultiAgentV2Config::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
         active_profile: Some("zdr".to_string()),
@@ -4770,7 +4873,6 @@ fn test_precedence_fixture_with_zdr_profile() -> std::io::Result<()> {
         check_for_update_on_startup: true,
         disable_paste_burst: false,
         tui_notifications: Default::default(),
-        tui_notification_method: Default::default(),
         animations: true,
         show_tooltips: true,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
@@ -4827,6 +4929,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         approvals_reviewer: ApprovalsReviewer::User,
         enforce_residency: Constrained::allow_any(/*initial_value*/ None),
         user_instructions: None,
+        user_instructions_path: None,
         notify: None,
         cwd: fixture.cwd(),
         cli_auth_credentials_store_mode: Default::default(),
@@ -4876,7 +4979,10 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         experimental_realtime_ws_startup_context: None,
         base_instructions: None,
         developer_instructions: None,
-        guardian_developer_instructions: None,
+        guardian_policy_config: None,
+        include_permissions_instructions: true,
+        include_apps_instructions: true,
+        include_environment_context: true,
         compact_prompt: None,
         commit_attribution: None,
         forced_chatgpt_workspace_id: None,
@@ -4887,6 +4993,7 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         use_experimental_unified_exec_tool: !cfg!(windows),
         background_terminal_max_timeout: DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
         ghost_snapshot: GhostSnapshotConfig::default(),
+        multi_agent_v2: MultiAgentV2Config::default(),
         features: Features::with_defaults().into(),
         suppress_unstable_features_warning: false,
         active_profile: Some("gpt5".to_string()),
@@ -4896,7 +5003,6 @@ fn test_precedence_fixture_with_gpt5_profile() -> std::io::Result<()> {
         check_for_update_on_startup: true,
         disable_paste_burst: false,
         tui_notifications: Default::default(),
-        tui_notification_method: Default::default(),
         animations: true,
         show_tooltips: true,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
@@ -4921,6 +5027,7 @@ fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() -> any
 
     let requirements_toml = crate::config_loader::ConfigRequirementsToml {
         allowed_approval_policies: None,
+        allowed_approvals_reviewers: None,
         allowed_sandbox_modes: None,
         allowed_web_search_modes: Some(vec![
             crate::config_loader::WebSearchModeRequirement::Cached,
@@ -4931,7 +5038,7 @@ fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() -> any
         rules: None,
         enforce_residency: None,
         network: None,
-        guardian_developer_instructions: None,
+        guardian_policy_config: None,
     };
     let requirement_source = crate::config_loader::RequirementSource::Unknown;
     let requirement_source_for_error = requirement_source.clone();
@@ -5513,7 +5620,7 @@ async fn requirements_disallowing_default_sandbox_falls_back_to_required_default
 -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .cloud_requirements(CloudRequirementsLoader::new(async {
             Ok(Some(crate::config_loader::ConfigRequirementsToml {
@@ -5543,6 +5650,7 @@ async fn explicit_sandbox_mode_falls_back_when_disallowed_by_requirements() -> s
 
     let requirements = crate::config_loader::ConfigRequirementsToml {
         allowed_approval_policies: None,
+        allowed_approvals_reviewers: None,
         allowed_sandbox_modes: Some(vec![crate::config_loader::SandboxModeRequirement::ReadOnly]),
         allowed_web_search_modes: None,
         feature_requirements: None,
@@ -5551,10 +5659,10 @@ async fn explicit_sandbox_mode_falls_back_when_disallowed_by_requirements() -> s
         rules: None,
         enforce_residency: None,
         network: None,
-        guardian_developer_instructions: None,
+        guardian_policy_config: None,
     };
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .cloud_requirements(CloudRequirementsLoader::new(async move {
@@ -5579,7 +5687,7 @@ async fn requirements_web_search_mode_overrides_danger_full_access_default() -> 
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .cloud_requirements(CloudRequirementsLoader::new(async {
@@ -5620,7 +5728,7 @@ trust_level = "untrusted"
         ),
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(workspace.path().to_path_buf()))
         .cloud_requirements(CloudRequirementsLoader::new(async {
@@ -5649,7 +5757,7 @@ async fn explicit_approval_policy_falls_back_when_disallowed_by_requirements() -
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .cloud_requirements(CloudRequirementsLoader::new(async {
@@ -5671,7 +5779,7 @@ async fn explicit_approval_policy_falls_back_when_disallowed_by_requirements() -
 async fn feature_requirements_normalize_effective_feature_values() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .cloud_requirements(CloudRequirementsLoader::new(async {
             Ok(Some(crate::config_loader::ConfigRequirementsToml {
@@ -5713,7 +5821,7 @@ shell_tool = true
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .cloud_requirements(CloudRequirementsLoader::new(async {
@@ -5749,13 +5857,42 @@ async fn approvals_reviewer_defaults_to_manual_only_without_guardian_feature() -
 {
     let codex_home = TempDir::new()?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
         .await?;
 
     assert_eq!(config.approvals_reviewer, ApprovalsReviewer::User);
+    Ok(())
+}
+
+#[tokio::test]
+async fn prompt_instruction_blocks_can_be_disabled_from_config_and_profiles() -> std::io::Result<()>
+{
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"include_permissions_instructions = false
+include_apps_instructions = false
+include_environment_context = false
+profile = "chatty"
+
+[profiles.chatty]
+include_permissions_instructions = true
+include_environment_context = true
+"#,
+    )?;
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+
+    assert!(config.include_permissions_instructions);
+    assert!(!config.include_apps_instructions);
+    assert!(config.include_environment_context);
     Ok(())
 }
 
@@ -5770,7 +5907,7 @@ guardian_approval = true
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -5790,7 +5927,7 @@ async fn approvals_reviewer_can_be_set_in_config_without_guardian_approval() -> 
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -5813,7 +5950,7 @@ approvals_reviewer = "guardian_subagent"
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -5822,6 +5959,138 @@ approvals_reviewer = "guardian_subagent"
     assert_eq!(
         config.approvals_reviewer,
         ApprovalsReviewer::GuardianSubagent
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn requirements_disallowing_default_approvals_reviewer_falls_back_to_required_default()
+-> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .cloud_requirements(CloudRequirementsLoader::new(async {
+            Ok(Some(crate::config_loader::ConfigRequirementsToml {
+                allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::GuardianSubagent]),
+                ..Default::default()
+            }))
+        }))
+        .build()
+        .await?;
+
+    assert_eq!(
+        config.approvals_reviewer,
+        ApprovalsReviewer::GuardianSubagent
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn root_approvals_reviewer_falls_back_when_disallowed_by_requirements() -> std::io::Result<()>
+{
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"approvals_reviewer = "user"
+"#,
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cloud_requirements(CloudRequirementsLoader::new(async {
+            Ok(Some(crate::config_loader::ConfigRequirementsToml {
+                allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::GuardianSubagent]),
+                ..Default::default()
+            }))
+        }))
+        .build()
+        .await?;
+
+    assert_eq!(
+        config.approvals_reviewer,
+        ApprovalsReviewer::GuardianSubagent
+    );
+    assert!(
+        config.startup_warnings.iter().any(|warning| {
+            warning
+                .contains("Configured value for `approvals_reviewer` is disallowed by requirements")
+        }),
+        "{:?}",
+        config.startup_warnings
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn profile_approvals_reviewer_falls_back_when_disallowed_by_requirements()
+-> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"profile = "default"
+
+[profiles.default]
+approvals_reviewer = "user"
+"#,
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cloud_requirements(CloudRequirementsLoader::new(async {
+            Ok(Some(crate::config_loader::ConfigRequirementsToml {
+                allowed_approvals_reviewers: Some(vec![ApprovalsReviewer::GuardianSubagent]),
+                ..Default::default()
+            }))
+        }))
+        .build()
+        .await?;
+
+    assert_eq!(
+        config.approvals_reviewer,
+        ApprovalsReviewer::GuardianSubagent
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn approvals_reviewer_preserves_valid_user_choice_when_allowed_by_requirements()
+-> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"approvals_reviewer = "guardian_subagent"
+"#,
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .cloud_requirements(CloudRequirementsLoader::new(async {
+            Ok(Some(crate::config_loader::ConfigRequirementsToml {
+                allowed_approvals_reviewers: Some(vec![
+                    ApprovalsReviewer::User,
+                    ApprovalsReviewer::GuardianSubagent,
+                ]),
+                ..Default::default()
+            }))
+        }))
+        .build()
+        .await?;
+
+    assert_eq!(
+        config.approvals_reviewer,
+        ApprovalsReviewer::GuardianSubagent
+    );
+    assert!(
+        config
+            .startup_warnings
+            .iter()
+            .all(|warning| !warning.contains("approvals_reviewer")),
+        "{:?}",
+        config.startup_warnings
     );
     Ok(())
 }
@@ -5836,7 +6105,7 @@ smart_approvals = true
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -5865,7 +6134,7 @@ smart_approvals = true
 "#,
     )?;
 
-    let config = ConfigBuilder::default()
+    let config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
         .build()
@@ -5879,6 +6148,71 @@ smart_approvals = true
     assert!(serialized.contains("smart_approvals = true"));
     assert!(!serialized.contains("guardian_approval"));
     assert!(!serialized.contains("approvals_reviewer"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_agent_v2_config_from_feature_table() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[features.multi_agent_v2]
+enabled = true
+usage_hint_enabled = false
+usage_hint_text = "Custom delegation guidance."
+hide_spawn_agent_metadata = true
+"#,
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+
+    assert!(config.features.enabled(Feature::MultiAgentV2));
+    assert!(!config.multi_agent_v2.usage_hint_enabled);
+    assert_eq!(
+        config.multi_agent_v2.usage_hint_text.as_deref(),
+        Some("Custom delegation guidance.")
+    );
+    assert!(config.multi_agent_v2.hide_spawn_agent_metadata);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn profile_multi_agent_v2_config_overrides_base() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"profile = "no_hint"
+
+[features.multi_agent_v2]
+usage_hint_enabled = true
+usage_hint_text = "base hint"
+hide_spawn_agent_metadata = true
+
+[profiles.no_hint.features.multi_agent_v2]
+usage_hint_enabled = false
+usage_hint_text = "profile hint"
+hide_spawn_agent_metadata = false
+"#,
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+
+    assert!(!config.multi_agent_v2.usage_hint_enabled);
+    assert_eq!(
+        config.multi_agent_v2.usage_hint_text.as_deref(),
+        Some("profile hint")
+    );
+    assert!(!config.multi_agent_v2.hide_spawn_agent_metadata);
 
     Ok(())
 }
@@ -6145,12 +6479,41 @@ experimental_realtime_ws_model = "realtime-test-model"
 }
 
 #[test]
+fn realtime_config_partial_table_uses_realtime_defaults() -> std::io::Result<()> {
+    let cfg: ConfigToml = toml::from_str(
+        r#"
+[realtime]
+voice = "marin"
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.path().to_path_buf(),
+    )?;
+
+    assert_eq!(
+        config.realtime,
+        RealtimeConfig {
+            voice: Some(RealtimeVoice::Marin),
+            ..RealtimeConfig::default()
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn realtime_loads_from_config_toml() -> std::io::Result<()> {
     let cfg: ConfigToml = toml::from_str(
         r#"
 [realtime]
 version = "v2"
 type = "transcription"
+transport = "webrtc"
+voice = "cedar"
 "#,
     )
     .expect("TOML deserialization should succeed");
@@ -6160,6 +6523,8 @@ type = "transcription"
         Some(RealtimeToml {
             version: Some(RealtimeWsVersion::V2),
             session_type: Some(RealtimeWsMode::Transcription),
+            transport: Some(RealtimeTransport::WebRtc),
+            voice: Some(RealtimeVoice::Cedar),
         })
     );
 
@@ -6175,6 +6540,8 @@ type = "transcription"
         RealtimeConfig {
             version: RealtimeWsVersion::V2,
             session_type: RealtimeWsMode::Transcription,
+            transport: RealtimeTransport::WebRtc,
+            voice: Some(RealtimeVoice::Cedar),
         }
     );
     Ok(())
@@ -6215,10 +6582,8 @@ speaker = "Desk Speakers"
 
 #[derive(Deserialize, Debug, PartialEq)]
 struct TuiTomlTest {
-    #[serde(default)]
-    notifications: Notifications,
-    #[serde(default)]
-    notification_method: NotificationMethod,
+    #[serde(default, flatten)]
+    notifications: TuiNotificationSettings,
 }
 
 #[derive(Deserialize, Debug, PartialEq)]
@@ -6233,7 +6598,10 @@ fn test_tui_notifications_true() {
             notifications = true
         "#;
     let parsed: RootTomlTest = toml::from_str(toml).expect("deserialize notifications=true");
-    assert_matches!(parsed.tui.notifications, Notifications::Enabled(true));
+    assert_matches!(
+        parsed.tui.notifications.notifications,
+        Notifications::Enabled(true)
+    );
 }
 
 #[test]
@@ -6244,7 +6612,7 @@ fn test_tui_notifications_custom_array() {
         "#;
     let parsed: RootTomlTest = toml::from_str(toml).expect("deserialize notifications=[\"foo\"]");
     assert_matches!(
-        parsed.tui.notifications,
+        parsed.tui.notifications.notifications,
         Notifications::Custom(ref v) if v == &vec!["foo".to_string()]
     );
 }
@@ -6257,5 +6625,48 @@ fn test_tui_notification_method() {
         "#;
     let parsed: RootTomlTest =
         toml::from_str(toml).expect("deserialize notification_method=\"bel\"");
-    assert_eq!(parsed.tui.notification_method, NotificationMethod::Bel);
+    assert_eq!(parsed.tui.notifications.method, NotificationMethod::Bel);
+}
+
+#[test]
+fn test_tui_notification_condition_defaults_to_unfocused() {
+    let toml = r#"
+            [tui]
+        "#;
+    let parsed: RootTomlTest =
+        toml::from_str(toml).expect("deserialize default notification condition");
+    assert_eq!(
+        parsed.tui.notifications.condition,
+        NotificationCondition::Unfocused
+    );
+}
+
+#[test]
+fn test_tui_notification_condition_always() {
+    let toml = r#"
+            [tui]
+            notification_condition = "always"
+        "#;
+    let parsed: RootTomlTest =
+        toml::from_str(toml).expect("deserialize notification_condition=\"always\"");
+    assert_eq!(
+        parsed.tui.notifications.condition,
+        NotificationCondition::Always
+    );
+}
+
+#[test]
+fn test_tui_notification_condition_rejects_unknown_value() {
+    let toml = r#"
+            [tui]
+            notification_condition = "background"
+        "#;
+    let err = toml::from_str::<RootTomlTest>(toml).expect_err("reject unknown condition");
+    let err = err.to_string();
+    assert!(
+        err.contains("unknown variant `background`")
+            && err.contains("unfocused")
+            && err.contains("always"),
+        "unexpected error: {err}"
+    );
 }

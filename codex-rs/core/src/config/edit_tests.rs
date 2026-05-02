@@ -1,7 +1,7 @@
 use super::*;
-use crate::config::types::AppToolApproval;
-use crate::config::types::McpServerToolConfig;
-use crate::config::types::McpServerTransportConfig;
+use codex_config::types::AppToolApproval;
+use codex_config::types::McpServerToolConfig;
+use codex_config::types::McpServerTransportConfig;
 use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 #[cfg(unix)]
@@ -1064,6 +1064,41 @@ fn blocking_builder_set_realtime_audio_persists_and_clears() {
         realtime_audio.get("speaker").and_then(TomlValue::as_str),
         Some("Desk Speakers")
     );
+}
+
+#[test]
+fn blocking_builder_set_realtime_voice_persists_and_clears() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_realtime_voice(Some("cedar"))
+        .apply_blocking()
+        .expect("persist realtime voice");
+
+    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let config: TomlValue = toml::from_str(&raw).expect("parse config");
+    let realtime = config
+        .get("realtime")
+        .and_then(TomlValue::as_table)
+        .expect("realtime table should exist");
+    assert_eq!(
+        realtime.get("voice").and_then(TomlValue::as_str),
+        Some("cedar")
+    );
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_realtime_voice(/*voice*/ None)
+        .apply_blocking()
+        .expect("clear realtime voice");
+
+    let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
+    let config: TomlValue = toml::from_str(&raw).expect("parse config");
+    let realtime = config
+        .get("realtime")
+        .and_then(TomlValue::as_table)
+        .expect("realtime table should exist");
+    assert_eq!(realtime.get("voice"), None);
 }
 
 #[test]

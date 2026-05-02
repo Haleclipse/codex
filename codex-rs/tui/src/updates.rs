@@ -4,7 +4,7 @@ use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
 use codex_core::config::Config;
-use codex_core::default_client::create_client;
+use codex_login::default_client::create_client;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::Path;
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use crate::version::CODEX_CLI_VERSION;
 
 pub fn get_upgrade_version(config: &Config) -> Option<String> {
-    if !config.check_for_update_on_startup {
+    if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
         return None;
     }
 
@@ -128,7 +128,7 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
 /// Returns the latest version to show in a popup, if it should be shown.
 /// This respects the user's dismissal choice for the current latest version.
 pub fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
-    if !config.check_for_update_on_startup {
+    if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
         return None;
     }
 
@@ -158,6 +158,10 @@ pub async fn dismiss_version(config: &Config, version: &str) -> anyhow::Result<(
     }
     tokio::fs::write(version_file, json_line).await?;
     Ok(())
+}
+
+fn is_source_build_version(version: &str) -> bool {
+    parse_version(version) == Some((0, 0, 0))
 }
 
 #[cfg(test)]
