@@ -9,19 +9,19 @@ pub struct UsageSegment;
 
 impl Segment for UsageSegment {
     fn collect(&self, ctx: &StatusLineContext) -> Option<SegmentData> {
-        // 5h limit 用于百分比显示
-        let hourly_percent = ctx.hourly_rate_limit_percent?;
-        // Weekly limit 用于圆圈进度
-        let weekly_percent = ctx.weekly_rate_limit_percent.unwrap_or(hourly_percent);
+        // @cometix: prefer hourly, fallback to weekly (Free Tier has no hourly)
+        let primary_percent = ctx
+            .hourly_rate_limit_percent
+            .or(ctx.weekly_rate_limit_percent)?;
+        let weekly_percent = ctx.weekly_rate_limit_percent.unwrap_or(primary_percent);
 
-        // 格式化百分比 (显示 5h limit)
-        let display = format!("{hourly_percent:.0}%");
+        let display = format!("{primary_percent:.0}%");
 
         // 动态图标：根据周限使用率选择不同的圆形切片图标
         let dynamic_icon = get_circle_icon(weekly_percent / 100.0);
 
         let mut data = SegmentData::new(display)
-            .with_metadata("hourly_percent", format!("{hourly_percent:.1}"))
+            .with_metadata("hourly_percent", format!("{primary_percent:.1}"))
             .with_metadata("weekly_percent", format!("{weekly_percent:.1}"))
             .with_metadata("dynamic_icon", dynamic_icon);
 

@@ -160,7 +160,6 @@ async fn guardian_allows_shell_additional_permissions_requests_past_policy_valid
                             enabled: Some(true),
                         }),
                         file_system: None,
-                        macos: None,
                     },
                     "justification": params.justification.clone(),
                 })
@@ -234,7 +233,7 @@ async fn guardian_allows_unified_exec_additional_permissions_requests_past_polic
 
     assert_eq!(
         output,
-        "missing `additional_permissions`; provide at least one of `network`, `file_system`, or `macos` when using `with_additional_permissions`"
+        "missing `additional_permissions`; provide at least one of `network` or `file_system` when using `with_additional_permissions`"
     );
 }
 
@@ -426,11 +425,14 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
     let models_manager = Arc::new(ModelsManager::new(
         config.codex_home.clone(),
         auth_manager.clone(),
-        None,
+        /*model_catalog*/ None,
         CollaborationModesConfig::default(),
     ));
     let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.clone()));
-    let skills_manager = Arc::new(SkillsManager::new(config.codex_home.clone(), true));
+    let skills_manager = Arc::new(SkillsManager::new(
+        config.codex_home.clone(),
+        /*bundled_skills_enabled*/ true,
+    ));
     let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
     let skills_watcher = Arc::new(SkillsWatcher::noop());
 

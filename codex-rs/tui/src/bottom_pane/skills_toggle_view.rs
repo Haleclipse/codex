@@ -22,7 +22,6 @@ use crate::render::renderable::Renderable;
 use crate::skills_helpers::match_skill;
 use crate::skills_helpers::truncate_skill_name;
 use crate::style::user_message_style;
-use codex_protocol::protocol::Op;
 
 use super::CancellationEvent;
 use super::bottom_pane_view::BottomPaneView;
@@ -135,7 +134,8 @@ impl SkillsToggleView {
             .filter_map(|(visible_idx, actual_idx)| {
                 self.items.get(*actual_idx).map(|item| {
                     let is_selected = self.state.selected_idx == Some(visible_idx);
-                    let prefix = if is_selected { '›' } else { ' ' };
+                    // @cometix: use ❯ instead of upstream ›
+                    let prefix = if is_selected { '❯' } else { ' ' };
                     let marker = if item.enabled { 'x' } else { ' ' };
                     let item_name = truncate_skill_name(&item.name);
                     let name = format!("{prefix} [{marker}] {item_name}");
@@ -187,10 +187,8 @@ impl SkillsToggleView {
         }
         self.complete = true;
         self.app_event_tx.send(AppEvent::ManageSkillsClosed);
-        self.app_event_tx.send(AppEvent::CodexOp(Op::ListSkills {
-            cwds: Vec::new(),
-            force_reload: true,
-        }));
+        self.app_event_tx
+            .list_skills(Vec::new(), /*force_reload*/ true);
     }
 
     fn rows_width(total_width: u16) -> u16 {
@@ -432,6 +430,6 @@ mod tests {
             },
         ];
         let view = SkillsToggleView::new(items, tx);
-        assert_snapshot!("skills_toggle_basic", render_lines(&view, 72));
+        assert_snapshot!("skills_toggle_basic", render_lines(&view, /*width*/ 72));
     }
 }

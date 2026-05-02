@@ -31,7 +31,7 @@ fn danger_full_access_defaults_to_no_sandbox_without_network_requirements() {
         NetworkSandboxPolicy::Enabled,
         SandboxablePreference::Auto,
         WindowsSandboxLevel::Disabled,
-        false,
+        /*has_managed_network_requirements*/ false,
     );
     assert_eq!(sandbox, SandboxType::None);
 }
@@ -39,13 +39,14 @@ fn danger_full_access_defaults_to_no_sandbox_without_network_requirements() {
 #[test]
 fn danger_full_access_uses_platform_sandbox_with_network_requirements() {
     let manager = SandboxManager::new();
-    let expected = get_platform_sandbox(false).unwrap_or(SandboxType::None);
+    let expected =
+        get_platform_sandbox(/*windows_sandbox_enabled*/ false).unwrap_or(SandboxType::None);
     let sandbox = manager.select_initial(
         &FileSystemSandboxPolicy::unrestricted(),
         NetworkSandboxPolicy::Enabled,
         SandboxablePreference::Auto,
         WindowsSandboxLevel::Disabled,
-        true,
+        /*has_managed_network_requirements*/ true,
     );
     assert_eq!(sandbox, expected);
 }
@@ -53,7 +54,8 @@ fn danger_full_access_uses_platform_sandbox_with_network_requirements() {
 #[test]
 fn restricted_file_system_uses_platform_sandbox_without_managed_network() {
     let manager = SandboxManager::new();
-    let expected = get_platform_sandbox(false).unwrap_or(SandboxType::None);
+    let expected =
+        get_platform_sandbox(/*windows_sandbox_enabled*/ false).unwrap_or(SandboxType::None);
     let sandbox = manager.select_initial(
         &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
             path: FileSystemPath::Special {
@@ -64,7 +66,7 @@ fn restricted_file_system_uses_platform_sandbox_without_managed_network() {
         NetworkSandboxPolicy::Enabled,
         SandboxablePreference::Auto,
         WindowsSandboxLevel::Disabled,
-        false,
+        /*has_managed_network_requirements*/ false,
     );
     assert_eq!(sandbox, expected);
 }
@@ -76,7 +78,7 @@ fn transform_preserves_unrestricted_file_system_policy_for_restricted_network() 
     let exec_request = manager
         .transform(SandboxTransformRequest {
             command: SandboxCommand {
-                program: "true".to_string(),
+                program: "true".into(),
                 args: Vec::new(),
                 cwd: cwd.clone(),
                 env: HashMap::new(),
@@ -91,8 +93,6 @@ fn transform_preserves_unrestricted_file_system_policy_for_restricted_network() 
             enforce_managed_network: false,
             network: None,
             sandbox_policy_cwd: cwd.as_path(),
-            #[cfg(target_os = "macos")]
-            macos_seatbelt_profile_extensions: None,
             codex_linux_sandbox_exe: None,
             use_legacy_landlock: false,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -122,7 +122,7 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
     let exec_request = manager
         .transform(SandboxTransformRequest {
             command: SandboxCommand {
-                program: "true".to_string(),
+                program: "true".into(),
                 args: Vec::new(),
                 cwd: cwd.clone(),
                 env: HashMap::new(),
@@ -134,7 +134,6 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
                         read: Some(vec![path]),
                         write: Some(Vec::new()),
                     }),
-                    ..Default::default()
                 }),
             },
             policy: &SandboxPolicy::ExternalSandbox {
@@ -146,8 +145,6 @@ fn transform_additional_permissions_enable_network_for_external_sandbox() {
             enforce_managed_network: false,
             network: None,
             sandbox_policy_cwd: cwd.as_path(),
-            #[cfg(target_os = "macos")]
-            macos_seatbelt_profile_extensions: None,
             codex_linux_sandbox_exe: None,
             use_legacy_landlock: false,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -181,7 +178,7 @@ fn transform_additional_permissions_preserves_denied_entries() {
     let exec_request = manager
         .transform(SandboxTransformRequest {
             command: SandboxCommand {
-                program: "true".to_string(),
+                program: "true".into(),
                 args: Vec::new(),
                 cwd: cwd.clone(),
                 env: HashMap::new(),
@@ -216,8 +213,6 @@ fn transform_additional_permissions_preserves_denied_entries() {
             enforce_managed_network: false,
             network: None,
             sandbox_policy_cwd: cwd.as_path(),
-            #[cfg(target_os = "macos")]
-            macos_seatbelt_profile_extensions: None,
             codex_linux_sandbox_exe: None,
             use_legacy_landlock: false,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -259,7 +254,7 @@ fn transform_linux_seccomp_request(
     manager
         .transform(SandboxTransformRequest {
             command: SandboxCommand {
-                program: "true".to_string(),
+                program: "true".into(),
                 args: Vec::new(),
                 cwd: cwd.clone(),
                 env: HashMap::new(),

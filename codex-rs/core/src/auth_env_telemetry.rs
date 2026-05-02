@@ -64,6 +64,7 @@ mod tests {
             env_key: Some("sk-should-not-leak".to_string()),
             env_key_instructions: None,
             experimental_bearer_token: None,
+            auth: None,
             wire_api: crate::model_provider_info::WireApi::Responses,
             query_params: None,
             http_headers: None,
@@ -76,7 +77,8 @@ mod tests {
             supports_websockets: false,
         };
 
-        let telemetry = collect_auth_env_telemetry(&provider, false);
+        let telemetry =
+            collect_auth_env_telemetry(&provider, /*codex_api_key_env_enabled*/ false);
 
         assert_eq!(
             telemetry.provider_env_key_name,

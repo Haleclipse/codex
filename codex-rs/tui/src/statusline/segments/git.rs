@@ -1,5 +1,4 @@
-// Git Segment - 显示 Git 分支和状态
-// 搬迁自 CCometixLine
+// Git Segment - displays git branch and status from async preview data
 
 use crate::statusline::GitPreviewData;
 use crate::statusline::StatusLineContext;
@@ -9,38 +8,27 @@ use crate::statusline::segment::SegmentId;
 use std::path::Path;
 use std::process::Command;
 
-/// Git 状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitStatus {
-    Clean,
-    Dirty,
-    Conflicts,
-}
-
-/// Git 信息
-#[derive(Debug)]
-pub struct GitInfo {
-    pub branch: String,
-    pub status: GitStatus,
-    pub ahead: u32,
-    pub behind: u32,
-}
-
 pub struct GitSegment;
 
 impl GitSegment {
-    fn get_git_info(&self, working_dir: &Path) -> Option<GitInfo> {
-        let working_dir = working_dir.to_string_lossy();
+    /// Collect git info by running git commands. Only called from async
+    /// `spawn_blocking` context via `collect_preview` — never on the render thread.
+    fn get_git_info(&self, cwd: &Path) -> Option<GitInfo> {
+        let wd = cwd.to_string_lossy();
 
-        if !self.is_git_repository(&working_dir) {
+        if !Command::new("git")
+            .args(["--no-optional-locks", "rev-parse", "--git-dir"])
+            .current_dir(wd.as_ref())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
             return None;
         }
 
-        let branch = self
-            .get_branch(&working_dir)
-            .unwrap_or_else(|| "detached".to_string());
-        let status = self.get_status(&working_dir);
-        let (ahead, behind) = self.get_ahead_behind(&working_dir);
+        let branch = get_branch(&wd).unwrap_or_else(|| "detached".to_string());
+        let status = get_status(&wd);
+        let (ahead, behind) = get_ahead_behind(&wd);
 
         Some(GitInfo {
             branch,
@@ -50,171 +38,130 @@ impl GitSegment {
         })
     }
 
-    fn is_git_repository(&self, working_dir: &str) -> bool {
-        Command::new("git")
-            .args(["--no-optional-locks", "rev-parse", "--git-dir"])
-            .current_dir(working_dir)
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    }
-
-    fn get_branch(&self, working_dir: &str) -> Option<String> {
-        // 首先尝试 --show-current
-        if let Ok(output) = Command::new("git")
-            .args(["--no-optional-locks", "branch", "--show-current"])
-            .current_dir(working_dir)
-            .output()
-            && output.status.success()
-        {
-            let branch = String::from_utf8(output.stdout).ok()?.trim().to_string();
-            if !branch.is_empty() {
-                return Some(branch);
-            }
-        }
-
-        // 回退到 symbolic-ref
-        if let Ok(output) = Command::new("git")
-            .args(["--no-optional-locks", "symbolic-ref", "--short", "HEAD"])
-            .current_dir(working_dir)
-            .output()
-            && output.status.success()
-        {
-            let branch = String::from_utf8(output.stdout).ok()?.trim().to_string();
-            if !branch.is_empty() {
-                return Some(branch);
-            }
-        }
-
-        None
-    }
-
-    fn get_status(&self, working_dir: &str) -> GitStatus {
-        let output = Command::new("git")
-            .args(["--no-optional-locks", "status", "--porcelain"])
-            .current_dir(working_dir)
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let status_text = String::from_utf8(output.stdout).unwrap_or_default();
-
-                if status_text.trim().is_empty() {
-                    return GitStatus::Clean;
-                }
-
-                // 检查冲突标记
-                if status_text.contains("UU")
-                    || status_text.contains("AA")
-                    || status_text.contains("DD")
-                {
-                    GitStatus::Conflicts
-                } else {
-                    GitStatus::Dirty
-                }
-            }
-            _ => GitStatus::Clean,
-        }
-    }
-
-    fn get_ahead_behind(&self, working_dir: &str) -> (u32, u32) {
-        let ahead = self.get_commit_count(working_dir, "@{u}..HEAD");
-        let behind = self.get_commit_count(working_dir, "HEAD..@{u}");
-        (ahead, behind)
-    }
-
-    fn get_commit_count(&self, working_dir: &str, range: &str) -> u32 {
-        let output = Command::new("git")
-            .args(["--no-optional-locks", "rev-list", "--count", range])
-            .current_dir(working_dir)
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => String::from_utf8(output.stdout)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0),
-            _ => 0,
-        }
-    }
-
+    /// Async-safe entry point: runs blocking git commands, returns preview data.
+    /// Called exclusively from `tokio::task::spawn_blocking`.
     pub(crate) fn collect_preview(&self, cwd: &Path) -> Option<GitPreviewData> {
-        let git_info = self.get_git_info(cwd)?;
-        let status = match git_info.status {
+        let info = self.get_git_info(cwd)?;
+        let status = match info.status {
             GitStatus::Clean => "✓",
             GitStatus::Dirty => "●",
             GitStatus::Conflicts => "⚠",
         };
-
         Some(GitPreviewData {
-            branch: git_info.branch,
+            branch: info.branch,
             status: status.to_string(),
-            ahead: git_info.ahead,
-            behind: git_info.behind,
+            ahead: info.ahead,
+            behind: info.behind,
         })
     }
 }
 
 impl Segment for GitSegment {
     fn collect(&self, ctx: &StatusLineContext) -> Option<SegmentData> {
-        // 如果有预览数据，使用预览数据
-        if let Some(preview) = &ctx.git_preview {
-            if preview.branch.is_empty() && preview.status.is_empty() {
-                return None;
-            }
-            let primary = preview.branch.clone();
-            let mut status_parts = Vec::new();
-            status_parts.push(preview.status.clone());
-            if preview.ahead > 0 {
-                status_parts.push(format!("↑{}", preview.ahead));
-            }
-            if preview.behind > 0 {
-                status_parts.push(format!("↓{}", preview.behind));
-            }
-            let secondary = status_parts.join(" ");
-            return Some(
-                SegmentData::new(primary)
-                    .with_secondary(secondary)
-                    .with_metadata("branch", &preview.branch)
-                    .with_metadata("status", &preview.status)
-                    .with_metadata("ahead", preview.ahead.to_string())
-                    .with_metadata("behind", preview.behind.to_string()),
-            );
+        // @cometix: only render from async preview data — never run blocking
+        // git commands on the render thread.
+        let preview = ctx.git_preview.as_ref()?;
+        if preview.branch.is_empty() && preview.status.is_empty() {
+            return None;
         }
-
-        let git_info = self.get_git_info(ctx.cwd)?;
-
-        let primary = git_info.branch.clone();
-        let mut status_parts = Vec::new();
-
-        // 状态符号
-        match git_info.status {
-            GitStatus::Clean => status_parts.push("✓".to_string()),
-            GitStatus::Dirty => status_parts.push("●".to_string()),
-            GitStatus::Conflicts => status_parts.push("⚠".to_string()),
+        let primary = preview.branch.clone();
+        let mut parts = Vec::new();
+        parts.push(preview.status.clone());
+        if preview.ahead > 0 {
+            parts.push(format!("↑{}", preview.ahead));
         }
-
-        // ahead/behind
-        if git_info.ahead > 0 {
-            status_parts.push(format!("↑{}", git_info.ahead));
+        if preview.behind > 0 {
+            parts.push(format!("↓{}", preview.behind));
         }
-        if git_info.behind > 0 {
-            status_parts.push(format!("↓{}", git_info.behind));
-        }
-
-        let secondary = status_parts.join(" ");
-
         Some(
             SegmentData::new(primary)
-                .with_secondary(secondary)
-                .with_metadata("branch", &git_info.branch)
-                .with_metadata("status", format!("{:?}", git_info.status))
-                .with_metadata("ahead", git_info.ahead.to_string())
-                .with_metadata("behind", git_info.behind.to_string()),
+                .with_secondary(parts.join(" "))
+                .with_metadata("branch", &preview.branch)
+                .with_metadata("status", &preview.status)
+                .with_metadata("ahead", preview.ahead.to_string())
+                .with_metadata("behind", preview.behind.to_string()),
         )
     }
 
     fn id(&self) -> SegmentId {
         SegmentId::Git
     }
+}
+
+// --- internal helpers (blocking, only called from spawn_blocking) ---
+
+#[derive(Debug)]
+struct GitInfo {
+    branch: String,
+    status: GitStatus,
+    ahead: u32,
+    behind: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitStatus {
+    Clean,
+    Dirty,
+    Conflicts,
+}
+
+fn get_branch(wd: &str) -> Option<String> {
+    if let Ok(o) = Command::new("git")
+        .args(["--no-optional-locks", "branch", "--show-current"])
+        .current_dir(wd)
+        .output()
+        && o.status.success()
+    {
+        let b = String::from_utf8(o.stdout).ok()?.trim().to_string();
+        if !b.is_empty() {
+            return Some(b);
+        }
+    }
+    if let Ok(o) = Command::new("git")
+        .args(["--no-optional-locks", "symbolic-ref", "--short", "HEAD"])
+        .current_dir(wd)
+        .output()
+        && o.status.success()
+    {
+        let b = String::from_utf8(o.stdout).ok()?.trim().to_string();
+        if !b.is_empty() {
+            return Some(b);
+        }
+    }
+    None
+}
+
+fn get_status(wd: &str) -> GitStatus {
+    match Command::new("git")
+        .args(["--no-optional-locks", "status", "--porcelain"])
+        .current_dir(wd)
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8(o.stdout).unwrap_or_default();
+            if text.trim().is_empty() {
+                GitStatus::Clean
+            } else if text.contains("UU") || text.contains("AA") || text.contains("DD") {
+                GitStatus::Conflicts
+            } else {
+                GitStatus::Dirty
+            }
+        }
+        _ => GitStatus::Clean,
+    }
+}
+
+fn get_ahead_behind(wd: &str) -> (u32, u32) {
+    let count = |range: &str| -> u32 {
+        Command::new("git")
+            .args(["--no-optional-locks", "rev-list", "--count", range])
+            .current_dir(wd)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (count("@{u}..HEAD"), count("HEAD..@{u}"))
 }

@@ -54,7 +54,7 @@ struct VersionInfo {
 
 const VERSION_FILENAME: &str = "version.json";
 
-/// npm registry API endpoint for package metadata.
+// @cometix: point to fork npm registry
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@cometix/codex";
 
 /// Response structure from npm registry API (only fields we need).
@@ -114,7 +114,7 @@ fn is_newer(latest: &str, current: &str) -> Option<bool> {
 }
 
 fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
-    // Strip any suffix like "-cometix" before parsing
+    // @cometix: strip any suffix like "-cometix" before parsing
     let v = v.trim();
     let v = v.split('-').next().unwrap_or(v);
 

@@ -2,7 +2,6 @@
 source: tui/src/chatwidget/tests.rs
 expression: term.backend().vt100().screen().contents()
 ---
-
 • Working (0s • esc to interrupt)
 
 • Queued follow-up messages
@@ -21,7 +20,8 @@ expression: term.backend().vt100().screen().contents()
   ↳ Hello, world! 12
   ↳ Hello, world! 13
   ↳ Hello, world! 14
-────────────────────────────────────────────────────────────────────────────────
-❯ Ask Codex to do anything
-────────────────────────────────────────────────────────────────────────────────
-   GPT 5.3 Codex │ 󰉋 tui │  - · - tokens
+  ↳ Hello, world! 15
+
+› Ask Codex to do anything
+
+  gpt-5.3-codex default · 100% left · /tmp/project

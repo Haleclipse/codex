@@ -46,6 +46,7 @@ async fn responses_stream_includes_subagent_header_on_review() {
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
+        auth: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -77,24 +78,24 @@ async fn responses_stream_includes_subagent_header_on_review() {
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
-        None,
+        /*account_id*/ None,
         Some("test@test.com".to_string()),
         Some(auth_mode),
         "test_originator".to_string(),
-        false,
+        /*log_user_prompts*/ false,
         "test".to_string(),
         session_source.clone(),
     );
 
     let client = ModelClient::new(
-        None,
+        /*auth_manager*/ None,
         conversation_id,
         provider.clone(),
         session_source,
         config.model_verbosity,
-        false,
-        false,
-        None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
     );
     let mut client_session = client.new_session();
 
@@ -116,8 +117,8 @@ async fn responses_stream_includes_subagent_header_on_review() {
             &session_telemetry,
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
-            None,
-            None,
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
         )
         .await
         .expect("stream failed");
@@ -158,6 +159,7 @@ async fn responses_stream_includes_subagent_header_on_other() {
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
+        auth: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -190,24 +192,24 @@ async fn responses_stream_includes_subagent_header_on_other() {
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
-        None,
+        /*account_id*/ None,
         Some("test@test.com".to_string()),
         Some(auth_mode),
         "test_originator".to_string(),
-        false,
+        /*log_user_prompts*/ false,
         "test".to_string(),
         session_source.clone(),
     );
 
     let client = ModelClient::new(
-        None,
+        /*auth_manager*/ None,
         conversation_id,
         provider.clone(),
         session_source,
         config.model_verbosity,
-        false,
-        false,
-        None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
     );
     let mut client_session = client.new_session();
 
@@ -229,8 +231,8 @@ async fn responses_stream_includes_subagent_header_on_other() {
             &session_telemetry,
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
-            None,
-            None,
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
         )
         .await
         .expect("stream failed");
@@ -265,6 +267,7 @@ async fn responses_respects_model_info_overrides_from_config() {
         env_key: None,
         env_key_instructions: None,
         experimental_bearer_token: None,
+        auth: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -302,24 +305,24 @@ async fn responses_respects_model_info_overrides_from_config() {
         conversation_id,
         model.as_str(),
         model_info.slug.as_str(),
-        None,
+        /*account_id*/ None,
         Some("test@test.com".to_string()),
         auth_mode,
         "test_originator".to_string(),
-        false,
+        /*log_user_prompts*/ false,
         "test".to_string(),
         session_source.clone(),
     );
 
     let client = ModelClient::new(
-        None,
+        /*auth_manager*/ None,
         conversation_id,
         provider.clone(),
         session_source,
         config.model_verbosity,
-        false,
-        false,
-        None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
     );
     let mut client_session = client.new_session();
 
@@ -341,8 +344,8 @@ async fn responses_respects_model_info_overrides_from_config() {
             &session_telemetry,
             effort,
             summary.unwrap_or(model_info.default_reasoning_summary),
-            None,
-            None,
+            /*service_tier*/ None,
+            /*turn_metadata_header*/ None,
         )
         .await
         .expect("stream failed");

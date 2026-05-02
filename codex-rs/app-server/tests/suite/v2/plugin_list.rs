@@ -1104,7 +1104,8 @@ async fn app_server_startup_remote_plugin_sync_runs_once() -> Result<()> {
         timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
         wait_for_path_exists(&marker_path).await?;
-        wait_for_remote_plugin_request_count(&server, "/plugins/list", 1).await?;
+        wait_for_remote_plugin_request_count(&server, "/plugins/list", /*expected_count*/ 1)
+            .await?;
         let request_id = mcp
             .send_plugin_list_request(PluginListParams {
                 cwds: None,
@@ -1130,7 +1131,8 @@ async fn app_server_startup_remote_plugin_sync_runs_once() -> Result<()> {
                 .collect::<Vec<_>>(),
             vec![("linear@openai-curated".to_string(), true, true)]
         );
-        wait_for_remote_plugin_request_count(&server, "/plugins/list", 1).await?;
+        wait_for_remote_plugin_request_count(&server, "/plugins/list", /*expected_count*/ 1)
+            .await?;
     }
 
     let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
@@ -1142,7 +1144,7 @@ async fn app_server_startup_remote_plugin_sync_runs_once() -> Result<()> {
     }
 
     tokio::time::sleep(Duration::from_millis(250)).await;
-    wait_for_remote_plugin_request_count(&server, "/plugins/list", 1).await?;
+    wait_for_remote_plugin_request_count(&server, "/plugins/list", /*expected_count*/ 1).await?;
     Ok(())
 }
 
@@ -1202,7 +1204,7 @@ async fn plugin_list_uses_warmed_featured_plugin_ids_cache_on_first_request() ->
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    wait_for_featured_plugin_request_count(&server, 1).await?;
+    wait_for_featured_plugin_request_count(&server, /*expected_count*/ 1).await?;
 
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {

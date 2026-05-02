@@ -5,7 +5,7 @@ pub enum UpdateAction {
     NpmGlobalLatest,
     /// Update via `bun install -g @cometix/codex`.
     BunGlobalLatest,
-    /// Update via `brew upgrade --cask codex`.
+    /// Update via `brew upgrade codex`.
     BrewUpgrade,
 }
 
@@ -57,7 +57,7 @@ fn detect_update_action(
     {
         Some(UpdateAction::BrewUpgrade)
     } else {
-        // cometix: default to npm if no specific manager is detected
+        // @cometix: default to npm if no specific manager is detected
         Some(UpdateAction::NpmGlobalLatest)
     }
 }
@@ -68,44 +68,59 @@ mod tests {
 
     #[test]
     fn detects_update_action_without_env_mutation() {
-        // cometix: default to npm when no manager is detected
+        // @cometix: default to npm when no manager is detected
         assert_eq!(
-            detect_update_action(false, std::path::Path::new("/any/path"), false, false),
+            detect_update_action(
+                /*is_macos*/ false,
+                std::path::Path::new("/any/path"),
+                /*managed_by_npm*/ false,
+                /*managed_by_bun*/ false
+            ),
             Some(UpdateAction::NpmGlobalLatest)
         );
         assert_eq!(
-            detect_update_action(false, std::path::Path::new("/any/path"), true, false),
+            detect_update_action(
+                /*is_macos*/ false,
+                std::path::Path::new("/any/path"),
+                /*managed_by_npm*/ true,
+                /*managed_by_bun*/ false
+            ),
             Some(UpdateAction::NpmGlobalLatest)
         );
         assert_eq!(
-            detect_update_action(false, std::path::Path::new("/any/path"), false, true),
+            detect_update_action(
+                /*is_macos*/ false,
+                std::path::Path::new("/any/path"),
+                /*managed_by_npm*/ false,
+                /*managed_by_bun*/ true
+            ),
             Some(UpdateAction::BunGlobalLatest)
         );
         assert_eq!(
             detect_update_action(
-                true,
+                /*is_macos*/ true,
                 std::path::Path::new("/opt/homebrew/bin/codex"),
-                false,
-                false
+                /*managed_by_npm*/ false,
+                /*managed_by_bun*/ false
             ),
             Some(UpdateAction::BrewUpgrade)
         );
         assert_eq!(
             detect_update_action(
-                true,
+                /*is_macos*/ true,
                 std::path::Path::new("/usr/local/bin/codex"),
-                false,
-                false
+                /*managed_by_npm*/ false,
+                /*managed_by_bun*/ false
             ),
             Some(UpdateAction::BrewUpgrade)
         );
         // npm takes precedence over brew
         assert_eq!(
             detect_update_action(
-                true,
+                /*is_macos*/ true,
                 std::path::Path::new("/opt/homebrew/bin/codex"),
-                true,
-                false
+                /*managed_by_npm*/ true,
+                /*managed_by_bun*/ false
             ),
             Some(UpdateAction::NpmGlobalLatest)
         );
