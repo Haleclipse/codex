@@ -1,9 +1,9 @@
 #![cfg(not(debug_assertions))]
 
+use crate::legacy_core::config::Config;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
-use codex_core::config::Config;
 use codex_login::default_client::create_client;
 use serde::Deserialize;
 use serde::Serialize;
@@ -70,7 +70,7 @@ struct NpmDistTags {
 }
 
 fn version_filepath(config: &Config) -> PathBuf {
-    config.codex_home.join(VERSION_FILENAME)
+    config.codex_home.join(VERSION_FILENAME).into_path_buf()
 }
 
 fn read_version_info(version_file: &Path) -> anyhow::Result<VersionInfo> {

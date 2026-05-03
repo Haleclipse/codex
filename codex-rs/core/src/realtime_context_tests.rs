@@ -1,19 +1,33 @@
+use super::build_current_thread_section;
 use super::build_recent_work_section;
 use super::build_workspace_section_with_user_root;
 use chrono::TimeZone;
 use chrono::Utc;
+use codex_git_utils::GitSha;
 use codex_protocol::ThreadId;
-use codex_state::ThreadMetadata;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::GitInfo;
+use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SessionSource;
+use codex_thread_store::StoredThread;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-fn thread_metadata(cwd: &str, title: &str, first_user_message: &str) -> ThreadMetadata {
-    ThreadMetadata {
-        id: ThreadId::new(),
-        rollout_path: PathBuf::from("/tmp/rollout.jsonl"),
+fn stored_thread(cwd: &str, title: &str, first_user_message: &str) -> StoredThread {
+    StoredThread {
+        thread_id: ThreadId::new(),
+        rollout_path: Some(PathBuf::from("/tmp/rollout.jsonl")),
+        forked_from_id: None,
+        preview: first_user_message.to_string(),
+        name: (!title.is_empty()).then(|| title.to_string()),
+        model_provider: "test-provider".to_string(),
+        model: Some("gpt-5".to_string()),
+        reasoning_effort: None,
         created_at: Utc
             .timestamp_opt(1_709_251_100, 0)
             .single()
@@ -22,25 +36,138 @@ fn thread_metadata(cwd: &str, title: &str, first_user_message: &str) -> ThreadMe
             .timestamp_opt(1_709_251_200, 0)
             .single()
             .expect("valid timestamp"),
-        source: "cli".to_string(),
-        agent_path: None,
-        agent_nickname: None,
-        agent_role: None,
-        model_provider: "test-provider".to_string(),
-        model: Some("gpt-5".to_string()),
-        reasoning_effort: None,
+        archived_at: None,
         cwd: PathBuf::from(cwd),
         cli_version: "test".to_string(),
-        title: title.to_string(),
-        sandbox_policy: "workspace-write".to_string(),
-        approval_mode: "never".to_string(),
-        tokens_used: 0,
+        source: SessionSource::Cli,
+        agent_nickname: None,
+        agent_role: None,
+        agent_path: None,
+        git_info: Some(GitInfo {
+            commit_hash: Some(GitSha::new("abcdef")),
+            branch: Some("main".to_string()),
+            repository_url: None,
+        }),
+        approval_mode: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        token_usage: None,
         first_user_message: Some(first_user_message.to_string()),
-        archived_at: None,
-        git_sha: None,
-        git_branch: Some("main".to_string()),
-        git_origin_url: None,
+        history: None,
     }
+}
+
+fn message(role: &str, content: ContentItem) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: role.to_string(),
+        content: vec![content],
+        end_turn: None,
+        phase: None,
+    }
+}
+
+fn user_message(text: impl Into<String>) -> ResponseItem {
+    message("user", ContentItem::InputText { text: text.into() })
+}
+
+fn assistant_message(text: impl Into<String>) -> ResponseItem {
+    message("assistant", ContentItem::OutputText { text: text.into() })
+}
+
+fn long_turn_text(index: usize) -> String {
+    format!(
+        "turn-{index}-start {} turn-{index}-middle {} turn-{index}-end",
+        "head filler ".repeat(160),
+        "tail filler ".repeat(240),
+    )
+}
+
+#[test]
+fn current_thread_section_includes_short_turns_newest_first_until_budget() {
+    let items = vec![
+        user_message("user turn 1"),
+        assistant_message("assistant turn 1"),
+        user_message("user turn 2"),
+        assistant_message("assistant turn 2"),
+        user_message("user turn 3"),
+        assistant_message("assistant turn 3"),
+        user_message("user turn 4"),
+        assistant_message("assistant turn 4"),
+    ];
+
+    assert_eq!(
+        build_current_thread_section(&items),
+        Some(
+            r#"Most recent user/assistant turns from this exact thread. Use them for continuity when responding.
+
+### Latest turn
+User:
+user turn 4
+
+Assistant:
+assistant turn 4
+
+### Previous turn 1
+User:
+user turn 3
+
+Assistant:
+assistant turn 3
+
+### Previous turn 2
+User:
+user turn 2
+
+Assistant:
+assistant turn 2
+
+### Previous turn 3
+User:
+user turn 1
+
+Assistant:
+assistant turn 1"#
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn current_thread_turn_truncation_preserves_start_and_end() {
+    let items = vec![user_message(long_turn_text(/*index*/ 0))];
+    let section = build_current_thread_section(&items).expect("current thread section");
+
+    assert_eq!(
+        (
+            section.contains("turn-0-start"),
+            section.contains("turn-0-middle"),
+            section.contains("turn-0-end"),
+            section.contains("tokens truncated"),
+        ),
+        (true, false, true, true),
+    );
+}
+
+#[test]
+fn current_thread_section_keeps_latest_turns_when_history_exceeds_budget() {
+    let mut items = Vec::new();
+    for index in 1..=8 {
+        items.push(user_message(long_turn_text(index)));
+        items.push(assistant_message(format!("assistant turn {index}")));
+    }
+
+    let section = build_current_thread_section(&items).expect("current thread section");
+
+    assert_eq!(
+        (
+            section.contains("turn-8-start"),
+            section.contains("turn-8-end"),
+            section.contains("### Previous turn 2"),
+            section.contains("turn-1-start"),
+            section.contains("turn-1-end"),
+        ),
+        (true, true, true, false, false),
+    );
 }
 
 #[test]
@@ -107,17 +234,17 @@ fn recent_work_section_groups_threads_by_cwd() {
     fs::create_dir_all(&outside).expect("create outside dir");
 
     let recent_threads = vec![
-        thread_metadata(
+        stored_thread(
             workspace_a.to_string_lossy().as_ref(),
             "Investigate realtime startup context",
             "Log the startup context before sending it",
         ),
-        thread_metadata(
+        stored_thread(
             workspace_b.to_string_lossy().as_ref(),
             "Trim websocket startup payload",
             "Remove memories from the realtime startup context",
         ),
-        thread_metadata(outside.to_string_lossy().as_ref(), "", "Inspect flaky test"),
+        stored_thread(outside.to_string_lossy().as_ref(), "", "Inspect flaky test"),
     ];
     let current_cwd = workspace_a;
     let repo = fs::canonicalize(repo).expect("canonicalize repo");

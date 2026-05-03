@@ -21,6 +21,7 @@ pub enum SlashCommand {
     #[strum(serialize = "sandbox-add-read-dir")]
     SandboxReadRoot,
     Experimental,
+    Memories,
     Skills,
     Review,
     Rename,
@@ -29,8 +30,6 @@ pub enum SlashCommand {
     Fork,
     Init,
     Compact,
-    Cxline,
-    Translate,
     Plan,
     Collab,
     Agent,
@@ -42,6 +41,9 @@ pub enum SlashCommand {
     DebugConfig,
     Title,
     Statusline,
+    // @cometix: configure statusline and translation overlays
+    Cxline,
+    Translate,
     Theme,
     Mcp,
     Apps,
@@ -91,6 +93,8 @@ impl SlashCommand {
             SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
             SlashCommand::Title => "configure which items appear in the terminal title",
             SlashCommand::Statusline => "configure which items appear in the status line",
+            SlashCommand::Cxline => "configure statusline appearance",
+            SlashCommand::Translate => "configure reasoning translation",
             SlashCommand::Theme => "choose a syntax highlighting theme",
             SlashCommand::Ps => "list background terminals",
             SlashCommand::Stop => "stop all background terminals",
@@ -111,8 +115,7 @@ impl SlashCommand {
                 "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
             }
             SlashCommand::Experimental => "toggle experimental features",
-            SlashCommand::Cxline => "configure statusline appearance",
-            SlashCommand::Translate => "configure reasoning translation",
+            SlashCommand::Memories => "configure memory use and generation",
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Apps => "manage apps",
             SlashCommand::Plugins => "browse plugins",
@@ -158,14 +161,15 @@ impl SlashCommand {
             | SlashCommand::ElevateSandbox
             | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
-            | SlashCommand::Cxline
-            | SlashCommand::Translate
+            | SlashCommand::Memories
             | SlashCommand::Review
             | SlashCommand::Plan
             | SlashCommand::Clear
             | SlashCommand::Logout
             | SlashCommand::MemoryDrop
-            | SlashCommand::MemoryUpdate => false,
+            | SlashCommand::MemoryUpdate
+            | SlashCommand::Cxline
+            | SlashCommand::Translate => false,
             SlashCommand::Diff
             | SlashCommand::Copy
             | SlashCommand::Rename
@@ -198,6 +202,7 @@ impl SlashCommand {
             SlashCommand::SandboxReadRoot => cfg!(target_os = "windows"),
             SlashCommand::Copy => !cfg!(target_os = "android"),
             SlashCommand::Rollout | SlashCommand::TestApproval => cfg!(debug_assertions),
+            SlashCommand::Memories => false,
             _ => true,
         }
     }

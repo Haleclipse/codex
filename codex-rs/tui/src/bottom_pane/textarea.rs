@@ -1367,7 +1367,7 @@ impl TextArea {
 impl WidgetRef for &TextArea {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let lines = self.wrapped_lines(area.width);
-        self.render_lines(area, buf, &lines, 0..lines.len(), Style::default());
+        self.render_lines(area, buf, &lines, 0..lines.len(), Style::default(), &[]);
     }
 }
 
@@ -1381,7 +1381,7 @@ impl StatefulWidgetRef for &TextArea {
 
         let start = scroll as usize;
         let end = (scroll + area.height).min(lines.len() as u16) as usize;
-        self.render_lines(area, buf, &lines, start..end, Style::default());
+        self.render_lines(area, buf, &lines, start..end, Style::default(), &[]);
     }
 }
 
@@ -1418,7 +1418,28 @@ impl TextArea {
 
         let start = scroll as usize;
         let end = (scroll + area.height).min(lines.len() as u16) as usize;
-        self.render_lines(area, buf, &lines, start..end, base_style);
+        self.render_lines(area, buf, &lines, start..end, base_style, &[]);
+    }
+
+    /// Render the textarea with `base_style` plus additional render-only highlight ranges.
+    ///
+    /// Highlight ranges are byte ranges in `self.text`. They affect only the buffer rendering and
+    /// do not mutate the editable text, cursor, element metadata, or wrapping cache.
+    pub(crate) fn render_ref_styled_with_highlights(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        state: &mut TextAreaState,
+        base_style: Style,
+        highlights: &[(Range<usize>, Style)],
+    ) {
+        let lines = self.wrapped_lines(area.width);
+        let scroll = self.effective_scroll(area.height, &lines, state.scroll);
+        state.scroll = scroll;
+
+        let start = scroll as usize;
+        let end = (scroll + area.height).min(lines.len() as u16) as usize;
+        self.render_lines(area, buf, &lines, start..end, base_style, highlights);
     }
 
     fn render_lines(
@@ -1428,6 +1449,7 @@ impl TextArea {
         lines: &[Range<usize>],
         range: std::ops::Range<usize>,
         base_style: Style,
+        highlights: &[(Range<usize>, Style)],
     ) {
         for (row, idx) in range.enumerate() {
             let r = &lines[idx];
@@ -1451,27 +1473,32 @@ impl TextArea {
                 buf.set_string(area.x + x_off, y, styled, style);
             }
 
-            // Apply reverse style to the character at cursor position.
-            // For wide characters (CJK, emoji), we need to apply the style to all cells
-            // that the character occupies.
+            // Overlay render-only highlight ranges last so transient search highlighting remains
+            // visible even when it intersects attachment placeholders or other styled elements.
+            for (highlight_range, style) in highlights {
+                let overlap_start = highlight_range.start.max(line_range.start);
+                let overlap_end = highlight_range.end.min(line_range.end);
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                let highlighted = &self.text[overlap_start..overlap_end];
+                let x_off = self.text[line_range.start..overlap_start].width() as u16;
+                buf.set_string(area.x + x_off, y, highlighted, *style);
+            }
+
+            // @cometix: apply reverse style to character at cursor position
             if self.cursor_pos >= line_range.start && self.cursor_pos <= line_range.end {
                 let cursor_x = self.text[line_range.start..self.cursor_pos].width() as u16;
                 let cursor_screen_x = area.x + cursor_x;
-
-                // Determine the width of the character at cursor position
                 let char_width = if self.cursor_pos < line_range.end {
-                    // Get the grapheme at cursor position and calculate its width
                     self.text[self.cursor_pos..]
                         .graphemes(true)
                         .next()
                         .map(unicode_width::UnicodeWidthStr::width)
                         .unwrap_or(1)
                 } else {
-                    // Cursor is at end of line, use width 1 for block cursor
                     1
                 };
-
-                // Apply reverse style to all cells occupied by this character
                 for offset in 0..char_width {
                     let x = cursor_screen_x + offset as u16;
                     if x < area.x + area.width
@@ -2217,6 +2244,43 @@ mod tests {
         // After render, state.scroll should be adjusted so cursor row fits
         let effective_lines = t.desired_height(small_area.width);
         assert!(state.scroll < effective_lines);
+    }
+
+    #[test]
+    fn render_highlights_apply_style_without_mutating_text() {
+        let t = ta_with("hello world");
+        let area = Rect::new(0, 0, 20, 1);
+        let mut state = TextAreaState::default();
+        let mut buf = Buffer::empty(area);
+        let highlight_style = Style::default().add_modifier(ratatui::style::Modifier::REVERSED);
+
+        t.render_ref_styled_with_highlights(
+            area,
+            &mut buf,
+            &mut state,
+            Style::default(),
+            &[(6..11, highlight_style)],
+        );
+
+        assert_eq!(t.text(), "hello world");
+        assert!(
+            !buf[(0, 0)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            buf[(6, 0)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert!(
+            buf[(10, 0)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
     }
 
     #[test]
