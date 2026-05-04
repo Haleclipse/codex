@@ -37,7 +37,7 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                         let tool_name =
                             ToolName::namespaced(namespace.name.clone(), tool.name.clone());
                         let definition = CodeModeToolDefinition {
-                            name: tool_name.display(),
+                            name: code_mode_name_for_tool_name(&tool_name),
                             tool_name,
                             description: tool.description.clone(),
                             kind: CodeModeToolKind::Function,
@@ -138,7 +138,8 @@ pub fn create_wait_tool() -> ToolSpec {
 pub fn create_code_mode_tool(
     enabled_tools: &[CodeModeToolDefinition],
     namespace_descriptions: &BTreeMap<String, codex_code_mode::ToolNamespaceDescription>,
-    code_mode_only_enabled: bool,
+    code_mode_only: bool,
+    deferred_tools_available: bool,
 ) -> ToolSpec {
     const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
 start: pragma_source | plain_source
@@ -155,7 +156,8 @@ SOURCE: /[\s\S]+/
         description: codex_code_mode::build_exec_tool_description(
             enabled_tools,
             namespace_descriptions,
-            code_mode_only_enabled,
+            code_mode_only,
+            deferred_tools_available,
         ),
         format: FreeformToolFormat {
             r#type: "grammar".to_string(),
@@ -206,7 +208,7 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 ResponsesApiNamespaceTool::Function(tool) => {
                     let tool_name = ToolName::namespaced(namespace.name.clone(), tool.name.clone());
                     CodeModeToolDefinition {
-                        name: tool_name.display(),
+                        name: code_mode_name_for_tool_name(&tool_name),
                         tool_name,
                         description: tool.description.clone(),
                         kind: CodeModeToolKind::Function,
@@ -220,6 +222,16 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
         | ToolSpec::ImageGeneration { .. }
         | ToolSpec::ToolSearch { .. }
         | ToolSpec::WebSearch { .. } => Vec::new(),
+    }
+}
+
+pub fn code_mode_name_for_tool_name(tool_name: &ToolName) -> String {
+    match tool_name.namespace.as_deref() {
+        Some(namespace) if namespace.ends_with('_') || tool_name.name.starts_with('_') => {
+            format!("{namespace}{}", tool_name.name)
+        }
+        Some(namespace) => format!("{namespace}_{}", tool_name.name),
+        None => tool_name.name.clone(),
     }
 }
 

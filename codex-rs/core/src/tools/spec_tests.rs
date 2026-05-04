@@ -16,6 +16,7 @@ use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
+use codex_tools::AdditionalProperties;
 use codex_tools::ConfiguredToolSpec;
 use codex_tools::DiscoverableTool;
 use codex_tools::JsonSchema;
@@ -106,9 +107,9 @@ fn discoverable_connector(id: &str, name: &str, description: &str) -> Discoverab
     }))
 }
 
-fn search_capable_model_info() -> ModelInfo {
-    let config = test_config();
-    let mut model_info = construct_model_info_offline("gpt-5-codex", &config);
+async fn search_capable_model_info() -> ModelInfo {
+    let config = test_config().await;
+    let mut model_info = construct_model_info_offline("gpt-5.4", &config);
     model_info.supports_search_tool = true;
     model_info
 }
@@ -215,9 +216,9 @@ fn find_namespace_function_tool<'a>(
         .unwrap_or_else(|| panic!("expected tool {expected_namespace}{expected_name} in namespace"))
 }
 
-fn multi_agent_v2_tools_config() -> ToolsConfig {
-    let config = test_config();
-    let model_info = construct_model_info_offline("gpt-5-codex", &config);
+async fn multi_agent_v2_tools_config() -> ToolsConfig {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::Collab);
     features.enable(Feature::MultiAgentV2);
@@ -249,8 +250,8 @@ fn multi_agent_v2_spawn_agent_description(tools_config: &ToolsConfig) -> String 
     description.clone()
 }
 
-fn model_info_from_models_json(slug: &str) -> ModelInfo {
-    let config = test_config();
+async fn model_info_from_models_json(slug: &str) -> ModelInfo {
+    let config = test_config().await;
     let response = bundled_models_response()
         .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
     let model = response
@@ -268,18 +269,35 @@ fn build_specs(
     deferred_mcp_tools: Option<HashMap<String, ToolInfo>>,
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
+    build_specs_with_unavailable_tools(
+        config,
+        mcp_tools,
+        deferred_mcp_tools,
+        Vec::new(),
+        dynamic_tools,
+    )
+}
+
+fn build_specs_with_unavailable_tools(
+    config: &ToolsConfig,
+    mcp_tools: Option<HashMap<String, ToolInfo>>,
+    deferred_mcp_tools: Option<HashMap<String, ToolInfo>>,
+    unavailable_called_tools: Vec<ToolName>,
+    dynamic_tools: &[DynamicToolSpec],
+) -> ToolRegistryBuilder {
     build_specs_with_discoverable_tools(
         config,
         mcp_tools,
         deferred_mcp_tools,
+        unavailable_called_tools,
         /*discoverable_tools*/ None,
         dynamic_tools,
     )
 }
 
-#[test]
-fn model_provided_unified_exec_is_blocked_for_windows_sandboxed_policies() {
-    let mut model_info = model_info_from_models_json("gpt-5-codex");
+#[tokio::test]
+async fn model_provided_unified_exec_is_blocked_for_windows_sandboxed_policies() {
+    let mut model_info = model_info_from_models_json("gpt-5.4").await;
     model_info.shell_type = ConfigShellToolType::UnifiedExec;
     let features = Features::with_defaults();
     let available_models = Vec::new();
@@ -302,10 +320,10 @@ fn model_provided_unified_exec_is_blocked_for_windows_sandboxed_policies() {
     assert_eq!(config.shell_type, expected_shell_type);
 }
 
-#[test]
-fn get_memory_requires_feature_flag() {
-    let config = test_config();
-    let model_info = construct_model_info_offline("gpt-5-codex", &config);
+#[tokio::test]
+async fn get_memory_requires_feature_flag() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
     let mut features = Features::with_defaults();
     features.disable(Feature::MemoryTool);
     let available_models = Vec::new();
@@ -332,14 +350,14 @@ fn get_memory_requires_feature_flag() {
     );
 }
 
-fn assert_model_tools(
+async fn assert_model_tools(
     model_slug: &str,
     features: &Features,
     web_search_mode: Option<WebSearchMode>,
     expected_tools: &[&str],
 ) {
-    let _config = test_config();
-    let model_info = model_info_from_models_json(model_slug);
+    let _config = test_config().await;
+    let model_info = model_info_from_models_json(model_slug).await;
     let available_models = Vec::new();
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
@@ -356,6 +374,7 @@ fn assert_model_tools(
         ToolRouterParams {
             mcp_tools: None,
             deferred_mcp_tools: None,
+            unavailable_called_tools: Vec::new(),
             parallel_mcp_server_names: std::collections::HashSet::new(),
             discoverable_tools: None,
             dynamic_tools: &[],
@@ -369,7 +388,7 @@ fn assert_model_tools(
     assert_eq!(&tool_names, &expected_tools,);
 }
 
-fn assert_default_model_tools(
+async fn assert_default_model_tools(
     model_slug: &str,
     features: &Features,
     web_search_mode: Option<WebSearchMode>,
@@ -382,14 +401,14 @@ fn assert_default_model_tools(
         vec![shell_tool]
     };
     expected.extend(expected_tail);
-    assert_model_tools(model_slug, features, web_search_mode, &expected);
+    assert_model_tools(model_slug, features, web_search_mode, &expected).await;
 }
 
-#[test]
-fn test_build_specs_gpt5_codex_default() {
+#[tokio::test]
+async fn test_build_specs_gpt5_codex_default() {
     let features = Features::with_defaults();
     assert_default_model_tools(
-        "gpt-5-codex",
+        "gpt-5.4",
         &features,
         Some(WebSearchMode::Cached),
         "shell_command",
@@ -398,6 +417,7 @@ fn test_build_specs_gpt5_codex_default() {
             "request_user_input",
             "apply_patch",
             "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
@@ -405,14 +425,15 @@ fn test_build_specs_gpt5_codex_default() {
             "wait_agent",
             "close_agent",
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_build_specs_gpt51_codex_default() {
+#[tokio::test]
+async fn test_build_specs_gpt51_codex_default() {
     let features = Features::with_defaults();
     assert_default_model_tools(
-        "gpt-5.1-codex",
+        "gpt-5.4",
         &features,
         Some(WebSearchMode::Cached),
         "shell_command",
@@ -421,6 +442,7 @@ fn test_build_specs_gpt51_codex_default() {
             "request_user_input",
             "apply_patch",
             "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
@@ -428,15 +450,16 @@ fn test_build_specs_gpt51_codex_default() {
             "wait_agent",
             "close_agent",
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_build_specs_gpt5_codex_unified_exec_web_search() {
+#[tokio::test]
+async fn test_build_specs_gpt5_codex_unified_exec_web_search() {
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
     assert_model_tools(
-        "gpt-5-codex",
+        "gpt-5.4",
         &features,
         Some(WebSearchMode::Live),
         &[
@@ -446,6 +469,7 @@ fn test_build_specs_gpt5_codex_unified_exec_web_search() {
             "request_user_input",
             "apply_patch",
             "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
@@ -453,15 +477,16 @@ fn test_build_specs_gpt5_codex_unified_exec_web_search() {
             "wait_agent",
             "close_agent",
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_build_specs_gpt51_codex_unified_exec_web_search() {
+#[tokio::test]
+async fn test_build_specs_gpt51_codex_unified_exec_web_search() {
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
     assert_model_tools(
-        "gpt-5.1-codex",
+        "gpt-5.4",
         &features,
         Some(WebSearchMode::Live),
         &[
@@ -471,6 +496,7 @@ fn test_build_specs_gpt51_codex_unified_exec_web_search() {
             "request_user_input",
             "apply_patch",
             "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
@@ -478,14 +504,15 @@ fn test_build_specs_gpt51_codex_unified_exec_web_search() {
             "wait_agent",
             "close_agent",
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_gpt_5_1_codex_max_defaults() {
+#[tokio::test]
+async fn test_gpt_5_1_codex_max_defaults() {
     let features = Features::with_defaults();
     assert_default_model_tools(
-        "gpt-5.1-codex-max",
+        "gpt-5.4",
         &features,
         Some(WebSearchMode::Cached),
         "shell_command",
@@ -494,6 +521,7 @@ fn test_gpt_5_1_codex_max_defaults() {
             "request_user_input",
             "apply_patch",
             "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
@@ -501,14 +529,15 @@ fn test_gpt_5_1_codex_max_defaults() {
             "wait_agent",
             "close_agent",
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_codex_5_1_mini_defaults() {
+#[tokio::test]
+async fn test_codex_5_1_mini_defaults() {
     let features = Features::with_defaults();
     assert_default_model_tools(
-        "gpt-5.1-codex-mini",
+        "gpt-5.4-mini",
         &features,
         Some(WebSearchMode::Cached),
         "shell_command",
@@ -517,6 +546,7 @@ fn test_codex_5_1_mini_defaults() {
             "request_user_input",
             "apply_patch",
             "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
@@ -524,36 +554,15 @@ fn test_codex_5_1_mini_defaults() {
             "wait_agent",
             "close_agent",
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_gpt_5_defaults() {
+#[tokio::test]
+async fn test_gpt_5_defaults() {
     let features = Features::with_defaults();
     assert_default_model_tools(
-        "gpt-5",
-        &features,
-        Some(WebSearchMode::Cached),
-        "shell",
-        &[
-            "update_plan",
-            "request_user_input",
-            "web_search",
-            "view_image",
-            "spawn_agent",
-            "send_input",
-            "resume_agent",
-            "wait_agent",
-            "close_agent",
-        ],
-    );
-}
-
-#[test]
-fn test_gpt_5_1_defaults() {
-    let features = Features::with_defaults();
-    assert_default_model_tools(
-        "gpt-5.1",
+        "gpt-5.2",
         &features,
         Some(WebSearchMode::Cached),
         "shell_command",
@@ -562,6 +571,7 @@ fn test_gpt_5_1_defaults() {
             "request_user_input",
             "apply_patch",
             "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
@@ -569,15 +579,41 @@ fn test_gpt_5_1_defaults() {
             "wait_agent",
             "close_agent",
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_gpt_5_1_codex_max_unified_exec_web_search() {
+#[tokio::test]
+async fn test_gpt_5_1_defaults() {
+    let features = Features::with_defaults();
+    assert_default_model_tools(
+        "gpt-5.4",
+        &features,
+        Some(WebSearchMode::Cached),
+        "shell_command",
+        &[
+            "update_plan",
+            "request_user_input",
+            "apply_patch",
+            "web_search",
+            "image_generation",
+            "view_image",
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_gpt_5_1_codex_max_unified_exec_web_search() {
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
     assert_model_tools(
-        "gpt-5.1-codex-max",
+        "gpt-5.4",
         &features,
         Some(WebSearchMode::Live),
         &[
@@ -587,6 +623,7 @@ fn test_gpt_5_1_codex_max_unified_exec_web_search() {
             "request_user_input",
             "apply_patch",
             "web_search",
+            "image_generation",
             "view_image",
             "spawn_agent",
             "send_input",
@@ -594,12 +631,13 @@ fn test_gpt_5_1_codex_max_unified_exec_web_search() {
             "wait_agent",
             "close_agent",
         ],
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_build_specs_default_shell_present() {
-    let config = test_config();
+#[tokio::test]
+async fn test_build_specs_default_shell_present() {
+    let config = test_config().await;
     let model_info = construct_model_info_offline("o3", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
@@ -630,9 +668,9 @@ fn test_build_specs_default_shell_present() {
     assert_contains_tool_names(&tools, &subset);
 }
 
-#[test]
-fn shell_zsh_fork_prefers_shell_command_over_unified_exec() {
-    let config = test_config();
+#[tokio::test]
+async fn shell_zsh_fork_prefers_shell_command_over_unified_exec() {
+    let config = test_config().await;
     let model_info = construct_model_info_offline("o3", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
@@ -694,19 +732,21 @@ fn shell_zsh_fork_prefers_shell_command_over_unified_exec() {
     );
 }
 
-#[test]
-fn spawn_agent_description_omits_usage_hint_when_disabled() {
+#[tokio::test]
+async fn spawn_agent_description_omits_usage_hint_when_disabled() {
     let tools_config = multi_agent_v2_tools_config()
+        .await
         .with_spawn_agent_usage_hint(/*spawn_agent_usage_hint*/ false);
     let description = multi_agent_v2_spawn_agent_description(&tools_config);
 
     assert_regex_match(
         r#"(?sx)
             ^\s*
-            No\ picker-visible\ models\ are\ currently\ loaded\.
+            No\ picker-visible\ model\ overrides\ are\ currently\ loaded\.
             \s+Spawns\ an\ agent\ to\ work\ on\ the\ specified\ task\.\ If\ your\ current\ task\ is\ `/root/task1`\ and\ you\ spawn_agent\ with\ task_name\ "task_3"\ the\ agent\ will\ have\ canonical\ task\ name\ `/root/task1/task_3`\.
             \s+You\ are\ then\ able\ to\ refer\ to\ this\ agent\ as\ `task_3`\ or\ `/root/task1/task_3`\ interchangeably\.\ However\ an\ agent\ `/root/task2/task_3`\ would\ only\ be\ able\ to\ communicate\ with\ this\ agent\ via\ its\ canonical\ name\ `/root/task1/task_3`\.
             \s+The\ spawned\ agent\ will\ have\ the\ same\ tools\ as\ you\ and\ the\ ability\ to\ spawn\ its\ own\ subagents\.
+            \s+Spawned\ agents\ inherit\ your\ current\ model\ by\ default\.\ Omit\ `model`\ to\ use\ that\ preferred\ default;\ set\ `model`\ only\ when\ an\ explicit\ override\ is\ needed\.
             \s+It\ will\ be\ able\ to\ send\ you\ and\ other\ running\ agents\ messages,\ and\ its\ final\ answer\ will\ be\ provided\ to\ you\ when\ it\ finishes\.
             \s+The\ new\ agent's\ canonical\ task\ name\ will\ be\ provided\ to\ it\ along\ with\ the\ message\.
             \s*$
@@ -715,20 +755,23 @@ fn spawn_agent_description_omits_usage_hint_when_disabled() {
     );
 }
 
-#[test]
-fn spawn_agent_description_uses_configured_usage_hint_text() {
-    let tools_config = multi_agent_v2_tools_config().with_spawn_agent_usage_hint_text(Some(
-        /*spawn_agent_usage_hint_text*/ "Custom delegation guidance only.".to_string(),
-    ));
+#[tokio::test]
+async fn spawn_agent_description_uses_configured_usage_hint_text() {
+    let tools_config = multi_agent_v2_tools_config()
+        .await
+        .with_spawn_agent_usage_hint_text(Some(
+            /*spawn_agent_usage_hint_text*/ "Custom delegation guidance only.".to_string(),
+        ));
     let description = multi_agent_v2_spawn_agent_description(&tools_config);
 
     assert_regex_match(
         r#"(?sx)
             ^\s*
-            No\ picker-visible\ models\ are\ currently\ loaded\.
+            No\ picker-visible\ model\ overrides\ are\ currently\ loaded\.
             \s+Spawns\ an\ agent\ to\ work\ on\ the\ specified\ task\.\ If\ your\ current\ task\ is\ `/root/task1`\ and\ you\ spawn_agent\ with\ task_name\ "task_3"\ the\ agent\ will\ have\ canonical\ task\ name\ `/root/task1/task_3`\.
             \s+You\ are\ then\ able\ to\ refer\ to\ this\ agent\ as\ `task_3`\ or\ `/root/task1/task_3`\ interchangeably\.\ However\ an\ agent\ `/root/task2/task_3`\ would\ only\ be\ able\ to\ communicate\ with\ this\ agent\ via\ its\ canonical\ name\ `/root/task1/task_3`\.
             \s+The\ spawned\ agent\ will\ have\ the\ same\ tools\ as\ you\ and\ the\ ability\ to\ spawn\ its\ own\ subagents\.
+            \s+Spawned\ agents\ inherit\ your\ current\ model\ by\ default\.\ Omit\ `model`\ to\ use\ that\ preferred\ default;\ set\ `model`\ only\ when\ an\ explicit\ override\ is\ needed\.
             \s+It\ will\ be\ able\ to\ send\ you\ and\ other\ running\ agents\ messages,\ and\ its\ final\ answer\ will\ be\ provided\ to\ you\ when\ it\ finishes\.
             \s+The\ new\ agent's\ canonical\ task\ name\ will\ be\ provided\ to\ it\ along\ with\ the\ message\.
             \s+Custom\ delegation\ guidance\ only\.
@@ -738,9 +781,9 @@ fn spawn_agent_description_uses_configured_usage_hint_text() {
     );
 }
 
-#[test]
-fn tool_suggest_requires_apps_and_plugins_features() {
-    let model_info = search_capable_model_info();
+#[tokio::test]
+async fn tool_suggest_requires_apps_and_plugins_features() {
+    let model_info = search_capable_model_info().await;
     let discoverable_tools = Some(vec![discoverable_connector(
         "connector_2128aebfecb84f64a069897515042a44",
         "Google Calendar",
@@ -770,6 +813,7 @@ fn tool_suggest_requires_apps_and_plugins_features() {
             &tools_config,
             /*mcp_tools*/ None,
             /*deferred_mcp_tools*/ None,
+            Vec::new(),
             discoverable_tools.clone(),
             &[],
         )
@@ -784,9 +828,9 @@ fn tool_suggest_requires_apps_and_plugins_features() {
     }
 }
 
-#[test]
-fn search_tool_description_handles_no_enabled_mcp_tools() {
-    let model_info = search_capable_model_info();
+#[tokio::test]
+async fn search_tool_description_handles_no_enabled_mcp_tools() {
+    let model_info = search_capable_model_info().await;
     let mut features = Features::with_defaults();
     features.enable(Feature::Apps);
     features.enable(Feature::ToolSearch);
@@ -818,9 +862,9 @@ fn search_tool_description_handles_no_enabled_mcp_tools() {
     assert!(!description.contains("{{source_descriptions}}"));
 }
 
-#[test]
-fn search_tool_description_falls_back_to_connector_name_without_description() {
-    let model_info = search_capable_model_info();
+#[tokio::test]
+async fn search_tool_description_falls_back_to_connector_name_without_description() {
+    let model_info = search_capable_model_info().await;
     let mut features = Features::with_defaults();
     features.enable(Feature::Apps);
     features.enable(Feature::ToolSearch);
@@ -869,9 +913,9 @@ fn search_tool_description_falls_back_to_connector_name_without_description() {
     assert!(!description.contains("- Calendar:"));
 }
 
-#[test]
-fn search_tool_registers_namespaced_mcp_tool_aliases() {
-    let model_info = search_capable_model_info();
+#[tokio::test]
+async fn search_tool_registers_namespaced_mcp_tool_aliases() {
+    let model_info = search_capable_model_info().await;
     let mut features = Features::with_defaults();
     features.enable(Feature::Apps);
     features.enable(Feature::ToolSearch);
@@ -954,10 +998,10 @@ fn search_tool_registers_namespaced_mcp_tool_aliases() {
     assert!(registry.has_handler(&mcp_alias));
 }
 
-#[test]
-fn direct_mcp_tools_register_namespaced_handlers() {
-    let config = test_config();
-    let model_info = construct_model_info_offline("gpt-5-codex", &config);
+#[tokio::test]
+async fn direct_mcp_tools_register_namespaced_handlers() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
     let available_models = Vec::new();
@@ -991,10 +1035,59 @@ fn direct_mcp_tools_register_namespaced_handlers() {
     assert!(!registry.has_handler(&ToolName::plain("mcp__test_server__echo")));
 }
 
-#[test]
-fn test_mcp_tool_property_missing_type_defaults_to_string() {
-    let config = test_config();
-    let model_info = construct_model_info_offline("gpt-5-codex", &config);
+#[tokio::test]
+async fn unavailable_mcp_tools_are_exposed_as_dummy_function_tools() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
+    let mut features = Features::with_defaults();
+    features.enable(Feature::UnifiedExec);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+
+    let unavailable_tool = ToolName::namespaced("mcp__codex_apps__calendar", "_create_event");
+    let (tools, registry) = build_specs_with_unavailable_tools(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        vec![unavailable_tool],
+        &[],
+    )
+    .build();
+
+    let tool = find_tool(&tools, "mcp__codex_apps__calendar_create_event");
+    let ToolSpec::Function(ResponsesApiTool {
+        description,
+        parameters,
+        ..
+    }) = &tool.spec
+    else {
+        panic!("unavailable MCP tool should be exposed as a function tool");
+    };
+    assert!(description.contains("not currently available"));
+    assert_eq!(
+        parameters.additional_properties,
+        Some(AdditionalProperties::Boolean(false))
+    );
+    assert!(registry.has_handler(&ToolName::namespaced(
+        "mcp__codex_apps__calendar",
+        "_create_event"
+    )));
+    assert!(!registry.has_handler(&ToolName::plain("mcp__codex_apps__calendar_create_event")));
+}
+
+#[tokio::test]
+async fn test_mcp_tool_property_missing_type_defaults_to_string() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
     let available_models = Vec::new();
@@ -1054,10 +1147,10 @@ fn test_mcp_tool_property_missing_type_defaults_to_string() {
     );
 }
 
-#[test]
-fn test_mcp_tool_preserves_integer_schema() {
-    let config = test_config();
-    let model_info = construct_model_info_offline("gpt-5-codex", &config);
+#[tokio::test]
+async fn test_mcp_tool_preserves_integer_schema() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
     let available_models = Vec::new();
@@ -1115,10 +1208,10 @@ fn test_mcp_tool_preserves_integer_schema() {
     );
 }
 
-#[test]
-fn test_mcp_tool_array_without_items_gets_default_string_items() {
-    let config = test_config();
-    let model_info = construct_model_info_offline("gpt-5-codex", &config);
+#[tokio::test]
+async fn test_mcp_tool_array_without_items_gets_default_string_items() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
     features.enable(Feature::ApplyPatchFreeform);
@@ -1180,10 +1273,10 @@ fn test_mcp_tool_array_without_items_gets_default_string_items() {
     );
 }
 
-#[test]
-fn test_mcp_tool_anyof_defaults_to_string() {
-    let config = test_config();
-    let model_info = construct_model_info_offline("gpt-5-codex", &config);
+#[tokio::test]
+async fn test_mcp_tool_anyof_defaults_to_string() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
     let available_models = Vec::new();
@@ -1249,10 +1342,10 @@ fn test_mcp_tool_anyof_defaults_to_string() {
     );
 }
 
-#[test]
-fn test_get_openai_tools_mcp_tools_with_additional_properties_schema() {
-    let config = test_config();
-    let model_info = construct_model_info_offline("gpt-5-codex", &config);
+#[tokio::test]
+async fn test_get_openai_tools_mcp_tools_with_additional_properties_schema() {
+    let config = test_config().await;
+    let model_info = construct_model_info_offline("gpt-5.4", &config);
     let mut features = Features::with_defaults();
     features.enable(Feature::UnifiedExec);
     let available_models = Vec::new();
@@ -1364,16 +1457,17 @@ fn test_get_openai_tools_mcp_tools_with_additional_properties_schema() {
     );
 }
 
-#[test]
-fn code_mode_only_restricts_model_tools_to_exec_tools() {
+#[tokio::test]
+async fn code_mode_only_restricts_model_tools_to_exec_tools() {
     let mut features = Features::with_defaults();
     features.enable(Feature::CodeMode);
     features.enable(Feature::CodeModeOnly);
 
     assert_model_tools(
-        "gpt-5.1-codex",
+        "gpt-5.4",
         &features,
         Some(WebSearchMode::Live),
         &["exec", "wait"],
-    );
+    )
+    .await;
 }

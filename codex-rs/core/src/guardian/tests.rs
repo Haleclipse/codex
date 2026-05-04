@@ -1,6 +1,4 @@
 use super::*;
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
 use crate::config::Constrained;
@@ -14,8 +12,14 @@ use crate::config_loader::NetworkDomainPermissionToml;
 use crate::config_loader::NetworkDomainPermissionsToml;
 use crate::config_loader::RequirementSource;
 use crate::config_loader::Sourced;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::test_support;
 use codex_config::config_toml::ConfigToml;
+use codex_config::types::McpServerConfig;
+use codex_exec_server::LOCAL_FS;
+use codex_features::Feature;
+use codex_model_provider::create_model_provider;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::NetworkApprovalProtocol;
@@ -24,6 +28,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::GuardianUserAuthorization;
@@ -50,6 +55,7 @@ use insta::Settings;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -69,7 +75,7 @@ async fn guardian_test_session_and_turn(
 async fn guardian_test_session_and_turn_with_base_url(
     base_url: &str,
 ) -> (Arc<Session>, Arc<TurnContext>) {
-    let (mut session, mut turn) = crate::codex::make_session_and_context().await;
+    let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
     session.conversation_id = fixed_guardian_parent_session_id();
     let mut config = (*turn.config).clone();
     config.model_provider.base_url = Some(format!("{base_url}/v1"));
@@ -82,7 +88,7 @@ async fn guardian_test_session_and_turn_with_base_url(
     ));
     session.services.models_manager = models_manager;
     turn.config = Arc::clone(&config);
-    turn.provider = config.model_provider.clone();
+    turn.provider = create_model_provider(config.model_provider.clone(), turn.auth_manager.clone());
     turn.user_instructions = None;
 
     (Arc::new(session), Arc::new(turn))
@@ -685,7 +691,7 @@ fn guardian_request_turn_id_prefers_network_access_owner_turn() {
 
 #[tokio::test]
 async fn cancelled_guardian_review_emits_terminal_abort_without_warning() {
-    let (session, turn, rx) = crate::codex::make_session_and_context_with_rx().await;
+    let (session, turn, rx) = crate::session::tests::make_session_and_context_with_rx().await;
     let cancel_token = CancellationToken::new();
     cancel_token.cancel();
 
@@ -736,8 +742,8 @@ fn guardian_timeout_message_distinguishes_timeout_from_policy_denial() {
 }
 
 #[tokio::test]
-async fn routes_approval_to_guardian_requires_auto_only_review_policy() {
-    let (_session, mut turn) = crate::codex::make_session_and_context().await;
+async fn routes_approval_to_guardian_requires_guardian_reviewer() {
+    let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config.approvals_reviewer = ApprovalsReviewer::User;
     turn.config = Arc::new(config.clone());
@@ -746,6 +752,25 @@ async fn routes_approval_to_guardian_requires_auto_only_review_policy() {
 
     config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
     turn.config = Arc::new(config);
+
+    assert!(routes_approval_to_guardian(&turn));
+}
+
+#[tokio::test]
+async fn routes_approval_to_guardian_allows_granular_review_policy() {
+    let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.approvals_reviewer = ApprovalsReviewer::GuardianSubagent;
+    turn.config = Arc::new(config);
+    turn.approval_policy
+        .set(AskForApproval::Granular(GranularApprovalConfig {
+            sandbox_approval: true,
+            rules: true,
+            skill_approval: true,
+            request_permissions: true,
+            mcp_elicitations: true,
+        }))
+        .expect("test setup should allow updating approval policy");
 
     assert!(routes_approval_to_guardian(&turn));
 }
@@ -874,7 +899,7 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     )
     .await;
 
-    let (mut session, mut turn) = crate::codex::make_session_and_context().await;
+    let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
     session.conversation_id = fixed_guardian_parent_session_id();
     let temp_cwd = TempDir::new()?;
     let mut config = (*turn.config).clone();
@@ -888,7 +913,7 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     ));
     session.services.models_manager = models_manager;
     turn.config = Arc::clone(&config);
-    turn.provider = config.model_provider.clone();
+    turn.provider = create_model_provider(config.model_provider.clone(), turn.auth_manager.clone());
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     seed_guardian_parent_history(&session, &turn).await;
@@ -941,7 +966,7 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
 
 #[tokio::test]
 async fn build_guardian_prompt_items_includes_parent_session_id() -> anyhow::Result<()> {
-    let (session, _) = crate::codex::make_session_and_context().await;
+    let (session, _) = crate::session::tests::make_session_and_context().await;
     let prompt = build_guardian_prompt_items(
         &session,
         /*retry_reason*/ None,
@@ -1244,7 +1269,8 @@ async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() -> 
     )
     .await;
 
-    let (mut session, mut turn, rx) = crate::codex::make_session_and_context_with_rx().await;
+    let (mut session, mut turn, rx) =
+        crate::session::tests::make_session_and_context_with_rx().await;
     let mut config = (*turn.config).clone();
     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
     config.user_instructions = None;
@@ -1260,7 +1286,8 @@ async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() -> 
         .models_manager = models_manager;
     let turn_mut = Arc::get_mut(&mut turn).expect("turn should be uniquely owned");
     turn_mut.config = Arc::clone(&config);
-    turn_mut.provider = config.model_provider.clone();
+    turn_mut.provider =
+        create_model_provider(config.model_provider.clone(), turn_mut.auth_manager.clone());
     turn_mut.user_instructions = None;
 
     seed_guardian_parent_history(&session, &turn).await;
@@ -1332,8 +1359,8 @@ async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() -> 
     Ok(())
 }
 
-#[test]
-fn guardian_parallel_reviews_fork_from_last_committed_trunk_history() -> anyhow::Result<()> {
+#[tokio::test]
+async fn guardian_parallel_reviews_fork_from_last_committed_trunk_history() -> anyhow::Result<()> {
     const TEST_STACK_SIZE_BYTES: usize = 2 * 1024 * 1024;
 
     let handle =
@@ -1569,9 +1596,9 @@ fn guardian_parallel_reviews_fork_from_last_committed_trunk_history() -> anyhow:
         )),
     }
 }
-#[test]
-fn guardian_review_session_config_preserves_parent_network_proxy() {
-    let mut parent_config = test_config();
+#[tokio::test]
+async fn guardian_review_session_config_preserves_parent_network_proxy() {
+    let mut parent_config = test_config().await;
     let network = NetworkProxySpec::from_config_and_constraints(
         NetworkProxyConfig::default(),
         Some(NetworkConstraints {
@@ -1616,9 +1643,9 @@ fn guardian_review_session_config_preserves_parent_network_proxy() {
     );
 }
 
-#[test]
-fn guardian_review_session_config_overrides_parent_developer_instructions() {
-    let mut parent_config = test_config();
+#[tokio::test]
+async fn guardian_review_session_config_overrides_parent_developer_instructions() {
+    let mut parent_config = test_config().await;
     parent_config.developer_instructions =
         Some("parent or managed config should not replace guardian policy".to_string());
 
@@ -1636,9 +1663,9 @@ fn guardian_review_session_config_overrides_parent_developer_instructions() {
     );
 }
 
-#[test]
-fn guardian_review_session_config_uses_live_network_proxy_state() {
-    let mut parent_config = test_config();
+#[tokio::test]
+async fn guardian_review_session_config_uses_live_network_proxy_state() {
+    let mut parent_config = test_config().await;
     let mut parent_network = NetworkProxyConfig::default();
     parent_network.network.enabled = true;
     parent_network
@@ -1680,9 +1707,42 @@ fn guardian_review_session_config_uses_live_network_proxy_state() {
     );
 }
 
-#[test]
-fn guardian_review_session_config_rejects_pinned_collab_feature() {
-    let mut parent_config = test_config();
+#[tokio::test]
+async fn guardian_review_session_config_disables_mcp_apps_and_plugins() {
+    let mut parent_config = test_config().await;
+    let server: McpServerConfig =
+        toml::from_str("command = \"docs-server\"").expect("deserialize MCP server");
+    parent_config
+        .mcp_servers
+        .set(HashMap::from([("docs".to_string(), server)]))
+        .expect("parent MCP servers are configurable");
+    parent_config
+        .features
+        .enable(Feature::Apps)
+        .expect("apps feature is configurable");
+    parent_config
+        .features
+        .enable(Feature::Plugins)
+        .expect("plugins feature is configurable");
+    parent_config.include_apps_instructions = true;
+
+    let guardian_config = build_guardian_review_session_config_for_test(
+        &parent_config,
+        /*live_network_config*/ None,
+        "active-model",
+        /*reasoning_effort*/ None,
+    )
+    .expect("guardian config");
+
+    assert!(guardian_config.mcp_servers.get().is_empty());
+    assert!(!guardian_config.features.enabled(Feature::Apps));
+    assert!(!guardian_config.features.enabled(Feature::Plugins));
+    assert!(!guardian_config.include_apps_instructions);
+}
+
+#[tokio::test]
+async fn guardian_review_session_config_allows_pinned_disabled_feature() {
+    let mut parent_config = test_config().await;
     parent_config.features = ManagedFeatures::from_configured(
         parent_config.features.get().clone(),
         Some(Sourced {
@@ -1694,23 +1754,22 @@ fn guardian_review_session_config_rejects_pinned_collab_feature() {
     )
     .expect("managed features");
 
-    let err = build_guardian_review_session_config_for_test(
+    let guardian_config = build_guardian_review_session_config_for_test(
         &parent_config,
         /*live_network_config*/ None,
         "active-model",
         /*reasoning_effort*/ None,
     )
-    .expect_err("guardian config should fail when collab is pinned on");
+    .expect("guardian config should continue when a disabled feature is pinned on");
 
-    assert!(
-        err.to_string()
-            .contains("guardian review session requires `features.multi_agent` to be disabled")
-    );
+    assert!(guardian_config.features.enabled(Feature::Collab));
+    assert!(guardian_config.mcp_servers.get().is_empty());
+    assert!(!guardian_config.include_apps_instructions);
 }
 
-#[test]
-fn guardian_review_session_config_uses_parent_active_model_instead_of_hardcoded_slug() {
-    let mut parent_config = test_config();
+#[tokio::test]
+async fn guardian_review_session_config_uses_parent_active_model_instead_of_hardcoded_slug() {
+    let mut parent_config = test_config().await;
     parent_config.model = Some("configured-model".to_string());
 
     let guardian_config = build_guardian_review_session_config_for_test(
@@ -1724,8 +1783,8 @@ fn guardian_review_session_config_uses_parent_active_model_instead_of_hardcoded_
     assert_eq!(guardian_config.model, Some("active-model".to_string()));
 }
 
-#[test]
-fn guardian_review_session_config_uses_requirements_guardian_policy_config() {
+#[tokio::test]
+async fn guardian_review_session_config_uses_requirements_guardian_policy_config() {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let workspace = tempfile::tempdir().expect("create temp dir");
     let config_layer_stack = ConfigLayerStack::new(
@@ -1740,6 +1799,7 @@ fn guardian_review_session_config_uses_requirements_guardian_policy_config() {
     )
     .expect("config layer stack");
     let parent_config = Config::load_config_with_layer_stack(
+        LOCAL_FS.as_ref(),
         ConfigToml::default(),
         ConfigOverrides {
             cwd: Some(workspace.path().to_path_buf()),
@@ -1748,6 +1808,7 @@ fn guardian_review_session_config_uses_requirements_guardian_policy_config() {
         codex_home.abs(),
         config_layer_stack,
     )
+    .await
     .expect("load config");
 
     let guardian_config = build_guardian_review_session_config_for_test(
@@ -1766,14 +1827,16 @@ fn guardian_review_session_config_uses_requirements_guardian_policy_config() {
     );
 }
 
-#[test]
-fn guardian_review_session_config_uses_default_guardian_policy_without_requirements_override() {
+#[tokio::test]
+async fn guardian_review_session_config_uses_default_guardian_policy_without_requirements_override()
+{
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let workspace = tempfile::tempdir().expect("create temp dir");
     let config_layer_stack =
         ConfigLayerStack::new(Vec::new(), Default::default(), Default::default())
             .expect("config layer stack");
     let parent_config = Config::load_config_with_layer_stack(
+        LOCAL_FS.as_ref(),
         ConfigToml::default(),
         ConfigOverrides {
             cwd: Some(workspace.path().to_path_buf()),
@@ -1782,6 +1845,7 @@ fn guardian_review_session_config_uses_default_guardian_policy_without_requireme
         codex_home.abs(),
         config_layer_stack,
     )
+    .await
     .expect("load config");
 
     let guardian_config = build_guardian_review_session_config_for_test(

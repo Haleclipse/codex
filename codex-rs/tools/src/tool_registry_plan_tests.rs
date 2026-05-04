@@ -97,6 +97,7 @@ fn test_full_toolset_specs_for_gpt5_codex_unified_exec_web_search() {
             search_context_size: None,
             search_content_types: None,
         },
+        create_image_generation_tool("png"),
         create_view_image_tool(ViewImageToolOptions {
             can_request_original_image_detail: config.can_request_original_image_detail,
         }),
@@ -1334,7 +1335,7 @@ fn search_tool_description_lists_each_mcp_source_once() {
 }
 
 #[test]
-fn search_tool_requires_model_capability_and_feature_flag() {
+fn search_tool_requires_model_capability_and_enabled_feature() {
     let model_info = search_capable_model_info();
     let deferred_mcp_tools = Some(vec![deferred_mcp_tool(
         "_create_event",
@@ -1367,10 +1368,12 @@ fn search_tool_requires_model_capability_and_feature_flag() {
     );
     assert_lacks_tool_name(&tools, TOOL_SEARCH_TOOL_NAME);
 
+    let mut features_without_tool_search = Features::with_defaults();
+    features_without_tool_search.disable(Feature::ToolSearch);
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
         available_models: &available_models,
-        features: &features,
+        features: &features_without_tool_search,
         image_generation_tool_auth_allowed: true,
         web_search_mode: Some(WebSearchMode::Cached),
         session_source: SessionSource::Cli,
@@ -1385,8 +1388,6 @@ fn search_tool_requires_model_capability_and_feature_flag() {
     );
     assert_lacks_tool_name(&tools, TOOL_SEARCH_TOOL_NAME);
 
-    let mut features = Features::with_defaults();
-    features.enable(Feature::ToolSearch);
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_info: &model_info,
         available_models: &available_models,
@@ -1404,6 +1405,92 @@ fn search_tool_requires_model_capability_and_feature_flag() {
         &[],
     );
     assert_contains_tool_names(&tools, &[TOOL_SEARCH_TOOL_NAME]);
+}
+
+#[test]
+fn search_tool_registers_for_deferred_dynamic_tools() {
+    let model_info = search_capable_model_info();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::ToolSearch);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let dynamic_tools = vec![
+        DynamicToolSpec {
+            namespace: Some("codex_app".to_string()),
+            name: "automation_update".to_string(),
+            description: "Create, update, view, or delete recurring automations.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string" },
+                },
+            }),
+            defer_loading: true,
+        },
+        DynamicToolSpec {
+            namespace: Some("codex_app".to_string()),
+            name: "automation_list".to_string(),
+            description: "List recurring automations.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+            }),
+            defer_loading: true,
+        },
+    ];
+
+    let (tools, handlers) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        &dynamic_tools,
+    );
+
+    let search_tool = find_tool(&tools, TOOL_SEARCH_TOOL_NAME);
+    let ToolSpec::ToolSearch { description, .. } = &search_tool.spec else {
+        panic!("expected tool_search tool");
+    };
+    assert!(description.contains("- Dynamic tools: Tools provided by the current Codex thread."));
+    assert_contains_tool_names(&tools, &[TOOL_SEARCH_TOOL_NAME, "codex_app"]);
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|tool| tool.name() == "codex_app")
+            .count(),
+        1
+    );
+    assert_eq!(
+        namespace_function_names(&tools, "codex_app"),
+        vec![
+            "automation_update".to_string(),
+            "automation_list".to_string()
+        ]
+    );
+    for tool_name in ["automation_update", "automation_list"] {
+        let dynamic_tool = find_namespace_function_tool(&tools, "codex_app", tool_name);
+        assert_eq!(dynamic_tool.defer_loading, Some(true));
+    }
+    assert!(handlers.contains(&ToolHandlerSpec {
+        name: ToolName::plain(TOOL_SEARCH_TOOL_NAME),
+        kind: ToolHandlerKind::ToolSearch,
+    }));
+    assert!(handlers.contains(&ToolHandlerSpec {
+        name: ToolName::namespaced("codex_app", "automation_update"),
+        kind: ToolHandlerKind::DynamicTool,
+    }));
+    assert!(handlers.contains(&ToolHandlerSpec {
+        name: ToolName::namespaced("codex_app", "automation_list"),
+        kind: ToolHandlerKind::DynamicTool,
+    }));
 }
 
 #[test]

@@ -1,8 +1,8 @@
 use crate::agent::AgentStatus;
-use crate::codex::Codex;
-use crate::codex::SteerInputError;
 use crate::config::ConstraintResult;
 use crate::file_watcher::WatchRegistration;
+use crate::session::Codex;
+use crate::session::SteerInputError;
 use codex_features::Feature;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::Personality;
@@ -22,6 +22,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -144,7 +145,12 @@ impl CodexThread {
         self.codex.session.total_token_usage().await
     }
 
-    // @cometix: expose token info for app-server to send after resume
+    /// Returns the complete token usage snapshot currently cached for this thread.
+    pub async fn token_usage_info(&self) -> Option<TokenUsageInfo> {
+        self.codex.session.token_usage_info().await
+    }
+
+    // @cometix: expose token info + rate limits for app-server to send after resume
     pub async fn token_info_and_rate_limits(
         &self,
     ) -> (

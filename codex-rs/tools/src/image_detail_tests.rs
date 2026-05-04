@@ -1,4 +1,6 @@
 use super::*;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::openai_models::ModelInfo;
 use pretty_assertions::assert_eq;
@@ -65,11 +67,51 @@ fn explicit_original_is_dropped_without_model_support() {
 }
 
 #[test]
-fn unsupported_non_original_detail_is_dropped() {
+fn explicit_non_original_detail_is_preserved() {
     let model_info = model_info();
 
     assert_eq!(
         normalize_output_image_detail(&model_info, Some(ImageDetail::Low)),
-        None
+        Some(ImageDetail::Low)
+    );
+    assert_eq!(
+        normalize_output_image_detail(&model_info, Some(ImageDetail::High)),
+        Some(ImageDetail::High)
+    );
+}
+
+#[test]
+fn sanitize_original_falls_back_to_high_without_support() {
+    let mut items = vec![
+        FunctionCallOutputContentItem::InputText {
+            text: "header".to_string(),
+        },
+        FunctionCallOutputContentItem::InputImage {
+            image_url: "data:image/png;base64,AAA".to_string(),
+            detail: Some(ImageDetail::Original),
+        },
+        FunctionCallOutputContentItem::InputImage {
+            image_url: "data:image/png;base64,BBB".to_string(),
+            detail: Some(ImageDetail::Low),
+        },
+    ];
+
+    sanitize_original_image_detail(/*can_request_original_image_detail*/ false, &mut items);
+
+    assert_eq!(
+        items,
+        vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "header".to_string(),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,AAA".to_string(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,BBB".to_string(),
+                detail: Some(ImageDetail::Low),
+            },
+        ]
     );
 }

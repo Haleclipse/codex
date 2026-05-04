@@ -1,6 +1,13 @@
+use super::CURRENT_THREAD_SECTION_TOKEN_BUDGET;
+use super::NOTES_SECTION_TOKEN_BUDGET;
+use super::RECENT_WORK_SECTION_TOKEN_BUDGET;
+use super::STARTUP_CONTEXT_HEADER;
+use super::WORKSPACE_SECTION_TOKEN_BUDGET;
 use super::build_current_thread_section;
 use super::build_recent_work_section;
 use super::build_workspace_section_with_user_root;
+use super::format_section;
+use super::format_startup_context_blob;
 use chrono::TimeZone;
 use chrono::Utc;
 use codex_git_utils::GitSha;
@@ -12,6 +19,8 @@ use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_thread_store::StoredThread;
+use core_test_support::PathBufExt;
+use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::PathBuf;
@@ -26,7 +35,7 @@ fn stored_thread(cwd: &str, title: &str, first_user_message: &str) -> StoredThre
         preview: first_user_message.to_string(),
         name: (!title.is_empty()).then(|| title.to_string()),
         model_provider: "test-provider".to_string(),
-        model: Some("gpt-5".to_string()),
+        model: Some("gpt-5.2".to_string()),
         reasoning_effort: None,
         created_at: Utc
             .timestamp_opt(1_709_251_100, 0)
@@ -171,29 +180,84 @@ fn current_thread_section_keeps_latest_turns_when_history_exceeds_budget() {
 }
 
 #[test]
-fn workspace_section_requires_meaningful_structure() {
-    let cwd = TempDir::new().expect("tempdir");
+fn startup_context_blob_is_wrapped_in_tags_without_final_truncation() {
+    let body = "Startup context from Codex.\n## Current Thread\nhello";
+    let wrapped = format_startup_context_blob(body);
+
     assert_eq!(
-        build_workspace_section_with_user_root(cwd.path(), /*user_root*/ None),
-        None
+        wrapped,
+        "<startup_context>\nStartup context from Codex.\n## Current Thread\nhello\n</startup_context>"
     );
 }
 
 #[test]
-fn workspace_section_includes_tree_when_entries_exist() {
+fn fixed_section_budgets_apply_per_section_without_total_blob_truncation() {
+    let body = [
+        STARTUP_CONTEXT_HEADER.to_string(),
+        format_section(
+            "Current Thread",
+            Some("current thread ".repeat(2_000)),
+            CURRENT_THREAD_SECTION_TOKEN_BUDGET,
+        )
+        .expect("current thread section"),
+        format_section(
+            "Recent Work",
+            Some("recent work ".repeat(3_000)),
+            RECENT_WORK_SECTION_TOKEN_BUDGET,
+        )
+        .expect("recent work section"),
+        format_section(
+            "Machine / Workspace Map",
+            Some("workspace map ".repeat(2_500)),
+            WORKSPACE_SECTION_TOKEN_BUDGET,
+        )
+        .expect("workspace section"),
+        format_section(
+            "Notes",
+            Some("notes ".repeat(500)),
+            NOTES_SECTION_TOKEN_BUDGET,
+        )
+        .expect("notes section"),
+    ]
+    .join("\n\n");
+
+    let wrapped = format_startup_context_blob(&body);
+
+    assert!(wrapped.starts_with("<startup_context>\n"));
+    assert!(wrapped.ends_with("\n</startup_context>"));
+    assert!(wrapped.contains("tokens truncated"));
+    assert!(wrapped.contains("## Current Thread"));
+    assert!(wrapped.contains("## Recent Work"));
+    assert!(wrapped.contains("## Machine / Workspace Map"));
+    assert!(wrapped.contains("## Notes"));
+}
+
+#[tokio::test]
+async fn workspace_section_requires_meaningful_structure() {
+    let cwd = TempDir::new().expect("tempdir");
+    assert_eq!(
+        build_workspace_section_with_user_root(&cwd.path().abs(), /*user_root*/ None).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn workspace_section_includes_tree_when_entries_exist() {
     let cwd = TempDir::new().expect("tempdir");
     fs::create_dir(cwd.path().join("docs")).expect("create docs dir");
     fs::write(cwd.path().join("README.md"), "hello").expect("write readme");
 
-    let section = build_workspace_section_with_user_root(cwd.path(), /*user_root*/ None)
-        .expect("workspace section");
+    let section =
+        build_workspace_section_with_user_root(&cwd.path().abs(), /*user_root*/ None)
+            .await
+            .expect("workspace section");
     assert!(section.contains("Working directory tree:"));
     assert!(section.contains("- docs/"));
     assert!(section.contains("- README.md"));
 }
 
-#[test]
-fn workspace_section_includes_user_root_tree_when_distinct() {
+#[tokio::test]
+async fn workspace_section_includes_user_root_tree_when_distinct() {
     let root = TempDir::new().expect("tempdir");
     let cwd = root.path().join("cwd");
     let git_root = root.path().join("git");
@@ -206,15 +270,16 @@ fn workspace_section_includes_user_root_tree_when_distinct() {
     fs::create_dir_all(user_root.join("code")).expect("create user root child");
     fs::write(user_root.join(".zshrc"), "export TEST=1").expect("write home file");
 
-    let section = build_workspace_section_with_user_root(cwd.as_path(), Some(user_root))
+    let section = build_workspace_section_with_user_root(&cwd.abs(), Some(user_root))
+        .await
         .expect("workspace section");
     assert!(section.contains("User root tree:"));
     assert!(section.contains("- code/"));
     assert!(!section.contains("- .zshrc"));
 }
 
-#[test]
-fn recent_work_section_groups_threads_by_cwd() {
+#[tokio::test]
+async fn recent_work_section_groups_threads_by_cwd() {
     let root = TempDir::new().expect("tempdir");
     let repo = root.path().join("repo");
     let workspace_a = repo.join("workspace-a");
@@ -247,9 +312,10 @@ fn recent_work_section_groups_threads_by_cwd() {
         stored_thread(outside.to_string_lossy().as_ref(), "", "Inspect flaky test"),
     ];
     let current_cwd = workspace_a;
-    let repo = fs::canonicalize(repo).expect("canonicalize repo");
+    let repo = repo.abs();
 
-    let section = build_recent_work_section(current_cwd.as_path(), &recent_threads)
+    let section = build_recent_work_section(&current_cwd.abs(), &recent_threads)
+        .await
         .expect("recent work section");
     assert!(section.contains(&format!("### Git repo: {}", repo.display())));
     assert!(section.contains("Recent sessions: 2"));

@@ -49,7 +49,6 @@ use crate::request_permissions::RequestPermissionsEvent;
 use crate::request_permissions::RequestPermissionsResponse;
 use crate::request_user_input::RequestUserInputResponse;
 use crate::user_input::UserInput;
-use codex_git_utils::GitSha;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -67,6 +66,7 @@ pub use crate::approvals::ExecPolicyAmendment;
 pub use crate::approvals::GuardianAssessmentAction;
 pub use crate::approvals::GuardianAssessmentDecisionSource;
 pub use crate::approvals::GuardianAssessmentEvent;
+pub use crate::approvals::GuardianAssessmentOutcome;
 pub use crate::approvals::GuardianAssessmentStatus;
 pub use crate::approvals::GuardianCommandSource;
 pub use crate::approvals::GuardianRiskLevel;
@@ -102,6 +102,17 @@ pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const REALTIME_CONVERSATION_OPEN_TAG: &str = "<realtime_conversation>";
 pub const REALTIME_CONVERSATION_CLOSE_TAG: &str = "</realtime_conversation>";
 pub const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct GitSha(pub String);
+
+impl GitSha {
+    pub fn new(sha: &str) -> Self {
+        Self(sha.to_string())
+    }
+}
 
 /// Submission Queue Entry - requests from user
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -319,6 +330,12 @@ pub struct RealtimeHandoffRequested {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct RealtimeNoopRequested {
+    pub call_id: String,
+    pub item_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct RealtimeInputAudioSpeechStarted {
     pub item_id: Option<String>,
 }
@@ -358,6 +375,7 @@ pub enum RealtimeEvent {
         item_id: String,
     },
     HandoffRequested(RealtimeHandoffRequested),
+    NoopRequested(RealtimeNoopRequested),
     Error(String),
 }
 
@@ -1223,11 +1241,15 @@ impl SandboxPolicy {
 
                 // Include /tmp on Unix unless explicitly excluded.
                 if cfg!(unix) && !exclude_slash_tmp {
-                    #[allow(clippy::expect_used)]
-                    let slash_tmp =
-                        AbsolutePathBuf::from_absolute_path("/tmp").expect("/tmp is absolute");
-                    if slash_tmp.as_path().is_dir() {
-                        roots.push(slash_tmp);
+                    match AbsolutePathBuf::from_absolute_path("/tmp") {
+                        Ok(slash_tmp) => {
+                            if slash_tmp.as_path().is_dir() {
+                                roots.push(slash_tmp);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Ignoring invalid /tmp for sandbox writable root: {e}");
+                        }
                     }
                 }
 
@@ -1532,6 +1554,9 @@ pub enum EventMsg {
     /// `ExecCommandBegin` so front‑ends can show progress indicators.
     PatchApplyBegin(PatchApplyBeginEvent),
 
+    /// Latest model-generated structured changes for an `apply_patch` call.
+    PatchApplyUpdated(PatchApplyUpdatedEvent),
+
     /// Notification that a patch application has finished.
     PatchApplyEnd(PatchApplyEndEvent),
 
@@ -1603,6 +1628,7 @@ pub enum EventMsg {
 #[serde(rename_all = "snake_case")]
 pub enum HookEventName {
     PreToolUse,
+    PermissionRequest,
     PostToolUse,
     SessionStart,
     UserPromptSubmit,
@@ -1629,6 +1655,20 @@ pub enum HookExecutionMode {
 pub enum HookScope {
     Thread,
     Turn,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HookSource {
+    System,
+    User,
+    Project,
+    Mdm,
+    SessionFlags,
+    LegacyManagedConfigFile,
+    LegacyManagedConfigMdm,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -1667,6 +1707,8 @@ pub struct HookRunSummary {
     pub execution_mode: HookExecutionMode,
     pub scope: HookScope,
     pub source_path: AbsolutePathBuf,
+    #[serde(default)]
+    pub source: HookSource,
     pub display_order: i64,
     pub status: HookRunStatus,
     pub status_message: Option<String>,
@@ -2166,6 +2208,18 @@ pub struct RateLimitSnapshot {
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
     pub plan_type: Option<crate::account::PlanType>,
+    pub rate_limit_reached_type: Option<RateLimitReachedType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum RateLimitReachedType {
+    RateLimitReached,
+    WorkspaceOwnerCreditsDepleted,
+    WorkspaceMemberCreditsDepleted,
+    WorkspaceOwnerUsageLimitReached,
+    WorkspaceMemberUsageLimitReached,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
@@ -2362,6 +2416,9 @@ pub struct McpToolCallBeginEvent {
     /// Identifier so this can be paired with the McpToolCallEnd event.
     pub call_id: String,
     pub invocation: McpInvocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_app_resource_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq)]
@@ -2369,6 +2426,9 @@ pub struct McpToolCallEndEvent {
     /// Identifier for the corresponding McpToolCallBegin that finished.
     pub call_id: String,
     pub invocation: McpInvocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_app_resource_uri: Option<String>,
     #[ts(type = "string")]
     pub duration: Duration,
     /// Result of the tool call. Note this could be an error.
@@ -2381,6 +2441,9 @@ pub struct DynamicToolCallResponseEvent {
     pub call_id: String,
     /// Turn ID that this dynamic tool call belongs to.
     pub turn_id: String,
+    /// Dynamic tool namespace, when one was provided.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Dynamic tool name.
     pub tool: String,
     /// Dynamic tool call arguments.
@@ -2671,6 +2734,9 @@ impl SessionSource {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_path, .. }) => {
                 agent_path.clone()
             }
+            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => {
+                Some(AgentPath::morpheus())
+            }
             _ => None,
         }
     }
@@ -2711,6 +2777,26 @@ impl fmt::Display for SubAgentSource {
             SubAgentSource::Other(other) => f.write_str(other),
         }
     }
+}
+
+/// Persisted agent-task details that let a resumed thread keep using the same backend task.
+///
+/// `agent_runtime_id` is validation metadata for the globally registered agent identity, not a
+/// separate session-scoped identity. Resume only restores this task after confirming that runtime
+/// id still matches the globally registered identity; otherwise the cached task is discarded and a
+/// fresh task can be registered.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct SessionAgentTask {
+    pub agent_runtime_id: String,
+    pub task_id: String,
+    pub registered_at: String,
+}
+
+/// Session-scoped state updates that can be appended after the canonical SessionMeta line.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS, Default)]
+pub struct SessionStateUpdate {
+    #[serde(default)]
+    pub agent_task: Option<SessionAgentTask>,
 }
 
 /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
@@ -2782,6 +2868,7 @@ pub struct SessionMetaLine {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
+    SessionState(SessionStateUpdate),
     ResponseItem(ResponseItem),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
@@ -2834,6 +2921,8 @@ pub struct TurnContextItem {
     pub sandbox_policy: SandboxPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<TurnContextNetworkItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_system_sandbox_policy: Option<FileSystemSandboxPolicy>,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personality: Option<Personality>,
@@ -3199,6 +3288,14 @@ pub struct PatchApplyBeginEvent {
     /// If true, there was no ApplyPatchApprovalRequest for this patch.
     pub auto_approved: bool,
     /// The changes to be applied.
+    pub changes: HashMap<PathBuf, FileChange>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct PatchApplyUpdatedEvent {
+    /// Identifier for the originating `apply_patch` tool call.
+    pub call_id: String,
+    /// Structured file changes parsed from the model-generated patch input so far.
     pub changes: HashMap<PathBuf, FileChange>,
 }
 
@@ -4964,6 +5061,7 @@ mod tests {
 
         assert_eq!(item.trace_id, None);
         assert_eq!(item.network, None);
+        assert_eq!(item.file_system_sandbox_policy, None);
         Ok(())
     }
 
@@ -4981,6 +5079,14 @@ mod tests {
                 allowed_domains: vec!["api.example.com".to_string()],
                 denied_domains: vec!["blocked.example.com".to_string()],
             }),
+            file_system_sandbox_policy: Some(FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry {
+                    path: FileSystemPath::GlobPattern {
+                        pattern: "/tmp/private/**/*.txt".to_string(),
+                    },
+                    access: FileSystemAccessMode::None,
+                },
+            ])),
             model: "gpt-5".to_string(),
             personality: None,
             collaboration_mode: None,
@@ -4999,6 +5105,19 @@ mod tests {
             json!({
                 "allowed_domains": ["api.example.com"],
                 "denied_domains": ["blocked.example.com"],
+            })
+        );
+        assert_eq!(
+            value["file_system_sandbox_policy"],
+            json!({
+                "kind": "restricted",
+                "entries": [{
+                    "path": {
+                        "type": "glob_pattern",
+                        "pattern": "/tmp/private/**/*.txt"
+                    },
+                    "access": "none"
+                }]
             })
         );
         Ok(())

@@ -1,3 +1,5 @@
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::openai_models::ModelInfo;
 
@@ -13,7 +15,25 @@ pub fn normalize_output_image_detail(
         Some(ImageDetail::Original) if can_request_original_image_detail(model_info) => {
             Some(ImageDetail::Original)
         }
-        Some(ImageDetail::Original) | Some(_) | None => None,
+        Some(ImageDetail::Original) | None => None,
+        Some(ImageDetail::Auto | ImageDetail::Low | ImageDetail::High) => detail,
+    }
+}
+
+pub fn sanitize_original_image_detail(
+    can_request_original_image_detail: bool,
+    items: &mut [FunctionCallOutputContentItem],
+) {
+    if can_request_original_image_detail {
+        return;
+    }
+
+    for item in items {
+        if let FunctionCallOutputContentItem::InputImage { detail, .. } = item
+            && matches!(detail, Some(ImageDetail::Original))
+        {
+            *detail = Some(DEFAULT_IMAGE_DETAIL);
+        }
     }
 }
 
