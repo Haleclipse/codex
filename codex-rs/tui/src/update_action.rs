@@ -7,6 +7,10 @@ pub enum UpdateAction {
     BunGlobalLatest,
     /// Update via `brew upgrade codex`.
     BrewUpgrade,
+    // Upstream standalone installer variants — not used by cometix fork but
+    // required for compilation because codex-cli references them on Windows.
+    StandaloneUnix,
+    StandaloneWindows,
 }
 
 impl UpdateAction {
@@ -16,6 +20,10 @@ impl UpdateAction {
             UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@cometix/codex"]),
             UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@cometix/codex"]),
             UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
+            // @cometix: standalone installers fall back to npm (fork has no standalone packages)
+            UpdateAction::StandaloneUnix | UpdateAction::StandaloneWindows => {
+                ("npm", &["install", "-g", "@cometix/codex"])
+            }
         }
     }
 
