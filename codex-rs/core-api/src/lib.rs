@@ -46,7 +46,6 @@ pub use codex_login::AuthManager;
 pub use codex_login::default_client::set_default_originator;
 pub use codex_model_provider_info::OPENAI_PROVIDER_ID;
 pub use codex_model_provider_info::built_in_model_providers;
-pub use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 pub use codex_models_manager::manager::RefreshStrategy;
 pub use codex_models_manager::manager::SharedModelsManager;
 pub use codex_protocol::ThreadId;

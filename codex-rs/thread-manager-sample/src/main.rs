@@ -16,7 +16,6 @@ use codex_core_api::AskForApproval;
 use codex_core_api::AuthCredentialsStoreMode;
 use codex_core_api::AuthManager;
 use codex_core_api::CodexThread;
-use codex_core_api::CollaborationModesConfig;
 use codex_core_api::Config;
 use codex_core_api::ConfigLayerStack;
 use codex_core_api::Constrained;
@@ -24,7 +23,6 @@ use codex_core_api::EnvironmentManager;
 use codex_core_api::EnvironmentManagerArgs;
 use codex_core_api::EventMsg;
 use codex_core_api::ExecServerRuntimePaths;
-use codex_core_api::Feature;
 use codex_core_api::GhostSnapshotConfig;
 use codex_core_api::History;
 use codex_core_api::MemoriesConfig;
@@ -116,11 +114,6 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
         &config,
         auth_manager,
         SessionSource::Exec,
-        CollaborationModesConfig {
-            default_mode_request_user_input: config
-                .features
-                .enabled(Feature::DefaultModeRequestUserInput),
-        },
         environment_manager,
         /*analytics_events_client*/ None,
     );
@@ -172,6 +165,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         permissions: Permissions {
             approval_policy: Constrained::allow_any(AskForApproval::Never),
             permission_profile: Constrained::allow_any(PermissionProfile::default()),
+            active_permission_profile: None,
             network: None,
             allow_login_shell: true,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
