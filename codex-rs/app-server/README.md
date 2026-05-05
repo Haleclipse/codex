@@ -25,7 +25,7 @@ Supported transports:
 
 - stdio (`--listen stdio://`, default): newline-delimited JSON (JSONL)
 - websocket (`--listen ws://IP:PORT`): one JSON-RPC message per websocket text frame (**experimental / unsupported**)
-- unix socket (`--listen unix://` or `--listen unix://PATH`): websocket frames over `$CODEX_HOME/app-server-control/app-server-control.sock` or a custom socket path without HTTP upgrade
+- unix socket (`--listen unix://` or `--listen unix://PATH`): websocket connections over `$CODEX_HOME/app-server-control/app-server-control.sock` or a custom socket path, using the standard HTTP Upgrade handshake
 - off (`--listen off`): do not expose a local transport
 
 When running with `--listen ws://IP:PORT`, the same listener also serves basic HTTP health probes:
@@ -39,7 +39,7 @@ Websocket transport is currently experimental and unsupported. Do not rely on it
 The unix socket transport is intended for local app-server control-plane clients. `codex app-server proxy`
 opens exactly one raw stream connection to `$CODEX_HOME/app-server-control/app-server-control.sock`
 by default, or to `--sock PATH` when provided, and proxies bytes between that socket and stdin/stdout.
-The socket uses websocket framing directly over the Unix socket, without an HTTP upgrade handshake.
+The proxied stream carries the websocket HTTP Upgrade handshake followed by websocket frames.
 
 Security note:
 
@@ -152,6 +152,11 @@ Example with notification opt-out:
 - `thread/metadata/update` — patch stored thread metadata in sqlite; currently supports updating persisted `gitInfo` fields and returns the refreshed `thread`.
 - `thread/memoryMode/set` — experimental; set a thread’s persisted memory eligibility to `"enabled"` or `"disabled"` for either a loaded thread or a stored rollout; returns `{}` on success.
 - `memory/reset` — experimental; clear the current `CODEX_HOME/memories` directory and reset persisted memory stage data in sqlite while preserving existing thread memory modes; returns `{}` on success.
+- `thread/goal/set` — create, replace, or update the single persisted goal for a materialized thread; returns the current goal and emits `thread/goal/updated`. Supplying a new `objective` replaces the goal and resets usage accounting. Supplying the current non-terminal objective or omitting `objective` updates the existing goal’s status and/or token budget while preserving usage.
+- `thread/goal/get` — fetch the current persisted goal for a materialized thread; returns `goal: null` when no goal exists.
+- `thread/goal/clear` — clear the current persisted goal for a materialized thread; returns whether a goal was removed and emits `thread/goal/cleared` when state changes.
+- `thread/goal/updated` — notification emitted whenever a thread goal changes; includes the full current goal.
+- `thread/goal/cleared` — notification emitted whenever a thread goal is removed.
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`).
 - `thread/archive` — move a thread’s rollout file into the archived directory and attempt to move any spawned descendant thread rollout files; returns `{}` on success and emits `thread/archived` for each archived thread.
 - `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server keeps the thread loaded and unloads it only after it has had no subscribers and no thread activity for 30 minutes, then emits `thread/closed`.
@@ -186,8 +191,9 @@ Example with notification opt-out:
 - `fs/unwatch` — stop sending notifications for a prior `fs/watch`; returns `{}`.
 - `fs/changed` — notification emitted when watched paths change, including the `watchId` and `changedPaths`.
 - `model/list` — list available models (set `includeHidden: true` to include entries with `hidden: true`), with reasoning effort options, `additionalSpeedTiers`, optional legacy `upgrade` model ids, optional `upgradeInfo` metadata (`model`, `upgradeCopy`, `modelLink`, `migrationMarkdown`), and optional `availabilityNux` metadata.
+- `modelProvider/capabilities/read` — read provider-level capabilities for the currently configured model provider.
 - `experimentalFeature/list` — list feature flags with stage metadata (`beta`, `underDevelopment`, `stable`, etc.), enabled/default-enabled state, and cursor pagination. For non-beta flags, `displayName`/`description`/`announcement` are `null`.
-- `experimentalFeature/enablement/set` — patch the in-memory process-wide runtime feature enablement for the currently supported feature keys (`apps`, `plugins`). For each feature, precedence is: cloud requirements > --enable <feature_name> > config.toml > experimentalFeature/enablement/set (new) > code default.
+- `experimentalFeature/enablement/set` — patch the in-memory process-wide runtime feature enablement for the currently supported feature keys (`apps`, `memories`, `plugins`, `remote_control`, `tool_search`, `tool_suggest`, `tool_call_mcp_elicitation`). For each feature, precedence is: cloud requirements > --enable <feature_name> > config.toml > experimentalFeature/enablement/set (new) > code default.
 - `collaborationMode/list` — list available collaboration mode presets (experimental, no pagination). This response omits built-in developer instructions; clients should either pass `settings.developer_instructions: null` when setting a mode to use Codex's built-in instructions, or provide their own instructions explicitly.
 - `skills/list` — list skills for one or more `cwd` values (optional `forceReload`).
 - `marketplace/add` — add a remote plugin marketplace from an HTTP(S) Git URL, SSH Git URL, or GitHub `owner/repo` shorthand, then persist it into the user marketplace config. Returns the installed root path plus whether the marketplace was already present.
@@ -200,9 +206,10 @@ Example with notification opt-out:
 - `device/key/create` — create or load a controller-local device signing key for an account/client binding. This local-key API is available only over local transports such as stdio and in-process; remote transports reject it. Hardware-backed providers are the target protection class; an OS-protected non-extractable fallback is allowed only with `protectionPolicy: "allow_os_protected_nonextractable"` and returns the reported `protectionClass`.
 - `device/key/public` — return a device key's SPKI DER public key as base64 plus its `algorithm` and `protectionClass`.
 - `device/key/sign` — sign one of the accepted structured payload variants with a controller-local device key. The only accepted payload today is `remoteControlClientConnection`, which binds a server-issued `/client` websocket challenge to the enrolled controller device without signing the bearer token itself; this is intentionally not an arbitrary-byte signing API.
+- `remoteControl/status/changed` — notification emitted when the remote-control status or client-visible environment id changes. `status` is one of `disabled`, `connecting`, `connected`, or `errored`; `environmentId` is a string when the app-server has a current enrollment and `null` when that enrollment is cleared, invalidated, or remote control is disabled. Newly initialized app-server clients always receive the current status snapshot.
 - `skills/config/write` — write user-level skill config by name or absolute path.
 - `plugin/install` — install a plugin from a discovered marketplace entry, rejecting marketplace entries marked unavailable for install, install MCPs if any, and return the effective plugin auth policy plus any apps that still need auth (**under development; do not call from production clients yet**).
-- `plugin/uninstall` — uninstall a plugin by id by removing its cached files and clearing its user-level config entry (**under development; do not call from production clients yet**).
+- `plugin/uninstall` — uninstall a local plugin by `pluginId` in `<plugin>@<marketplace>` form by removing its cached files and clearing its user-level config entry, or uninstall a remote ChatGPT plugin by backend `pluginId` by forwarding the uninstall to the ChatGPT plugin backend and removing any downloaded remote-plugin cache (**under development; do not call from production clients yet**).
 - `mcpServer/oauth/login` — start an OAuth login for a configured MCP server; returns an `authorization_url` and later emits `mcpServer/oauthLogin/completed` once the browser flow finishes.
 - `tool/requestUserInput` — prompt the user with 1–3 short questions for a tool call and return their answers (experimental).
 - `config/mcpServer/reload` — reload MCP server config from disk and queue a refresh for loaded threads (applied on each thread's next active turn); returns `{}`. Use this after editing `config.toml` without restarting the server.
@@ -468,6 +475,70 @@ Experimental: use `memory/reset` to clear local memory artifacts and sqlite-back
 ```json
 { "method": "memory/reset", "id": 27 }
 { "id": 27, "result": {} }
+```
+
+### Example: Set and update a thread goal
+
+Use `thread/goal/set` with an `objective` to create or replace the current goal for a materialized thread. Supplying a new objective resets `tokensUsed`, `timeUsedSeconds`, and `createdAt`. Supplying the current non-terminal objective, or omitting `objective`, updates the existing goal’s status or token budget while preserving usage history. Clients can set `budgetLimited` when they stop because a token budget is exhausted or nearly exhausted; the system also sets it when accounting crosses a configured token budget.
+
+```json
+{ "method": "thread/goal/set", "id": 27, "params": {
+    "threadId": "thr_123",
+    "objective": "Keep improving the benchmark until p95 latency is under 120ms",
+    "tokenBudget": 200000
+} }
+{ "id": 27, "result": { "goal": {
+    "threadId": "thr_123",
+    "objective": "Keep improving the benchmark until p95 latency is under 120ms",
+    "status": "active",
+    "tokenBudget": 200000,
+    "tokensUsed": 0,
+    "timeUsedSeconds": 0,
+    "createdAt": 1776272400,
+    "updatedAt": 1776272400
+} } }
+{ "method": "thread/goal/updated", "params": { "threadId": "thr_123", "goal": {
+    "threadId": "thr_123",
+    "objective": "Keep improving the benchmark until p95 latency is under 120ms",
+    "status": "active",
+    "tokenBudget": 200000,
+    "tokensUsed": 0,
+    "timeUsedSeconds": 0,
+    "createdAt": 1776272400,
+    "updatedAt": 1776272400
+} } }
+```
+
+```json
+{ "method": "thread/goal/set", "id": 28, "params": {
+    "threadId": "thr_123",
+    "status": "paused"
+} }
+{ "id": 28, "result": { "goal": {
+    "threadId": "thr_123",
+    "objective": "Keep improving the benchmark until p95 latency is under 120ms",
+    "status": "paused",
+    "tokenBudget": 200000,
+    "tokensUsed": 10000,
+    "timeUsedSeconds": 60,
+    "createdAt": 1776272400,
+    "updatedAt": 1776272460
+} } }
+```
+
+Use `thread/goal/get` to read the current goal without changing it.
+
+```json
+{ "method": "thread/goal/get", "id": 29, "params": { "threadId": "thr_123" } }
+{ "id": 29, "result": { "goal": null } }
+```
+
+Use `thread/goal/clear` to remove the current goal.
+
+```json
+{ "method": "thread/goal/clear", "id": 30, "params": { "threadId": "thr_123" } }
+{ "id": 30, "result": { "cleared": true } }
+{ "method": "thread/goal/cleared", "params": { "threadId": "thr_123" } }
 ```
 
 ### Example: Archive a thread
@@ -840,7 +911,7 @@ Run a standalone command (argv vector) in the server’s sandbox without creatin
         "type": "managed",
         "fileSystem": { "type": "restricted", "entries": [
             { "path": { "type": "special", "value": { "kind": "root" } }, "access": "read" },
-            { "path": { "type": "special", "value": { "kind": "current_working_directory" } }, "access": "write" }
+            { "path": { "type": "special", "value": { "kind": "project_roots", "subpath": null } }, "access": "write" }
         ] },
         "network": { "enabled": false }
     },
@@ -1186,7 +1257,7 @@ the client can offer session-scoped and/or persistent approval choices.
 
 ### Permission requests
 
-The built-in `request_permissions` tool sends an `item/permissions/requestApproval` JSON-RPC request to the client with the requested permission profile. This v2 payload mirrors the command-execution `additionalPermissions` shape: it can request network access and additional filesystem access. The `cwd` field identifies the directory used to resolve cwd-relative permissions such as `:cwd`, `:project_roots`, and relative deny globs.
+The built-in `request_permissions` tool sends an `item/permissions/requestApproval` JSON-RPC request to the client with the requested permission profile. This v2 payload mirrors the command-execution `additionalPermissions` shape: it can request network access and additional filesystem access. The `cwd` field identifies the directory used to resolve project-root permissions and relative deny globs.
 
 ```json
 {
@@ -1233,7 +1304,7 @@ If the session approval policy uses `Granular` with `request_permissions: false`
 
 `dynamicTools` on `thread/start` and the corresponding `item/tool/call` request/response flow are experimental APIs. To enable them, set `initialize.params.capabilities.experimentalApi = true`.
 
-Each dynamic tool may set `deferLoading`. When omitted, it defaults to `false`. Set it to `true` to keep the tool registered and callable by runtime features such as `js_repl`, while excluding it from the model-facing tool list sent on ordinary turns. When `tool_search` is available, deferred dynamic tools are searchable and can be exposed by a matching search result.
+Each dynamic tool may set `deferLoading`. When omitted, it defaults to `false`. Set it to `true` to keep the tool registered and callable by runtime features such as `code_mode`, while excluding it from the model-facing tool list sent on ordinary turns. When `tool_search` is available, deferred dynamic tools are searchable and can be exposed by a matching search result.
 
 When a dynamic tool is invoked during a turn, the server sends an `item/tool/call` JSON-RPC request to the client:
 

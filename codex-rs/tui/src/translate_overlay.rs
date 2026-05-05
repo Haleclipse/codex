@@ -307,6 +307,7 @@ impl TranslateOverlay {
                     self.render(frame.area(), frame.buffer_mut());
                 })?;
             }
+            TuiEvent::Resize => {}
         }
         Ok(())
     }

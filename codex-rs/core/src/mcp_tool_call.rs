@@ -73,6 +73,14 @@ use url::Url;
 
 const MCP_CALL_COUNT_METRIC: &str = "codex.mcp.call";
 const MCP_CALL_DURATION_METRIC: &str = "codex.mcp.call.duration_ms";
+const MCP_RESULT_TELEMETRY_META_KEY: &str = "codex/telemetry";
+const MCP_RESULT_TELEMETRY_SPAN_KEY: &str = "span";
+const MCP_RESULT_TELEMETRY_TARGET_ID_KEY: &str = "target_id";
+const MCP_RESULT_TELEMETRY_DID_TRIGGER_SERVER_USER_FLOW_KEY: &str = "did_trigger_server_user_flow";
+const MCP_RESULT_TELEMETRY_TARGET_ID_SPAN_ATTR: &str = "codex.mcp.target.id";
+const MCP_RESULT_TELEMETRY_SERVER_USER_FLOW_SPAN_ATTR: &str =
+    "codex.mcp.server_user_flow.triggered";
+const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
 
 /// Handles the specified tool call dispatches the appropriate
 /// `McpToolCallBegin` and `McpToolCallEnd` events to the `Session`.
@@ -159,8 +167,12 @@ pub(crate) async fn handle_mcp_tool_call(
                 .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
         };
     }
-    let request_meta =
-        build_mcp_tool_call_request_meta(turn_context.as_ref(), &server, metadata.as_ref());
+    let request_meta = build_mcp_tool_call_request_meta(
+        turn_context.as_ref(),
+        &server,
+        &call_id,
+        metadata.as_ref(),
+    );
     let connector_id = metadata
         .as_ref()
         .and_then(|metadata| metadata.connector_id.clone());
@@ -315,7 +327,7 @@ async fn handle_approved_mcp_tool_call(
     };
     let result = async {
         let rewritten_arguments = rewrite?;
-        execute_mcp_tool_call(
+        let result = execute_mcp_tool_call(
             sess,
             turn_context,
             &server,
@@ -323,7 +335,9 @@ async fn handle_approved_mcp_tool_call(
             rewritten_arguments,
             request_meta,
         )
-        .await
+        .await;
+        record_mcp_result_span_telemetry(&Span::current(), result.as_ref().ok());
+        result
     }
     .instrument(mcp_tool_call_span(
         sess,
@@ -440,6 +454,8 @@ fn mcp_tool_call_span(
         turn.id = turn_context.sub_id.as_str(),
         server.address = Empty,
         server.port = Empty,
+        codex.mcp.target.id = Empty,
+        codex.mcp.server_user_flow.triggered = Empty,
     );
     record_server_fields(&span, fields.server_origin);
     span
@@ -466,6 +482,47 @@ fn record_server_fields(span: &Span, url: Option<&str>) {
     }
     if let Some(port) = parsed.port_or_known_default() {
         span.record("server.port", port as i64);
+    }
+}
+
+fn record_mcp_result_span_telemetry(span: &Span, result: Option<&CallToolResult>) {
+    let Some(span_telemetry) = result
+        .and_then(|result| result.meta.as_ref())
+        .and_then(JsonValue::as_object)
+        .and_then(|meta| meta.get(MCP_RESULT_TELEMETRY_META_KEY))
+        .and_then(JsonValue::as_object)
+        .and_then(|telemetry| telemetry.get(MCP_RESULT_TELEMETRY_SPAN_KEY))
+        .and_then(JsonValue::as_object)
+    else {
+        return;
+    };
+
+    if let Some(target_id) = span_telemetry
+        .get(MCP_RESULT_TELEMETRY_TARGET_ID_KEY)
+        .and_then(JsonValue::as_str)
+        .filter(|target_id| !target_id.is_empty())
+    {
+        span.record(
+            MCP_RESULT_TELEMETRY_TARGET_ID_SPAN_ATTR,
+            truncate_str_to_char_boundary(target_id, MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS),
+        );
+    }
+
+    if let Some(did_trigger_server_user_flow) = span_telemetry
+        .get(MCP_RESULT_TELEMETRY_DID_TRIGGER_SERVER_USER_FLOW_KEY)
+        .and_then(JsonValue::as_bool)
+    {
+        span.record(
+            MCP_RESULT_TELEMETRY_SERVER_USER_FLOW_SPAN_ATTR,
+            did_trigger_server_user_flow,
+        );
+    }
+}
+
+fn truncate_str_to_char_boundary(value: &str, max_chars: usize) -> &str {
+    match value.char_indices().nth(max_chars) {
+        Some((index, _)) => &value[..index],
+        None => value,
     }
 }
 
@@ -520,7 +577,7 @@ async fn augment_mcp_tool_request_meta_with_sandbox_state(
 
     let sandbox_state = serde_json::to_value(SandboxState {
         permission_profile: Some(turn_context.permission_profile()),
-        sandbox_policy: turn_context.sandbox_policy.get().clone(),
+        sandbox_policy: turn_context.sandbox_policy(),
         codex_linux_sandbox_exe: turn_context.codex_linux_sandbox_exe.clone(),
         sandbox_cwd: turn_context.cwd.to_path_buf(),
         use_legacy_landlock: turn_context.features.use_legacy_landlock(),
@@ -694,6 +751,7 @@ fn custom_mcp_tool_approval_mode(
 fn build_mcp_tool_call_request_meta(
     turn_context: &TurnContext,
     server: &str,
+    call_id: &str,
     metadata: Option<&McpToolApprovalMetadata>,
 ) -> Option<serde_json::Value> {
     let mut request_meta = serde_json::Map::new();
@@ -705,10 +763,14 @@ fn build_mcp_tool_call_request_meta(
         );
     }
 
-    if server == CODEX_APPS_MCP_SERVER_NAME
-        && let Some(codex_apps_meta) =
-            metadata.and_then(|metadata| metadata.codex_apps_meta.clone())
-    {
+    if server == CODEX_APPS_MCP_SERVER_NAME {
+        let mut codex_apps_meta = metadata
+            .and_then(|metadata| metadata.codex_apps_meta.clone())
+            .unwrap_or_default();
+        codex_apps_meta.insert(
+            "call_id".to_string(),
+            serde_json::Value::String(call_id.to_string()),
+        );
         request_meta.insert(
             MCP_TOOL_CODEX_APPS_META_KEY.to_string(),
             serde_json::Value::Object(codex_apps_meta),
@@ -821,7 +883,7 @@ async fn maybe_request_mcp_tool_approval(
 ) -> Option<McpToolApprovalDecision> {
     if mcp_permission_prompt_is_auto_approved(
         turn_context.approval_policy.value(),
-        turn_context.sandbox_policy.get(),
+        &turn_context.permission_profile(),
     ) {
         return None;
     }
@@ -1185,11 +1247,21 @@ pub(crate) async fn lookup_mcp_tool_metadata(
             .and_then(|meta| meta.get(MCP_TOOL_CODEX_APPS_META_KEY))
             .and_then(serde_json::Value::as_object)
             .cloned(),
-        openai_file_input_params: Some(declared_openai_file_input_param_names(
+        // Disallow custom MCPs from uploading files via fileParams.
+        openai_file_input_params: openai_file_input_params_for_server(
+            server,
             tool_info.tool.meta.as_deref(),
-        ))
-        .filter(|params| !params.is_empty()),
+        ),
     })
+}
+
+fn openai_file_input_params_for_server(
+    server: &str,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<Vec<String>> {
+    (server == CODEX_APPS_MCP_SERVER_NAME)
+        .then_some(declared_openai_file_input_param_names(meta))
+        .filter(|params| !params.is_empty())
 }
 
 fn get_mcp_app_resource_uri(

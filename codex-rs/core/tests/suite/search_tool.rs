@@ -12,11 +12,11 @@ use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::user_input::UserInput;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::CALENDAR_CREATE_EVENT_MCP_APP_RESOURCE_URI;
@@ -157,10 +157,10 @@ async fn search_tool_enabled_by_default_adds_tool_search() -> Result<()> {
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -221,10 +221,10 @@ async fn always_defer_feature_hides_small_app_tool_sets() -> Result<()> {
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -265,10 +265,10 @@ async fn tool_search_disabled_exposes_apps_tools_directly() -> Result<()> {
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -311,10 +311,10 @@ async fn search_tool_is_hidden_for_api_key_auth() -> Result<()> {
         .with_config(move |config| configure_apps(config, apps_server.chatgpt_base_url.as_str()));
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -347,10 +347,10 @@ async fn search_tool_adds_discovery_instructions_to_tool_description() -> Result
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -389,10 +389,10 @@ async fn search_tool_hides_apps_tools_without_search() -> Result<()> {
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "hello tools",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -425,10 +425,10 @@ async fn explicit_app_mentions_expose_apps_tools_without_search() -> Result<()> 
     let mut builder = configured_builder(apps_server.chatgpt_base_url.clone());
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "Use [$calendar](app://calendar) and then call tools.",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 
@@ -555,6 +555,7 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
             .structured_content,
         Some(json!({
             "_codex_apps": {
+                "call_id": "calendar-call-1",
                 "resource_uri": CALENDAR_CREATE_EVENT_RESOURCE_URI,
                 "contains_mcp_source": true,
                 "connector_id": "calendar",
@@ -586,6 +587,7 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
     assert_eq!(
         apps_tool_call.pointer("/params/_meta/_codex_apps"),
         Some(&json!({
+            "call_id": "calendar-call-1",
             "resource_uri": CALENDAR_CREATE_EVENT_RESOURCE_URI,
             "contains_mcp_source": true,
             "connector_id": "calendar",
@@ -602,8 +604,30 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
             .is_some_and(|turn_id| !turn_id.is_empty()),
         "apps tools/call should include turn metadata turn_id: {apps_tool_call:?}"
     );
+    let mcp_turn_started_at_unix_ms = apps_tool_call
+        .pointer("/params/_meta/x-codex-turn-metadata/turn_started_at_unix_ms")
+        .and_then(Value::as_i64)
+        .expect("apps tools/call should include turn_started_at_unix_ms");
+    assert!(
+        mcp_turn_started_at_unix_ms > 0,
+        "apps tools/call should include a positive turn_started_at_unix_ms: {apps_tool_call:?}"
+    );
 
-    let first_request_tools = tool_names(&requests[0].body_json());
+    let first_request_turn_metadata: Value = serde_json::from_str(
+        &requests[0]
+            .header("x-codex-turn-metadata")
+            .expect("first response request should include turn metadata"),
+    )
+    .expect("first response request turn metadata should be valid JSON");
+    assert_eq!(
+        first_request_turn_metadata
+            .get("turn_started_at_unix_ms")
+            .and_then(Value::as_i64),
+        Some(mcp_turn_started_at_unix_ms)
+    );
+
+    let first_request_body = requests[0].body_json();
+    let first_request_tools = tool_names(&first_request_body);
     assert!(
         first_request_tools
             .iter()
@@ -821,7 +845,8 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
 
-    let first_request_tools = tool_names(&requests[0].body_json());
+    let first_request_body = requests[0].body_json();
+    let first_request_tools = tool_names(&first_request_body);
     assert!(
         first_request_tools
             .iter()
@@ -851,7 +876,8 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         })]
     );
 
-    let second_request_tools = tool_names(&requests[1].body_json());
+    let second_request_body = requests[1].body_json();
+    let second_request_tools = tool_names(&second_request_body);
     assert!(
         !second_request_tools.iter().any(|name| name == tool_name),
         "follow-up request should rely on tool_search_output history, not tool injection: {second_request_tools:?}"
@@ -868,7 +894,8 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         FunctionCallOutputPayload::from_text("dynamic-search-ok".to_string())
     );
 
-    let third_request_tools = tool_names(&requests[2].body_json());
+    let third_request_body = requests[2].body_json();
+    let third_request_tools = tool_names(&third_request_body);
     assert!(
         !third_request_tools.iter().any(|name| name == tool_name),
         "post-tool follow-up should rely on tool_search_output history, not tool injection: {third_request_tools:?}"
@@ -951,10 +978,10 @@ async fn tool_search_indexes_only_enabled_non_app_mcp_tools() -> Result<()> {
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_policies(
+    test.submit_turn_with_approval_and_permission_profile(
         "Find the rmcp echo and image tools.",
         AskForApproval::Never,
-        SandboxPolicy::DangerFullAccess,
+        PermissionProfile::Disabled,
     )
     .await?;
 

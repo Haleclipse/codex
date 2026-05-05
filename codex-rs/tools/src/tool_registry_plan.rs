@@ -26,11 +26,11 @@ use crate::create_apply_patch_json_tool;
 use crate::create_close_agent_tool_v1;
 use crate::create_close_agent_tool_v2;
 use crate::create_code_mode_tool;
+use crate::create_create_goal_tool;
 use crate::create_exec_command_tool;
 use crate::create_followup_task_tool;
+use crate::create_get_goal_tool;
 use crate::create_image_generation_tool;
-use crate::create_js_repl_reset_tool;
-use crate::create_js_repl_tool;
 use crate::create_list_agents_tool;
 use crate::create_list_dir_tool;
 use crate::create_list_mcp_resource_templates_tool;
@@ -51,6 +51,7 @@ use crate::create_spawn_agents_on_csv_tool;
 use crate::create_test_sync_tool;
 use crate::create_tool_search_tool;
 use crate::create_tool_suggest_tool;
+use crate::create_update_goal_tool;
 use crate::create_update_plan_tool;
 use crate::create_view_image_tool;
 use crate::create_wait_agent_tool_v1;
@@ -217,20 +218,25 @@ pub fn build_tool_registry_plan(
         config.code_mode_enabled,
     );
     plan.register_handler("update_plan", ToolHandlerKind::Plan);
-
-    if config.has_environment && config.js_repl_enabled {
+    if config.goal_tools {
         plan.push_spec(
-            create_js_repl_tool(),
+            create_get_goal_tool(),
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
         );
+        plan.register_handler("get_goal", ToolHandlerKind::Goal);
         plan.push_spec(
-            create_js_repl_reset_tool(),
+            create_create_goal_tool(),
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
         );
-        plan.register_handler("js_repl", ToolHandlerKind::JsRepl);
-        plan.register_handler("js_repl_reset", ToolHandlerKind::JsReplReset);
+        plan.register_handler("create_goal", ToolHandlerKind::Goal);
+        plan.push_spec(
+            create_update_goal_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.register_handler("update_goal", ToolHandlerKind::Goal);
     }
 
     plan.push_spec(
@@ -257,14 +263,18 @@ pub fn build_tool_registry_plan(
     let deferred_dynamic_tools = params
         .dynamic_tools
         .iter()
-        .filter(|tool| tool.defer_loading)
+        .filter(|tool| tool.defer_loading && (config.namespace_tools || tool.namespace.is_none()))
         .collect::<Vec<_>>();
+    let deferred_mcp_tools_for_search = if config.namespace_tools {
+        params.deferred_mcp_tools
+    } else {
+        None
+    };
 
     if config.search_tool
-        && (params.deferred_mcp_tools.is_some() || !deferred_dynamic_tools.is_empty())
+        && (deferred_mcp_tools_for_search.is_some() || !deferred_dynamic_tools.is_empty())
     {
-        let mut search_source_infos = params
-            .deferred_mcp_tools
+        let mut search_source_infos = deferred_mcp_tools_for_search
             .map(|deferred_mcp_tools| {
                 collect_tool_search_source_infos(deferred_mcp_tools.iter().map(|tool| {
                     ToolSearchSource {
@@ -290,7 +300,7 @@ pub fn build_tool_registry_plan(
         );
         plan.register_handler(TOOL_SEARCH_TOOL_NAME, ToolHandlerKind::ToolSearch);
 
-        if let Some(deferred_mcp_tools) = params.deferred_mcp_tools {
+        if let Some(deferred_mcp_tools) = deferred_mcp_tools_for_search {
             for tool in deferred_mcp_tools {
                 plan.register_handler(tool.name.clone(), ToolHandlerKind::Mcp);
             }
@@ -400,6 +410,7 @@ pub fn build_tool_registry_plan(
                     hide_agent_type_model_reasoning: config.hide_spawn_agent_metadata,
                     include_usage_hint: config.spawn_agent_usage_hint,
                     usage_hint_text: config.spawn_agent_usage_hint_text.clone(),
+                    max_concurrent_threads_per_session: config.max_concurrent_threads_per_session,
                 }),
                 /*supports_parallel_tool_calls*/ false,
                 config.code_mode_enabled,
@@ -445,6 +456,7 @@ pub fn build_tool_registry_plan(
                     hide_agent_type_model_reasoning: config.hide_spawn_agent_metadata,
                     include_usage_hint: config.spawn_agent_usage_hint,
                     usage_hint_text: config.spawn_agent_usage_hint_text.clone(),
+                    max_concurrent_threads_per_session: config.max_concurrent_threads_per_session,
                 }),
                 /*supports_parallel_tool_calls*/ false,
                 config.code_mode_enabled,
@@ -579,6 +591,11 @@ pub fn build_tool_registry_plan(
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
         );
+    }
+
+    if !config.namespace_tools {
+        plan.specs
+            .retain(|configured_tool| !matches!(&configured_tool.spec, ToolSpec::Namespace(_)));
     }
 
     plan

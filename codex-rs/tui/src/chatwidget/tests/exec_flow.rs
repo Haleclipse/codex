@@ -598,7 +598,9 @@ async fn unified_exec_end_after_task_complete_is_suppressed() {
     );
     drain_insert_history(&mut rx);
 
-    chat.on_task_complete(/*last_agent_message*/ None, /*from_replay*/ false);
+    chat.on_task_complete(
+        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+    );
     end_exec(&mut chat, begin, "", "", /*exit_code*/ 0);
 
     let cells = drain_insert_history(&mut rx);
@@ -612,7 +614,9 @@ async fn unified_exec_end_after_task_complete_is_suppressed() {
 async fn unified_exec_interaction_after_task_complete_is_suppressed() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
-    chat.on_task_complete(/*last_agent_message*/ None, /*from_replay*/ false);
+    chat.on_task_complete(
+        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+    );
 
     chat.handle_codex_event(Event {
         id: "call-1".to_string(),
@@ -710,6 +714,56 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
     assert_chatwidget_snapshot!("unified_exec_wait_before_streamed_agent_message", combined);
+}
+
+#[tokio::test]
+async fn final_worked_for_uses_cumulative_turn_duration_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".to_string(),
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+
+    let exec = begin_exec_with_source(
+        &mut chat,
+        "call-1",
+        "echo preparing",
+        ExecCommandSource::Agent,
+    );
+    end_exec(&mut chat, exec, "preparing\n", "", /*exit_code*/ 0);
+
+    complete_assistant_message(
+        &mut chat,
+        "msg-final",
+        "Final response.",
+        Some(MessagePhase::FinalAnswer),
+    );
+    chat.handle_codex_event(Event {
+        id: "turn-1".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: Some("Final response.".to_string()),
+            completed_at: None,
+            duration_ms: Some(125_000),
+            time_to_first_token_ms: None,
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let combined = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect::<String>();
+    assert!(
+        combined.contains("Worked for 2m 05s"),
+        "expected final separator to use cumulative turn duration, got:\n{combined}"
+    );
+    assert_chatwidget_snapshot!("final_worked_for_uses_cumulative_turn_duration", combined);
 }
 
 #[tokio::test]
@@ -1004,8 +1058,7 @@ async fn bang_shell_enter_while_task_running_submits_run_user_shell_command() {
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: None,
+        permission_profile: PermissionProfile::read_only(),
         cwd: test_path_buf("/home/user/project").abs(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         history_log_id: 0,
@@ -1038,6 +1091,10 @@ async fn bang_shell_enter_while_task_running_submits_run_user_shell_command() {
         Ok(Op::RunUserShellCommand { command }) => assert_eq!(command, "echo hi"),
         other => panic!("expected RunUserShellCommand op, got {other:?}"),
     }
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::AddToHistory { text }) if text == "!echo hi"
+    );
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
 }
 
@@ -1317,10 +1374,9 @@ async fn approval_modal_patch_snapshot() -> anyhow::Result<()> {
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw patch approval modal");
-    assert_chatwidget_snapshot!(
-        "approval_modal_patch",
-        terminal.backend().vt100().screen().contents()
-    );
+    let contents = terminal.backend().vt100().screen().contents();
+    assert!(!contents.contains("$ apply_patch"));
+    assert_chatwidget_snapshot!("approval_modal_patch", contents);
 
     Ok(())
 }
@@ -1465,27 +1521,10 @@ async fn apply_patch_events_emit_history_cells() {
         id: "s1".into(),
         msg: EventMsg::ApplyPatchApprovalRequest(ev),
     });
-    let cells = drain_insert_history(&mut rx);
     assert!(
-        cells.is_empty(),
+        drain_insert_history(&mut rx).is_empty(),
         "expected approval request to surface via modal without emitting history cells"
     );
-
-    let area = Rect::new(0, 0, 80, chat.desired_height(/*width*/ 80));
-    let mut buf = ratatui::buffer::Buffer::empty(area);
-    chat.render(area, &mut buf);
-    let mut saw_summary = false;
-    for y in 0..area.height {
-        let mut row = String::new();
-        for x in 0..area.width {
-            row.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
-        }
-        if row.contains("foo.txt (+1 -0)") {
-            saw_summary = true;
-            break;
-        }
-    }
-    assert!(saw_summary, "expected approval modal to show diff summary");
 
     // 2) Begin apply -> per-file apply block cell (no global header)
     let mut changes2 = HashMap::new();
@@ -1816,7 +1855,7 @@ async fn apply_patch_untrusted_shows_approval_modal() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn apply_patch_request_shows_diff_summary() -> anyhow::Result<()> {
+async fn apply_patch_request_omits_diff_summary_from_modal() -> anyhow::Result<()> {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     // Ensure we are in OnRequest so an approval is surfaced
@@ -1845,43 +1884,24 @@ async fn apply_patch_request_shows_diff_summary() -> anyhow::Result<()> {
         }),
     });
 
-    // No history entries yet; the modal should contain the diff summary
-    let cells = drain_insert_history(&mut rx);
     assert!(
-        cells.is_empty(),
+        drain_insert_history(&mut rx).is_empty(),
         "expected approval request to render via modal instead of history"
     );
 
     let area = Rect::new(0, 0, 80, chat.desired_height(/*width*/ 80));
     let mut buf = ratatui::buffer::Buffer::empty(area);
     chat.render(area, &mut buf);
-
-    let mut saw_header = false;
-    let mut saw_line1 = false;
-    let mut saw_line2 = false;
+    let mut contents = String::new();
     for y in 0..area.height {
-        let mut row = String::new();
         for x in 0..area.width {
-            row.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+            contents.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
         }
-        if row.contains("README.md (+2 -0)") {
-            saw_header = true;
-        }
-        if row.contains("+line one") {
-            saw_line1 = true;
-        }
-        if row.contains("+line two") {
-            saw_line2 = true;
-        }
-        if saw_header && saw_line1 && saw_line2 {
-            break;
-        }
+        contents.push('\n');
     }
-    assert!(saw_header, "expected modal to show diff header with totals");
-    assert!(
-        saw_line1 && saw_line2,
-        "expected modal to show per-line diff summary"
-    );
+    assert!(!contents.contains("README.md (+2 -0)"));
+    assert!(!contents.contains("+line one"));
+    assert!(!contents.contains("+line two"));
 
     Ok(())
 }

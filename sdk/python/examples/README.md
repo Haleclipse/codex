@@ -15,10 +15,8 @@ All examples intentionally use only public SDK exports from `codex_app_server`.
 Recommended setup (from `sdk/python`):
 
 ```bash
-python -m venv .venv
+uv sync
 source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -e .
 ```
 
 When running examples from this repo checkout, the SDK source uses the local
@@ -30,7 +28,7 @@ will download the matching GitHub release artifact, stage a temporary local
 `openai-codex-cli-bin` package, install it into your active interpreter, and clean up
 the temporary files afterward.
 
-Current pinned runtime version: `0.116.0-alpha.1`
+The pinned runtime version comes from the SDK package version.
 
 ## Run examples
 

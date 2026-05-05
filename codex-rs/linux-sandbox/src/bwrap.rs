@@ -24,7 +24,10 @@ use std::process::Command;
 
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
+use codex_protocol::protocol::FileSystemAccessMode;
+use codex_protocol::protocol::FileSystemPath;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
+use codex_protocol::protocol::FileSystemSpecialPath;
 use codex_protocol::protocol::WritableRoot;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use globset::GlobBuilder;
@@ -32,7 +35,7 @@ use globset::GlobSet;
 use globset::GlobSetBuilder;
 
 /// Linux "platform defaults" that keep common system binaries and dynamic
-/// libraries readable when `ReadOnlyAccess::Restricted` requests them.
+/// libraries readable when a split filesystem policy requests `:minimal`.
 ///
 /// These are intentionally system-level paths only (plus Nix store roots) so
 /// `include_platform_defaults` does not silently widen access to user data.
@@ -256,8 +259,38 @@ fn create_filesystem_args(
         writable_roots.push(WritableRoot {
             root: AbsolutePathBuf::from_absolute_path("/")?,
             read_only_subpaths: Vec::new(),
+            protected_metadata_names: Vec::new(),
         });
     }
+    let missing_auto_metadata_read_only_project_root_subpaths: HashSet<PathBuf> =
+        file_system_sandbox_policy
+            .entries
+            .iter()
+            .filter(|entry| entry.access == FileSystemAccessMode::Read)
+            .filter_map(|entry| {
+                let FileSystemPath::Special {
+                    value:
+                        FileSystemSpecialPath::ProjectRoots {
+                            subpath: Some(subpath),
+                        },
+                } = &entry.path
+                else {
+                    return None;
+                };
+                // Missing `.codex` remains protected so first-time project config
+                // creation still goes through the protected-path approval flow.
+                // Only the automatic repo-metadata read masks are skipped here:
+                // user-authored `read` rules for other subpaths and `none` rules
+                // should keep their normal bwrap behavior, which can mask the
+                // first missing component to prevent creation under writable roots.
+                let project_subpath = subpath.as_path();
+                if project_subpath != Path::new(".git") && project_subpath != Path::new(".agents") {
+                    return None;
+                }
+                let resolved = AbsolutePathBuf::resolve_path_against_base(subpath, cwd);
+                (!resolved.as_path().exists()).then(|| resolved.into_path_buf())
+            })
+            .collect();
     let mut unreadable_roots = file_system_sandbox_policy
         .get_unreadable_roots_with_cwd(cwd)
         .into_iter()
@@ -410,6 +443,7 @@ fn create_filesystem_args(
             .iter()
             .map(|path| path.as_path().to_path_buf())
             .filter(|path| !unreadable_paths.contains(path))
+            .filter(|path| !missing_auto_metadata_read_only_project_root_subpaths.contains(path))
             .collect();
         if let Some(target) = &symlink_target {
             read_only_subpaths = remap_paths_for_symlink_target(read_only_subpaths, root, target);
@@ -1002,8 +1036,6 @@ mod tests {
     use codex_protocol::protocol::FileSystemSandboxEntry;
     use codex_protocol::protocol::FileSystemSandboxPolicy;
     use codex_protocol::protocol::FileSystemSpecialPath;
-    use codex_protocol::protocol::ReadOnlyAccess;
-    use codex_protocol::protocol::SandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -1033,7 +1065,7 @@ mod tests {
         let command = vec!["/bin/true".to_string()];
         let args = create_bwrap_command_args(
             command.clone(),
-            &FileSystemSandboxPolicy::from(&SandboxPolicy::DangerFullAccess),
+            &FileSystemSandboxPolicy::unrestricted(),
             Path::new("/"),
             Path::new("/"),
             BwrapOptions {
@@ -1052,7 +1084,7 @@ mod tests {
         let command = vec!["/bin/true".to_string()];
         let args = create_bwrap_command_args(
             command,
-            &FileSystemSandboxPolicy::from(&SandboxPolicy::DangerFullAccess),
+            &FileSystemSandboxPolicy::unrestricted(),
             Path::new("/"),
             Path::new("/"),
             BwrapOptions {
@@ -1144,7 +1176,7 @@ mod tests {
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
             },
@@ -1366,23 +1398,18 @@ mod tests {
         let missing_root = temp_dir.path().join("missing");
         std::fs::create_dir(&existing_root).expect("create existing root");
 
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![
+        let policy = FileSystemSandboxPolicy::workspace_write(
+            &[
                 AbsolutePathBuf::try_from(existing_root.as_path()).expect("absolute existing root"),
                 AbsolutePathBuf::try_from(missing_root.as_path()).expect("absolute missing root"),
             ],
-            read_only_access: Default::default(),
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: true,
-        };
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        );
 
-        let args = create_filesystem_args(
-            &FileSystemSandboxPolicy::from(&policy),
-            temp_dir.path(),
-            NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH,
-        )
-        .expect("filesystem args");
+        let args =
+            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
+                .expect("filesystem args");
         let existing_root = path_to_string(&existing_root);
         let missing_root = path_to_string(&missing_root);
 
@@ -1399,17 +1426,115 @@ mod tests {
     }
 
     #[test]
+    fn skips_missing_project_root_metadata_carveouts_except_codex() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(Some(".git".into())),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(Some(".agents".into())),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(Some(".codex".into())),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+        ]);
+
+        let args =
+            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
+                .expect("filesystem args");
+        let dot_git = path_to_string(&temp_dir.path().join(".git"));
+        let dot_agents = path_to_string(&temp_dir.path().join(".agents"));
+        let dot_codex = path_to_string(&temp_dir.path().join(".codex"));
+
+        assert!(!args.args.iter().any(|arg| arg == &dot_git));
+        assert!(!args.args.iter().any(|arg| arg == &dot_agents));
+        assert!(
+            args.args
+                .windows(3)
+                .any(|window| { window == ["--ro-bind", "/dev/null", dot_codex.as_str()] })
+        );
+    }
+
+    #[test]
+    fn missing_user_project_root_subpath_rules_are_still_enforced() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(Some(".vscode".into())),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(Some(".secrets".into())),
+                },
+                access: FileSystemAccessMode::None,
+            },
+        ]);
+
+        let args =
+            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
+                .expect("filesystem args");
+        let dot_vscode = path_to_string(&temp_dir.path().join(".vscode"));
+        let dot_secrets = path_to_string(&temp_dir.path().join(".secrets"));
+
+        assert!(
+            args.args
+                .windows(3)
+                .any(|window| { window == ["--ro-bind", "/dev/null", dot_vscode.as_str()] })
+        );
+        assert!(
+            args.args
+                .windows(3)
+                .any(|window| { window == ["--ro-bind", "/dev/null", dot_secrets.as_str()] })
+        );
+    }
+
+    #[test]
     fn mounts_dev_before_writable_dev_binds() {
-        let sandbox_policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![AbsolutePathBuf::try_from(Path::new("/dev")).expect("/dev path")],
-            read_only_access: Default::default(),
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: true,
-        };
+        let sandbox_policy = FileSystemSandboxPolicy::workspace_write(
+            &[AbsolutePathBuf::try_from(Path::new("/dev")).expect("/dev path")],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        );
 
         let args = create_filesystem_args(
-            &FileSystemSandboxPolicy::from(&sandbox_policy),
+            &sandbox_policy,
             Path::new("/"),
             NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH,
         )
@@ -1430,7 +1555,7 @@ mod tests {
                 "/".to_string(),
                 // Mask the default protected .codex subpath under that writable
                 // root. Because the root is `/` in this test, the carveout path
-                // appears as `/.codex`.
+                // appears at the filesystem root.
                 "--ro-bind".to_string(),
                 "/dev/null".to_string(),
                 "/.codex".to_string(),
@@ -1449,23 +1574,17 @@ mod tests {
         let readable_root = temp_dir.path().join("readable");
         std::fs::create_dir(&readable_root).expect("create readable root");
 
-        let policy = SandboxPolicy::ReadOnly {
-            access: ReadOnlyAccess::Restricted {
-                include_platform_defaults: false,
-                readable_roots: vec![
-                    AbsolutePathBuf::try_from(readable_root.as_path())
-                        .expect("absolute readable root"),
-                ],
+        let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: AbsolutePathBuf::try_from(readable_root.as_path())
+                    .expect("absolute readable root"),
             },
-            network_access: false,
-        };
+            access: FileSystemAccessMode::Read,
+        }]);
 
-        let args = create_filesystem_args(
-            &FileSystemSandboxPolicy::from(&policy),
-            temp_dir.path(),
-            NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH,
-        )
-        .expect("filesystem args");
+        let args =
+            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
+                .expect("filesystem args");
 
         assert_eq!(args.args[0..4], ["--tmpfs", "/", "--dev", "/dev"]);
 
@@ -1483,23 +1602,16 @@ mod tests {
     #[test]
     fn restricted_read_only_with_platform_defaults_includes_usr_when_present() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let policy = SandboxPolicy::ReadOnly {
-            access: ReadOnlyAccess::Restricted {
-                include_platform_defaults: true,
-                readable_roots: Vec::new(),
+        let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
             },
-            network_access: false,
-        };
+            access: FileSystemAccessMode::Read,
+        }]);
 
-        // `ReadOnlyAccess::Restricted` always includes `cwd` as a readable
-        // root. Using `"/"` here would intentionally collapse to broad read
-        // access, so use a non-root cwd to exercise the restricted path.
-        let args = create_filesystem_args(
-            &FileSystemSandboxPolicy::from(&policy),
-            temp_dir.path(),
-            NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH,
-        )
-        .expect("filesystem args");
+        let args =
+            create_filesystem_args(&policy, temp_dir.path(), NO_UNREADABLE_GLOB_SCAN_MAX_DEPTH)
+                .expect("filesystem args");
 
         assert!(
             args.args

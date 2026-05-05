@@ -1,12 +1,12 @@
 use super::*;
 use crate::config::CONFIG_TOML_FILE;
 use crate::config::ConfigBuilder;
-use crate::config_loader::AppRequirementToml;
-use crate::config_loader::AppsRequirementsToml;
-use crate::config_loader::CloudRequirementsLoader;
-use crate::config_loader::ConfigLayerStack;
-use crate::config_loader::ConfigRequirements;
-use crate::config_loader::ConfigRequirementsToml;
+use codex_config::AppRequirementToml;
+use codex_config::AppsRequirementsToml;
+use codex_config::CloudRequirementsLoader;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigRequirements;
+use codex_config::ConfigRequirementsToml;
 use codex_config::types::AppConfig;
 use codex_config::types::AppToolConfig;
 use codex_config::types::AppToolsConfig;
@@ -1109,6 +1109,35 @@ discoverables = [
     assert_eq!(
         tool_suggest_connector_ids(&config).await,
         HashSet::from(["connector_2128aebfecb84f64a069897515042a44".to_string()])
+    );
+}
+
+#[tokio::test]
+async fn tool_suggest_connector_ids_exclude_disabled_tool_suggestions() {
+    let codex_home = tempdir().expect("tempdir should succeed");
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"
+[tool_suggest]
+discoverables = [
+  { type = "connector", id = "connector_calendar" },
+  { type = "connector", id = "connector_gmail" }
+]
+disabled_tools = [
+  { type = "connector", id = "connector_calendar" }
+]
+"#,
+    )
+    .expect("write config");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config should load");
+
+    assert_eq!(
+        tool_suggest_connector_ids(&config).await,
+        HashSet::from(["connector_gmail".to_string()])
     );
 }
 

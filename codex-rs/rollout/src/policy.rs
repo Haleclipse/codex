@@ -37,7 +37,6 @@ pub fn should_persist_response_item(item: &ResponseItem) -> bool {
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Compaction { .. } => true,
         ResponseItem::Other => false,
     }
@@ -58,7 +57,6 @@ pub fn should_persist_response_item_for_memories(item: &ResponseItem) -> bool {
         | ResponseItem::WebSearchCall { .. } => true,
         ResponseItem::Reasoning { .. }
         | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Compaction { .. }
         | ResponseItem::Other => false,
     }
@@ -145,6 +143,7 @@ fn event_msg_persistence_mode(ev: &EventMsg) -> Option<EventPersistenceMode> {
         | EventMsg::AgentReasoningSectionBreak(_)
         | EventMsg::RawResponseItem(_)
         | EventMsg::SessionConfigured(_)
+        | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::McpToolCallBegin(_)
         | EventMsg::WebSearchBegin(_)
         | EventMsg::ExecCommandBegin(_)

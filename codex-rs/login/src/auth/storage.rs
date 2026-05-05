@@ -19,6 +19,8 @@ use std::sync::Mutex;
 use tracing::warn;
 
 use crate::token_data::TokenData;
+use codex_agent_identity::AgentIdentityJwtClaims;
+use codex_agent_identity::decode_agent_identity_jwt;
 use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_keyring_store::DefaultKeyringStore;
@@ -42,7 +44,7 @@ pub struct AuthDotJson {
     pub last_refresh: Option<DateTime<Utc>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_identity: Option<AgentIdentityAuthRecord>,
+    pub agent_identity: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
@@ -54,6 +56,29 @@ pub struct AgentIdentityAuthRecord {
     pub email: String,
     pub plan_type: AccountPlanType,
     pub chatgpt_account_is_fedramp: bool,
+}
+
+impl AgentIdentityAuthRecord {
+    pub(crate) fn from_agent_identity_jwt(jwt: &str) -> std::io::Result<Self> {
+        let claims =
+            decode_agent_identity_jwt(jwt, /*jwks*/ None).map_err(std::io::Error::other)?;
+
+        Ok(claims.into())
+    }
+}
+
+impl From<AgentIdentityJwtClaims> for AgentIdentityAuthRecord {
+    fn from(claims: AgentIdentityJwtClaims) -> Self {
+        Self {
+            agent_runtime_id: claims.agent_runtime_id,
+            agent_private_key: claims.agent_private_key,
+            account_id: claims.account_id,
+            chatgpt_user_id: claims.chatgpt_user_id,
+            email: claims.email,
+            plan_type: claims.plan_type.into(),
+            chatgpt_account_is_fedramp: claims.chatgpt_account_is_fedramp,
+        }
+    }
 }
 
 pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {

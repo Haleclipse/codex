@@ -1243,6 +1243,10 @@ impl BottomPaneView for RequestUserInputOverlay {
         }
     }
 
+    fn terminal_title_requires_action(&self) -> bool {
+        true
+    }
+
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         if self.confirm_unanswered_active() {
             self.close_unanswered_confirmation();

@@ -73,10 +73,15 @@ pub(crate) struct RunningTask {
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) handle: Arc<AbortOnDropHandle<()>>,
+    pub(crate) handle: AbortOnDropHandle<()>,
     pub(crate) turn_context: Arc<TurnContext>,
     // Timer recorded when the task drops to capture the full turn duration.
     pub(crate) _timer: Option<codex_otel::Timer>,
+}
+
+pub(crate) struct RemovedTask {
+    pub(crate) records_turn_token_usage_on_span: bool,
+    pub(crate) active_turn_is_empty: bool,
 }
 
 impl ActiveTurn {
@@ -85,9 +90,14 @@ impl ActiveTurn {
         self.tasks.insert(sub_id, task);
     }
 
-    pub(crate) fn remove_task(&mut self, sub_id: &str) -> bool {
-        self.tasks.swap_remove(sub_id);
-        self.tasks.is_empty()
+    pub(crate) fn remove_task(&mut self, sub_id: &str) -> Option<RemovedTask> {
+        let task = self.tasks.swap_remove(sub_id)?;
+        let records_turn_token_usage_on_span = task.task.records_turn_token_usage_on_span();
+        task.handle.detach();
+        Some(RemovedTask {
+            records_turn_token_usage_on_span,
+            active_turn_is_empty: self.tasks.is_empty(),
+        })
     }
 
     pub(crate) fn drain_tasks(&mut self) -> Vec<RunningTask> {

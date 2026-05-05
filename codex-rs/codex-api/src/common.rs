@@ -81,6 +81,9 @@ pub enum ResponseEvent {
     Completed {
         response_id: String,
         token_usage: Option<TokenUsage>,
+        /// Did the model affirmatively end its turn? Some providers do not set this,
+        /// so we rely on fallback logic when this is `None`.
+        end_turn: Option<bool>,
     },
     OutputTextDelta(String),
     ToolCallInputDelta {
@@ -284,6 +287,8 @@ pub fn create_text_param_for_request(
 
 pub struct ResponseStream {
     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
+    /// Server-assigned `x-request-id` response header, when present.
+    pub upstream_request_id: Option<String>,
 }
 
 impl Stream for ResponseStream {

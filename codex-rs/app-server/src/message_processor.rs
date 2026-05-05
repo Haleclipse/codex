@@ -9,8 +9,9 @@ use crate::codex_message_processor::CodexMessageProcessor;
 use crate::codex_message_processor::CodexMessageProcessorArgs;
 use crate::config_api::ConfigApi;
 use crate::config_manager::ConfigManager;
+use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::device_key_api::DeviceKeyApi;
-use crate::error_code::INVALID_REQUEST_ERROR_CODE;
+use crate::error_code::invalid_request;
 use crate::external_agent_config_api::ExternalAgentConfigApi;
 use crate::fs_api::FsApi;
 use crate::fs_watch::FsWatchManager;
@@ -18,6 +19,9 @@ use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
+use crate::request_serialization::QueuedInitializedRequest;
+use crate::request_serialization::RequestSerializationQueueKey;
+use crate::request_serialization::RequestSerializationQueues;
 use crate::transport::AppServerTransport;
 use crate::transport::ConnectionOrigin;
 use crate::transport::RemoteControlHandle;
@@ -34,7 +38,6 @@ use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigBatchWriteParams;
-use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::DeviceKeyCreateParams;
@@ -42,26 +45,18 @@ use codex_app_server_protocol::DeviceKeyPublicParams;
 use codex_app_server_protocol::DeviceKeySignParams;
 use codex_app_server_protocol::ExperimentalApi;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
-use codex_app_server_protocol::ExternalAgentConfigDetectParams;
 use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
 use codex_app_server_protocol::ExternalAgentConfigImportParams;
 use codex_app_server_protocol::ExternalAgentConfigImportResponse;
+use codex_app_server_protocol::ExternalAgentConfigMigrationItem;
 use codex_app_server_protocol::ExternalAgentConfigMigrationItemType;
-use codex_app_server_protocol::FsCopyParams;
-use codex_app_server_protocol::FsCreateDirectoryParams;
-use codex_app_server_protocol::FsGetMetadataParams;
-use codex_app_server_protocol::FsReadDirectoryParams;
-use codex_app_server_protocol::FsReadFileParams;
-use codex_app_server_protocol::FsRemoveParams;
-use codex_app_server_protocol::FsUnwatchParams;
-use codex_app_server_protocol::FsWatchParams;
-use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ModelProviderCapabilitiesReadResponse;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
 use codex_app_server_protocol::experimental_required_message;
@@ -82,6 +77,7 @@ use codex_login::default_client::USER_AGENT_SUFFIX;
 use codex_login::default_client::get_codex_user_agent;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::default_client::set_default_originator;
+use codex_model_provider::create_model_provider;
 use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
@@ -95,7 +91,6 @@ use tokio::time::timeout;
 use tracing::Instrument;
 
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
-
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
     outgoing: Arc<OutgoingMessageSender>,
@@ -179,11 +174,13 @@ pub(crate) struct MessageProcessor {
     config_warnings: Arc<Vec<ConfigWarningNotification>>,
     rpc_transport: AppServerRpcTransport,
     remote_control_handle: Option<RemoteControlHandle>,
+    request_serialization_queues: RequestSerializationQueues,
 }
 
 #[derive(Debug)]
 pub(crate) struct ConnectionSessionState {
     origin: ConnectionOrigin,
+    pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
@@ -205,6 +202,7 @@ impl ConnectionSessionState {
     pub(crate) fn new(origin: ConnectionOrigin) -> Self {
         Self {
             origin,
+            rpc_gate: Arc::new(ConnectionRpcGate::new()),
             initialized: OnceLock::new(),
         }
     }
@@ -260,6 +258,7 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) rpc_transport: AppServerRpcTransport,
     pub(crate) remote_control_handle: Option<RemoteControlHandle>,
+    pub(crate) plugin_startup_tasks: crate::PluginStartupTasks,
 }
 
 impl MessageProcessor {
@@ -279,6 +278,7 @@ impl MessageProcessor {
             auth_manager,
             rpc_transport,
             remote_control_handle,
+            plugin_startup_tasks,
         } = args;
         auth_manager.set_external_auth(Arc::new(ExternalAuthRefreshBridge {
             outgoing: outgoing.clone(),
@@ -315,11 +315,13 @@ impl MessageProcessor {
             feedback,
             log_db,
         });
-        // Keep plugin startup warmups aligned at app-server startup.
-        // TODO(xl): Move into PluginManager once this no longer depends on config feature gating.
-        thread_manager
-            .plugins_manager()
-            .maybe_start_plugin_startup_tasks_for_config(&config, auth_manager.clone());
+        if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
+            // Keep plugin startup warmups aligned at app-server startup.
+            // TODO(xl): Move into PluginManager once this no longer depends on config feature gating.
+            thread_manager
+                .plugins_manager()
+                .maybe_start_plugin_startup_tasks_for_config(&config, auth_manager.clone());
+        }
         let config_api = ConfigApi::new(
             config_manager,
             thread_manager.clone(),
@@ -352,6 +354,7 @@ impl MessageProcessor {
             config_warnings: Arc::new(config_warnings),
             rpc_transport,
             remote_control_handle,
+            request_serialization_queues: RequestSerializationQueues::default(),
         }
     }
 
@@ -387,43 +390,28 @@ impl MessageProcessor {
             Arc::clone(&self.outgoing),
             request_context.clone(),
             async {
-                let request_json = match serde_json::to_value(&request) {
-                    Ok(request_json) => request_json,
-                    Err(err) => {
-                        let error = JSONRPCErrorError {
-                            code: INVALID_REQUEST_ERROR_CODE,
-                            message: format!("Invalid request: {err}"),
-                            data: None,
-                        };
-                        self.outgoing.send_error(request_id.clone(), error).await;
-                        return;
-                    }
-                };
-
-                let codex_request = match serde_json::from_value::<ClientRequest>(request_json) {
-                    Ok(codex_request) => codex_request,
-                    Err(err) => {
-                        let error = JSONRPCErrorError {
-                            code: INVALID_REQUEST_ERROR_CODE,
-                            message: format!("Invalid request: {err}"),
-                            data: None,
-                        };
-                        self.outgoing.send_error(request_id.clone(), error).await;
-                        return;
-                    }
-                };
-                // Websocket callers finalize outbound readiness in lib.rs after mirroring
-                // session state into outbound state and sending initialize notifications to
-                // this specific connection. Passing `None` avoids marking the connection
-                // ready too early from inside the shared request handler.
-                self.handle_client_request(
-                    request_id.clone(),
-                    codex_request,
-                    Arc::clone(&session),
-                    /*outbound_initialized*/ None,
-                    request_context.clone(),
-                )
+                let result = async {
+                    let request_json = serde_json::to_value(&request)
+                        .map_err(|err| invalid_request(format!("Invalid request: {err}")))?;
+                    let codex_request = serde_json::from_value::<ClientRequest>(request_json)
+                        .map_err(|err| invalid_request(format!("Invalid request: {err}")))?;
+                    // Websocket callers finalize outbound readiness in lib.rs after mirroring
+                    // session state into outbound state and sending initialize notifications to
+                    // this specific connection. Passing `None` avoids marking the connection
+                    // ready too early from inside the shared request handler.
+                    self.handle_client_request(
+                        request_id.clone(),
+                        codex_request,
+                        Arc::clone(&session),
+                        /*outbound_initialized*/ None,
+                        request_context.clone(),
+                    )
+                    .await
+                }
                 .await;
+                if let Err(error) = result {
+                    self.outgoing.send_error(request_id.clone(), error).await;
+                }
             },
         )
         .await;
@@ -460,14 +448,18 @@ impl MessageProcessor {
                 // In-process clients do not have the websocket transport loop that performs
                 // post-initialize bookkeeping, so they still finalize outbound readiness in
                 // the shared request handler.
-                self.handle_client_request(
-                    request_id.clone(),
-                    request,
-                    Arc::clone(&session),
-                    Some(outbound_initialized),
-                    request_context.clone(),
-                )
-                .await;
+                let result = self
+                    .handle_client_request(
+                        request_id.clone(),
+                        request,
+                        Arc::clone(&session),
+                        Some(outbound_initialized),
+                        request_context.clone(),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    self.outgoing.send_error(request_id.clone(), error).await;
+                }
             },
         )
         .await;
@@ -559,7 +551,12 @@ impl MessageProcessor {
         self.codex_message_processor.shutdown_threads().await;
     }
 
-    pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+    pub(crate) async fn connection_closed(
+        &self,
+        connection_id: ConnectionId,
+        session_state: &ConnectionSessionState,
+    ) {
+        session_state.rpc_gate.shutdown().await;
         self.outgoing.connection_closed(connection_id).await;
         self.fs_watch_manager.connection_closed(connection_id).await;
         self.codex_message_processor
@@ -595,7 +592,7 @@ impl MessageProcessor {
         // lib.rs can deliver connection-scoped initialize notifications first.
         outbound_initialized: Option<&AtomicBool>,
         request_context: RequestContext,
-    ) {
+    ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
         if let ClientRequest::Initialize { request_id, params } = codex_request {
             // Handle Initialize internally so CodexMessageProcessor does not have to concern
@@ -605,13 +602,7 @@ impl MessageProcessor {
                 request_id,
             };
             if session.initialized() {
-                let error = JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: "Already initialized".to_string(),
-                    data: None,
-                };
-                self.outgoing.send_error(connection_request_id, error).await;
-                return;
+                return Err(invalid_request("Already initialized"));
             }
 
             // TODO(maxj): Revisit capability scoping for `experimental_api_enabled`.
@@ -639,17 +630,9 @@ impl MessageProcessor {
             // Validate before committing; set_default_originator validates while
             // mutating process-global metadata.
             if HeaderValue::from_str(&name).is_err() {
-                let error = JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!(
-                        "Invalid clientInfo.name: '{name}'. Must be a valid HTTP header value."
-                    ),
-                    data: None,
-                };
-                self.outgoing
-                    .send_error(connection_request_id.clone(), error)
-                    .await;
-                return;
+                return Err(invalid_request(format!(
+                    "Invalid clientInfo.name: '{name}'. Must be a valid HTTP header value."
+                )));
             }
             let originator = name.clone();
             let user_agent_suffix = format!("{name}; {version}");
@@ -665,13 +648,7 @@ impl MessageProcessor {
                 })
                 .is_err()
             {
-                let error = JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: "Already initialized".to_string(),
-                    data: None,
-                };
-                self.outgoing.send_error(connection_request_id, error).await;
-                return;
+                return Err(invalid_request("Already initialized"));
             }
 
             // Only the request that wins session initialization may mutate
@@ -692,14 +669,12 @@ impl MessageProcessor {
                     }
                 }
             }
-            if self.config.features.enabled(Feature::GeneralAnalytics) {
-                self.analytics_events_client.track_initialize(
-                    connection_id.0,
-                    analytics_initialize_params,
-                    originator,
-                    self.rpc_transport,
-                );
-            }
+            self.analytics_events_client.track_initialize(
+                connection_id.0,
+                analytics_initialize_params,
+                originator,
+                self.rpc_transport,
+            );
             set_default_client_residency_requirement(self.config.enforce_residency.value());
             if let Ok(mut suffix) = USER_AGENT_SUFFIX.lock() {
                 *suffix = Some(user_agent_suffix);
@@ -726,7 +701,7 @@ impl MessageProcessor {
                     .connection_initialized(connection_id)
                     .await;
             }
-            return;
+            return Ok(());
         }
 
         self.dispatch_initialized_client_request(
@@ -735,7 +710,7 @@ impl MessageProcessor {
             session,
             request_context,
         )
-        .await;
+        .await
     }
 
     async fn dispatch_initialized_client_request(
@@ -744,32 +719,19 @@ impl MessageProcessor {
         codex_request: ClientRequest,
         session: Arc<ConnectionSessionState>,
         request_context: RequestContext,
-    ) {
+    ) -> Result<(), JSONRPCErrorError> {
         if !session.initialized() {
-            let error = JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: "Not initialized".to_string(),
-                data: None,
-            };
-            self.outgoing.send_error(connection_request_id, error).await;
-            return;
+            return Err(invalid_request("Not initialized"));
         }
 
         if let Some(reason) = codex_request.experimental_reason()
             && !session.experimental_api_enabled()
         {
-            let error = JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message: experimental_required_message(reason),
-                data: None,
-            };
-            self.outgoing.send_error(connection_request_id, error).await;
-            return;
+            return Err(invalid_request(experimental_required_message(reason)));
         }
         let connection_id = connection_request_id.connection_id;
-        if self.config.features.enabled(Feature::GeneralAnalytics)
-            && let ClientRequest::TurnStart { request_id, .. }
-            | ClientRequest::TurnSteer { request_id, .. } = &codex_request
+        if let ClientRequest::TurnStart { request_id, .. }
+        | ClientRequest::TurnSteer { request_id, .. } = &codex_request
         {
             self.analytics_events_client.track_request(
                 connection_id.0,
@@ -778,19 +740,46 @@ impl MessageProcessor {
             );
         }
 
+        let serialization_scope = codex_request.serialization_scope();
         let app_server_client_name = session.app_server_client_name().map(str::to_string);
         let client_version = session.client_version().map(str::to_string);
         let device_key_requests_allowed = session.allows_device_key_requests();
-        Arc::clone(self)
-            .handle_initialized_client_request(
-                connection_request_id,
-                codex_request,
-                request_context,
-                app_server_client_name,
-                client_version,
-                device_key_requests_allowed,
-            )
-            .await;
+        let error_request_id = connection_request_id.clone();
+        let rpc_gate = Arc::clone(&session.rpc_gate);
+        let processor = Arc::clone(self);
+        let span = request_context.span();
+        let request = QueuedInitializedRequest::new(
+            rpc_gate,
+            async move {
+                let processor_for_request = Arc::clone(&processor);
+                let result = processor_for_request
+                    .handle_initialized_client_request(
+                        connection_request_id,
+                        codex_request,
+                        request_context,
+                        app_server_client_name,
+                        client_version,
+                        device_key_requests_allowed,
+                    )
+                    .await;
+                if let Err(error) = result {
+                    processor.outgoing.send_error(error_request_id, error).await;
+                }
+            }
+            .instrument(span),
+        );
+
+        if let Some(scope) = serialization_scope {
+            let key = RequestSerializationQueueKey::from_scope(connection_id, scope);
+            self.request_serialization_queues
+                .enqueue(key, request)
+                .await;
+        } else {
+            tokio::spawn(async move {
+                request.run().await;
+            });
+        }
+        Ok(())
     }
 
     async fn handle_initialized_client_request(
@@ -801,66 +790,48 @@ impl MessageProcessor {
         app_server_client_name: Option<String>,
         client_version: Option<String>,
         device_key_requests_allowed: bool,
-    ) {
+    ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
+        let request_id_for_connection = |request_id| ConnectionRequestId {
+            connection_id,
+            request_id,
+        };
 
         match codex_request {
             ClientRequest::ConfigRead { request_id, params } => {
-                self.handle_config_read(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.config_api.read(params).await,
+                    )
+                    .await;
             }
             ClientRequest::ExternalAgentConfigDetect { request_id, params } => {
-                self.handle_external_agent_config_detect(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.external_agent_config_api.detect(params).await,
+                    )
+                    .await;
             }
             ClientRequest::ExternalAgentConfigImport { request_id, params } => {
                 self.handle_external_agent_config_import(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
+                    request_id_for_connection(request_id),
                     params,
                 )
-                .await;
+                .await?;
             }
             ClientRequest::ConfigValueWrite { request_id, params } => {
-                self.handle_config_value_write(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.handle_config_value_write(request_id_for_connection(request_id), params)
+                    .await;
             }
             ClientRequest::ConfigBatchWrite { request_id, params } => {
-                self.handle_config_batch_write(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.handle_config_batch_write(request_id_for_connection(request_id), params)
+                    .await;
             }
             ClientRequest::ExperimentalFeatureEnablementSet { request_id, params } => {
                 self.handle_experimental_feature_enablement_set(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
+                    request_id_for_connection(request_id),
                     params,
                 )
                 .await;
@@ -869,133 +840,112 @@ impl MessageProcessor {
                 request_id,
                 params: _,
             } => {
-                self.handle_config_requirements_read(ConnectionRequestId {
-                    connection_id,
-                    request_id,
-                })
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.config_api.config_requirements_read().await,
+                    )
+                    .await;
             }
             ClientRequest::DeviceKeyCreate { request_id, params } => {
                 self.handle_device_key_create(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
+                    request_id_for_connection(request_id),
                     params,
                     device_key_requests_allowed,
                 );
             }
             ClientRequest::DeviceKeyPublic { request_id, params } => {
                 self.handle_device_key_public(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
+                    request_id_for_connection(request_id),
                     params,
                     device_key_requests_allowed,
                 );
             }
             ClientRequest::DeviceKeySign { request_id, params } => {
                 self.handle_device_key_sign(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
+                    request_id_for_connection(request_id),
                     params,
                     device_key_requests_allowed,
                 );
             }
             ClientRequest::FsReadFile { request_id, params } => {
-                self.handle_fs_read_file(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.read_file(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsWriteFile { request_id, params } => {
-                self.handle_fs_write_file(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.write_file(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsCreateDirectory { request_id, params } => {
-                self.handle_fs_create_directory(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.create_directory(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsGetMetadata { request_id, params } => {
-                self.handle_fs_get_metadata(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.get_metadata(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsReadDirectory { request_id, params } => {
-                self.handle_fs_read_directory(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.read_directory(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsRemove { request_id, params } => {
-                self.handle_fs_remove(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.remove(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsCopy { request_id, params } => {
-                self.handle_fs_copy(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_api.copy(params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsWatch { request_id, params } => {
-                self.handle_fs_watch(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    connection_id,
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_watch_manager.watch(connection_id, params).await,
+                    )
+                    .await;
             }
             ClientRequest::FsUnwatch { request_id, params } => {
-                self.handle_fs_unwatch(
-                    ConnectionRequestId {
-                        connection_id,
-                        request_id,
-                    },
-                    connection_id,
-                    params,
-                )
-                .await;
+                self.outgoing
+                    .send_result(
+                        request_id_for_connection(request_id),
+                        self.fs_watch_manager.unwatch(connection_id, params).await,
+                    )
+                    .await;
+            }
+            ClientRequest::ModelProviderCapabilitiesRead {
+                request_id,
+                params: _,
+            } => {
+                self.handle_model_provider_capabilities_read(request_id_for_connection(request_id))
+                    .await;
             }
             other => {
                 // Box the delegated future so this wrapper's async state machine does not
@@ -1013,13 +963,25 @@ impl MessageProcessor {
                     .await;
             }
         }
+        Ok(())
     }
 
-    async fn handle_config_read(&self, request_id: ConnectionRequestId, params: ConfigReadParams) {
-        match self.config_api.read(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
+    async fn handle_model_provider_capabilities_read(&self, request_id: ConnectionRequestId) {
+        let result = async {
+            let config = self
+                .config_api
+                .load_latest_config(/*fallback_cwd*/ None)
+                .await?;
+            let provider = create_model_provider(config.model_provider, /*auth_manager*/ None);
+            let capabilities = provider.capabilities();
+            Ok::<_, JSONRPCErrorError>(ModelProviderCapabilitiesReadResponse {
+                namespace_tools: capabilities.namespace_tools,
+                image_generation: capabilities.image_generation,
+                web_search: capabilities.web_search,
+            })
         }
+        .await;
+        self.outgoing.send_result(request_id, result).await;
     }
 
     async fn handle_config_value_write(
@@ -1164,13 +1126,6 @@ impl MessageProcessor {
         }
     }
 
-    async fn handle_config_requirements_read(&self, request_id: ConnectionRequestId) {
-        match self.config_api.config_requirements_read().await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
     fn handle_device_key_create(
         &self,
         request_id: ConnectionRequestId,
@@ -1227,195 +1182,148 @@ impl MessageProcessor {
         let device_key_api = self.device_key_api.clone();
         let outgoing = Arc::clone(&self.outgoing);
         tokio::spawn(async move {
-            if !device_key_requests_allowed {
-                outgoing
-                    .send_error(
-                        request_id,
-                        JSONRPCErrorError {
-                            code: INVALID_REQUEST_ERROR_CODE,
-                            message: format!("{method} is not available over remote transports"),
-                            data: None,
-                        },
-                    )
-                    .await;
-                return;
+            let result = async {
+                if !device_key_requests_allowed {
+                    return Err(invalid_request(format!(
+                        "{method} is not available over remote transports"
+                    )));
+                }
+                run_request(device_key_api).await
             }
-
-            match run_request(device_key_api).await {
-                Ok(response) => outgoing.send_response(request_id, response).await,
-                Err(error) => outgoing.send_error(request_id, error).await,
-            }
+            .await;
+            outgoing.send_result(request_id, result).await;
         });
-    }
-
-    async fn handle_external_agent_config_detect(
-        &self,
-        request_id: ConnectionRequestId,
-        params: ExternalAgentConfigDetectParams,
-    ) {
-        match self.external_agent_config_api.detect(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
     }
 
     async fn handle_external_agent_config_import(
         &self,
         request_id: ConnectionRequestId,
         params: ExternalAgentConfigImportParams,
-    ) {
+    ) -> Result<(), JSONRPCErrorError> {
+        let needs_runtime_refresh = migration_items_need_runtime_refresh(&params.migration_items);
         let has_plugin_imports = params.migration_items.iter().any(|item| {
             matches!(
                 item.item_type,
                 ExternalAgentConfigMigrationItemType::Plugins
             )
         });
-        match self.external_agent_config_api.import(params).await {
-            Ok(pending_plugin_imports) => {
-                if has_plugin_imports {
-                    self.handle_config_mutation().await;
-                }
-                self.outgoing
-                    .send_response(request_id, ExternalAgentConfigImportResponse {})
-                    .await;
+        let pending_session_imports = self
+            .external_agent_config_api
+            .prepare_pending_session_imports(&params)?;
+        let pending_plugin_imports = self.external_agent_config_api.import(params).await?;
+        if needs_runtime_refresh {
+            self.handle_config_mutation().await;
+        }
+        for pending_session_import in pending_session_imports {
+            let imported_thread_id = self
+                .codex_message_processor
+                .import_external_agent_session(pending_session_import.session)
+                .await?;
+            self.external_agent_config_api
+                .record_imported_session(&pending_session_import.source_path, imported_thread_id);
+        }
+        self.outgoing
+            .send_response(request_id, ExternalAgentConfigImportResponse {})
+            .await;
 
-                if !has_plugin_imports {
-                    return;
-                }
+        if !has_plugin_imports {
+            return Ok(());
+        }
 
-                if pending_plugin_imports.is_empty() {
-                    self.outgoing
-                        .send_server_notification(
-                            ServerNotification::ExternalAgentConfigImportCompleted(
-                                ExternalAgentConfigImportCompletedNotification {},
-                            ),
-                        )
-                        .await;
-                    return;
-                }
+        if pending_plugin_imports.is_empty() {
+            self.outgoing
+                .send_server_notification(ServerNotification::ExternalAgentConfigImportCompleted(
+                    ExternalAgentConfigImportCompletedNotification {},
+                ))
+                .await;
+            return Ok(());
+        }
 
-                let external_agent_config_api = self.external_agent_config_api.clone();
-                let outgoing = Arc::clone(&self.outgoing);
-                let thread_manager = Arc::clone(&self.thread_manager);
-                tokio::spawn(async move {
-                    for pending_plugin_import in pending_plugin_imports {
-                        match external_agent_config_api
-                            .complete_pending_plugin_import(pending_plugin_import)
-                            .await
-                        {
-                            Ok(()) => {}
-                            Err(error) => {
-                                tracing::warn!(
-                                    error = %error.message,
-                                    "external agent config plugin import failed"
-                                );
-                            }
-                        }
+        let external_agent_config_api = self.external_agent_config_api.clone();
+        let outgoing = Arc::clone(&self.outgoing);
+        let thread_manager = Arc::clone(&self.thread_manager);
+        tokio::spawn(async move {
+            for pending_plugin_import in pending_plugin_imports {
+                match external_agent_config_api
+                    .complete_pending_plugin_import(pending_plugin_import)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error.message,
+                            "external agent config plugin import failed"
+                        );
                     }
-                    thread_manager.plugins_manager().clear_cache();
-                    thread_manager.skills_manager().clear_cache();
-                    outgoing
-                        .send_server_notification(
-                            ServerNotification::ExternalAgentConfigImportCompleted(
-                                ExternalAgentConfigImportCompletedNotification {},
-                            ),
-                        )
-                        .await;
-                });
+                }
             }
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
+            thread_manager.plugins_manager().clear_cache();
+            thread_manager.skills_manager().clear_cache();
+            outgoing
+                .send_server_notification(ServerNotification::ExternalAgentConfigImportCompleted(
+                    ExternalAgentConfigImportCompletedNotification {},
+                ))
+                .await;
+        });
 
-    async fn handle_fs_read_file(&self, request_id: ConnectionRequestId, params: FsReadFileParams) {
-        match self.fs_api.read_file(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
+        Ok(())
     }
+}
 
-    async fn handle_fs_write_file(
-        &self,
-        request_id: ConnectionRequestId,
-        params: FsWriteFileParams,
-    ) {
-        match self.fs_api.write_file(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_create_directory(
-        &self,
-        request_id: ConnectionRequestId,
-        params: FsCreateDirectoryParams,
-    ) {
-        match self.fs_api.create_directory(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_get_metadata(
-        &self,
-        request_id: ConnectionRequestId,
-        params: FsGetMetadataParams,
-    ) {
-        match self.fs_api.get_metadata(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_read_directory(
-        &self,
-        request_id: ConnectionRequestId,
-        params: FsReadDirectoryParams,
-    ) {
-        match self.fs_api.read_directory(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_remove(&self, request_id: ConnectionRequestId, params: FsRemoveParams) {
-        match self.fs_api.remove(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_copy(&self, request_id: ConnectionRequestId, params: FsCopyParams) {
-        match self.fs_api.copy(params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_watch(
-        &self,
-        request_id: ConnectionRequestId,
-        connection_id: ConnectionId,
-        params: FsWatchParams,
-    ) {
-        match self.fs_watch_manager.watch(connection_id, params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
-
-    async fn handle_fs_unwatch(
-        &self,
-        request_id: ConnectionRequestId,
-        connection_id: ConnectionId,
-        params: FsUnwatchParams,
-    ) {
-        match self.fs_watch_manager.unwatch(connection_id, params).await {
-            Ok(response) => self.outgoing.send_response(request_id, response).await,
-            Err(error) => self.outgoing.send_error(request_id, error).await,
-        }
-    }
+fn migration_items_need_runtime_refresh(items: &[ExternalAgentConfigMigrationItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item.item_type,
+            ExternalAgentConfigMigrationItemType::Config
+                | ExternalAgentConfigMigrationItemType::Skills
+                | ExternalAgentConfigMigrationItemType::McpServerConfig
+                | ExternalAgentConfigMigrationItemType::Hooks
+                | ExternalAgentConfigMigrationItemType::Commands
+                | ExternalAgentConfigMigrationItemType::Plugins
+        )
+    })
 }
 
 #[cfg(test)]
 mod tracing_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn migration_item(
+        item_type: ExternalAgentConfigMigrationItemType,
+    ) -> ExternalAgentConfigMigrationItem {
+        ExternalAgentConfigMigrationItem {
+            item_type,
+            description: String::new(),
+            cwd: None,
+            details: None,
+        }
+    }
+
+    #[test]
+    fn migration_items_that_update_runtime_sources_trigger_refresh() {
+        assert!(migration_items_need_runtime_refresh(&[migration_item(
+            ExternalAgentConfigMigrationItemType::Config,
+        )]));
+        assert!(migration_items_need_runtime_refresh(&[migration_item(
+            ExternalAgentConfigMigrationItemType::Skills,
+        )]));
+        assert!(migration_items_need_runtime_refresh(&[migration_item(
+            ExternalAgentConfigMigrationItemType::McpServerConfig,
+        )]));
+        assert!(migration_items_need_runtime_refresh(&[migration_item(
+            ExternalAgentConfigMigrationItemType::Hooks,
+        )]));
+        assert!(migration_items_need_runtime_refresh(&[migration_item(
+            ExternalAgentConfigMigrationItemType::Commands,
+        )]));
+        assert!(migration_items_need_runtime_refresh(&[migration_item(
+            ExternalAgentConfigMigrationItemType::Plugins,
+        )]));
+        assert!(!migration_items_need_runtime_refresh(&[migration_item(
+            ExternalAgentConfigMigrationItemType::Sessions,
+        )]));
+    }
+}

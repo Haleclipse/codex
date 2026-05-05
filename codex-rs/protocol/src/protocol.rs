@@ -4,8 +4,6 @@
 //! between user and agent.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fmt;
 use std::ops::Mul;
 use std::path::Path;
@@ -84,6 +82,7 @@ pub use crate::permissions::FileSystemSandboxKind;
 pub use crate::permissions::FileSystemSandboxPolicy;
 pub use crate::permissions::FileSystemSpecialPath;
 pub use crate::permissions::NetworkSandboxPolicy;
+use crate::permissions::default_read_only_subpaths_for_writable_root;
 pub use crate::request_permissions::RequestPermissionsArgs;
 pub use crate::request_user_input::RequestUserInputEvent;
 
@@ -758,12 +757,6 @@ pub enum Op {
     /// to generate a summary which will be returned as an AgentMessage event.
     Compact,
 
-    /// Drop all persisted memory artifacts and memory-tracking DB rows.
-    DropMemories,
-
-    /// Trigger a single pass of the startup memory pipeline.
-    UpdateMemories,
-
     /// Set a user-facing thread name in the persisted rollout metadata.
     /// This is a local-only operation handled by codex-core; it does not
     /// involve the model.
@@ -775,7 +768,10 @@ pub enum Op {
     /// model.
     SetThreadMemoryMode { mode: ThreadMemoryMode },
 
-    /// Request Codex to undo a turn (turn are stacked so it is the same effect as CMD + Z).
+    /// Legacy request to undo a turn.
+    ///
+    /// The op is still accepted for compatibility, but ghost snapshots are no
+    /// longer produced so the request reports unavailable.
     Undo,
 
     /// Request Codex to drop the last N user turns from in-memory context.
@@ -858,6 +854,7 @@ impl InterAgentCommunication {
             content: vec![ContentItem::OutputText {
                 text: serde_json::to_string(self).unwrap_or_default(),
             }],
+            phase: Some(MessagePhase::Commentary),
         }
     }
 
@@ -903,8 +900,6 @@ impl Op {
             Self::ReloadUserConfig => "reload_user_config",
             Self::ListSkills { .. } => "list_skills",
             Self::Compact => "compact",
-            Self::DropMemories => "drop_memories",
-            Self::UpdateMemories => "update_memories",
             Self::SetThreadName { .. } => "set_thread_name",
             Self::SetThreadMemoryMode { .. } => "set_thread_memory_mode",
             Self::Undo => "undo",
@@ -1025,76 +1020,6 @@ impl NetworkAccess {
         matches!(self, NetworkAccess::Enabled)
     }
 }
-fn default_include_platform_defaults() -> bool {
-    true
-}
-
-/// Determines how read-only file access is granted inside a restricted
-/// sandbox.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Default, JsonSchema, TS)]
-#[strum(serialize_all = "kebab-case")]
-#[serde(tag = "type", rename_all = "kebab-case")]
-#[ts(tag = "type")]
-pub enum ReadOnlyAccess {
-    /// Restrict reads to an explicit set of roots.
-    ///
-    /// When `include_platform_defaults` is `true`, platform defaults required
-    /// for basic execution are included in addition to `readable_roots`.
-    Restricted {
-        /// Include built-in platform read roots required for basic process
-        /// execution.
-        #[serde(default = "default_include_platform_defaults")]
-        include_platform_defaults: bool,
-        /// Additional absolute roots that should be readable.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        readable_roots: Vec<AbsolutePathBuf>,
-    },
-
-    /// Allow unrestricted file reads.
-    #[default]
-    FullAccess,
-}
-
-impl ReadOnlyAccess {
-    pub fn has_full_disk_read_access(&self) -> bool {
-        matches!(self, ReadOnlyAccess::FullAccess)
-    }
-
-    /// Returns true if platform defaults should be included for restricted read access.
-    pub fn include_platform_defaults(&self) -> bool {
-        matches!(
-            self,
-            ReadOnlyAccess::Restricted {
-                include_platform_defaults: true,
-                ..
-            }
-        )
-    }
-
-    /// Returns the readable roots for restricted read access.
-    ///
-    /// For [`ReadOnlyAccess::FullAccess`], returns an empty list because
-    /// callers should grant blanket read access instead.
-    pub fn get_readable_roots_with_cwd(&self, cwd: &Path) -> Vec<AbsolutePathBuf> {
-        let mut roots: Vec<AbsolutePathBuf> = match self {
-            ReadOnlyAccess::FullAccess => return Vec::new(),
-            ReadOnlyAccess::Restricted { readable_roots, .. } => {
-                let mut roots = readable_roots.clone();
-                match AbsolutePathBuf::from_absolute_path(cwd) {
-                    Ok(cwd_root) => roots.push(cwd_root),
-                    Err(err) => {
-                        error!("Ignoring invalid cwd {cwd:?} for sandbox readable root: {err}");
-                    }
-                }
-                roots
-            }
-        };
-
-        let mut seen = HashSet::new();
-        roots.retain(|root| seen.insert(root.to_path_buf()));
-        roots
-    }
-}
 
 /// Determines execution restrictions for model shell commands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, JsonSchema, TS)]
@@ -1108,13 +1033,6 @@ pub enum SandboxPolicy {
     /// Read-only access configuration.
     #[serde(rename = "read-only")]
     ReadOnly {
-        /// Read access granted while running under this policy.
-        #[serde(
-            default,
-            skip_serializing_if = "ReadOnlyAccess::has_full_disk_read_access"
-        )]
-        access: ReadOnlyAccess,
-
         /// When set to `true`, outbound network access is allowed. `false` by
         /// default.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1138,13 +1056,6 @@ pub enum SandboxPolicy {
         /// writable from within the sandbox.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         writable_roots: Vec<AbsolutePathBuf>,
-
-        /// Read access granted while running under this policy.
-        #[serde(
-            default,
-            skip_serializing_if = "ReadOnlyAccess::has_full_disk_read_access"
-        )]
-        read_only_access: ReadOnlyAccess,
 
         /// When set to `true`, outbound network access is allowed. `false` by
         /// default.
@@ -1175,6 +1086,11 @@ pub struct WritableRoot {
 
     /// By construction, these subpaths are all under `root`.
     pub read_only_subpaths: Vec<AbsolutePathBuf>,
+
+    /// Workspace metadata path names that must not be created or replaced under
+    /// `root` unless the policy grants an explicit write rule for that metadata
+    /// path.
+    pub protected_metadata_names: Vec<String>,
 }
 
 impl WritableRoot {
@@ -1191,7 +1107,25 @@ impl WritableRoot {
             }
         }
 
+        if self.path_contains_protected_metadata_name(path) {
+            return false;
+        }
+
         true
+    }
+
+    fn path_contains_protected_metadata_name(&self, path: &Path) -> bool {
+        let Ok(relative_path) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+
+        let Some(first_component) = relative_path.components().next() else {
+            return false;
+        };
+
+        self.protected_metadata_names
+            .iter()
+            .any(|name| first_component.as_os_str() == std::ffi::OsStr::new(name))
     }
 }
 
@@ -1223,7 +1157,6 @@ impl SandboxPolicy {
     /// Returns a policy with read-only disk access and no network.
     pub fn new_read_only_policy() -> Self {
         SandboxPolicy::ReadOnly {
-            access: ReadOnlyAccess::FullAccess,
             network_access: false,
         }
     }
@@ -1234,7 +1167,6 @@ impl SandboxPolicy {
     pub fn new_workspace_write_policy() -> Self {
         SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
-            read_only_access: ReadOnlyAccess::FullAccess,
             network_access: false,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
@@ -1242,14 +1174,7 @@ impl SandboxPolicy {
     }
 
     pub fn has_full_disk_read_access(&self) -> bool {
-        match self {
-            SandboxPolicy::DangerFullAccess => true,
-            SandboxPolicy::ExternalSandbox { .. } => true,
-            SandboxPolicy::ReadOnly { access, .. } => access.has_full_disk_read_access(),
-            SandboxPolicy::WorkspaceWrite {
-                read_only_access, ..
-            } => read_only_access.has_full_disk_read_access(),
-        }
+        true
     }
 
     pub fn has_full_disk_write_access(&self) -> bool {
@@ -1270,46 +1195,6 @@ impl SandboxPolicy {
         }
     }
 
-    /// Returns true if platform defaults should be included for restricted read access.
-    pub fn include_platform_defaults(&self) -> bool {
-        if self.has_full_disk_read_access() {
-            return false;
-        }
-        match self {
-            SandboxPolicy::ReadOnly { access, .. } => access.include_platform_defaults(),
-            SandboxPolicy::WorkspaceWrite {
-                read_only_access, ..
-            } => read_only_access.include_platform_defaults(),
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => false,
-        }
-    }
-
-    /// Returns the list of readable roots (tailored to the current working
-    /// directory) when read access is restricted.
-    ///
-    /// For policies with full read access, this returns an empty list because
-    /// callers should grant blanket reads.
-    pub fn get_readable_roots_with_cwd(&self, cwd: &Path) -> Vec<AbsolutePathBuf> {
-        let mut roots = match self {
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => Vec::new(),
-            SandboxPolicy::ReadOnly { access, .. } => access.get_readable_roots_with_cwd(cwd),
-            SandboxPolicy::WorkspaceWrite {
-                read_only_access, ..
-            } => {
-                let mut roots = read_only_access.get_readable_roots_with_cwd(cwd);
-                roots.extend(
-                    self.get_writable_roots_with_cwd(cwd)
-                        .into_iter()
-                        .map(|root| root.root),
-                );
-                roots
-            }
-        };
-        let mut seen = HashSet::new();
-        roots.retain(|root| seen.insert(root.to_path_buf()));
-        roots
-    }
-
     /// Returns the list of writable roots (tailored to the current working
     /// directory) together with subpaths that should remain read‑only under
     /// each writable root.
@@ -1320,7 +1205,6 @@ impl SandboxPolicy {
             SandboxPolicy::ReadOnly { .. } => Vec::new(),
             SandboxPolicy::WorkspaceWrite {
                 writable_roots,
-                read_only_access: _,
                 exclude_tmpdir_env_var,
                 exclude_slash_tmp,
                 network_access: _,
@@ -1395,6 +1279,7 @@ impl SandboxPolicy {
                                 &writable_root,
                                 protect_missing_dot_codex,
                             ),
+                            protected_metadata_names: Vec::new(),
                             root: writable_root,
                         }
                     })
@@ -1402,107 +1287,6 @@ impl SandboxPolicy {
             }
         }
     }
-}
-
-fn default_read_only_subpaths_for_writable_root(
-    writable_root: &AbsolutePathBuf,
-    protect_missing_dot_codex: bool,
-) -> Vec<AbsolutePathBuf> {
-    let mut subpaths: Vec<AbsolutePathBuf> = Vec::new();
-    let top_level_git = writable_root.join(".git");
-    // This applies to typical repos (directory .git), worktrees/submodules
-    // (file .git with gitdir pointer), and bare repos when the gitdir is the
-    // writable root itself.
-    let top_level_git_is_file = top_level_git.as_path().is_file();
-    let top_level_git_is_dir = top_level_git.as_path().is_dir();
-    if top_level_git_is_dir || top_level_git_is_file {
-        if top_level_git_is_file
-            && is_git_pointer_file(&top_level_git)
-            && let Some(gitdir) = resolve_gitdir_from_file(&top_level_git)
-        {
-            subpaths.push(gitdir);
-        }
-        subpaths.push(top_level_git);
-    }
-
-    let top_level_agents = writable_root.join(".agents");
-    if top_level_agents.as_path().is_dir() {
-        subpaths.push(top_level_agents);
-    }
-
-    // Keep top-level project metadata under .codex read-only to the agent by
-    // default. For the workspace root itself, protect it even before the
-    // directory exists so first-time creation still goes through the
-    // protected-path approval flow.
-    let top_level_codex = writable_root.join(".codex");
-    if protect_missing_dot_codex || top_level_codex.as_path().is_dir() {
-        subpaths.push(top_level_codex);
-    }
-
-    let mut deduped = Vec::with_capacity(subpaths.len());
-    let mut seen = HashSet::new();
-    for path in subpaths {
-        if seen.insert(path.to_path_buf()) {
-            deduped.push(path);
-        }
-    }
-    deduped
-}
-
-fn is_git_pointer_file(path: &AbsolutePathBuf) -> bool {
-    path.as_path().is_file() && path.as_path().file_name() == Some(OsStr::new(".git"))
-}
-
-fn resolve_gitdir_from_file(dot_git: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
-    let contents = match std::fs::read_to_string(dot_git.as_path()) {
-        Ok(contents) => contents,
-        Err(err) => {
-            error!(
-                "Failed to read {path} for gitdir pointer: {err}",
-                path = dot_git.as_path().display()
-            );
-            return None;
-        }
-    };
-
-    let trimmed = contents.trim();
-    let (_, gitdir_raw) = match trimmed.split_once(':') {
-        Some(parts) => parts,
-        None => {
-            error!(
-                "Expected {path} to contain a gitdir pointer, but it did not match `gitdir: <path>`.",
-                path = dot_git.as_path().display()
-            );
-            return None;
-        }
-    };
-    let gitdir_raw = gitdir_raw.trim();
-    if gitdir_raw.is_empty() {
-        error!(
-            "Expected {path} to contain a gitdir pointer, but it was empty.",
-            path = dot_git.as_path().display()
-        );
-        return None;
-    }
-    let base = match dot_git.as_path().parent() {
-        Some(base) => base,
-        None => {
-            error!(
-                "Unable to resolve parent directory for {path}.",
-                path = dot_git.as_path().display()
-            );
-            return None;
-        }
-    };
-    let gitdir_path = AbsolutePathBuf::resolve_path_against_base(gitdir_raw, base);
-    if !gitdir_path.as_path().exists() {
-        error!(
-            "Resolved gitdir path {path} does not exist.",
-            path = gitdir_path.as_path().display()
-        );
-        return None;
-    }
-    Some(gitdir_path)
 }
 
 /// Event Queue Entry - events from agent
@@ -1597,6 +1381,9 @@ pub enum EventMsg {
 
     /// Updated session metadata (e.g., thread name changes).
     ThreadNameUpdated(ThreadNameUpdatedEvent),
+
+    /// Updated long-running goal metadata for the thread.
+    ThreadGoalUpdated(ThreadGoalUpdatedEvent),
 
     /// Incremental MCP startup progress updates.
     McpStartupUpdate(McpStartupUpdateEvent),
@@ -1776,6 +1563,7 @@ pub enum HookSource {
     Project,
     Mdm,
     SessionFlags,
+    Plugin,
     LegacyManagedConfigFile,
     LegacyManagedConfigMdm,
     #[default]
@@ -2640,7 +2428,7 @@ pub struct ConversationPathResponseEvent {
 pub struct ResumedHistory {
     pub conversation_id: ThreadId,
     pub history: Vec<RolloutItem>,
-    pub rollout_path: PathBuf,
+    pub rollout_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -2768,9 +2556,17 @@ pub enum SessionSource {
     Exec,
     Mcp,
     Custom(String),
+    Internal(InternalSessionSource),
     SubAgent(SubAgentSource),
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum InternalSessionSource {
+    MemoryConsolidation,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -2801,6 +2597,7 @@ impl fmt::Display for SessionSource {
             SessionSource::Exec => f.write_str("exec"),
             SessionSource::Mcp => f.write_str("mcp"),
             SessionSource::Custom(source) => f.write_str(source),
+            SessionSource::Internal(source) => write!(f, "internal_{source}"),
             SessionSource::SubAgent(sub_source) => write!(f, "subagent_{sub_source}"),
             SessionSource::Unknown => f.write_str("unknown"),
         }
@@ -2829,18 +2626,27 @@ impl SessionSource {
     pub fn thread_source_name(&self) -> Option<&'static str> {
         match self {
             SessionSource::Cli | SessionSource::VSCode | SessionSource::Exec => Some("user"),
+            SessionSource::Internal(_) => Some("internal"),
             SessionSource::SubAgent(_) => Some("subagent"),
             SessionSource::Mcp | SessionSource::Custom(_) | SessionSource::Unknown => None,
         }
+    }
+
+    pub fn is_internal(&self) -> bool {
+        matches!(self, SessionSource::Internal(_))
+    }
+
+    pub fn is_non_root_agent(&self) -> bool {
+        matches!(
+            self,
+            SessionSource::Internal(_) | SessionSource::SubAgent(_)
+        )
     }
 
     pub fn get_nickname(&self) -> Option<String> {
         match self {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_nickname, .. }) => {
                 agent_nickname.clone()
-            }
-            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => {
-                Some("Morpheus".to_string())
             }
             _ => None,
         }
@@ -2851,9 +2657,6 @@ impl SessionSource {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
                 agent_role.clone()
             }
-            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => {
-                Some("memory builder".to_string())
-            }
             _ => None,
         }
     }
@@ -2862,9 +2665,6 @@ impl SessionSource {
         match self {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_path, .. }) => {
                 agent_path.clone()
-            }
-            SessionSource::SubAgent(SubAgentSource::MemoryConsolidation) => {
-                Some(AgentPath::morpheus())
             }
             _ => None,
         }
@@ -2878,7 +2678,7 @@ impl SessionSource {
             | SessionSource::Exec
             | SessionSource::Mcp
             | SessionSource::Unknown => Some(Product::Codex),
-            SessionSource::SubAgent(_) => None,
+            SessionSource::Internal(_) | SessionSource::SubAgent(_) => None,
         }
     }
 
@@ -2904,6 +2704,14 @@ impl fmt::Display for SubAgentSource {
                 write!(f, "thread_spawn_{parent_thread_id}_d{depth}")
             }
             SubAgentSource::Other(other) => f.write_str(other),
+        }
+    }
+}
+
+impl fmt::Display for InternalSessionSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InternalSessionSource::MemoryConsolidation => f.write_str("memory_consolidation"),
         }
     }
 }
@@ -2998,7 +2806,6 @@ impl From<CompactedItem> for ResponseItem {
             content: vec![ContentItem::OutputText {
                 text: value.message,
             }],
-            end_turn: None,
             phase: None,
         }
     }
@@ -3058,7 +2865,7 @@ impl TurnContextItem {
         self.permission_profile.clone().unwrap_or_else(|| {
             let file_system_sandbox_policy =
                 self.file_system_sandbox_policy.clone().unwrap_or_else(|| {
-                    FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+                    FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
                         &self.sandbox_policy,
                         &self.cwd,
                     )
@@ -3670,7 +3477,7 @@ pub struct SessionNetworkProxyRuntime {
     pub socks_addr: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Debug, Clone, Serialize, JsonSchema, TS)]
 pub struct SessionConfiguredEvent {
     pub session_id: ThreadId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3698,16 +3505,8 @@ pub struct SessionConfiguredEvent {
     #[serde(default)]
     pub approvals_reviewer: ApprovalsReviewer,
 
-    /// Legacy sandbox projection for commands executed in the system.
-    ///
-    /// Consumers should prefer `permission_profile` when it is present. This
-    /// field remains available as a compatibility fallback for older emitters
-    /// and sessions that only expose legacy sandbox state.
-    pub sandbox_policy: SandboxPolicy,
-
     /// Canonical effective permissions for commands executed in the session.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission_profile: Option<PermissionProfile>,
+    pub permission_profile: PermissionProfile,
 
     /// Working directory that should be treated as the *root* of the
     /// session.
@@ -3738,12 +3537,127 @@ pub struct SessionConfiguredEvent {
     pub rollout_path: Option<PathBuf>,
 }
 
+impl<'de> Deserialize<'de> for SessionConfiguredEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            session_id: ThreadId,
+            forked_from_id: Option<ThreadId>,
+            #[serde(default)]
+            thread_name: Option<String>,
+            model: String,
+            model_provider_id: String,
+            service_tier: Option<ServiceTier>,
+            approval_policy: AskForApproval,
+            #[serde(default)]
+            approvals_reviewer: ApprovalsReviewer,
+            // `SessionConfiguredEvent` is persisted into rollout history. Older
+            // rollouts only have `sandbox_policy`, so accept it on deserialize
+            // and immediately project it into the canonical `permission_profile`.
+            sandbox_policy: Option<SandboxPolicy>,
+            permission_profile: Option<PermissionProfile>,
+            cwd: AbsolutePathBuf,
+            reasoning_effort: Option<ReasoningEffortConfig>,
+            history_log_id: u64,
+            history_entry_count: usize,
+            initial_messages: Option<Vec<EventMsg>>,
+            network_proxy: Option<SessionNetworkProxyRuntime>,
+            rollout_path: Option<PathBuf>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let permission_profile = match (wire.permission_profile, wire.sandbox_policy) {
+            (Some(permission_profile), _) => permission_profile,
+            (None, Some(sandbox_policy)) => PermissionProfile::from_legacy_sandbox_policy_for_cwd(
+                &sandbox_policy,
+                wire.cwd.as_path(),
+            ),
+            (None, None) => {
+                return Err(serde::de::Error::missing_field("permission_profile"));
+            }
+        };
+
+        Ok(Self {
+            session_id: wire.session_id,
+            forked_from_id: wire.forked_from_id,
+            thread_name: wire.thread_name,
+            model: wire.model,
+            model_provider_id: wire.model_provider_id,
+            service_tier: wire.service_tier,
+            approval_policy: wire.approval_policy,
+            approvals_reviewer: wire.approvals_reviewer,
+            permission_profile,
+            cwd: wire.cwd,
+            reasoning_effort: wire.reasoning_effort,
+            history_log_id: wire.history_log_id,
+            history_entry_count: wire.history_entry_count,
+            initial_messages: wire.initial_messages,
+            network_proxy: wire.network_proxy,
+            rollout_path: wire.rollout_path,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ThreadNameUpdatedEvent {
     pub thread_id: ThreadId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub thread_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "protocol/")]
+pub enum ThreadGoalStatus {
+    Active,
+    Paused,
+    BudgetLimited,
+    Complete,
+}
+
+pub const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
+
+pub fn validate_thread_goal_objective(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("goal objective must not be empty".to_string());
+    }
+    if value.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return Err(format!(
+            "goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "protocol/")]
+pub struct ThreadGoal {
+    pub thread_id: ThreadId,
+    pub objective: String,
+    pub status: ThreadGoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub token_budget: Option<i64>,
+    pub tokens_used: i64,
+    pub time_used_seconds: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "protocol/")]
+pub struct ThreadGoalUpdatedEvent {
+    pub thread_id: ThreadId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub turn_id: Option<String>,
+    pub goal: ThreadGoal,
 }
 
 /// User's decision in response to an ExecApprovalRequest.
@@ -3848,6 +3762,7 @@ pub enum TurnAbortReason {
     Interrupted,
     Replaced,
     ReviewEnded,
+    BudgetLimited,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -4077,19 +3992,8 @@ mod tests {
         sorted_roots
     }
 
-    fn sandbox_policy_allows_read(policy: &SandboxPolicy, path: &Path, cwd: &Path) -> bool {
-        if policy.has_full_disk_read_access() {
-            return true;
-        }
-
-        policy
-            .get_readable_roots_with_cwd(cwd)
-            .iter()
-            .any(|root| path.starts_with(root.as_path()))
-            || policy
-                .get_writable_roots_with_cwd(cwd)
-                .iter()
-                .any(|root| path.starts_with(root.root.as_path()))
+    fn sandbox_policy_allows_read(policy: &SandboxPolicy, _path: &Path, _cwd: &Path) -> bool {
+        policy.has_full_disk_read_access()
     }
 
     fn sandbox_policy_allows_write(policy: &SandboxPolicy, path: &Path, cwd: &Path) -> bool {
@@ -4134,6 +4038,10 @@ mod tests {
             (SessionSource::VSCode, Some("user")),
             (SessionSource::Exec, Some("user")),
             (
+                SessionSource::Internal(InternalSessionSource::MemoryConsolidation),
+                Some("internal"),
+            ),
+            (
                 SessionSource::SubAgent(SubAgentSource::Review),
                 Some("subagent"),
             ),
@@ -4173,6 +4081,11 @@ mod tests {
     fn session_source_restriction_product_does_not_guess_subagent_products() {
         assert_eq!(
             SessionSource::SubAgent(SubAgentSource::Review).restriction_product(),
+            None
+        );
+        assert_eq!(
+            SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+                .restriction_product(),
             None
         );
     }
@@ -4217,12 +4130,6 @@ mod tests {
 
     fn sandbox_policy_probe_paths(policy: &SandboxPolicy, cwd: &Path) -> Vec<PathBuf> {
         let mut paths = vec![cwd.to_path_buf()];
-        paths.extend(
-            policy
-                .get_readable_roots_with_cwd(cwd)
-                .into_iter()
-                .map(|path| path.to_path_buf()),
-        );
         for root in policy.get_writable_roots_with_cwd(cwd) {
             paths.push(root.root.to_path_buf());
             paths.extend(
@@ -4252,10 +4159,6 @@ mod tests {
         assert_eq!(
             actual.has_full_network_access(),
             expected.has_full_network_access()
-        );
-        assert_eq!(
-            actual.include_platform_defaults(),
-            expected.include_platform_defaults()
         );
         let mut probe_paths = sandbox_policy_probe_paths(expected, cwd);
         probe_paths.extend(sandbox_policy_probe_paths(actual, cwd));
@@ -4299,7 +4202,6 @@ mod tests {
         assert!(!restricted.has_full_network_access());
 
         let enabled = SandboxPolicy::ReadOnly {
-            access: ReadOnlyAccess::FullAccess,
             network_access: true,
         };
         assert!(enabled.has_full_network_access());
@@ -4396,38 +4298,6 @@ mod tests {
                 mcp_elicitations: true,
             }
         );
-    }
-
-    #[test]
-    fn workspace_write_restricted_read_access_includes_effective_writable_roots() {
-        let cwd = if cfg!(windows) {
-            Path::new(r"C:\workspace")
-        } else {
-            Path::new("/tmp/workspace")
-        };
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            read_only_access: ReadOnlyAccess::Restricted {
-                include_platform_defaults: false,
-                readable_roots: vec![],
-            },
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: false,
-        };
-
-        let readable_roots = policy.get_readable_roots_with_cwd(cwd);
-        let writable_roots = policy.get_writable_roots_with_cwd(cwd);
-
-        for writable_root in writable_roots {
-            assert!(
-                readable_roots
-                    .iter()
-                    .any(|root| root.as_path() == writable_root.root.as_path()),
-                "expected writable root {} to also be readable",
-                writable_root.root.as_path().display()
-            );
-        }
     }
 
     #[test]
@@ -4531,7 +4401,7 @@ mod tests {
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
             },
@@ -4593,7 +4463,7 @@ mod tests {
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::CurrentWorkingDirectory,
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
             },
@@ -4620,34 +4490,6 @@ mod tests {
                 ),
                 (expected_docs_public.to_path_buf(), Vec::new()),
             ]
-        );
-    }
-
-    #[test]
-    fn legacy_workspace_write_nested_readable_root_stays_writable() {
-        let cwd = TempDir::new().expect("tempdir");
-        let docs = AbsolutePathBuf::resolve_path_against_base("docs", cwd.path());
-        let canonical_cwd = codex_utils_absolute_path::canonicalize_preserving_symlinks(cwd.path())
-            .expect("canonicalize cwd");
-        let expected_dot_codex = AbsolutePathBuf::from_absolute_path(canonical_cwd.join(".codex"))
-            .expect("canonical .codex");
-        let policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![],
-            read_only_access: ReadOnlyAccess::Restricted {
-                include_platform_defaults: true,
-                readable_roots: vec![docs],
-            },
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: true,
-        };
-
-        assert_eq!(
-            sorted_writable_roots(
-                FileSystemSandboxPolicy::from_legacy_sandbox_policy(&policy, cwd.path())
-                    .get_writable_roots_with_cwd(cwd.path())
-            ),
-            vec![(canonical_cwd, vec![expected_dot_codex.to_path_buf()])]
         );
     }
 
@@ -4684,9 +4526,7 @@ mod tests {
     #[test]
     fn legacy_sandbox_policy_semantics_survive_split_bridge() {
         let cwd = TempDir::new().expect("tempdir");
-        let readable_root = AbsolutePathBuf::resolve_path_against_base("readable", cwd.path());
         let writable_root = AbsolutePathBuf::resolve_path_against_base("writable", cwd.path());
-        let nested_readable_root = AbsolutePathBuf::resolve_path_against_base("docs", cwd.path());
         let policies = [
             SandboxPolicy::DangerFullAccess,
             SandboxPolicy::ExternalSandbox {
@@ -4696,49 +4536,27 @@ mod tests {
                 network_access: NetworkAccess::Enabled,
             },
             SandboxPolicy::ReadOnly {
-                access: ReadOnlyAccess::FullAccess,
                 network_access: false,
-            },
-            SandboxPolicy::ReadOnly {
-                access: ReadOnlyAccess::Restricted {
-                    include_platform_defaults: true,
-                    readable_roots: vec![readable_root.clone()],
-                },
-                network_access: true,
             },
             SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![],
-                read_only_access: ReadOnlyAccess::FullAccess,
                 network_access: false,
                 exclude_tmpdir_env_var: true,
                 exclude_slash_tmp: true,
             },
             SandboxPolicy::WorkspaceWrite {
                 writable_roots: vec![writable_root],
-                read_only_access: ReadOnlyAccess::Restricted {
-                    include_platform_defaults: true,
-                    readable_roots: vec![readable_root],
-                },
                 network_access: true,
                 exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: true,
-            },
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![],
-                read_only_access: ReadOnlyAccess::Restricted {
-                    include_platform_defaults: true,
-                    readable_roots: vec![nested_readable_root],
-                },
-                network_access: false,
-                exclude_tmpdir_env_var: true,
                 exclude_slash_tmp: true,
             },
         ];
 
         for expected in policies {
-            let actual = FileSystemSandboxPolicy::from_legacy_sandbox_policy(&expected, cwd.path())
-                .to_legacy_sandbox_policy(NetworkSandboxPolicy::from(&expected), cwd.path())
-                .expect("legacy bridge should preserve legacy policy semantics");
+            let actual =
+                FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&expected, cwd.path())
+                    .to_legacy_sandbox_policy(NetworkSandboxPolicy::from(&expected), cwd.path())
+                    .expect("legacy bridge should preserve legacy policy semantics");
 
             assert_same_sandbox_policy_semantics(&expected, &actual, cwd.path());
         }
@@ -5271,6 +5089,7 @@ mod tests {
     fn serialize_event() -> Result<()> {
         let conversation_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
         let rollout_file = NamedTempFile::new()?;
+        let permission_profile = PermissionProfile::read_only();
         let event = Event {
             id: "1234".to_string(),
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
@@ -5282,8 +5101,7 @@ mod tests {
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
                 approvals_reviewer: ApprovalsReviewer::User,
-                sandbox_policy: SandboxPolicy::new_read_only_policy(),
-                permission_profile: None,
+                permission_profile: permission_profile.clone(),
                 cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: Some(ReasoningEffortConfig::default()),
                 history_log_id: 0,
@@ -5303,9 +5121,7 @@ mod tests {
                 "model_provider_id": "openai",
                 "approval_policy": "never",
                 "approvals_reviewer": "user",
-                "sandbox_policy": {
-                    "type": "read-only"
-                },
+                "permission_profile": permission_profile,
                 "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": "medium",
                 "history_log_id": 0,
@@ -5314,6 +5130,28 @@ mod tests {
             }
         });
         assert_eq!(expected, serde_json::to_value(&event)?);
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_legacy_session_configured_event_uses_sandbox_policy() -> Result<()> {
+        let cwd = test_path_buf("/home/user/project");
+        let value = json!({
+            "session_id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+            "model": "codex-mini-latest",
+            "model_provider_id": "openai",
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "sandbox_policy": {
+                "type": "read-only"
+            },
+            "cwd": cwd,
+            "history_log_id": 0,
+            "history_entry_count": 0,
+        });
+
+        let event: SessionConfiguredEvent = serde_json::from_value(value)?;
+        assert_eq!(event.permission_profile, PermissionProfile::read_only());
         Ok(())
     }
 

@@ -41,6 +41,8 @@ use crate::history_cell;
 use crate::history_cell::HistoryCell;
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
+use crate::key_hint::KeyBindingListExt;
+use crate::keymap::RuntimeKeymap;
 use crate::legacy_core::append_message_history_entry;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::ConfigBuilder;
@@ -71,6 +73,7 @@ use crate::test_support::PathBufExt;
 use crate::test_support::test_path_buf;
 #[cfg(test)]
 use crate::test_support::test_path_display;
+use crate::transcript_reflow::TranscriptReflowState;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
@@ -128,11 +131,14 @@ use codex_protocol::approvals::ExecApprovalRequestEvent;
 use codex_protocol::config_types::Personality;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelAvailabilityNux;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelUpgrade;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AskForApproval;
+#[cfg(target_os = "windows")]
+use codex_protocol::protocol::FileSystemSandboxKind;
 use codex_protocol::protocol::FinalOutput;
 use codex_protocol::protocol::GetHistoryEntryResponseEvent;
 use codex_protocol::protocol::ListSkillsResponseEvent;
@@ -140,7 +146,6 @@ use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::McpAuthStatus;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RateLimitSnapshot;
-use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillErrorInfo;
 use codex_protocol::protocol::TokenUsage;
@@ -190,10 +195,12 @@ mod loaded_threads;
 mod pending_interactive_replay;
 mod platform_actions;
 mod replay_filter;
+mod resize_reflow;
 mod session_lifecycle;
 mod side;
 mod startup_prompts;
 mod thread_events;
+mod thread_goal_actions;
 mod thread_routing;
 mod thread_session_state;
 
@@ -303,7 +310,7 @@ fn default_exec_approval_decisions(
 struct AutoReviewMode {
     approval_policy: AskForApproval,
     approvals_reviewer: ApprovalsReviewer,
-    sandbox_policy: SandboxPolicy,
+    permission_profile: PermissionProfile,
 }
 
 /// Enabling the Auto-review experiment in the TUI should also switch the
@@ -314,9 +321,18 @@ fn auto_review_mode() -> AutoReviewMode {
     AutoReviewMode {
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
-        sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+        permission_profile: PermissionProfile::workspace_write(),
     }
 }
+
+#[cfg(target_os = "windows")]
+fn managed_filesystem_sandbox_is_restricted(permission_profile: &PermissionProfile) -> bool {
+    matches!(
+        permission_profile.file_system_sandbox_policy().kind,
+        FileSystemSandboxKind::Restricted
+    )
+}
+
 /// Baseline cadence for periodic stream commit animation ticks.
 ///
 /// Smooth-mode streaming drains one line per tick, so this interval controls
@@ -487,6 +503,11 @@ struct SessionSummary {
     resume_command: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct InitialHistoryReplayBuffer {
+    retained_lines: VecDeque<Line<'static>>,
+}
+
 pub(crate) struct App {
     model_catalog: Arc<ModelCatalog>,
     pub(crate) session_telemetry: SessionTelemetry,
@@ -498,7 +519,7 @@ pub(crate) struct App {
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
     runtime_approval_policy_override: Option<AskForApproval>,
-    runtime_sandbox_policy_override: Option<SandboxPolicy>,
+    runtime_permission_profile_override: Option<PermissionProfile>,
 
     pub(crate) file_search: FileSearchManager,
 
@@ -508,8 +529,11 @@ pub(crate) struct App {
     pub(crate) overlay: Option<Overlay>,
     pub(crate) deferred_history_lines: Vec<Line<'static>>,
     has_emitted_history_lines: bool,
+    transcript_reflow: TranscriptReflowState,
+    initial_history_replay_buffer: Option<InitialHistoryReplayBuffer>,
 
     pub(crate) enhanced_keys_supported: bool,
+    pub(crate) keymap: RuntimeKeymap,
 
     /// Controls the animation thread that sends CommitTick events.
     pub(crate) commit_anim_running: Arc<AtomicBool>,
@@ -873,6 +897,13 @@ impl App {
             .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
 
         let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
+        let runtime_keymap = RuntimeKeymap::from_config(&config.tui_keymap).map_err(|err| {
+            color_eyre::eyre::eyre!(
+                "Invalid `tui.keymap` configuration: {err}\n\
+Fix the config and retry.\n\
+See the Codex keymap documentation for supported actions and examples."
+            )
+        })?;
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
@@ -886,13 +917,16 @@ impl App {
             cli_kv_overrides,
             harness_overrides,
             runtime_approval_policy_override: None,
-            runtime_sandbox_policy_override: None,
+            runtime_permission_profile_override: None,
             file_search,
             enhanced_keys_supported,
+            keymap: runtime_keymap,
             transcript_cells: Vec::new(),
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
+            transcript_reflow: TranscriptReflowState::default(),
+            initial_history_replay_buffer: None,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
             terminal_title_invalid_items_warned: terminal_title_invalid_items_warned.clone(),
@@ -924,16 +958,14 @@ impl App {
                 .await?;
         }
 
-        // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
+        // On startup, if a managed filesystem sandbox is active, warn about
+        // world-writable dirs on Windows.
         #[cfg(target_os = "windows")]
         {
+            let startup_permission_profile = app.config.permissions.permission_profile();
             let should_check = WindowsSandboxLevel::from_config(&app.config)
                 != WindowsSandboxLevel::Disabled
-                && matches!(
-                    app.config.permissions.sandbox_policy.get(),
-                    codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
-                        | codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
-                )
+                && managed_filesystem_sandbox_is_restricted(&startup_permission_profile)
                 && !app
                     .config
                     .notices
@@ -944,8 +976,13 @@ impl App {
                 let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
                 let tx = app.app_event_tx.clone();
                 let logs_base_dir = app.config.codex_home.clone();
-                let sandbox_policy = app.config.permissions.sandbox_policy.get().clone();
-                Self::spawn_world_writable_scan(cwd, env_map, logs_base_dir, sandbox_policy, tx);
+                Self::spawn_world_writable_scan(
+                    cwd,
+                    env_map,
+                    logs_base_dir,
+                    startup_permission_profile,
+                    tx,
+                );
             }
         }
 
@@ -1085,7 +1122,10 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
-        if matches!(event, TuiEvent::Draw) {
+        let terminal_resize_reflow_enabled = self.terminal_resize_reflow_enabled();
+        if terminal_resize_reflow_enabled && matches!(event, TuiEvent::Draw | TuiEvent::Resize) {
+            self.handle_draw_pre_render(tui)?;
+        } else if matches!(event, TuiEvent::Draw | TuiEvent::Resize) {
             let size = tui.terminal.size()?;
             if size != tui.terminal.last_known_screen_size {
                 self.refresh_status_line();
@@ -1107,7 +1147,7 @@ impl App {
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
                 }
-                TuiEvent::Draw => {
+                TuiEvent::Draw | TuiEvent::Resize => {
                     if self.backtrack_render_pending {
                         self.backtrack_render_pending = false;
                         self.render_transcript_once(tui);
@@ -1123,15 +1163,23 @@ impl App {
                     // @cometix: process translation results and timeouts on each draw
                     self.chat_widget.translation_draw_tick();
                     self.chat_widget.pre_draw_tick();
-                    tui.draw(
-                        self.chat_widget.desired_height(tui.terminal.size()?.width),
-                        |frame| {
+                    let desired_height =
+                        self.chat_widget.desired_height(tui.terminal.size()?.width);
+                    if terminal_resize_reflow_enabled {
+                        tui.draw_with_resize_reflow(desired_height, |frame| {
                             self.chat_widget.render(frame.area(), frame.buffer);
                             if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
                                 frame.set_cursor_position((x, y));
                             }
-                        },
-                    )?;
+                        })?;
+                    } else {
+                        tui.draw(desired_height, |frame| {
+                            self.chat_widget.render(frame.area(), frame.buffer);
+                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
+                                frame.set_cursor_position((x, y));
+                            }
+                        })?;
+                    }
                     if self.chat_widget.external_editor_state() == ExternalEditorState::Requested {
                         self.chat_widget
                             .set_external_editor_state(ExternalEditorState::Active);
