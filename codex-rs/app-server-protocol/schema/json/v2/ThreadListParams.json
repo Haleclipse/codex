@@ -8,6 +8,19 @@
       ],
       "type": "string"
     },
+    "ThreadListCwdFilter": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ]
+    },
     "ThreadSortKey": {
       "enum": [
         "created_at",
@@ -48,11 +61,15 @@
       ]
     },
     "cwd": {
-      "description": "Optional cwd filter; when set, only threads whose session cwd exactly matches this path are returned.",
-      "type": [
-        "string",
-        "null"
-      ]
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadListCwdFilter"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional cwd filter or filters; when set, only threads whose session cwd exactly matches one of these paths are returned."
     },
     "limit": {
       "description": "Optional page size; defaults to a reasonable server-side value.",
@@ -111,6 +128,10 @@
         "array",
         "null"
       ]
+    },
+    "useStateDbOnly": {
+      "description": "If true, return from the state DB without scanning JSONL rollouts to repair thread metadata. Omitted or false preserves scan-and-repair behavior.",
+      "type": "boolean"
     }
   },
   "title": "ThreadListParams",

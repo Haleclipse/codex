@@ -79,11 +79,11 @@ ignore = [
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust is unmaintained; pulled in via syntect v5.3.0 used by codex-tui for syntax highlighting; no fixed release yet" },
     { id = "RUSTSEC-2025-0141", reason = "bincode is unmaintained; pulled in via syntect v5.3.0 used by codex-tui for syntax highlighting; no fixed release yet" },
     { id = "RUSTSEC-2026-0097", reason = "rand 0.8.5 is pulled in via age v0.11.2/codex-secrets and zbus v4.4.0/keyring; no compatible rand 0.8 fixed release, remove when transitive dependencies move to rand >=0.9.3" },
-    # rustls-webpki 0.103.10 security advisories; pulled in transitively via rustls stack.
+    # rustls-webpki security advisories; pulled in transitively via rustls stack.
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki vulnerability; indirect dep via rustls stack; upgrade tracked with upstream" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki vulnerability; indirect dep via rustls stack; upgrade tracked with upstream" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki vulnerability; indirect dep via rustls stack; upgrade tracked with upstream" },
-    # hickory-proto 0.25.2 security advisories; pulled in transitively via hickory-resolver/reqwest DNS stack.
+    # hickory-proto security advisories; pulled in transitively via hickory-resolver/reqwest DNS stack.
     { id = "RUSTSEC-2026-0118", reason = "hickory-proto vulnerability; indirect dep via DNS resolver stack; upgrade tracked with upstream" },
     { id = "RUSTSEC-2026-0119", reason = "hickory-proto vulnerability; indirect dep via DNS resolver stack; upgrade tracked with upstream" },
 ]
