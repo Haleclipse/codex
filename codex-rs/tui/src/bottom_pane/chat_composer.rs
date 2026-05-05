@@ -4230,7 +4230,7 @@ impl ChatComposer {
             buf.set_string(
                 composer_rect.x,
                 composer_rect.y,
-                &"─".repeat(composer_rect.width as usize),
+                "─".repeat(composer_rect.width as usize),
                 ratatui::style::Style::default().dim(),
             );
         }
@@ -4239,7 +4239,7 @@ impl ChatComposer {
             buf.set_string(
                 composer_rect.x,
                 bottom_y,
-                &"─".repeat(composer_rect.width as usize),
+                "─".repeat(composer_rect.width as usize),
                 ratatui::style::Style::default().dim(),
             );
         }
