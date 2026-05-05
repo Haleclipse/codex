@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use codex_config::ConfigLayerStack;
 use codex_plugin::PluginHookSource;
+use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::HookSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -65,6 +67,20 @@ impl ConfiguredHandler {
             codex_protocol::protocol::HookEventName::Stop => "stop",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookListEntry {
+    pub event_name: HookEventName,
+    pub handler_type: HookHandlerType,
+    pub matcher: Option<String>,
+    pub command: Option<String>,
+    pub timeout_sec: u64,
+    pub status_message: Option<String>,
+    pub source_path: AbsolutePathBuf,
+    pub source: HookSource,
+    pub plugin_id: Option<String>,
+    pub display_order: i64,
 }
 
 #[derive(Clone)]
