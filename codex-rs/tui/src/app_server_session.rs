@@ -633,6 +633,20 @@ impl AppServerSession {
             .await
     }
 
+    // @cometix: delete a thread via app-server
+    pub(crate) async fn delete_thread(&mut self, thread_id: String) -> Result<()> {
+        let request_id = self.next_request_id();
+        let _: codex_app_server_protocol::ThreadDeleteResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadDelete {
+                request_id,
+                params: codex_app_server_protocol::ThreadDeleteParams { thread_id },
+            })
+            .await
+            .wrap_err("thread/delete failed in TUI")?;
+        Ok(())
+    }
+
     pub(crate) async fn thread_set_name(
         &mut self,
         thread_id: ThreadId,

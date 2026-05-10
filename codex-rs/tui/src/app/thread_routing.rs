@@ -1307,7 +1307,7 @@ impl App {
     pub(super) fn should_wait_for_initial_session(session_selection: &SessionSelection) -> bool {
         matches!(
             session_selection,
-            SessionSelection::StartFresh | SessionSelection::Exit
+            SessionSelection::StartFresh | SessionSelection::Exit | SessionSelection::Delete(_)
         )
     }
 

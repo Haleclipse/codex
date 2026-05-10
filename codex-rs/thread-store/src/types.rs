@@ -256,3 +256,9 @@ pub struct ArchiveThreadParams {
     /// Thread id to archive or unarchive.
     pub thread_id: ThreadId,
 }
+
+// @cometix: parameters for permanently deleting a thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteThreadParams {
+    pub thread_id: ThreadId,
+}

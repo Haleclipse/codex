@@ -924,6 +924,40 @@ ON CONFLICT(thread_id, position) DO NOTHING
             .await?;
         Ok(result.rows_affected())
     }
+
+    // @cometix: permanently delete a thread and all related data.
+    // Returns the rollout_path (if any) so the caller can remove the file.
+    pub async fn delete_thread_cascade(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<Option<String>> {
+        let tid = thread_id.to_string();
+
+        // Fetch rollout_path before deletion.
+        let rollout_path: Option<String> =
+            sqlx::query_scalar("SELECT rollout_path FROM threads WHERE id = ?")
+                .bind(&tid)
+                .fetch_optional(self.pool.as_ref())
+                .await?;
+
+        // thread_spawn_edges has no ON DELETE CASCADE — clean up manually.
+        sqlx::query(
+            "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ? OR child_thread_id = ?",
+        )
+        .bind(&tid)
+        .bind(&tid)
+        .execute(self.pool.as_ref())
+        .await?;
+
+        // DELETE FROM threads cascades to: thread_dynamic_tools, thread_goals,
+        // stage1_outputs, and other tables with ON DELETE CASCADE foreign keys.
+        sqlx::query("DELETE FROM threads WHERE id = ?")
+            .bind(&tid)
+            .execute(self.pool.as_ref())
+            .await?;
+
+        Ok(rollout_path)
+    }
 }
 
 fn one_thread_id_from_rows(

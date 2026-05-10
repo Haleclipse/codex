@@ -93,6 +93,26 @@ impl App {
                             }
                         }
                     }
+                    // @cometix: delete thread from resume picker via app-server
+                    SessionSelection::Delete(target) => {
+                        let thread_id = target.thread_id.to_string();
+                        match app_server
+                            .delete_thread(thread_id.clone())
+                            .await
+                        {
+                            Ok(_) => {
+                                self.chat_widget.add_info_message(
+                                    format!("Thread {thread_id} deleted."),
+                                    /*hint*/ None,
+                                );
+                            }
+                            Err(err) => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to delete thread: {err}"
+                                ));
+                            }
+                        }
+                    }
                     SessionSelection::Exit
                     | SessionSelection::StartFresh
                     | SessionSelection::Fork(_) => {}

@@ -1012,6 +1012,11 @@ impl CodexMessageProcessor {
                 self.thread_archive(to_connection_request_id(request_id), params)
                     .await;
             }
+            // @cometix: permanently delete a thread
+            ClientRequest::ThreadDelete { request_id, params } => {
+                self.thread_delete(to_connection_request_id(request_id), params)
+                    .await;
+            }
             ClientRequest::ThreadIncrementElicitation { request_id, params } => {
                 self.thread_increment_elicitation(to_connection_request_id(request_id), params)
                     .await;
@@ -2971,6 +2976,56 @@ impl CodexMessageProcessor {
                 let notification = ThreadArchivedNotification { thread_id };
                 self.outgoing
                     .send_server_notification(ServerNotification::ThreadArchived(notification))
+                    .await;
+            }
+        }
+    }
+
+    // @cometix: permanently delete a thread via thread store
+    async fn thread_delete(
+        &self,
+        request_id: ConnectionRequestId,
+        params: codex_app_server_protocol::ThreadDeleteParams,
+    ) {
+        let _thread_list_state_permit = match self.acquire_thread_list_state_permit().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
+        let thread_id = match ThreadId::from_string(&params.thread_id) {
+            Ok(id) => id,
+            Err(err) => {
+                self.outgoing
+                    .send_error(request_id, invalid_request(format!("invalid thread id: {err}")))
+                    .await;
+                return;
+            }
+        };
+        let delete_params = codex_thread_store::DeleteThreadParams { thread_id };
+        match self.thread_store.delete_thread(delete_params).await {
+            Ok(()) => {
+                self.outgoing
+                    .send_response(
+                        request_id,
+                        codex_app_server_protocol::ThreadDeleteResponse {},
+                    )
+                    .await;
+                self.outgoing
+                    .send_server_notification(ServerNotification::ThreadDeleted(
+                        codex_app_server_protocol::ThreadDeletedNotification {
+                            thread_id: thread_id.to_string(),
+                        },
+                    ))
+                    .await;
+            }
+            Err(err) => {
+                self.outgoing
+                    .send_error(
+                        request_id,
+                        internal_error(format!("failed to delete thread: {err}")),
+                    )
                     .await;
             }
         }

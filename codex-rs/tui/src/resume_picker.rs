@@ -60,6 +60,8 @@ pub enum SessionSelection {
     StartFresh,
     Resume(SessionTarget),
     Fork(SessionTarget),
+    // @cometix: delete thread from resume picker
+    Delete(SessionTarget),
     Exit,
 }
 
@@ -370,6 +372,8 @@ struct PickerState {
     action: SessionPickerAction,
     sort_key: ThreadSortKey,
     inline_error: Option<String>,
+    // @cometix: two-step delete confirmation state
+    pending_delete: Option<ThreadId>,
 }
 
 struct PaginationState {
@@ -531,6 +535,7 @@ impl PickerState {
             action,
             sort_key: ThreadSortKey::UpdatedAt,
             inline_error: None,
+            pending_delete: None,
         }
     }
 
@@ -540,6 +545,10 @@ impl PickerState {
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<SessionSelection>> {
         self.inline_error = None;
+        // @cometix: clear pending delete on any key other than Delete
+        if key.code != KeyCode::Delete {
+            self.pending_delete = None;
+        }
         match key {
             KeyEvent {
                 code: KeyCode::Esc, ..
@@ -550,6 +559,30 @@ impl PickerState {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) => {
                 return Ok(Some(SessionSelection::Exit));
+            }
+            // @cometix: Delete key to delete the selected thread (two-step confirmation)
+            KeyEvent {
+                code: KeyCode::Delete,
+                ..
+            } => {
+                if let Some(row) = self.filtered_rows.get(self.selected) {
+                    if let Some(thread_id) = row.thread_id {
+                        if self.pending_delete == Some(thread_id) {
+                            // Second press: confirm delete
+                            self.pending_delete = None;
+                            return Ok(Some(SessionSelection::Delete(SessionTarget {
+                                path: row.path.clone(),
+                                thread_id,
+                            })));
+                        } else {
+                            // First press: show confirmation
+                            self.pending_delete = Some(thread_id);
+                            self.inline_error =
+                                Some("Press Delete again to permanently delete this thread".into());
+                            self.request_frame();
+                        }
+                    }
+                }
             }
             KeyEvent {
                 code: KeyCode::Enter,
@@ -1090,6 +1123,10 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
             "/".dim(),
             key_hint::plain(KeyCode::Down).into(),
             " to browse".dim(),
+            "    ".dim(),
+            // @cometix: delete thread shortcut hint
+            key_hint::plain(KeyCode::Delete).into(),
+            " to delete".dim(),
         ]
         .into();
         frame.render_widget_ref(hint_line, hint);

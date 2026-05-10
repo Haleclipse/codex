@@ -454,6 +454,12 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadArchiveResponse,
     },
+    // @cometix: permanently delete a thread.
+    ThreadDelete => "thread/delete" {
+        params: v2::ThreadDeleteParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadDeleteResponse,
+    },
     ThreadUnsubscribe => "thread/unsubscribe" {
         params: v2::ThreadUnsubscribeParams,
         serialization: thread_id(params.thread_id),
@@ -1354,6 +1360,7 @@ server_notification_definitions! {
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),
     ThreadStatusChanged => "thread/status/changed" (v2::ThreadStatusChangedNotification),
     ThreadArchived => "thread/archived" (v2::ThreadArchivedNotification),
+    ThreadDeleted => "thread/deleted" (v2::ThreadDeletedNotification), // @cometix
     ThreadUnarchived => "thread/unarchived" (v2::ThreadUnarchivedNotification),
     ThreadClosed => "thread/closed" (v2::ThreadClosedNotification),
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),

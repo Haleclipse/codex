@@ -15,6 +15,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
+use crate::DeleteThreadParams;
 use crate::ListThreadsParams;
 use crate::LoadThreadHistoryParams;
 use crate::ReadThreadByRolloutPathParams;
@@ -59,6 +60,7 @@ pub struct InMemoryThreadStoreCalls {
     pub update_thread_metadata: usize,
     pub archive_thread: usize,
     pub unarchive_thread: usize,
+    pub delete_thread: usize, // @cometix
 }
 
 /// Test-only in-memory [`ThreadStore`] implementation.
@@ -228,6 +230,12 @@ impl ThreadStore for InMemoryThreadStore {
 
     async fn archive_thread(&self, _params: ArchiveThreadParams) -> ThreadStoreResult<()> {
         self.state.lock().await.calls.archive_thread += 1;
+        Ok(())
+    }
+
+    // @cometix
+    async fn delete_thread(&self, _params: DeleteThreadParams) -> ThreadStoreResult<()> {
+        self.state.lock().await.calls.delete_thread += 1;
         Ok(())
     }
 

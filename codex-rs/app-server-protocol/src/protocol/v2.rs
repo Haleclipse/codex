@@ -3896,6 +3896,20 @@ pub struct ThreadArchiveParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadArchiveResponse {}
 
+// @cometix: permanently delete a thread and all associated data.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadDeleteParams {
+    pub thread_id: String,
+}
+
+// @cometix
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadDeleteResponse {}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -6619,6 +6633,14 @@ pub struct ThreadStatusChangedNotification {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadArchivedNotification {
+    pub thread_id: String,
+}
+
+// @cometix
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadDeletedNotification {
     pub thread_id: String,
 }
 

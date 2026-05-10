@@ -7,6 +7,7 @@ use codex_protocol::ThreadId;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
+use crate::DeleteThreadParams;
 use crate::ListThreadsParams;
 use crate::LoadThreadHistoryParams;
 use crate::ReadThreadByRolloutPathParams;
@@ -258,5 +259,12 @@ impl ThreadStore for RemoteThreadStore {
             message: "remote thread store omitted unarchive_thread response thread".to_string(),
         })?;
         helpers::stored_thread_from_proto(thread)
+    }
+
+    // @cometix: remote delete is unsupported — threads are local-only for now.
+    async fn delete_thread(&self, _params: DeleteThreadParams) -> ThreadStoreResult<()> {
+        Err(ThreadStoreError::InvalidRequest {
+            message: "delete_thread is not supported on remote thread stores".to_string(),
+        })
     }
 }

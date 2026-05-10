@@ -776,7 +776,7 @@ impl App {
         let wait_for_initial_session_configured =
             Self::should_wait_for_initial_session(&session_selection);
         let (mut chat_widget, initial_started_thread) = match session_selection {
-            SessionSelection::StartFresh | SessionSelection::Exit => {
+            SessionSelection::StartFresh | SessionSelection::Exit | SessionSelection::Delete(_) => {
                 let started = app_server.start_thread(&config).await?;
                 let startup_tooltip_override =
                     prepare_startup_tooltip_override(&mut config, &available_models, is_first_run)
