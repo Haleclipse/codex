@@ -84,8 +84,8 @@ ignore = [
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki vulnerability; indirect dep via rustls stack; upgrade tracked with upstream" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki vulnerability; indirect dep via rustls stack; upgrade tracked with upstream" },
     # hickory-proto security advisories; pulled in transitively via hickory-resolver/reqwest DNS stack.
-    { id = "RUSTSEC-2026-0118", reason = "hickory-proto vulnerability; indirect dep via DNS resolver stack; upgrade tracked with upstream" },
-    { id = "RUSTSEC-2026-0119", reason = "hickory-proto vulnerability; indirect dep via DNS resolver stack; upgrade tracked with upstream" },
+    { id = "RUSTSEC-2026-0118", reason = "hickory-proto v0.25.2 is pulled in via rama-dns/rama-tcp used by codex-network-proxy; DNSSEC features are not enabled; remove when rama updates to hickory 0.26.1 or hickory-net" },
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto v0.25.2 is pulled in via rama-dns/rama-tcp used by codex-network-proxy; no fixed rama release is available yet; remove when rama updates to hickory 0.26.1 or hickory-net" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

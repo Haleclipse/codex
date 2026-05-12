@@ -77,9 +77,11 @@ macro_rules! experimental_type_entry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientRequestSerializationScope {
     Global(&'static str),
+    GlobalSharedRead(&'static str),
     Thread { thread_id: String },
     ThreadPath { path: PathBuf },
     CommandExecProcess { process_id: String },
+    Process { process_handle: String },
     FuzzyFileSearchSession { session_id: String },
     FsWatch { watch_id: String },
     McpOauth { server_name: String },
@@ -91,6 +93,9 @@ macro_rules! serialization_scope_expr {
     };
     ($actual_params:ident, global($key:literal)) => {
         Some(ClientRequestSerializationScope::Global($key))
+    };
+    ($actual_params:ident, global_shared_read($key:literal)) => {
+        Some(ClientRequestSerializationScope::GlobalSharedRead($key))
     };
     ($actual_params:ident, thread_id($params:ident . $field:ident)) => {
         Some(ClientRequestSerializationScope::Thread {
@@ -125,6 +130,11 @@ macro_rules! serialization_scope_expr {
     ($actual_params:ident, command_process_id($params:ident . $field:ident)) => {
         Some(ClientRequestSerializationScope::CommandExecProcess {
             process_id: $actual_params.$field.clone(),
+        })
+    };
+    ($actual_params:ident, process_handle($params:ident . $field:ident)) => {
+        Some(ClientRequestSerializationScope::Process {
+            process_handle: $actual_params.$field.clone(),
         })
     };
     ($actual_params:ident, fuzzy_session_id($params:ident . $field:ident)) => {
@@ -570,6 +580,7 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadReadResponse,
     },
+    #[experimental("thread/turns/list")]
     ThreadTurnsList => "thread/turns/list" {
         params: v2::ThreadTurnsListParams,
         // Explicitly concurrent: this primarily reads append-only rollout storage.
@@ -584,7 +595,7 @@ client_request_definitions! {
     },
     SkillsList => "skills/list" {
         params: v2::SkillsListParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::SkillsListResponse,
     },
     HooksList => "hooks/list" {
@@ -609,13 +620,38 @@ client_request_definitions! {
     },
     PluginList => "plugin/list" {
         params: v2::PluginListParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::PluginListResponse,
     },
     PluginRead => "plugin/read" {
         params: v2::PluginReadParams,
         serialization: global("config"),
         response: v2::PluginReadResponse,
+    },
+    PluginSkillRead => "plugin/skill/read" {
+        params: v2::PluginSkillReadParams,
+        serialization: global("config"),
+        response: v2::PluginSkillReadResponse,
+    },
+    PluginShareSave => "plugin/share/save" {
+        params: v2::PluginShareSaveParams,
+        serialization: global("config"),
+        response: v2::PluginShareSaveResponse,
+    },
+    PluginShareUpdateTargets => "plugin/share/updateTargets" {
+        params: v2::PluginShareUpdateTargetsParams,
+        serialization: global("config"),
+        response: v2::PluginShareUpdateTargetsResponse,
+    },
+    PluginShareList => "plugin/share/list" {
+        params: v2::PluginShareListParams,
+        serialization: global("config"),
+        response: v2::PluginShareListResponse,
+    },
+    PluginShareDelete => "plugin/share/delete" {
+        params: v2::PluginShareDeleteParams,
+        serialization: global("config"),
+        response: v2::PluginShareDeleteResponse,
     },
     AppsList => "app/list" {
         params: v2::AppsListParams,
@@ -822,6 +858,11 @@ client_request_definitions! {
         serialization: global("windows-sandbox-setup"),
         response: v2::WindowsSandboxSetupStartResponse,
     },
+    WindowsSandboxReadiness => "windowsSandbox/readiness" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        serialization: global("config"),
+        response: v2::WindowsSandboxReadinessResponse,
+    },
 
     LoginAccount => "account/login/start" {
         params: v2::LoginAccountParams,
@@ -885,10 +926,38 @@ client_request_definitions! {
         serialization: command_process_id(params.process_id),
         response: v2::CommandExecResizeResponse,
     },
+    #[experimental("process/spawn")]
+    /// Spawn a standalone process (argv vector) without a Codex sandbox.
+    ProcessSpawn => "process/spawn" {
+        params: v2::ProcessSpawnParams,
+        serialization: process_handle(params.process_handle),
+        response: v2::ProcessSpawnResponse,
+    },
+    #[experimental("process/writeStdin")]
+    /// Write stdin bytes to a running `process/spawn` session or close stdin.
+    ProcessWriteStdin => "process/writeStdin" {
+        params: v2::ProcessWriteStdinParams,
+        serialization: process_handle(params.process_handle),
+        response: v2::ProcessWriteStdinResponse,
+    },
+    #[experimental("process/kill")]
+    /// Terminate a running `process/spawn` session by client-supplied `processHandle`.
+    ProcessKill => "process/kill" {
+        params: v2::ProcessKillParams,
+        serialization: process_handle(params.process_handle),
+        response: v2::ProcessKillResponse,
+    },
+    #[experimental("process/resizePty")]
+    /// Resize a running PTY-backed `process/spawn` session by client-supplied `processHandle`.
+    ProcessResizePty => "process/resizePty" {
+        params: v2::ProcessResizePtyParams,
+        serialization: process_handle(params.process_handle),
+        response: v2::ProcessResizePtyResponse,
+    },
 
     ConfigRead => "config/read" {
         params: v2::ConfigReadParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::ConfigReadResponse,
     },
     ExternalAgentConfigDetect => "externalAgentConfig/detect" {
@@ -1387,8 +1456,15 @@ server_notification_definitions! {
     PlanDelta => "item/plan/delta" (v2::PlanDeltaNotification),
     /// Stream base64-encoded stdout/stderr chunks for a running `command/exec` session.
     CommandExecOutputDelta => "command/exec/outputDelta" (v2::CommandExecOutputDeltaNotification),
+    /// Stream base64-encoded stdout/stderr chunks for a running `process/spawn` session.
+    #[experimental("process/outputDelta")]
+    ProcessOutputDelta => "process/outputDelta" (v2::ProcessOutputDeltaNotification),
+    /// Final exit notification for a `process/spawn` session.
+    #[experimental("process/exited")]
+    ProcessExited => "process/exited" (v2::ProcessExitedNotification),
     CommandExecutionOutputDelta => "item/commandExecution/outputDelta" (v2::CommandExecutionOutputDeltaNotification),
     TerminalInteraction => "item/commandExecution/terminalInteraction" (v2::TerminalInteractionNotification),
+    /// Deprecated legacy apply_patch output stream notification.
     FileChangeOutputDelta => "item/fileChange/outputDelta" (v2::FileChangeOutputDeltaNotification),
     FileChangePatchUpdated => "item/fileChange/patchUpdated" (v2::FileChangePatchUpdatedNotification),
     ServerRequestResolved => "serverRequest/resolved" (v2::ServerRequestResolvedNotification),
@@ -1590,6 +1666,31 @@ mod tests {
             Some(ClientRequestSerializationScope::Global("config"))
         );
 
+        let skills_list = ClientRequest::SkillsList {
+            request_id: request_id(),
+            params: v2::SkillsListParams {
+                cwds: Vec::new(),
+                force_reload: false,
+                per_cwd_extra_user_roots: None,
+            },
+        };
+        assert_eq!(
+            skills_list.serialization_scope(),
+            Some(ClientRequestSerializationScope::GlobalSharedRead("config"))
+        );
+
+        let plugin_list = ClientRequest::PluginList {
+            request_id: request_id(),
+            params: v2::PluginListParams {
+                cwds: None,
+                marketplace_kinds: None,
+            },
+        };
+        assert_eq!(
+            plugin_list.serialization_scope(),
+            Some(ClientRequestSerializationScope::GlobalSharedRead("config"))
+        );
+
         let plugin_uninstall = ClientRequest::PluginUninstall {
             request_id: request_id(),
             params: v2::PluginUninstallParams {
@@ -1640,7 +1741,7 @@ mod tests {
         };
         assert_eq!(
             config_read.serialization_scope(),
-            Some(ClientRequestSerializationScope::Global("config"))
+            Some(ClientRequestSerializationScope::GlobalSharedRead("config"))
         );
 
         let account_read = ClientRequest::GetAccount {
@@ -2113,6 +2214,7 @@ mod tests {
             response: v2::ThreadStartResponse {
                 thread: v2::Thread {
                     id: "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
+                    session_id: "67e55044-10b1-426f-9247-bb680e5fe0c7".to_string(),
                     forked_from_id: None,
                     preview: "first prompt".to_string(),
                     ephemeral: true,
@@ -2124,6 +2226,7 @@ mod tests {
                     cwd: cwd.clone(),
                     cli_version: "0.0.0".to_string(),
                     source: v2::SessionSource::Exec,
+                    thread_source: None,
                     agent_nickname: None,
                     agent_role: None,
                     git_info: None,
@@ -2153,6 +2256,7 @@ mod tests {
                 "response": {
                     "thread": {
                         "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+                        "sessionId": "67e55044-10b1-426f-9247-bb680e5fe0c7",
                         "forkedFromId": null,
                         "preview": "first prompt",
                         "ephemeral": true,
@@ -2166,6 +2270,7 @@ mod tests {
                         "cwd": absolute_path_string("tmp"),
                         "cliVersion": "0.0.0",
                         "source": "exec",
+                        "threadSource": null,
                         "agentNickname": null,
                         "agentRole": null,
                         "gitInfo": null,
@@ -2550,7 +2655,7 @@ mod tests {
                 thread_id: "thr_123".to_string(),
                 output_modality: RealtimeOutputModality::Audio,
                 prompt: Some(Some("You are on a call".to_string())),
-                session_id: Some("sess_456".to_string()),
+                realtime_session_id: Some("sess_456".to_string()),
                 transport: None,
                 voice: Some(RealtimeVoice::Marin),
             },
@@ -2563,7 +2668,7 @@ mod tests {
                     "threadId": "thr_123",
                     "outputModality": "audio",
                     "prompt": "You are on a call",
-                    "sessionId": "sess_456",
+                    "realtimeSessionId": "sess_456",
                     "transport": null,
                     "voice": "marin"
                 }
@@ -2581,7 +2686,7 @@ mod tests {
                 thread_id: "thr_123".to_string(),
                 output_modality: RealtimeOutputModality::Audio,
                 prompt: None,
-                session_id: None,
+                realtime_session_id: None,
                 transport: None,
                 voice: None,
             },
@@ -2593,7 +2698,7 @@ mod tests {
                 "params": {
                     "threadId": "thr_123",
                     "outputModality": "audio",
-                    "sessionId": null,
+                    "realtimeSessionId": null,
                     "transport": null,
                     "voice": null
                 }
@@ -2607,7 +2712,7 @@ mod tests {
                 thread_id: "thr_123".to_string(),
                 output_modality: RealtimeOutputModality::Audio,
                 prompt: Some(None),
-                session_id: None,
+                realtime_session_id: None,
                 transport: None,
                 voice: None,
             },
@@ -2620,7 +2725,7 @@ mod tests {
                     "threadId": "thr_123",
                     "outputModality": "audio",
                     "prompt": null,
-                    "sessionId": null,
+                    "realtimeSessionId": null,
                     "transport": null,
                     "voice": null
                 }
@@ -2634,7 +2739,7 @@ mod tests {
             "params": {
                 "threadId": "thr_123",
                 "outputModality": "audio",
-                "sessionId": null,
+                "realtimeSessionId": null,
                 "transport": null,
                 "voice": null
             }
@@ -2651,7 +2756,7 @@ mod tests {
                 "threadId": "thr_123",
                 "outputModality": "audio",
                 "prompt": null,
-                "sessionId": null,
+                "realtimeSessionId": null,
                 "transport": null,
                 "voice": null
             }
@@ -2763,7 +2868,7 @@ mod tests {
                 thread_id: "thr_123".to_string(),
                 output_modality: RealtimeOutputModality::Audio,
                 prompt: Some(Some("You are on a call".to_string())),
-                session_id: None,
+                realtime_session_id: None,
                 transport: None,
                 voice: None,
             },
@@ -2846,7 +2951,7 @@ mod tests {
         let notification =
             ServerNotification::ThreadRealtimeStarted(v2::ThreadRealtimeStartedNotification {
                 thread_id: "thr_123".to_string(),
-                session_id: Some("sess_456".to_string()),
+                realtime_session_id: Some("sess_456".to_string()),
                 version: RealtimeConversationVersion::V1,
             });
         let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&notification);
