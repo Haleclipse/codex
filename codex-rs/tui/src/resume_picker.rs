@@ -96,8 +96,6 @@ pub enum SessionSelection {
     StartFresh,
     Resume(SessionTarget),
     Fork(SessionTarget),
-    // @cometix: delete thread from resume picker
-    Delete(SessionTarget),
     Exit,
 }
 
@@ -151,6 +149,8 @@ enum PickerLoadRequest {
     Page(PageLoadRequest),
     Preview { thread_id: ThreadId },
     Transcript { thread_id: ThreadId },
+    // @cometix: delete a thread via the picker's own app-server connection
+    Delete { thread_id: ThreadId },
 }
 
 #[derive(Clone)]
@@ -252,6 +252,11 @@ enum BackgroundEvent {
     Transcript {
         thread_id: ThreadId,
         transcript: std::io::Result<TranscriptCells>,
+    },
+    // @cometix: result of a thread delete request
+    Deleted {
+        thread_id: ThreadId,
+        result: std::io::Result<()>,
     },
 }
 
@@ -582,6 +587,14 @@ fn spawn_app_server_page_loader(
                         thread_id,
                         transcript,
                     });
+                }
+                // @cometix: delete thread via the picker's app-server connection
+                PickerLoadRequest::Delete { thread_id } => {
+                    let result = app_server
+                        .delete_thread(thread_id.to_string())
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()));
+                    let _ = bg_tx.send(BackgroundEvent::Deleted { thread_id, result });
                 }
             }
         }
@@ -1064,12 +1077,12 @@ impl PickerState {
                     && let Some(thread_id) = row.thread_id
                 {
                     if self.pending_delete == Some(thread_id) {
-                        // Second press: confirm delete
+                        // @cometix: second press — send delete to background loader
                         self.pending_delete = None;
-                        return Ok(Some(SessionSelection::Delete(SessionTarget {
-                            path: row.path.clone(),
-                            thread_id,
-                        })));
+                        (self.picker_loader)(PickerLoadRequest::Delete { thread_id });
+                        self.inline_error =
+                            Some("Deleting…".into());
+                        self.request_frame();
                     } else {
                         // First press: show confirmation
                         self.pending_delete = Some(thread_id);
@@ -1383,6 +1396,22 @@ impl PickerState {
                     self.request_frame();
                 }
             },
+            // @cometix: handle delete result — remove row and refresh list
+            BackgroundEvent::Deleted { thread_id, result } => {
+                match result {
+                    Ok(()) => {
+                        self.all_rows.retain(|row| row.thread_id != Some(thread_id));
+                        self.apply_filter();
+                        if self.selected >= self.filtered_rows.len() && self.selected > 0 {
+                            self.selected -= 1;
+                        }
+                    }
+                    Err(err) => {
+                        self.inline_error = Some(format!("Failed to delete thread: {err}"));
+                    }
+                }
+                self.request_frame();
+            }
         }
         Ok(())
     }
