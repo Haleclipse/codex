@@ -22,11 +22,12 @@ This fork includes the following enhancements over the upstream [openai/codex](h
 - **Reasoning Translation** — Real-time translation of agent reasoning content via `/translate` command, supporting 15+ LLM providers (OpenAI, Anthropic, DeepSeek, Moonshot, Qwen, Groq, Gemini, etc.)
 - **Personality for all models** — The Personality feature is enabled for every model, not limited to select ones
 - **CJK block cursor fix** — Correct block cursor width for CJK characters on Windows Terminal
+- **Thread Delete** — Delete threads directly from the resume picker with a two-step confirmation (press `Delete` twice)
 - **Update detection via npm** — Version checking uses the `@cometix/codex` npm registry instead of GitHub releases
 
 ## Upstream Sync
 
-This fork is regularly synced with the upstream OpenAI Codex repository. Current base: **0.117.0**.
+This fork is regularly synced with the upstream OpenAI Codex repository. Current base: **0.129.0**.
 
 ## Using Codex with your ChatGPT plan
 
