@@ -275,6 +275,10 @@ jobs:
             cp target/${{ matrix.target }}/release/codex-command-runner.exe "$dest/codex-command-runner-${{ matrix.target }}.exe"
           else
             cp target/${{ matrix.target }}/release/codex "$dest/codex-${{ matrix.target }}"
+            # @cometix: include bwrap for Linux npm packages
+            if [[ -f target/${{ matrix.target }}/release/bwrap ]]; then
+              cp target/${{ matrix.target }}/release/bwrap "$dest/bwrap-${{ matrix.target }}"
+            fi
           fi
 
       - name: Compress artifacts
