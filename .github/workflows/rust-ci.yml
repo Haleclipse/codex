@@ -118,7 +118,8 @@ jobs:
           components: clippy
 
       - name: cargo clippy
-        run: cargo clippy --target ${{ matrix.target }} --all-features --tests --profile ${{ matrix.profile }} -- -D warnings
+        # @cometix: exclude v8-poc (requires pre-built V8 binaries not available in fork)
+        run: cargo clippy --target ${{ matrix.target }} --all-features --tests --profile ${{ matrix.profile }} --exclude codex-v8-poc -- -D warnings
 
   # --- Gatherer job (the ONLY required status check) --------------------------
   results:
