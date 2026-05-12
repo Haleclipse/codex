@@ -17,7 +17,7 @@ jobs:
       codex: ${{ steps.detect.outputs.codex }}
       workflows: ${{ steps.detect.outputs.workflows }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
       - name: Detect changed paths
@@ -54,8 +54,8 @@ jobs:
       run:
         working-directory: codex-rs
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
           components: rustfmt
       - name: cargo fmt
@@ -71,19 +71,19 @@ jobs:
       run:
         working-directory: codex-rs
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.93.0
-      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
           tool: cargo-shear
+          version: 1.11.2
       - name: cargo shear
         run: cargo shear
 
-  # --- Clippy lint on standard GitHub-hosted runners --------------------------
+  # --- Lint + build (clippy) --------------------------------------------------
   lint_build:
-    name: Lint/Build — ${{ matrix.runner }} - ${{ matrix.target }}${{ matrix.profile == 'release' && ' (release)' || '' }}
+    name: Lint/Build — ${{ matrix.runner }} - ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
     needs: changed
     if: ${{ needs.changed.outputs.codex == 'true' || needs.changed.outputs.workflows == 'true' || github.event_name == 'push' }}
     defaults:
@@ -91,34 +91,32 @@ jobs:
         working-directory: codex-rs
     env:
       CARGO_INCREMENTAL: "0"
-
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-latest
-            target: aarch64-apple-darwin
-            profile: dev
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             profile: dev
-
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            profile: dev
     steps:
-      - uses: actions/checkout@v6
-      - name: Install Linux build dependencies
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Linux bwrap build dependencies
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
-      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
         with:
           targets: ${{ matrix.target }}
           components: clippy
 
       - name: cargo clippy
-        # @cometix: exclude v8-poc (requires pre-built V8 binaries not available in fork)
+        # @cometix: exclude v8-poc (requires pre-built V8 binaries not available via cargo)
         run: cargo clippy --target ${{ matrix.target }} --all-features --tests --profile ${{ matrix.profile }} --exclude codex-v8-poc -- -D warnings
 
   # --- Gatherer job (the ONLY required status check) --------------------------

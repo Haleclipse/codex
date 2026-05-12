@@ -325,6 +325,7 @@ impl AnalyticsReducer {
             } => {}
             AnalyticsFact::ServerResponse {
                 response: _response,
+                ..
             } => {}
             AnalyticsFact::Custom(input) => match input {
                 CustomAnalyticsFact::SubAgentThreadStarted(input) => {
@@ -1447,7 +1448,7 @@ fn tool_item_base(
         item_id,
         app_server_client: context.connection_state.app_server_client.clone(),
         runtime: context.connection_state.runtime.clone(),
-        thread_source: thread_metadata.thread_source.map(ThreadSource::as_str),
+        thread_source: thread_metadata.thread_source,
         subagent_source: thread_metadata.subagent_source.clone(),
         parent_thread_id: thread_metadata.parent_thread_id.clone(),
         tool_name,

@@ -587,6 +587,13 @@ client_request_definitions! {
         serialization: None,
         response: v2::ThreadTurnsListResponse,
     },
+    #[experimental("thread/turns/items/list")]
+    ThreadTurnsItemsList => "thread/turns/items/list" {
+        params: v2::ThreadTurnsItemsListParams,
+        // Explicitly concurrent: this primarily reads append-only rollout storage.
+        serialization: None,
+        response: v2::ThreadTurnsItemsListResponse,
+    },
     /// Append raw Responses API items to the thread history without starting a user turn.
     ThreadInjectItems => "thread/inject_items" {
         params: v2::ThreadInjectItemsParams,
@@ -657,21 +664,6 @@ client_request_definitions! {
         params: v2::AppsListParams,
         serialization: None,
         response: v2::AppsListResponse,
-    },
-    DeviceKeyCreate => "device/key/create" {
-        params: v2::DeviceKeyCreateParams,
-        serialization: global("device-key"),
-        response: v2::DeviceKeyCreateResponse,
-    },
-    DeviceKeyPublic => "device/key/public" {
-        params: v2::DeviceKeyPublicParams,
-        serialization: global("device-key"),
-        response: v2::DeviceKeyPublicResponse,
-    },
-    DeviceKeySign => "device/key/sign" {
-        params: v2::DeviceKeySignParams,
-        serialization: global("device-key"),
-        response: v2::DeviceKeySignResponse,
     },
     // File system requests are intentionally concurrent. Desktop already treats local
     // file system operations as concurrent, and app-server remote fs mirrors that model.
@@ -1671,7 +1663,6 @@ mod tests {
             params: v2::SkillsListParams {
                 cwds: Vec::new(),
                 force_reload: false,
-                per_cwd_extra_user_roots: None,
             },
         };
         assert_eq!(
@@ -1796,19 +1787,6 @@ mod tests {
             Some(ClientRequestSerializationScope::Global("config"))
         );
 
-        let device_key_create = ClientRequest::DeviceKeyCreate {
-            request_id: request_id(),
-            params: v2::DeviceKeyCreateParams {
-                protection_policy: None,
-                account_user_id: "user".to_string(),
-                client_id: "client".to_string(),
-            },
-        };
-        assert_eq!(
-            device_key_create.serialization_scope(),
-            Some(ClientRequestSerializationScope::Global("device-key"))
-        );
-
         let add_credits_nudge = ClientRequest::SendAddCreditsNudgeEmail {
             request_id: request_id(),
             params: v2::SendAddCreditsNudgeEmailParams {
@@ -1878,9 +1856,22 @@ mod tests {
                 cursor: None,
                 limit: None,
                 sort_direction: None,
+                items_view: None,
             },
         };
         assert_eq!(thread_turns_list.serialization_scope(), None);
+
+        let thread_turns_items_list = ClientRequest::ThreadTurnsItemsList {
+            request_id: request_id(),
+            params: v2::ThreadTurnsItemsListParams {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                cursor: None,
+                limit: None,
+                sort_direction: None,
+            },
+        };
+        assert_eq!(thread_turns_items_list.serialization_scope(), None);
 
         let mcp_resource_read = ClientRequest::McpResourceRead {
             request_id: request_id(),
@@ -2982,6 +2973,7 @@ mod tests {
             thread_id: "thr_123".to_string(),
             turn_id: "turn_123".to_string(),
             item_id: "call_123".to_string(),
+            started_at_ms: 0,
             approval_id: None,
             reason: None,
             network_approval_context: None,

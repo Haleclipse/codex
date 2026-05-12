@@ -1643,6 +1643,7 @@ fn request_permissions_from_params(
     RequestPermissionsEvent {
         turn_id: params.turn_id,
         call_id: params.item_id,
+        started_at_ms: params.started_at_ms,
         reason: params.reason,
         permissions: params.permissions.into(),
         cwd: Some(params.cwd),
@@ -6536,8 +6537,9 @@ impl ChatWidget {
                 self.on_guardian_review_notification(
                     notification.review_id,
                     notification.turn_id,
+                    notification.started_at_ms,
                     notification.review,
-                    /*decision_source*/ None,
+                    /*completion*/ None,
                     notification.action,
                 );
             }
@@ -6545,8 +6547,9 @@ impl ChatWidget {
                 self.on_guardian_review_notification(
                     notification.review_id,
                     notification.turn_id,
+                    notification.started_at_ms,
                     notification.review,
-                    Some(notification.decision_source),
+                    Some((notification.completed_at_ms, notification.decision_source)),
                     notification.action,
                 );
             }
@@ -6733,14 +6736,24 @@ impl ChatWidget {
         &mut self,
         id: String,
         turn_id: String,
+        started_at_ms: i64,
         review: codex_app_server_protocol::GuardianApprovalReview,
-        decision_source: Option<codex_app_server_protocol::AutoReviewDecisionSource>,
+        completion: Option<(i64, codex_app_server_protocol::AutoReviewDecisionSource)>,
         action: GuardianApprovalReviewAction,
     ) {
+        let (completed_at_ms, decision_source) = match completion {
+            Some((completed_at_ms, decision_source)) => {
+                (Some(completed_at_ms), Some(decision_source))
+            }
+            None => (None, None),
+        };
+
         self.on_guardian_assessment(GuardianAssessmentEvent {
             id,
             target_item_id: None,
             turn_id,
+            started_at_ms,
+            completed_at_ms,
             status: match review.status {
                 codex_app_server_protocol::GuardianApprovalReviewStatus::InProgress => {
                     GuardianAssessmentStatus::InProgress
