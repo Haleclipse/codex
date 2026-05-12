@@ -228,7 +228,8 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - if: ${{ contains(matrix.target, 'linux') && matrix.bundle == 'primary' }}
+      # @cometix: build bwrap on all Linux targets (upstream gates on matrix.bundle which we don't use)
+      - if: ${{ contains(matrix.target, 'linux') }}
         name: Build bwrap and export digest
         shell: bash
         run: |
