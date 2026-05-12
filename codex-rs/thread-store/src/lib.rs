@@ -26,8 +26,8 @@ pub use remote::RemoteThreadStore;
 pub use store::ThreadStore;
 pub use types::AppendThreadItemsParams;
 pub use types::ArchiveThreadParams;
-pub use types::DeleteThreadParams; // @cometix
 pub use types::CreateThreadParams;
+pub use types::DeleteThreadParams; // @cometix
 pub use types::GitInfoPatch;
 pub use types::ListThreadsParams;
 pub use types::LoadThreadHistoryParams;

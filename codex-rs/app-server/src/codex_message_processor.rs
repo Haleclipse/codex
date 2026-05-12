@@ -2998,7 +2998,10 @@ impl CodexMessageProcessor {
             Ok(id) => id,
             Err(err) => {
                 self.outgoing
-                    .send_error(request_id, invalid_request(format!("invalid thread id: {err}")))
+                    .send_error(
+                        request_id,
+                        invalid_request(format!("invalid thread id: {err}")),
+                    )
                     .await;
                 return;
             }
