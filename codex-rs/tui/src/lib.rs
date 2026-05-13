@@ -146,8 +146,9 @@ mod model_migration;
 mod motion;
 mod multi_agents;
 mod notifications;
-#[cfg(any(not(debug_assertions), test))]
-mod npm_registry;
+// @cometix: npm_registry unused — cometix uses updates.rs with @cometix registry
+// #[cfg(any(not(debug_assertions), test))]
+// mod npm_registry;
 pub(crate) mod onboarding;
 mod oss_selection;
 mod pager_overlay;
@@ -191,8 +192,9 @@ pub use update_action::UpdateAction;
 #[cfg(not(debug_assertions))]
 pub use update_action::get_update_action;
 mod update_prompt;
-#[cfg(any(not(debug_assertions), test))]
-mod update_versions;
+// @cometix: update_versions unused — cometix uses updates.rs
+// #[cfg(any(not(debug_assertions), test))]
+// mod update_versions;
 mod updates;
 mod version;
 #[cfg(not(target_os = "linux"))]
