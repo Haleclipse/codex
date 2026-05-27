@@ -4246,23 +4246,8 @@ fn footer_insert_newline_key(
         .or_else(|| bindings.first().copied())
 }
 
-#[cfg(not(target_os = "linux"))]
+// @cometix: statusline/cxline methods (must be unconditional, not behind cfg(not(linux)))
 impl ChatComposer {
-    pub fn update_recording_meter_in_place(&mut self, id: &str, text: &str) -> bool {
-        self.draft.textarea.update_named_element_by_id(id, text)
-    }
-
-    pub fn insert_recording_meter_placeholder(&mut self, text: &str) -> String {
-        let id = self.next_id();
-        self.draft.textarea.insert_named_element(text, id.clone());
-        id
-    }
-
-    pub fn remove_recording_meter_placeholder(&mut self, id: &str) {
-        let _ = self.draft.textarea.replace_element_by_id(id, "");
-    }
-
-    // @cometix: statusline/cxline methods
     pub fn get_statusline_config(&self) -> crate::statusline::config::CxLineConfig {
         self.statusline_config.clone()
     }
@@ -4310,6 +4295,23 @@ impl ChatComposer {
             git_preview: self.statusline_git_preview.clone(),
         };
         crate::statusline::build_statusline(&self.statusline_config, &ctx).render_line()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl ChatComposer {
+    pub fn update_recording_meter_in_place(&mut self, id: &str, text: &str) -> bool {
+        self.draft.textarea.update_named_element_by_id(id, text)
+    }
+
+    pub fn insert_recording_meter_placeholder(&mut self, text: &str) -> String {
+        let id = self.next_id();
+        self.draft.textarea.insert_named_element(text, id.clone());
+        id
+    }
+
+    pub fn remove_recording_meter_placeholder(&mut self, id: &str) {
+        let _ = self.draft.textarea.replace_element_by_id(id, "");
     }
 }
 
