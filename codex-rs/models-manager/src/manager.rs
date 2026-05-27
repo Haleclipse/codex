@@ -3,11 +3,13 @@ use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::config::ModelsManagerConfig;
 use crate::model_info;
 use async_trait::async_trait;
+use codex_app_server_protocol::AuthMode;
 use codex_login::AuthManager;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::Result as CoreResult;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use std::fmt;
 use std::path::PathBuf;
@@ -323,6 +325,23 @@ impl OpenAiModelsManager {
     /// overwrites a bundled entry, the bundled visibility is preserved so that cometix
     /// visibility overrides are never lost to upstream server refreshes.
     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
+        // Use the remote models list as the source of truth if it contains at least one
+        // non-hidden model and the user is using ChatGPT auth.
+        let should_use_remote_models_only = !models.is_empty()
+            && models
+                .iter()
+                .any(|model| model.visibility == ModelVisibility::List)
+            && self.auth_manager.as_ref().is_some_and(|auth_manager| {
+                matches!(
+                    auth_manager.auth_mode(),
+                    Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
+                )
+            });
+        if should_use_remote_models_only {
+            *self.remote_models.write().await = models;
+            return;
+        }
+
         let mut existing_models = load_remote_models_from_file().unwrap_or_default();
         for model in models {
             if let Some(existing_index) = existing_models

@@ -7,6 +7,7 @@ use codex_app_server_protocol::PermissionProfile as AppServerPermissionProfile;
 use codex_app_server_protocol::PermissionProfileFileSystemPermissions;
 use codex_app_server_protocol::PermissionProfileNetworkPermissions;
 use pretty_assertions::assert_eq;
+use std::collections::VecDeque;
 
 #[tokio::test]
 async fn submission_preserves_text_elements_and_local_images() {
@@ -27,6 +28,7 @@ async fn submission_preserves_text_elements_and_local_images() {
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         message_history: None,
@@ -130,6 +132,7 @@ async fn submission_includes_configured_permission_profile() {
         permission_profile: expected_permission_profile.clone(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         message_history: None,
@@ -179,6 +182,7 @@ async fn submission_keeps_profile_when_legacy_projection_is_external() {
         permission_profile: expected_permission_profile.clone(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         message_history: None,
@@ -220,6 +224,7 @@ async fn submission_with_remote_and_local_images_keeps_local_placeholder_numberi
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         message_history: None,
@@ -313,6 +318,7 @@ async fn enter_with_only_remote_images_submits_user_turn() {
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         message_history: None,
@@ -376,6 +382,7 @@ async fn shift_enter_with_only_remote_images_does_not_submit_user_turn() {
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         message_history: None,
@@ -414,6 +421,7 @@ async fn enter_with_only_remote_images_does_not_submit_when_modal_is_active() {
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         message_history: None,
@@ -452,6 +460,7 @@ async fn enter_with_only_remote_images_does_not_submit_when_input_disabled() {
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         message_history: None,
@@ -493,6 +502,7 @@ async fn submission_prefers_selected_duplicate_skill_path() {
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
         instruction_source_paths: Vec::new(),
         reasoning_effort: Some(ReasoningEffortConfig::default()),
         message_history: None,
@@ -710,7 +720,7 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
 
     chat.set_collaboration_mask(plan_mask);
     chat.on_task_started();
-    chat.queued_user_messages.push_back(
+    chat.input_queue.queued_user_messages.push_back(
         UserMessage {
             text: "Implement the plan.".to_string(),
             local_images: Vec::new(),
@@ -725,7 +735,7 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
     handle_turn_interrupted(&mut chat, "turn-1");
 
     assert_eq!(chat.bottom_pane.composer_text(), "Implement the plan.");
-    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.input_queue.queued_user_messages.is_empty());
     assert_eq!(chat.active_collaboration_mode_kind(), expected_mode);
 
     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
@@ -885,7 +895,7 @@ async fn empty_enter_during_task_does_not_queue() {
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     // Ensure nothing was queued.
-    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.input_queue.queued_user_messages.is_empty());
 }
 
 #[tokio::test]
@@ -894,7 +904,9 @@ async fn pending_steer_esc_does_not_steal_vim_insert_escape() {
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
     chat.bottom_pane.set_task_running(/*running*/ true);
-    chat.pending_steers.push_back(pending_steer("queued steer"));
+    chat.input_queue
+        .pending_steers
+        .push_back(pending_steer("queued steer"));
     chat.toggle_vim_mode_and_notify();
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
 
@@ -902,8 +914,8 @@ async fn pending_steer_esc_does_not_steal_vim_insert_escape() {
     chat.handle_key_event(esc);
 
     assert!(!chat.should_handle_vim_insert_escape(esc));
-    assert_eq!(chat.pending_steers.len(), 1);
-    assert!(!chat.submit_pending_steers_after_interrupt);
+    assert_eq!(chat.input_queue.pending_steers.len(), 1);
+    assert!(!chat.input_queue.submit_pending_steers_after_interrupt);
     assert!(op_rx.try_recv().is_err());
 
     chat.handle_key_event(esc);
@@ -912,7 +924,7 @@ async fn pending_steer_esc_does_not_steal_vim_insert_escape() {
         Ok(Op::Interrupt) => {}
         other => panic!("expected Op::Interrupt, got {other:?}"),
     }
-    assert!(chat.submit_pending_steers_after_interrupt);
+    assert!(chat.input_queue.submit_pending_steers_after_interrupt);
 }
 
 #[tokio::test]
@@ -936,14 +948,14 @@ async fn restore_thread_input_state_syncs_sleep_inhibitor_state() {
         agent_turn_running: true,
     }));
 
-    assert!(chat.agent_turn_running);
-    assert!(chat.turn_sleep_inhibitor.is_turn_running());
+    assert!(chat.turn_lifecycle.agent_turn_running);
+    assert!(chat.turn_lifecycle.sleep_inhibitor.is_turn_running());
     assert!(chat.bottom_pane.is_task_running());
 
     chat.restore_thread_input_state(/*input_state*/ None);
 
-    assert!(!chat.agent_turn_running);
-    assert!(!chat.turn_sleep_inhibitor.is_turn_running());
+    assert!(!chat.turn_lifecycle.agent_turn_running);
+    assert!(!chat.turn_lifecycle.sleep_inhibitor.is_turn_running());
     assert!(!chat.bottom_pane.is_task_running());
 }
 
@@ -959,9 +971,11 @@ async fn alt_up_edits_most_recent_queued_message() {
     chat.bottom_pane.set_task_running(/*running*/ true);
 
     // Seed two queued messages.
-    chat.queued_user_messages
+    chat.input_queue
+        .queued_user_messages
         .push_back(UserMessage::from("first queued".to_string()).into());
-    chat.queued_user_messages
+    chat.input_queue
+        .queued_user_messages
         .push_back(UserMessage::from("second queued".to_string()).into());
     chat.refresh_pending_input_preview();
 
@@ -974,9 +988,9 @@ async fn alt_up_edits_most_recent_queued_message() {
         "second queued".to_string()
     );
     // And the queue should now contain only the remaining (older) item.
-    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
     assert_eq!(
-        chat.queued_user_messages.front().unwrap().text,
+        chat.input_queue.queued_user_messages.front().unwrap().text,
         "first queued"
     );
 }
@@ -989,14 +1003,15 @@ async fn unbound_queued_message_edit_does_not_fall_back_to_alt_up() {
     chat.bottom_pane
         .set_queued_message_edit_binding(chat.queued_message_edit_hint_binding);
     chat.bottom_pane.set_task_running(/*running*/ true);
-    chat.queued_user_messages
+    chat.input_queue
+        .queued_user_messages
         .push_back(UserMessage::from("queued".to_string()).into());
     chat.refresh_pending_input_preview();
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
 
     assert!(chat.bottom_pane.composer_text().is_empty());
-    assert_eq!(chat.queued_user_messages.len(), 1);
+    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
 }
 
 #[tokio::test]
@@ -1126,8 +1141,8 @@ async fn enqueueing_history_prompt_multiple_times_is_stable() {
         chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     }
 
-    assert_eq!(chat.queued_user_messages.len(), 3);
-    for message in chat.queued_user_messages.iter() {
+    assert_eq!(chat.input_queue.queued_user_messages.len(), 3);
+    for message in chat.input_queue.queued_user_messages.iter() {
         assert_eq!(message.text, "repeat me");
     }
 }
@@ -1244,9 +1259,11 @@ async fn interrupt_restores_queued_messages_into_composer() {
     chat.bottom_pane.set_task_running(/*running*/ true);
 
     // Queue two user messages while the task is running.
-    chat.queued_user_messages
+    chat.input_queue
+        .queued_user_messages
         .push_back(UserMessage::from("first queued".to_string()).into());
-    chat.queued_user_messages
+    chat.input_queue
+        .queued_user_messages
         .push_back(UserMessage::from("second queued".to_string()).into());
     chat.refresh_pending_input_preview();
 
@@ -1260,7 +1277,7 @@ async fn interrupt_restores_queued_messages_into_composer() {
     );
 
     // Queue should be cleared and no new user input should have been auto-submitted.
-    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.input_queue.queued_user_messages.is_empty());
     assert!(
         op_rx.try_recv().is_err(),
         "unexpected outbound op after interrupt"
@@ -1278,9 +1295,11 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
     chat.bottom_pane
         .set_composer_text("current draft".to_string(), Vec::new(), Vec::new());
 
-    chat.queued_user_messages
+    chat.input_queue
+        .queued_user_messages
         .push_back(UserMessage::from("first queued".to_string()).into());
-    chat.queued_user_messages
+    chat.input_queue
+        .queued_user_messages
         .push_back(UserMessage::from("second queued".to_string()).into());
     chat.refresh_pending_input_preview();
 
@@ -1290,7 +1309,7 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
         chat.bottom_pane.composer_text(),
         "first queued\nsecond queued\ncurrent draft"
     );
-    assert!(chat.queued_user_messages.is_empty());
+    assert!(chat.input_queue.queued_user_messages.is_empty());
     assert!(
         op_rx.try_recv().is_err(),
         "unexpected outbound op after interrupt"

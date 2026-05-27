@@ -13,12 +13,12 @@ use codex_protocol::protocol::GranularApprovalConfig;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
     McpConfig {
         chatgpt_base_url: "https://chatgpt.com".to_string(),
         apps_mcp_path_override: None,
+        apps_mcp_product_sku: None,
         codex_home,
         mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode::default(),
         mcp_oauth_callback_port: None,
@@ -28,8 +28,8 @@ fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
         codex_linux_sandbox_exe: None,
         use_legacy_landlock: false,
         apps_enabled: false,
+        client_elicitation_capability: ElicitationCapability::default(),
         configured_mcp_servers: HashMap::new(),
-        builtin_mcp_servers: Vec::new(),
         plugin_capability_summaries: Vec::new(),
     }
 }
@@ -252,6 +252,40 @@ fn codex_apps_server_config_uses_configured_apps_mcp_path_override() {
     assert_eq!(url, "https://chatgpt.com/backend-api/custom/mcp");
 }
 
+#[test]
+fn codex_apps_server_config_forwards_configured_product_sku_header() {
+    let mut config = test_mcp_config(PathBuf::from("/tmp"));
+    config.apps_mcp_product_sku = Some("tpp".to_string());
+    config.apps_enabled = true;
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+
+    let servers = with_codex_apps_mcp(HashMap::new(), Some(&auth), &config);
+    let server = servers
+        .get(CODEX_APPS_MCP_SERVER_NAME)
+        .expect("codex apps should be present when apps is enabled");
+    let config = server
+        .configured_config()
+        .expect("codex apps should use configured transport");
+
+    match &config.transport {
+        McpServerTransportConfig::StreamableHttp {
+            http_headers,
+            env_http_headers,
+            ..
+        } => {
+            assert_eq!(
+                http_headers,
+                &Some(HashMap::from([(
+                    "X-OpenAI-Product-Sku".to_string(),
+                    "tpp".to_string(),
+                )]))
+            );
+            assert!(env_http_headers.is_none());
+        }
+        other => panic!("expected streamable http transport, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn effective_mcp_servers_preserve_user_servers_and_add_codex_apps() {
     let codex_home = tempfile::tempdir().expect("tempdir");
@@ -279,6 +313,7 @@ async fn effective_mcp_servers_preserve_user_servers_and_add_codex_apps() {
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         },
@@ -303,6 +338,7 @@ async fn effective_mcp_servers_preserve_user_servers_and_add_codex_apps() {
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth: None,
             oauth_resource: None,
             tools: HashMap::new(),
         },
@@ -346,54 +382,4 @@ async fn effective_mcp_servers_preserve_user_servers_and_add_codex_apps() {
         }
         other => panic!("expected streamable http transport, got {other:?}"),
     }
-}
-
-#[test]
-fn effective_mcp_servers_preserve_builtin_runtime_shape() {
-    let mut config = test_mcp_config(PathBuf::from("/tmp"));
-    config.builtin_mcp_servers = vec![codex_builtin_mcps::BuiltinMcpServer::Memories];
-
-    let effective = effective_mcp_servers(&config, /*auth*/ None);
-    let memories = effective
-        .get(codex_builtin_mcps::MEMORIES_MCP_SERVER_NAME)
-        .expect("memories server should exist");
-
-    assert!(!crate::server::McpServerMetadata::from(memories).pollutes_memory);
-    assert!(matches!(
-        memories.launch(),
-        crate::server::McpServerLaunch::Builtin(codex_builtin_mcps::BuiltinMcpServer::Memories)
-    ));
-}
-
-#[tokio::test]
-async fn builtin_memories_server_runs_in_process() {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let mut config = test_mcp_config(codex_home.path().to_path_buf());
-    config.builtin_mcp_servers = vec![codex_builtin_mcps::BuiltinMcpServer::Memories];
-
-    let snapshot = collect_mcp_server_status_snapshot_with_detail(
-        &config,
-        /*auth*/ None,
-        "builtin-memories-test".to_string(),
-        McpRuntimeEnvironment::new(
-            Arc::new(codex_exec_server::Environment::default_for_tests()),
-            codex_home.path().to_path_buf(),
-        ),
-        McpSnapshotDetail::ToolsAndAuthOnly,
-    )
-    .await;
-
-    let tools = snapshot
-        .tools_by_server
-        .get(codex_builtin_mcps::MEMORIES_MCP_SERVER_NAME)
-        .expect("memories tools should be listed");
-    assert_eq!(
-        tools
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>(),
-        ["list".to_string(), "read".to_string(), "search".to_string()]
-            .into_iter()
-            .collect()
-    );
 }

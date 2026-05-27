@@ -462,6 +462,16 @@ pub enum Op {
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<PathBuf>,
 
+        /// Updated runtime workspace roots used to materialize symbolic
+        /// `:workspace_roots` filesystem permissions.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        workspace_roots: Option<Vec<AbsolutePathBuf>>,
+
+        /// Updated profile-defined workspace roots for status summaries and
+        /// per-turn config reconstruction.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        profile_workspace_roots: Option<Vec<AbsolutePathBuf>>,
+
         /// Updated command approval policy.
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_policy: Option<AskForApproval>,
@@ -1400,9 +1410,6 @@ pub enum EventMsg {
 
     /// List of voices supported by realtime conversation streams.
     RealtimeConversationListVoicesResponse(RealtimeConversationListVoicesResponseEvent),
-
-    /// Notification that skill data may have been updated and clients may want to reload.
-    SkillsUpdateAvailable,
 
     PlanUpdate(UpdatePlanArgs),
 

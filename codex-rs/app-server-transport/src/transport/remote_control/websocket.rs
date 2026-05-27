@@ -15,6 +15,7 @@ use super::protocol::ClientId;
 use super::protocol::RemoteControlTarget;
 use super::protocol::ServerEnvelope;
 use super::protocol::StreamId;
+use super::remote_control_status_with_connection_status;
 use super::segment::ClientSegmentObservation;
 use super::segment::ClientSegmentReassembler;
 use super::segment::REMOTE_CONTROL_SEGMENT_MAX_BYTES;
@@ -55,6 +56,7 @@ use tracing::warn;
 
 pub(super) const REMOTE_CONTROL_PROTOCOL_VERSION: &str = "3";
 pub(super) const REMOTE_CONTROL_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+pub(super) const REMOTE_CONTROL_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 const REMOTE_CONTROL_SUBSCRIBE_CURSOR_HEADER: &str = "x-codex-subscribe-cursor";
 const REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
@@ -214,6 +216,8 @@ impl WebsocketState {
 
 pub(crate) struct RemoteControlWebsocket {
     remote_control_url: String,
+    installation_id: String,
+    server_name: String,
     remote_control_target: Option<RemoteControlTarget>,
     state_db: Option<Arc<StateRuntime>>,
     auth_manager: Arc<AuthManager>,
@@ -227,6 +231,13 @@ pub(crate) struct RemoteControlWebsocket {
     server_event_rx: Arc<Mutex<mpsc::Receiver<super::QueuedServerEnvelope>>>,
     used_rx: watch::Receiver<usize>,
     enabled_rx: watch::Receiver<bool>,
+}
+
+pub(crate) struct RemoteControlWebsocketConfig {
+    pub(crate) remote_control_url: String,
+    pub(crate) installation_id: String,
+    pub(crate) remote_control_target: Option<RemoteControlTarget>,
+    pub(crate) server_name: String,
 }
 
 enum ConnectOutcome {
@@ -252,14 +263,8 @@ impl RemoteControlStatusPublisher {
 
     fn publish_status(&self, connection_status: RemoteControlConnectionStatus) {
         self.tx.send_if_modified(|status| {
-            let next_status = RemoteControlStatusChangedNotification {
-                status: connection_status,
-                environment_id: if connection_status == RemoteControlConnectionStatus::Disabled {
-                    None
-                } else {
-                    status.environment_id.clone()
-                },
-            };
+            let next_status =
+                remote_control_status_with_connection_status(status, connection_status);
             if *status == next_status {
                 return false;
             }
@@ -276,6 +281,8 @@ impl RemoteControlStatusPublisher {
             }
             let next_status = RemoteControlStatusChangedNotification {
                 status: status.status,
+                server_name: status.server_name.clone(),
+                installation_id: status.installation_id.clone(),
                 environment_id,
             };
             if *status == next_status {
@@ -290,14 +297,15 @@ impl RemoteControlStatusPublisher {
 
 #[derive(Clone, Copy)]
 pub(super) struct RemoteControlConnectOptions<'a> {
+    installation_id: &'a str,
+    server_name: &'a str,
     subscribe_cursor: Option<&'a str>,
     app_server_client_name: Option<&'a str>,
 }
 
 impl RemoteControlWebsocket {
     pub(crate) fn new(
-        remote_control_url: String,
-        remote_control_target: Option<RemoteControlTarget>,
+        config: RemoteControlWebsocketConfig,
         state_db: Option<Arc<StateRuntime>>,
         auth_manager: Arc<AuthManager>,
         channels: RemoteControlChannels,
@@ -315,8 +323,10 @@ impl RemoteControlWebsocket {
         let auth_recovery = auth_manager.unauthorized_recovery();
 
         Self {
-            remote_control_url,
-            remote_control_target,
+            remote_control_url: config.remote_control_url,
+            installation_id: config.installation_id,
+            server_name: config.server_name,
+            remote_control_target: config.remote_control_target,
             state_db,
             auth_manager,
             status_publisher: channels.status_publisher,
@@ -442,6 +452,8 @@ impl RemoteControlWebsocket {
         loop {
             let subscribe_cursor = self.state.lock().await.subscribe_cursor.clone();
             let connect_options = RemoteControlConnectOptions {
+                installation_id: &self.installation_id,
+                server_name: &self.server_name,
                 subscribe_cursor: subscribe_cursor.as_deref(),
                 app_server_client_name,
             };
@@ -918,6 +930,7 @@ fn build_remote_control_websocket_request(
     websocket_url: &str,
     enrollment: &RemoteControlEnrollment,
     auth: &RemoteControlConnectionAuth,
+    installation_id: &str,
     subscribe_cursor: Option<&str>,
 ) -> io::Result<tungstenite::http::Request<()>> {
     let mut request = websocket_url.into_client_request().map_err(|err| {
@@ -942,6 +955,11 @@ fn build_remote_control_websocket_request(
     auth.auth_provider.add_auth_headers(&mut auth_headers);
     headers.extend(auth_headers);
     set_remote_control_header(headers, REMOTE_CONTROL_ACCOUNT_ID_HEADER, &auth.account_id)?;
+    set_remote_control_header(
+        headers,
+        REMOTE_CONTROL_INSTALLATION_ID_HEADER,
+        installation_id,
+    )?;
     if let Some(subscribe_cursor) = subscribe_cursor {
         set_remote_control_header(
             headers,
@@ -1058,7 +1076,10 @@ pub(super) async fn connect_remote_control_websocket(
         if let Some(loaded_enrollment) = loaded_enrollment.as_ref() {
             status_publisher.publish_environment_id(Some(loaded_enrollment.environment_id.clone()));
         }
-        *enrollment = loaded_enrollment;
+        *enrollment = loaded_enrollment.map(|mut enrollment| {
+            enrollment.server_name = connect_options.server_name.to_string();
+            enrollment
+        });
     }
 
     if enrollment.is_none() {
@@ -1066,7 +1087,13 @@ pub(super) async fn connect_remote_control_websocket(
             "creating new remote control enrollment: websocket_url={}, enroll_url={}, account_id={}",
             remote_control_target.websocket_url, remote_control_target.enroll_url, auth.account_id
         );
-        let new_enrollment = match enroll_remote_control_server(remote_control_target, &auth).await
+        let new_enrollment = match enroll_remote_control_server(
+            remote_control_target,
+            &auth,
+            connect_options.installation_id,
+            connect_options.server_name,
+        )
+        .await
         {
             Ok(new_enrollment) => new_enrollment,
             Err(err)
@@ -1110,6 +1137,7 @@ pub(super) async fn connect_remote_control_websocket(
         &remote_control_target.websocket_url,
         enrollment_ref,
         &auth,
+        connect_options.installation_id,
         connect_options.subscribe_cursor,
     )?;
 
@@ -1247,6 +1275,7 @@ mod tests {
     const TEST_HTTP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
     #[cfg(not(windows))]
     const TEST_HTTP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
     fn remote_control_status_channel() -> (
         RemoteControlStatusPublisher,
@@ -1254,6 +1283,8 @@ mod tests {
     ) {
         let (status_tx, status_rx) = watch::channel(RemoteControlStatusChangedNotification {
             status: RemoteControlConnectionStatus::Connecting,
+            server_name: "test-server".to_string(),
+            installation_id: TEST_INSTALLATION_ID.to_string(),
             environment_id: None,
         });
         (RemoteControlStatusPublisher::new(status_tx), status_rx)
@@ -1359,6 +1390,8 @@ mod tests {
             &mut auth_recovery,
             &mut enrollment,
             RemoteControlConnectOptions {
+                installation_id: TEST_INSTALLATION_ID,
+                server_name: "test-server",
                 subscribe_cursor: None,
                 app_server_client_name: None,
             },
@@ -1376,6 +1409,8 @@ mod tests {
             status_rx.borrow().clone(),
             RemoteControlStatusChangedNotification {
                 status: RemoteControlConnectionStatus::Connecting,
+                server_name: "test-server".to_string(),
+                installation_id: TEST_INSTALLATION_ID.to_string(),
                 environment_id: Some("env_test".to_string()),
             }
         );
@@ -1435,6 +1470,8 @@ mod tests {
             &mut auth_recovery,
             &mut enrollment,
             RemoteControlConnectOptions {
+                installation_id: TEST_INSTALLATION_ID,
+                server_name: "test-server",
                 subscribe_cursor: None,
                 app_server_client_name: None,
             },
@@ -1448,6 +1485,8 @@ mod tests {
             status_rx.borrow().clone(),
             RemoteControlStatusChangedNotification {
                 status: RemoteControlConnectionStatus::Connecting,
+                server_name: "test-server".to_string(),
+                installation_id: TEST_INSTALLATION_ID.to_string(),
                 environment_id: Some("env_test".to_string()),
             }
         );
@@ -1515,6 +1554,8 @@ mod tests {
             &mut auth_recovery,
             &mut enrollment,
             RemoteControlConnectOptions {
+                installation_id: TEST_INSTALLATION_ID,
+                server_name: "test-server",
                 subscribe_cursor: None,
                 app_server_client_name: None,
             },
@@ -1567,6 +1608,8 @@ mod tests {
             &mut auth_recovery,
             &mut enrollment,
             RemoteControlConnectOptions {
+                installation_id: TEST_INSTALLATION_ID,
+                server_name: "test-server",
                 subscribe_cursor: None,
                 app_server_client_name: None,
             },
@@ -1614,6 +1657,8 @@ mod tests {
             &mut auth_recovery,
             &mut enrollment,
             RemoteControlConnectOptions {
+                installation_id: TEST_INSTALLATION_ID,
+                server_name: "test-server",
                 subscribe_cursor: None,
                 app_server_client_name: None,
             },
@@ -1632,6 +1677,8 @@ mod tests {
             status_rx.borrow().clone(),
             RemoteControlStatusChangedNotification {
                 status: RemoteControlConnectionStatus::Connecting,
+                server_name: "test-server".to_string(),
+                installation_id: TEST_INSTALLATION_ID.to_string(),
                 environment_id: None,
             }
         );
@@ -1656,8 +1703,12 @@ mod tests {
             let shutdown_token = shutdown_token.clone();
             async move {
                 RemoteControlWebsocket::new(
-                    remote_control_url,
-                    Some(remote_control_target),
+                    RemoteControlWebsocketConfig {
+                        remote_control_url,
+                        installation_id: TEST_INSTALLATION_ID.to_string(),
+                        remote_control_target: Some(remote_control_target),
+                        server_name: "test-server".to_string(),
+                    },
                     /*state_db*/ None,
                     remote_control_auth_manager(),
                     RemoteControlChannels {
@@ -1701,6 +1752,8 @@ mod tests {
             status_rx.borrow().clone(),
             RemoteControlStatusChangedNotification {
                 status: RemoteControlConnectionStatus::Connecting,
+                server_name: "test-server".to_string(),
+                installation_id: TEST_INSTALLATION_ID.to_string(),
                 environment_id: Some("env_first".to_string()),
             }
         );
@@ -1721,6 +1774,8 @@ mod tests {
             status_rx.borrow().clone(),
             RemoteControlStatusChangedNotification {
                 status: RemoteControlConnectionStatus::Connected,
+                server_name: "test-server".to_string(),
+                installation_id: TEST_INSTALLATION_ID.to_string(),
                 environment_id: Some("env_first".to_string()),
             }
         );
@@ -1734,6 +1789,8 @@ mod tests {
             status_rx.borrow().clone(),
             RemoteControlStatusChangedNotification {
                 status: RemoteControlConnectionStatus::Connected,
+                server_name: "test-server".to_string(),
+                installation_id: TEST_INSTALLATION_ID.to_string(),
                 environment_id: None,
             }
         );
@@ -1748,6 +1805,8 @@ mod tests {
             status_rx.borrow().clone(),
             RemoteControlStatusChangedNotification {
                 status: RemoteControlConnectionStatus::Disabled,
+                server_name: "test-server".to_string(),
+                installation_id: TEST_INSTALLATION_ID.to_string(),
                 environment_id: None,
             }
         );

@@ -1,12 +1,12 @@
 ---
-source: tui/src/chatwidget/tests.rs
+source: tui/src/chatwidget/tests/popups_and_settings.rs
 expression: strip_osc8_for_snapshot(&popup)
 ---
   Plugins
   Figma · Installed · ChatGPT Marketplace
   Turn Figma files into implementation context.
 
-❯ 1. Back to plugins   Return to the plugin list.
+› 1. Back to plugins   Return to the plugin list.
   2. Uninstall plugin  Remove this plugin now.
      Skills            design-review, extract-copy
      Hooks             PreToolUse (1), Stop (2)

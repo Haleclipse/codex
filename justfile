@@ -30,7 +30,7 @@ app-server-test-client *args:
     cargo build -p codex-cli
     cargo run -p codex-app-server-test-client -- --codex-bin ./target/debug/codex "$@"
 
-# format code
+# @cometix: format Rust code only (upstream also formats Python SDK which we don't ship)
 fmt:
     cargo fmt -- --config imports_granularity=Item 2>/dev/null
 
