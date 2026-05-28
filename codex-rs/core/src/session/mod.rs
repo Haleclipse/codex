@@ -10,8 +10,6 @@ use std::time::UNIX_EPOCH;
 
 use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
-use crate::agent::Mailbox;
-use crate::agent::MailboxReceiver;
 use crate::agent::agent_status_from_event;
 use crate::agent::status::is_final;
 use crate::attestation::AttestationProvider;
@@ -74,13 +72,14 @@ use codex_otel::current_span_trace_id;
 use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::ThreadId;
-use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyRuleAction;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
@@ -95,6 +94,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
@@ -193,6 +193,7 @@ use codex_protocol::exec_output::StreamOutput;
 
 mod config_lock;
 mod handlers;
+mod input_queue;
 mod mcp;
 mod multi_agents;
 mod review;
@@ -206,6 +207,8 @@ use self::config_lock::validate_config_lock_if_configured;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
 use self::handlers::submission_loop;
+pub(crate) use self::input_queue::TurnInput;
+pub(crate) use self::input_queue::TurnInputQueue;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
@@ -215,8 +218,6 @@ pub(crate) use self::session::SessionSettingsUpdate;
 use self::turn::AssistantMessageStreamParsers;
 #[cfg(test)]
 use self::turn::collect_explicit_app_ids_from_skill_items;
-#[cfg(test)]
-use self::turn::filter_connectors_for_input;
 use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
 use self::turn_context::TurnSkillsContext;
@@ -289,8 +290,7 @@ use crate::rollout::map_session_init_error;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::shell;
 use crate::shell_snapshot::ShellSnapshot;
-use crate::state::ActiveTurn;
-use crate::state::MailboxDeliveryPhase;
+use crate::state::AutoCompactWindowSnapshot;
 use crate::state::PendingRequestPermissions;
 use crate::state::SessionServices;
 use crate::state::SessionState;
@@ -320,7 +320,6 @@ use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
-use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
@@ -359,8 +358,8 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_tools::ToolEnvironmentMode;
-use codex_tools::ToolsConfig;
-use codex_tools::ToolsConfigParams;
+use codex_tools::UnifiedExecShellMode;
+use codex_tools::shell_command_backend_for_features;
 use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(test)]
 use codex_utils_stream_parser::ProposedPlanSegment;
@@ -480,20 +479,6 @@ impl Codex {
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
-        let fs = environment_selections.primary_filesystem();
-        let plugins_input = config.plugins_config_input();
-        let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
-        let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
-        let skills_input = skills_load_input_from_config(&config, effective_skill_roots);
-        let loaded_skills = skills_manager.skills_for_config(&skills_input, fs).await;
-
-        for err in &loaded_skills.errors {
-            error!(
-                "failed to load skill {}: {}",
-                err.path.display(),
-                err.message
-            );
-        }
 
         if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) = session_source
             && depth >= config.agent_max_depth
@@ -504,9 +489,14 @@ impl Codex {
         }
 
         let primary_environment = environment_selections.primary_environment();
+        let mut user_instruction_warnings = Vec::new();
         let user_instructions = AgentsMdManager::new(&config)
-            .user_instructions(primary_environment.as_deref())
+            .user_instructions(
+                primary_environment.as_deref(),
+                &mut user_instruction_warnings,
+            )
             .await;
+        config.startup_warnings.extend(user_instruction_warnings);
 
         let exec_policy = if crate::guardian::is_guardian_reviewer_source(&session_source) {
             // Guardian review should rely on the built-in shell safety checks,
@@ -598,14 +588,10 @@ impl Codex {
                 developer_instructions: None,
             },
         };
-        let account_plan_type = auth_manager
-            .auth_cached()
-            .and_then(|auth| auth.account_plan_type());
         let service_tier = get_service_tier(
             config.service_tier.clone(),
-            config.notices.fast_default_opt_out.unwrap_or(false),
-            account_plan_type,
             config.features.enabled(Feature::FastMode),
+            &model_info,
         );
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
@@ -807,29 +793,22 @@ impl Codex {
 
 fn get_service_tier(
     configured_service_tier: Option<String>,
-    fast_default_opt_out: bool,
-    account_plan_type: Option<AccountPlanType>,
     fast_mode_enabled: bool,
+    model_info: &ModelInfo,
 ) -> Option<String> {
-    if configured_service_tier.is_some() || fast_default_opt_out || !fast_mode_enabled {
-        return configured_service_tier;
+    if !fast_mode_enabled {
+        return None;
     }
-
-    account_plan_type
-        .is_some_and(is_enterprise_default_service_tier_plan)
-        .then_some(ServiceTier::Fast.request_value().to_string())
+    configured_service_tier.filter(|service_tier| {
+        service_tier == SERVICE_TIER_DEFAULT_REQUEST_VALUE
+            || model_info.supports_service_tier(service_tier)
+    })
 }
 
 fn session_permission_profile_state_from_config(
     config: &Config,
 ) -> CodexResult<PermissionProfileState> {
     Ok(config.permissions.permission_profile_state().clone())
-}
-
-fn is_enterprise_default_service_tier_plan(plan_type: AccountPlanType) -> bool {
-    plan_type == AccountPlanType::Enterprise
-        || plan_type.is_business_like()
-        || plan_type.is_team_like()
 }
 
 #[cfg(test)]
@@ -886,22 +865,6 @@ impl Session {
                 .app_server_client_version
                 .clone(),
         }
-    }
-
-    pub(crate) async fn configured_multi_agent_v2_usage_hint_texts(&self) -> Vec<String> {
-        if !self.features.enabled(Feature::MultiAgentV2) {
-            return Vec::new();
-        }
-
-        let state = self.state.lock().await;
-        let config = &state.session_configuration.original_config_do_not_use;
-        [
-            config.multi_agent_v2.root_agent_usage_hint_text.clone(),
-            config.multi_agent_v2.subagent_usage_hint_text.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
     }
 
     fn managed_network_proxy_active_for_permission_profile(
@@ -977,9 +940,6 @@ impl Session {
     }
 
     async fn refresh_managed_network_proxy_for_current_permission_profile(&self) {
-        let Some(started_proxy) = self.services.network_proxy.as_ref() else {
-            return;
-        };
         let Ok(_refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
             error!("managed network proxy refresh semaphore closed");
             return;
@@ -993,7 +953,9 @@ impl Session {
             .permissions
             .network
             .as_ref()
+            .cloned()
         else {
+            self.services.network_proxy.store(None);
             return;
         };
 
@@ -1016,8 +978,36 @@ impl Session {
                 spec
             }
         };
-        if let Err(err) = spec.apply_to_started_proxy(started_proxy).await {
-            warn!("failed to refresh managed network proxy for sandbox change: {err}");
+        if let Some(started_proxy) = self.services.network_proxy.load_full() {
+            if let Err(err) = spec.apply_to_started_proxy(started_proxy.as_ref()).await {
+                warn!("failed to refresh managed network proxy for sandbox change: {err}");
+            }
+            return;
+        }
+
+        match Self::start_managed_network_proxy(
+            &spec,
+            current_exec_policy.as_ref(),
+            &session_configuration.permission_profile(),
+            /*network_policy_decider*/ None,
+            self.services
+                .managed_network_requirements_configured
+                .then(|| {
+                    build_blocked_request_observer(Arc::clone(&self.services.network_approval))
+                }),
+            self.services.managed_network_requirements_configured,
+            self.services.network_proxy_audit_metadata.clone(),
+        )
+        .await
+        {
+            Ok((started_proxy, _session_network_proxy)) => {
+                self.services
+                    .network_proxy
+                    .store(Some(Arc::new(started_proxy)));
+            }
+            Err(err) => {
+                warn!("failed to start managed network proxy for sandbox change: {err}");
+            }
         }
     }
 
@@ -1096,6 +1086,7 @@ impl Session {
                 }],
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
+                thread_settings: Default::default(),
             },
             /*mirror_user_text_to_realtime*/ None,
         )
@@ -1105,6 +1096,11 @@ impl Session {
     pub(crate) async fn get_total_token_usage(&self) -> i64 {
         let state = self.state.lock().await;
         state.get_total_token_usage(state.server_reasoning_included())
+    }
+
+    pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {
+        let state = self.state.lock().await;
+        state.auto_compact_window_snapshot()
     }
 
     pub(crate) async fn get_total_token_usage_breakdown(&self) -> TotalTokenUsageBreakdown {
@@ -1273,9 +1269,39 @@ impl Session {
             reconstructed_rollout.reference_context_item,
         )
         .await;
+        let prefix_tokens = if matches!(
+            turn_context.config.model_auto_compact_token_limit_scope,
+            AutoCompactTokenLimitScope::BodyAfterPrefix
+        ) {
+            let history = self.clone_history().await;
+            let base_instructions = self.get_base_instructions().await;
+            history.estimate_token_count_with_base_instructions(&base_instructions)
+        } else {
+            None
+        };
+        if let Some(prefix_tokens) = prefix_tokens {
+            self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
+                .await;
+        }
         self.set_previous_turn_settings(previous_turn_settings.clone())
             .await;
         previous_turn_settings
+    }
+
+    async fn set_auto_compact_window_estimated_prefill_for_scope(
+        &self,
+        turn_context: &TurnContext,
+        tokens: i64,
+    ) {
+        if !matches!(
+            turn_context.config.model_auto_compact_token_limit_scope,
+            AutoCompactTokenLimitScope::BodyAfterPrefix
+        ) {
+            return;
+        }
+
+        let mut state = self.state.lock().await;
+        state.set_auto_compact_window_estimated_prefill(tokens);
     }
 
     fn last_token_info_from_rollout(rollout_items: &[RolloutItem]) -> Option<TokenUsageInfo> {
@@ -1393,12 +1419,15 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) async fn validate_settings(
+    pub(crate) async fn preview_settings(
         &self,
         updates: &SessionSettingsUpdate,
-    ) -> ConstraintResult<()> {
+    ) -> ConstraintResult<ThreadConfigSnapshot> {
         let state = self.state.lock().await;
-        state.session_configuration.apply(updates).map(|_| ())
+        state
+            .session_configuration
+            .apply(updates)
+            .map(|configuration| configuration.thread_config_snapshot())
     }
 
     pub(crate) async fn set_session_startup_prewarm(
@@ -1880,7 +1909,7 @@ impl Session {
         let execpolicy_amendment =
             execpolicy_network_rule_amendment(amendment, network_approval_context, &host);
 
-        if let Some(started_network_proxy) = self.services.network_proxy.as_ref() {
+        if let Some(started_network_proxy) = self.services.network_proxy.load_full() {
             let proxy = started_network_proxy.proxy();
             match amendment.action {
                 NetworkPolicyRuleAction::Allow => proxy
@@ -2591,14 +2620,21 @@ impl Session {
         reference_context_item: Option<TurnContextItem>,
         compacted_item: CompactedItem,
     ) {
-        self.replace_history(items, reference_context_item.clone())
-            .await;
+        {
+            let mut state = self.state.lock().await;
+            state.replace_history(items, reference_context_item.clone());
+            state.start_next_auto_compact_window();
+        }
 
         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
             .await;
         if let Some(turn_context_item) = reference_context_item {
             self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
                 .await;
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
         }
         self.services.model_client.advance_window_generation();
     }
@@ -2950,6 +2986,12 @@ impl Session {
                 let mut state = self.state.lock().await;
                 state
                     .update_token_info_from_usage(token_usage, turn_context.model_context_window());
+                if matches!(
+                    turn_context.config.model_auto_compact_token_limit_scope,
+                    AutoCompactTokenLimitScope::BodyAfterPrefix
+                ) {
+                    state.ensure_auto_compact_window_server_prefill_from_usage(token_usage);
+                }
                 state.token_info()
             };
             if let Some(token_info) = token_info.as_ref() {
@@ -2997,6 +3039,11 @@ impl Session {
 
             state.set_token_info(Some(info));
         }
+        self.set_auto_compact_window_estimated_prefill_for_scope(
+            turn_context,
+            estimated_total_tokens,
+        )
+        .await;
         self.send_token_count_event(turn_context).await;
     }
 
@@ -3027,16 +3074,6 @@ impl Session {
     {
         let mut state = self.state.lock().await;
         state.record_mcp_dependency_prompted(names);
-    }
-
-    pub async fn dependency_env(&self) -> HashMap<String, String> {
-        let state = self.state.lock().await;
-        state.dependency_env()
-    }
-
-    pub async fn set_dependency_env(&self, values: HashMap<String, String>) {
-        let mut state = self.state.lock().await;
-        state.set_dependency_env(values);
     }
 
     pub(crate) async fn set_server_reasoning_included(&self, included: bool) {
@@ -3081,11 +3118,11 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         input: &[UserInput],
-        response_item: ResponseItem,
     ) {
         // Persist the user message to history, but emit the turn item from `UserInput` so
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
+        let response_item = ResponseItem::from(ResponseInputItem::from(input.to_vec()));
         self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
             .await;
         let turn_item = TurnItem::UserMessage(UserMessageItem::new(input));
@@ -3125,10 +3162,6 @@ impl Session {
         expected_turn_id: Option<&str>,
         responsesapi_client_metadata: Option<HashMap<String, String>>,
     ) -> Result<String, SteerInputError> {
-        if input.is_empty() {
-            return Err(SteerInputError::EmptyInput);
-        }
-
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
             return Err(SteerInputError::NoActiveTurn(input));
@@ -3162,6 +3195,10 @@ impl Session {
             None => return Err(SteerInputError::NoActiveTurn(input)),
         }
 
+        if input.is_empty() {
+            return Err(SteerInputError::EmptyInput);
+        }
+
         if let Some(responsesapi_client_metadata) = responsesapi_client_metadata
             && let Some((_, active_task)) = active_turn.tasks.first()
         {
@@ -3171,193 +3208,34 @@ impl Session {
                 .set_responsesapi_client_metadata(responsesapi_client_metadata);
         }
 
-        let mut turn_state = active_turn.turn_state.lock().await;
-        turn_state.push_pending_input(input.into());
-        turn_state.accept_mailbox_delivery_for_current_turn();
+        self.input_queue
+            .push_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                active_turn.turn_state.as_ref(),
+                TurnInput::UserInput(input),
+            )
+            .await;
         Ok(active_turn_id.clone())
     }
 
     /// Returns the input if there was no task running to inject into.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
     pub async fn inject_response_items(
         &self,
         input: Vec<ResponseInputItem>,
     ) -> Result<(), Vec<ResponseInputItem>> {
-        let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
-            Some(at) => {
-                let mut ts = at.turn_state.lock().await;
-                for item in input {
-                    ts.push_pending_input(item);
-                }
-                Ok(())
-            }
-            None => Err(input),
-        }
-    }
-
-    pub(crate) async fn defer_mailbox_delivery_to_next_turn(&self, sub_id: &str) {
-        let turn_state = self.turn_state_for_sub_id(sub_id).await;
-        let Some(turn_state) = turn_state else {
-            return;
-        };
-        let mut turn_state = turn_state.lock().await;
-        if turn_state.has_pending_input() {
-            return;
-        }
-        turn_state.set_mailbox_delivery_phase(MailboxDeliveryPhase::NextTurn);
-    }
-
-    pub(crate) async fn accept_mailbox_delivery_for_current_turn(&self, sub_id: &str) {
-        let turn_state = self.turn_state_for_sub_id(sub_id).await;
-        let Some(turn_state) = turn_state else {
-            return;
-        };
-        turn_state
-            .lock()
+        self.input_queue
+            .inject_response_items(&self.active_turn, input)
             .await
-            .set_mailbox_delivery_phase(MailboxDeliveryPhase::CurrentTurn);
     }
 
     pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {
-        let turn_state = self.turn_state_for_sub_id(sub_id).await;
+        let turn_state = self
+            .input_queue
+            .turn_state_for_sub_id(&self.active_turn, sub_id)
+            .await;
         let Some(turn_state) = turn_state else {
             return;
         };
         turn_state.lock().await.has_memory_citation = true;
-    }
-
-    async fn turn_state_for_sub_id(
-        &self,
-        sub_id: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::state::TurnState>>> {
-        let active = self.active_turn.lock().await;
-        active.as_ref().and_then(|active_turn| {
-            active_turn
-                .tasks
-                .contains_key(sub_id)
-                .then(|| Arc::clone(&active_turn.turn_state))
-        })
-    }
-
-    pub(crate) fn subscribe_mailbox_seq(&self) -> watch::Receiver<u64> {
-        self.mailbox.subscribe()
-    }
-
-    pub(crate) fn enqueue_mailbox_communication(&self, communication: InterAgentCommunication) {
-        self.mailbox.send(communication);
-    }
-
-    pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
-        self.mailbox_rx.lock().await.has_pending_trigger_turn()
-    }
-
-    pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
-        self.mailbox_rx.lock().await.has_pending()
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
-    pub async fn prepend_pending_input(&self, input: Vec<ResponseInputItem>) -> Result<(), ()> {
-        let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
-            Some(at) => {
-                let mut ts = at.turn_state.lock().await;
-                ts.prepend_pending_input(input);
-                Ok(())
-            }
-            None => Err(()),
-        }
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
-    pub async fn get_pending_input(&self) -> Vec<ResponseInputItem> {
-        let (pending_input, accepts_mailbox_delivery) = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
-                    (
-                        ts.take_pending_input(),
-                        ts.accepts_mailbox_delivery_for_current_turn(),
-                    )
-                }
-                None => (Vec::new(), true),
-            }
-        };
-        if !accepts_mailbox_delivery {
-            return pending_input;
-        }
-        let mailbox_items = {
-            let mut mailbox_rx = self.mailbox_rx.lock().await;
-            mailbox_rx
-                .drain()
-                .into_iter()
-                .map(|mail| mail.to_response_input_item())
-                .collect::<Vec<_>>()
-        };
-        if pending_input.is_empty() {
-            mailbox_items
-        } else if mailbox_items.is_empty() {
-            pending_input
-        } else {
-            let mut pending_input = pending_input;
-            pending_input.extend(mailbox_items);
-            pending_input
-        }
-    }
-
-    /// Queue response items to be injected into the next active turn created for this session.
-    pub(crate) async fn queue_response_items_for_next_turn(&self, items: Vec<ResponseInputItem>) {
-        if items.is_empty() {
-            return;
-        }
-
-        let mut idle_pending_input = self.idle_pending_input.lock().await;
-        idle_pending_input.extend(items);
-    }
-
-    pub(crate) async fn take_queued_response_items_for_next_turn(&self) -> Vec<ResponseInputItem> {
-        std::mem::take(&mut *self.idle_pending_input.lock().await)
-    }
-
-    pub(crate) async fn has_queued_response_items_for_next_turn(&self) -> bool {
-        !self.idle_pending_input.lock().await.is_empty()
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state reads must remain atomic"
-    )]
-    pub async fn has_pending_input(&self) -> bool {
-        let (has_turn_pending_input, accepts_mailbox_delivery) = {
-            let active = self.active_turn.lock().await;
-            match active.as_ref() {
-                Some(at) => {
-                    let ts = at.turn_state.lock().await;
-                    (
-                        ts.has_pending_input(),
-                        ts.accepts_mailbox_delivery_for_current_turn(),
-                    )
-                }
-                None => (false, true),
-            }
-        };
-        if has_turn_pending_input {
-            return true;
-        }
-        if !accepts_mailbox_delivery {
-            return false;
-        }
-        self.has_pending_mailbox_items().await
     }
 
     pub async fn interrupt_task(self: &Arc<Self>) {

@@ -1271,17 +1271,18 @@ impl ThreadRequestProcessor {
         approval_policy: Option<codex_app_server_protocol::AskForApproval>,
         approvals_reviewer: Option<codex_app_server_protocol::ApprovalsReviewer>,
         sandbox: Option<SandboxMode>,
-        permissions: Option<PermissionProfileSelectionParams>,
+        permissions: Option<String>,
         base_instructions: Option<String>,
         developer_instructions: Option<String>,
         personality: Option<Personality>,
     ) -> ConfigOverrides {
-        let mut overrides = ConfigOverrides {
+        ConfigOverrides {
             model,
             model_provider,
             service_tier,
             cwd: cwd.map(PathBuf::from),
             workspace_roots: runtime_workspace_roots,
+            default_permissions: permissions,
             approval_policy: approval_policy
                 .map(codex_app_server_protocol::AskForApproval::to_core),
             approvals_reviewer: approvals_reviewer
@@ -1293,9 +1294,7 @@ impl ThreadRequestProcessor {
             developer_instructions,
             personality,
             ..Default::default()
-        };
-        apply_permission_profile_selection_to_config_overrides(&mut overrides, permissions);
-        overrides
+        }
     }
 
     fn parse_environment_selections(
@@ -1770,6 +1769,16 @@ impl ThreadRequestProcessor {
         let command = command.trim().to_string();
         if command.is_empty() {
             return Err(invalid_request("command must not be empty"));
+        }
+        // `thread/shellCommand` is app-server's local-host shell escape hatch,
+        // not the normal turn-selected shell tool path.
+        if self
+            .thread_manager
+            .environment_manager()
+            .try_local_environment()
+            .is_none()
+        {
+            return Err(internal_error("local environment is not configured"));
         }
 
         let (_, thread) = self.load_thread(&thread_id).await?;
@@ -2662,31 +2671,6 @@ impl ThreadRequestProcessor {
                 )));
             }
             None
-        } else if params.path.is_some() {
-            let source_thread = self
-                .read_stored_thread_for_resume(
-                    &params.thread_id,
-                    params.path.as_ref(),
-                    /*include_history*/ true,
-                )
-                .await?;
-            let existing_thread_id = source_thread.thread_id;
-            if let Ok(existing_thread) = self.thread_manager.get_thread(existing_thread_id).await {
-                if let (Some(requested_path), Some(active_path)) = (
-                    params.path.as_ref(),
-                    existing_thread.rollout_path().as_ref(),
-                ) && requested_path != active_path
-                {
-                    return Err(invalid_request(format!(
-                        "cannot resume running thread {existing_thread_id} with stale path: requested `{}`, active `{}`",
-                        requested_path.display(),
-                        active_path.display()
-                    )));
-                }
-                Some((existing_thread_id, existing_thread, source_thread))
-            } else {
-                None
-            }
         } else if let Ok(existing_thread_id) = ThreadId::from_string(&params.thread_id)
             && let Ok(existing_thread) = self.thread_manager.get_thread(existing_thread_id).await
         {
@@ -2709,6 +2693,19 @@ impl ThreadRequestProcessor {
         };
 
         if let Some((existing_thread_id, existing_thread, source_thread)) = running_thread {
+            let existing_thread_rollout_path = existing_thread.rollout_path();
+            let active_path = existing_thread_rollout_path
+                .as_ref()
+                .or(source_thread.rollout_path.as_ref());
+            if let (Some(requested_path), Some(active_path)) = (params.path.as_ref(), active_path)
+                && requested_path != active_path
+            {
+                return Err(invalid_request(format!(
+                    "cannot resume running thread {existing_thread_id} with stale path: requested `{}`, active `{}`",
+                    requested_path.display(),
+                    active_path.display()
+                )));
+            }
             let redact_resume_payloads =
                 should_redact_thread_resume_payloads(app_server_client_name.as_deref());
             let history_items = source_thread

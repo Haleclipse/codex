@@ -11,6 +11,7 @@ use crate::ExtensionData;
 
 mod prompt;
 mod thread_lifecycle;
+mod tool_lifecycle;
 mod turn_lifecycle;
 
 pub use prompt::PromptFragment;
@@ -18,6 +19,11 @@ pub use prompt::PromptSlot;
 pub use thread_lifecycle::ThreadResumeInput;
 pub use thread_lifecycle::ThreadStartInput;
 pub use thread_lifecycle::ThreadStopInput;
+pub use tool_lifecycle::ToolCallOutcome;
+pub use tool_lifecycle::ToolCallSource;
+pub use tool_lifecycle::ToolFinishInput;
+pub use tool_lifecycle::ToolLifecycleFuture;
+pub use tool_lifecycle::ToolStartInput;
 pub use turn_lifecycle::TurnAbortInput;
 pub use turn_lifecycle::TurnStartInput;
 pub use turn_lifecycle::TurnStopInput;
@@ -111,34 +117,45 @@ pub trait ToolContributor: Send + Sync {
     ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>>;
 }
 
-/// Future returned by one claimed approval-review contribution.
-pub type ApprovalReviewFuture<'a> =
-    std::pin::Pin<Box<dyn Future<Output = ReviewDecision> + Send + 'a>>;
+/// Contributor for host-owned tool lifecycle gates.
+///
+/// Implementations should use these callbacks to observe tool execution without
+/// inspecting or rewriting tool input/output. Use `ToolContributor` for owning a
+/// tool implementation and hooks for policy that needs tool payloads.
+pub trait ToolLifecycleContributor: Send + Sync {
+    /// Called once the host has accepted a tool call for execution.
+    fn on_tool_start<'a>(&'a self, _input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
+        Box::pin(std::future::ready(()))
+    }
 
-/// Extension contribution that can claim rendered approval-review prompts.
-pub trait ApprovalReviewContributor: Send + Sync {
-    fn contribute<'a>(
-        &'a self,
-        session_store: &'a ExtensionData,
-        thread_store: &'a ExtensionData,
-        prompt: &'a str,
-    ) -> Option<ApprovalReviewFuture<'a>>;
+    /// Called after the tool call returns, is blocked, fails, or is cancelled.
+    fn on_tool_finish<'a>(&'a self, _input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
-/// Future returned by one ordered turn-item contribution.
-pub type TurnItemContributionFuture<'a> =
-    std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+/// Extension contribution that can claim rendered approval-review prompts.
+#[async_trait::async_trait]
+pub trait ApprovalReviewContributor: Send + Sync {
+    async fn contribute(
+        &self,
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+        prompt: &str,
+    ) -> Option<ReviewDecision>;
+}
 
 /// Ordered post-processing contribution for one parsed turn item.
 ///
 /// Implementations may mutate the item before it is emitted and may use the
 /// explicitly exposed thread- and turn-lifetime stores when they need durable
 /// extension-private state.
+#[async_trait::async_trait]
 pub trait TurnItemContributor: Send + Sync {
-    fn contribute<'a>(
-        &'a self,
-        thread_store: &'a ExtensionData,
-        turn_store: &'a ExtensionData,
-        item: &'a mut TurnItem,
-    ) -> TurnItemContributionFuture<'a>;
+    async fn contribute(
+        &self,
+        thread_store: &ExtensionData,
+        turn_store: &ExtensionData,
+        item: &mut TurnItem,
+    ) -> Result<(), String>;
 }

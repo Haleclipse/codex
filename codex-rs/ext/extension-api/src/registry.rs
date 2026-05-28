@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use codex_protocol::protocol::ReviewDecision;
+
 use crate::ApprovalReviewContributor;
-use crate::ApprovalReviewFuture;
 use crate::ConfigContributor;
 use crate::ContextContributor;
 use crate::ExtensionData;
@@ -10,6 +11,7 @@ use crate::NoopExtensionEventSink;
 use crate::ThreadLifecycleContributor;
 use crate::TokenUsageContributor;
 use crate::ToolContributor;
+use crate::ToolLifecycleContributor;
 use crate::TurnItemContributor;
 use crate::TurnLifecycleContributor;
 
@@ -22,6 +24,7 @@ pub struct ExtensionRegistryBuilder<C: Sync> {
     token_usage_contributors: Vec<Arc<dyn TokenUsageContributor>>,
     context_contributors: Vec<Arc<dyn ContextContributor>>,
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
+    tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
     approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
@@ -37,6 +40,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
             approval_review_contributors: Vec::new(),
             context_contributors: Vec::new(),
             tool_contributors: Vec::new(),
+            tool_lifecycle_contributors: Vec::new(),
             turn_item_contributors: Vec::new(),
         }
     }
@@ -99,6 +103,11 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
         self.tool_contributors.push(contributor);
     }
 
+    /// Registers one tool-lifecycle contributor.
+    pub fn tool_lifecycle_contributor(&mut self, contributor: Arc<dyn ToolLifecycleContributor>) {
+        self.tool_lifecycle_contributors.push(contributor);
+    }
+
     /// Registers one ordered turn-item contributor.
     pub fn turn_item_contributor(&mut self, contributor: Arc<dyn TurnItemContributor>) {
         self.turn_item_contributors.push(contributor);
@@ -115,6 +124,7 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
             approval_review_contributors: self.approval_review_contributors,
             context_contributors: self.context_contributors,
             tool_contributors: self.tool_contributors,
+            tool_lifecycle_contributors: self.tool_lifecycle_contributors,
             turn_item_contributors: self.turn_item_contributors,
         }
     }
@@ -129,6 +139,7 @@ pub struct ExtensionRegistry<C: Sync> {
     token_usage_contributors: Vec<Arc<dyn TokenUsageContributor>>,
     context_contributors: Vec<Arc<dyn ContextContributor>>,
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
+    tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
     approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
@@ -161,15 +172,22 @@ impl<C: Sync> ExtensionRegistry<C> {
 
     /// Claims the first rendered approval-review prompt accepted by an
     /// installed contributor.
-    pub fn approval_review<'a>(
-        &'a self,
-        session_store: &'a ExtensionData,
-        thread_store: &'a ExtensionData,
-        prompt: &'a str,
-    ) -> Option<ApprovalReviewFuture<'a>> {
-        self.approval_review_contributors
-            .iter()
-            .find_map(|contributor| contributor.contribute(session_store, thread_store, prompt))
+    pub async fn approval_review(
+        &self,
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+        prompt: &str,
+    ) -> Option<ReviewDecision> {
+        for contributor in &self.approval_review_contributors {
+            if let Some(decision) = contributor
+                .contribute(session_store, thread_store, prompt)
+                .await
+            {
+                return Some(decision);
+            }
+        }
+
+        None
     }
 
     /// Returns the registered prompt contributors.
@@ -180,6 +198,11 @@ impl<C: Sync> ExtensionRegistry<C> {
     /// Returns the registered native tool contributors.
     pub fn tool_contributors(&self) -> &[Arc<dyn ToolContributor>] {
         &self.tool_contributors
+    }
+
+    /// Returns the registered tool-lifecycle contributors.
+    pub fn tool_lifecycle_contributors(&self) -> &[Arc<dyn ToolLifecycleContributor>] {
+        &self.tool_lifecycle_contributors
     }
 
     /// Returns the registered ordered turn-item contributors.

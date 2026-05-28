@@ -117,7 +117,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.132.0"
+version = "0.133.0"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -413,7 +413,7 @@ unicode-width = "0.2"
 url = "2"
 urlencoding = "2.1"
 uuid = "1"
-v8 = "=146.4.0"
+v8 = "=147.4.0"
 vt100 = "0.16.2"
 walkdir = "2.5.0"
 webbrowser = "1.0"

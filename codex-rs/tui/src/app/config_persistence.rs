@@ -360,6 +360,7 @@ impl App {
                 /*cwd*/ None,
                 approval_policy_override,
                 approvals_reviewer_override,
+                permission_profile_override,
                 active_permission_profile_override,
                 /*windows_sandbox_level*/ None,
                 /*model*/ None,
@@ -387,6 +388,7 @@ impl App {
                         /*cwd*/ None,
                         /*approval_policy*/ None,
                         /*approvals_reviewer*/ None,
+                        /*permission_profile*/ None,
                         /*active_permission_profile*/ None,
                         #[cfg(target_os = "windows")]
                         Some(windows_sandbox_level),
@@ -589,6 +591,7 @@ mod tests {
     use super::*;
     use crate::app::test_support::app_enabled_in_effective_config;
     use crate::app::test_support::make_test_app;
+    use crate::legacy_core::config::edit::ConfigEdit;
     use crate::test_support::PathBufExt;
     use codex_protocol::models::PermissionProfile;
     use pretty_assertions::assert_eq;
@@ -691,6 +694,8 @@ mod tests {
                 runtime_workspace_roots: Vec::new(),
                 instruction_source_paths: Vec::new(),
                 reasoning_effort: None,
+                collaboration_mode: None,
+                personality: None,
                 message_history: None,
                 network_proxy: None,
                 rollout_path: Some(PathBuf::new()),

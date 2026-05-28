@@ -52,6 +52,7 @@ mod doctor;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod plugin_cmd;
+mod remote_control_cmd;
 mod state_db_recovery;
 #[cfg(not(windows))]
 mod wsl_paths;
@@ -59,6 +60,7 @@ mod wsl_paths;
 use crate::mcp_cmd::McpCli;
 use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
+use crate::remote_control_cmd::RemoteControlCommand;
 use doctor::DoctorCommand;
 use state_db_recovery as local_state_db;
 
@@ -476,19 +478,23 @@ struct AppServerCommand {
 
 #[derive(Debug, Parser)]
 struct ExecServerCommand {
+    /// Error out when config.toml contains fields that are not recognized by this version of Codex.
+    #[arg(long = "strict-config", default_value_t = false)]
+    strict_config: bool,
+
     /// Transport endpoint URL. Supported values: `ws://IP:PORT` (default), `stdio`, `stdio://`.
     #[arg(long = "listen", value_name = "URL", conflicts_with = "remote")]
     listen: Option<String>,
 
-    /// Register this exec-server as a remote executor using the given base URL.
-    #[arg(long = "remote", value_name = "URL", requires = "executor_id")]
+    /// Register this exec-server as a remote environment using the given base URL.
+    #[arg(long = "remote", value_name = "URL", requires = "environment_id")]
     remote: Option<String>,
 
-    /// Executor id to attach to when registering remotely.
-    #[arg(long = "executor-id", value_name = "ID")]
-    executor_id: Option<String>,
+    /// Environment id to attach to when registering remotely.
+    #[arg(long = "environment-id", value_name = "ID")]
+    environment_id: Option<String>,
 
-    /// Human-readable executor name.
+    /// Human-readable environment name.
     #[arg(long = "name", value_name = "NAME")]
     name: Option<String>,
 
@@ -563,21 +569,6 @@ struct AppServerBootstrapCommand {
     /// Launch the managed app-server with remote control enabled.
     #[arg(long = "remote-control")]
     remote_control: bool,
-}
-
-#[derive(Debug, Args)]
-struct RemoteControlCommand {
-    #[command(subcommand)]
-    subcommand: Option<RemoteControlSubcommand>,
-}
-
-#[derive(Debug, Clone, Copy, clap::Subcommand)]
-enum RemoteControlSubcommand {
-    /// Start the app-server daemon with remote control enabled.
-    Start,
-
-    /// Stop the app-server daemon.
-    Stop,
 }
 
 #[derive(Debug, Args)]
@@ -1070,24 +1061,18 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             }
         }
         Some(Subcommand::RemoteControl(remote_control_cli)) => {
-            let subcommand_name = remote_control_subcommand_name(&remote_control_cli);
+            let subcommand_name = remote_control_cli.subcommand_name();
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
                 root_remote_auth_token_env.as_deref(),
                 subcommand_name,
             )?;
-            match remote_control_cli
-                .subcommand
-                .unwrap_or(RemoteControlSubcommand::Start)
-            {
-                RemoteControlSubcommand::Start => {
-                    let output = codex_app_server_daemon::ensure_remote_control_started().await?;
-                    println!("{}", serde_json::to_string(&output)?);
-                }
-                RemoteControlSubcommand::Stop => {
-                    print_app_server_daemon_output(AppServerLifecycleCommand::Stop).await?;
-                }
-            }
+            remote_control_cmd::run(
+                remote_control_cli,
+                arg0_paths.clone(),
+                root_config_overrides,
+            )
+            .await?;
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(app_cli)) => {
@@ -1395,11 +1380,13 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 root_remote_auth_token_env.as_deref(),
                 "exec-server",
             )?;
+            let strict_config = cmd.strict_config || root_strict_config;
             run_exec_server_command(
                 cmd,
                 &arg0_paths,
                 &root_config_overrides,
                 interactive.config_profile.clone(),
+                strict_config,
             )
             .await?;
         }
@@ -1500,6 +1487,7 @@ async fn run_exec_server_command(
     arg0_paths: &Arg0DispatchPaths,
     root_config_overrides: &CliConfigOverrides,
     config_profile: Option<String>,
+    strict_config: bool,
 ) -> anyhow::Result<()> {
     let codex_self_exe = arg0_paths
         .codex_self_exe
@@ -1510,38 +1498,45 @@ async fn run_exec_server_command(
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
     if let Some(base_url) = cmd.remote {
-        let executor_id = cmd
-            .executor_id
-            .ok_or_else(|| anyhow::anyhow!("--executor-id is required when --remote is set"))?;
-        let auth_provider = load_exec_server_remote_auth_provider(
-            root_config_overrides,
-            config_profile,
-            cmd.use_agent_identity_auth,
-        )
-        .await?;
-        let mut remote_config =
-            codex_exec_server::RemoteExecutorConfig::new(base_url, executor_id, auth_provider)?;
+        let environment_id = cmd
+            .environment_id
+            .ok_or_else(|| anyhow::anyhow!("--environment-id is required when --remote is set"))?;
+        let config =
+            load_exec_server_config(root_config_overrides, config_profile, strict_config).await?;
+        let auth_provider =
+            load_exec_server_remote_auth_provider(&config, cmd.use_agent_identity_auth).await?;
+        let mut remote_config = codex_exec_server::RemoteEnvironmentConfig::new(
+            base_url,
+            environment_id,
+            auth_provider,
+        )?;
         if let Some(name) = cmd.name {
             remote_config.name = name;
         }
-        codex_exec_server::run_remote_executor(remote_config, runtime_paths).await?;
-        return Ok(());
+        codex_exec_server::run_remote_environment(remote_config, runtime_paths).await?;
+        Ok(())
+    } else {
+        if strict_config {
+            // Local exec-server startup does not consume Config, but strict
+            // mode should still reject unknown fields before opening a listener.
+            let _validated_config =
+                load_exec_server_config(root_config_overrides, config_profile, strict_config)
+                    .await?;
+        }
+        let listen_url = cmd
+            .listen
+            .as_deref()
+            .unwrap_or(codex_exec_server::DEFAULT_LISTEN_URL);
+        codex_exec_server::run_main(listen_url, runtime_paths)
+            .await
+            .map_err(anyhow::Error::from_boxed)
     }
-    let listen_url = cmd
-        .listen
-        .as_deref()
-        .unwrap_or(codex_exec_server::DEFAULT_LISTEN_URL);
-    codex_exec_server::run_main(listen_url, runtime_paths)
-        .await
-        .map_err(anyhow::Error::from_boxed)
 }
 
 async fn load_exec_server_remote_auth_provider(
-    root_config_overrides: &CliConfigOverrides,
-    config_profile: Option<String>,
+    config: &codex_core::config::Config,
     use_agent_identity_auth: bool,
 ) -> anyhow::Result<codex_api::SharedAuthProvider> {
-    let config = load_exec_server_remote_config(root_config_overrides, config_profile).await?;
     if use_agent_identity_auth {
         let agent_identity_jwt = read_codex_access_token_from_env().ok_or_else(|| {
             anyhow::anyhow!("CODEX_ACCESS_TOKEN is required when --use-agent-identity-auth is set")
@@ -1553,7 +1548,7 @@ async fn load_exec_server_remote_auth_provider(
     }
 
     let auth = load_exec_server_remote_auth(
-        &config,
+        config,
         "remote exec-server registration requires ChatGPT authentication; run `codex login` first",
     )
     .await?;
@@ -1567,9 +1562,10 @@ async fn load_exec_server_remote_auth_provider(
     Ok(codex_model_provider::auth_provider_from_auth(&auth))
 }
 
-async fn load_exec_server_remote_config(
+async fn load_exec_server_config(
     root_config_overrides: &CliConfigOverrides,
     config_profile: Option<String>,
+    strict_config: bool,
 ) -> anyhow::Result<codex_core::config::Config> {
     let cli_kv_overrides = root_config_overrides
         .parse_overrides()
@@ -1580,6 +1576,7 @@ async fn load_exec_server_remote_config(
             config_profile,
             ..Default::default()
         })
+        .strict_config(strict_config)
         .build()
         .await?)
 }
@@ -1885,6 +1882,7 @@ fn unsupported_subcommand_name_for_strict_config(
         | Some(Subcommand::Exec(_))
         | Some(Subcommand::Review(_))
         | Some(Subcommand::McpServer(_))
+        | Some(Subcommand::ExecServer(_))
         | Some(Subcommand::Resume(_))
         | Some(Subcommand::Fork(_))
         | Some(Subcommand::Doctor(_)) => None,
@@ -1892,9 +1890,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::AppServer(app_server)) => {
             Some(app_server_subcommand_name(app_server.subcommand.as_ref()))
         }
-        Some(Subcommand::RemoteControl(remote_control)) => {
-            Some(remote_control_subcommand_name(remote_control))
-        }
+        Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1910,7 +1906,6 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::Apply(_)) => Some("apply"),
         Some(Subcommand::ResponsesApiProxy(_)) => Some("responses-api-proxy"),
         Some(Subcommand::StdioToUds(_)) => Some("stdio-to-uds"),
-        Some(Subcommand::ExecServer(_)) => Some("exec-server"),
         Some(Subcommand::Features(_)) => Some("features"),
     }
 }
@@ -1945,14 +1940,6 @@ fn reject_remote_mode_for_app_server_subcommand(
 ) -> anyhow::Result<()> {
     let subcommand_name = app_server_subcommand_name(subcommand);
     reject_remote_mode_for_subcommand(remote, remote_auth_token_env, subcommand_name)
-}
-
-fn remote_control_subcommand_name(command: &RemoteControlCommand) -> &'static str {
-    match command.subcommand {
-        None => "remote-control",
-        Some(RemoteControlSubcommand::Start) => "remote-control start",
-        Some(RemoteControlSubcommand::Stop) => "remote-control stop",
-    }
 }
 
 fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'static str {
@@ -2923,6 +2910,25 @@ mod tests {
                 ..
             }))
         );
+
+        let cli = MultitoolCli::try_parse_from(["codex", "exec-server", "--strict-config"])
+            .expect("parse");
+        assert_matches!(
+            cli.subcommand,
+            Some(Subcommand::ExecServer(ExecServerCommand {
+                strict_config: true,
+                ..
+            }))
+        );
+    }
+
+    #[test]
+    fn root_strict_config_is_supported_for_exec_server() {
+        let cli = MultitoolCli::try_parse_from(["codex", "--strict-config", "exec-server"])
+            .expect("parse");
+
+        reject_root_strict_config_for_subcommand(cli.interactive.strict_config, &cli.subcommand)
+            .expect("exec-server should support root --strict-config");
     }
 
     #[test]
@@ -2974,12 +2980,10 @@ mod tests {
     fn reject_remote_flag_for_remote_control() {
         let cli = MultitoolCli::try_parse_from(["codex", "--remote", "unix://", "remote-control"])
             .expect("parse");
-        assert_matches!(
-            cli.subcommand,
-            Some(Subcommand::RemoteControl(RemoteControlCommand {
-                subcommand: None
-            }))
-        );
+        let Some(Subcommand::RemoteControl(remote_control)) = &cli.subcommand else {
+            panic!("expected remote-control subcommand");
+        };
+        assert_eq!(remote_control.subcommand_name(), "remote-control");
 
         let err = reject_remote_mode_for_subcommand(
             cli.remote.remote.as_deref(),

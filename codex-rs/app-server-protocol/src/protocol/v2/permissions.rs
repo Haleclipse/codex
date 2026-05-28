@@ -18,9 +18,7 @@ use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequest
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde::Deserializer;
 use serde::Serialize;
-use serde::Serializer;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use ts_rs::TS;
@@ -180,7 +178,7 @@ v2_enum_from_core!(
     pub enum FileSystemAccessMode from CoreFileSystemAccessMode {
         Read,
         Write,
-        None
+        Deny
     }
 );
 
@@ -289,6 +287,41 @@ impl From<FileSystemSandboxEntry> for CoreFileSystemSandboxEntry {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PermissionProfileListParams {
+    /// Opaque pagination cursor returned by a previous call.
+    #[ts(optional = nullable)]
+    pub cursor: Option<String>,
+    /// Optional page size; defaults to the full result set.
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
+    /// Optional working directory to resolve project config layers.
+    #[ts(optional = nullable)]
+    pub cwd: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PermissionProfileSummary {
+    /// Available permission profile identifier.
+    pub id: String,
+    /// Optional user-facing description for display in clients.
+    pub description: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct PermissionProfileListResponse {
+    pub data: Vec<PermissionProfileSummary>,
+    /// Opaque cursor to pass to the next call to continue after the last item.
+    /// If None, there are no more items to return.
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -296,8 +329,8 @@ pub struct ActivePermissionProfile {
     /// Identifier from `default_permissions` or the implicit built-in default,
     /// such as `:workspace` or a user-defined `[permissions.<id>]` profile.
     pub id: String,
-    /// Parent profile identifier once permissions profiles support
-    /// inheritance. This is currently always `null`.
+    /// Parent profile identifier from the selected permissions profile's
+    /// `extends` setting, when present.
     #[serde(default)]
     pub extends: Option<String>,
 }
@@ -329,102 +362,6 @@ impl From<ActivePermissionProfile> for CoreActivePermissionProfile {
         Self {
             id: value.id,
             extends: value.extends,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionProfileSelectionParams {
-    id: String,
-    legacy_additional_writable_roots: Vec<AbsolutePathBuf>,
-}
-
-impl PermissionProfileSelectionParams {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            legacy_additional_writable_roots: Vec::new(),
-        }
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn into_id(self) -> String {
-        self.id
-    }
-
-    pub fn legacy_additional_writable_roots(&self) -> &[AbsolutePathBuf] {
-        &self.legacy_additional_writable_roots
-    }
-}
-
-impl From<String> for PermissionProfileSelectionParams {
-    fn from(id: String) -> Self {
-        Self::new(id)
-    }
-}
-
-impl Serialize for PermissionProfileSelectionParams {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.id)
-    }
-}
-
-impl<'de> Deserialize<'de> for PermissionProfileSelectionParams {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Wire {
-            Id(String),
-            LegacyProfile {
-                #[serde(rename = "type")]
-                _type: LegacyPermissionProfileSelectionType,
-                id: String,
-                #[serde(default)]
-                modifications: Option<Vec<LegacyPermissionProfileModificationParams>>,
-            },
-        }
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        enum LegacyPermissionProfileSelectionType {
-            Profile,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(tag = "type", rename_all = "camelCase")]
-        enum LegacyPermissionProfileModificationParams {
-            #[serde(rename_all = "camelCase")]
-            AdditionalWritableRoot { path: AbsolutePathBuf },
-        }
-
-        match Wire::deserialize(deserializer)? {
-            Wire::Id(id) => Ok(Self::new(id)),
-            Wire::LegacyProfile {
-                id, modifications, ..
-            } => {
-                let legacy_additional_writable_roots = modifications
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|modification| match modification {
-                        LegacyPermissionProfileModificationParams::AdditionalWritableRoot {
-                            path,
-                        } => path,
-                    })
-                    .collect();
-                Ok(Self {
-                    id,
-                    legacy_additional_writable_roots,
-                })
-            }
         }
     }
 }

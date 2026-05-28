@@ -11,6 +11,10 @@ use codex_app_server_protocol::ConfigEdit;
 use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::SkillsConfigWriteParams;
+use codex_app_server_protocol::SkillsConfigWriteResponse;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use serde_json::Value as JsonValue;
@@ -35,6 +39,11 @@ pub(crate) fn profile_scoped_key_path(profile: Option<&str>, key_path: &str) -> 
     } else {
         key_path.to_string()
     }
+}
+
+pub(crate) fn app_scoped_key_path(app_id: &str, key_path: &str) -> String {
+    let app_id = serde_json::Value::String(app_id.to_string()).to_string();
+    format!("apps.{app_id}.{key_path}")
 }
 
 pub(crate) fn build_model_selection_edits(
@@ -67,26 +76,22 @@ pub(crate) fn build_service_tier_selection_edits(
     let service_tier_edit = service_tier.map_or_else(
         || clear_config_value(profile_scoped_key_path(profile, "service_tier")),
         |service_tier| {
-            let config_value =
+            let config_value = if service_tier == SERVICE_TIER_DEFAULT_REQUEST_VALUE {
+                SERVICE_TIER_DEFAULT_REQUEST_VALUE
+            } else {
                 match codex_protocol::config_types::ServiceTier::from_request_value(service_tier) {
                     Some(codex_protocol::config_types::ServiceTier::Fast) => "fast",
                     Some(codex_protocol::config_types::ServiceTier::Flex) => "flex",
                     None => service_tier,
-                };
+                }
+            };
             replace_config_value(
                 profile_scoped_key_path(profile, "service_tier"),
                 serde_json::json!(config_value),
             )
         },
     );
-    let mut edits = vec![service_tier_edit];
-    if service_tier.is_none() {
-        edits.push(replace_config_value(
-            "notice.fast_default_opt_out",
-            serde_json::json!(true),
-        ));
-    }
-    edits
+    vec![service_tier_edit]
 }
 
 pub(crate) async fn write_config_batch(
@@ -109,6 +114,26 @@ pub(crate) async fn write_config_batch(
     Ok(())
 }
 
+pub(crate) async fn write_skill_enabled(
+    request_handle: AppServerRequestHandle,
+    path: AbsolutePathBuf,
+    enabled: bool,
+) -> Result<()> {
+    let request_id = RequestId::String(format!("tui-skill-config-write-{}", Uuid::new_v4()));
+    let _: SkillsConfigWriteResponse = request_handle
+        .request_typed(ClientRequest::SkillsConfigWrite {
+            request_id,
+            params: SkillsConfigWriteParams {
+                path: Some(path),
+                name: None,
+                enabled,
+            },
+        })
+        .await
+        .wrap_err("skills/config/write failed in TUI")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +144,14 @@ mod tests {
         assert_eq!(
             profile_scoped_key_path(Some("team.prod"), "model"),
             "profiles.\"team.prod\".model"
+        );
+    }
+
+    #[test]
+    fn app_scoped_key_path_quotes_dotted_app_ids() {
+        assert_eq!(
+            app_scoped_key_path("plugin.linear", "enabled"),
+            "apps.\"plugin.linear\".enabled"
         );
     }
 }
