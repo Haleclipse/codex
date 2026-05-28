@@ -578,6 +578,77 @@ fn test_build_specs_multi_agent_v2_uses_task_names_and_hides_resume() {
 }
 
 #[test]
+fn test_build_specs_multi_agent_v2_uses_configured_tool_namespace() {
+    let model_info = model_info();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::MultiAgentV2);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        permission_profile: &PermissionProfile::Disabled,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    })
+    .with_multi_agent_v2_tool_namespace(Some("agents".to_string()));
+    let (tools, registry) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        &[],
+    );
+
+    assert_contains_tool_names(&tools, &["agents"]);
+    for tool_name in [
+        "spawn_agent",
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "close_agent",
+        "list_agents",
+    ] {
+        assert_lacks_tool_name(&tools, tool_name);
+        assert!(registry.has_tool(&ToolName::namespaced("agents", tool_name)));
+        assert!(!registry.has_tool(&ToolName::plain(tool_name)));
+        assert_namespace_contains_function(&tools, "agents", tool_name);
+    }
+}
+
+#[test]
+fn test_build_specs_multi_agent_v2_ignores_tool_namespace_without_namespace_support() {
+    let model_info = model_info();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::MultiAgentV2);
+    let available_models = Vec::new();
+    let mut tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        image_generation_tool_auth_allowed: true,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        permission_profile: &PermissionProfile::Disabled,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    })
+    .with_multi_agent_v2_tool_namespace(Some("agents".to_string()));
+    tools_config.namespace_tools = false;
+    let (tools, registry) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*deferred_mcp_tools*/ None,
+        &[],
+    );
+
+    assert_contains_tool_names(&tools, &["spawn_agent", "send_message", "list_agents"]);
+    assert_lacks_tool_name(&tools, "agents");
+    assert!(registry.has_tool(&ToolName::plain("spawn_agent")));
+    assert!(!registry.has_tool(&ToolName::namespaced("agents", "spawn_agent")));
+}
+
+#[test]
 fn test_build_specs_multi_agent_v2_does_not_require_collab_feature() {
     let model_info = model_info();
     let mut features = Features::with_defaults();
@@ -711,13 +782,14 @@ fn view_image_tool_includes_detail_with_original_detail_support() {
     };
     let (properties, _) = expect_object_schema(parameters);
     assert!(properties.contains_key("detail"));
-    let description = expect_string_description(
-        properties
-            .get("detail")
-            .expect("view_image detail should include a description"),
-    );
-    assert!(description.contains("only supported value is `original`"));
-    assert!(description.contains("omit this field for default resized behavior"));
+    let detail_schema = properties
+        .get("detail")
+        .expect("view_image detail should include a description");
+    let description = expect_string_description(detail_schema);
+    let expected = vec![json!("high"), json!("original")];
+    assert_eq!(detail_schema.enum_values.as_ref(), Some(&expected));
+    assert!(description.contains("Supported values are `high` and `original`"));
+    assert!(description.contains("omit this field for default high resized behavior"));
 }
 
 #[test]
@@ -2239,7 +2311,7 @@ fn code_mode_augments_builtin_tool_descriptions_with_typed_sample() {
 
     assert_eq!(
         description,
-        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags).\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Local filesystem path to an image file\n  path: string;\n}): Promise<{\n  // Image detail hint returned by view_image. Returns `original` when original resolution is preserved, otherwise `null`.\n  detail: string | null;\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```"
+        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags).\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Local filesystem path to an image file\n  path: string;\n}): Promise<{\n  // Image detail hint returned by view_image. Returns `high` for default resized behavior or `original` when original resolution is preserved.\n  detail: \"high\" | \"original\";\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```"
     );
 }
 
@@ -2654,6 +2726,23 @@ fn find_tool<'a>(tools: &'a [ToolSpec], expected_name: &str) -> &'a ToolSpec {
         .iter()
         .find(|tool| tool.name() == expected_name)
         .unwrap_or_else(|| panic!("expected tool {expected_name}"))
+}
+
+fn assert_namespace_contains_function(
+    tools: &[ToolSpec],
+    expected_namespace: &str,
+    expected_name: &str,
+) {
+    let namespace_tool = find_tool(tools, expected_namespace);
+    let ToolSpec::Namespace(namespace) = namespace_tool else {
+        panic!("expected namespace tool {expected_namespace}");
+    };
+    assert!(
+        namespace.tools.iter().any(|tool| {
+            matches!(tool, ResponsesApiNamespaceTool::Function(tool) if tool.name == expected_name)
+        }),
+        "expected tool {expected_name} in namespace {expected_namespace}"
+    );
 }
 
 fn assert_process_tool_environment_id(
