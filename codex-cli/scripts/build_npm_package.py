@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage and optionally package the @openai/codex npm module."""
+"""Stage and optionally package the @cometix/codex npm module."""
 
 import argparse
 import json
@@ -14,54 +14,46 @@ CODEX_CLI_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = CODEX_CLI_ROOT.parent
 RESPONSES_API_PROXY_NPM_ROOT = REPO_ROOT / "codex-rs" / "responses-api-proxy" / "npm"
 CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
-CODEX_NPM_NAME = "@openai/codex"
-CODEX_PACKAGE_COMPONENT = "codex-package"
-CODEX_PACKAGE_ENTRIES = ("codex-package.json", "bin", "codex-resources", "codex-path")
+CODEX_NPM_NAME = "@cometix/codex"
 
 # `npm_name` is the local optional-dependency alias consumed by `bin/codex.js`.
-# The underlying package published to npm is always `@openai/codex`.
+# The underlying package published to npm is always `@cometix/codex`.
+# @cometix: removed win32-arm64 (not built in our release workflow)
 CODEX_PLATFORM_PACKAGES: dict[str, dict[str, str]] = {
     "codex-linux-x64": {
-        "npm_name": "@openai/codex-linux-x64",
+        "npm_name": "@cometix/codex-linux-x64",
         "npm_tag": "linux-x64",
         "target_triple": "x86_64-unknown-linux-musl",
         "os": "linux",
         "cpu": "x64",
     },
     "codex-linux-arm64": {
-        "npm_name": "@openai/codex-linux-arm64",
+        "npm_name": "@cometix/codex-linux-arm64",
         "npm_tag": "linux-arm64",
         "target_triple": "aarch64-unknown-linux-musl",
         "os": "linux",
         "cpu": "arm64",
     },
     "codex-darwin-x64": {
-        "npm_name": "@openai/codex-darwin-x64",
+        "npm_name": "@cometix/codex-darwin-x64",
         "npm_tag": "darwin-x64",
         "target_triple": "x86_64-apple-darwin",
         "os": "darwin",
         "cpu": "x64",
     },
     "codex-darwin-arm64": {
-        "npm_name": "@openai/codex-darwin-arm64",
+        "npm_name": "@cometix/codex-darwin-arm64",
         "npm_tag": "darwin-arm64",
         "target_triple": "aarch64-apple-darwin",
         "os": "darwin",
         "cpu": "arm64",
     },
     "codex-win32-x64": {
-        "npm_name": "@openai/codex-win32-x64",
+        "npm_name": "@cometix/codex-win32-x64",
         "npm_tag": "win32-x64",
         "target_triple": "x86_64-pc-windows-msvc",
         "os": "win32",
         "cpu": "x64",
-    },
-    "codex-win32-arm64": {
-        "npm_name": "@openai/codex-win32-arm64",
-        "npm_tag": "win32-arm64",
-        "target_triple": "aarch64-pc-windows-msvc",
-        "os": "win32",
-        "cpu": "arm64",
     },
 }
 
@@ -71,12 +63,11 @@ PACKAGE_EXPANSIONS: dict[str, list[str]] = {
 
 PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
     "codex": [],
-    "codex-linux-x64": [CODEX_PACKAGE_COMPONENT],
-    "codex-linux-arm64": [CODEX_PACKAGE_COMPONENT],
-    "codex-darwin-x64": [CODEX_PACKAGE_COMPONENT],
-    "codex-darwin-arm64": [CODEX_PACKAGE_COMPONENT],
-    "codex-win32-x64": [CODEX_PACKAGE_COMPONENT],
-    "codex-win32-arm64": [CODEX_PACKAGE_COMPONENT],
+    "codex-linux-x64": ["bwrap", "codex", "rg"],
+    "codex-linux-arm64": ["bwrap", "codex", "rg"],
+    "codex-darwin-x64": ["codex", "rg"],
+    "codex-darwin-arm64": ["codex", "rg"],
+    "codex-win32-x64": ["codex", "rg", "codex-windows-sandbox-setup", "codex-command-runner"],
     "codex-responses-api-proxy": ["codex-responses-api-proxy"],
     "codex-sdk": [],
 }
@@ -385,11 +376,7 @@ def copy_native_binaries(
     if not vendor_src.exists():
         raise RuntimeError(f"Vendor source directory not found: {vendor_src}")
 
-    components_set = {
-        component
-        for component in components
-        if component == CODEX_PACKAGE_COMPONENT or component in COMPONENT_DEST_DIR
-    }
+    components_set = {component for component in components if component in COMPONENT_DEST_DIR}
     allow_missing_components = allow_missing_components or set()
     if not components_set:
         return
@@ -408,26 +395,11 @@ def copy_native_binaries(
         if target_filter is not None and target_dir.name not in target_filter:
             continue
 
+        dest_target_dir = vendor_dest / target_dir.name
+        dest_target_dir.mkdir(parents=True, exist_ok=True)
         copied_targets.add(target_dir.name)
 
-        dest_target_dir = vendor_dest / target_dir.name
-
-        if CODEX_PACKAGE_COMPONENT in components_set:
-            validate_codex_package_dir(target_dir)
-            if dest_target_dir.exists():
-                shutil.rmtree(dest_target_dir)
-            dest_target_dir.mkdir(parents=True, exist_ok=True)
-            for entry in CODEX_PACKAGE_ENTRIES:
-                src = target_dir / entry
-                dest = dest_target_dir / entry
-                if src.is_dir():
-                    shutil.copytree(src, dest)
-                else:
-                    shutil.copy2(src, dest)
-        else:
-            dest_target_dir.mkdir(parents=True, exist_ok=True)
-
-        for component in components_set - {CODEX_PACKAGE_COMPONENT}:
+        for component in components_set:
             dest_dir_name = COMPONENT_DEST_DIR.get(component)
             if dest_dir_name is None:
                 continue
@@ -450,35 +422,6 @@ def copy_native_binaries(
         if missing_targets:
             missing_list = ", ".join(missing_targets)
             raise RuntimeError(f"Missing target directories in vendor source: {missing_list}")
-
-
-def validate_codex_package_dir(package_dir: Path) -> None:
-    is_windows = "windows" in package_dir.name
-    required_files = [
-        Path("codex-package.json"),
-        Path("bin") / ("codex.exe" if is_windows else "codex"),
-        Path("codex-path") / ("rg.exe" if is_windows else "rg"),
-    ]
-
-    if "linux" in package_dir.name:
-        required_files.append(Path("codex-resources") / "bwrap")
-
-    if is_windows:
-        required_files.extend(
-            [
-                Path("codex-resources") / "codex-command-runner.exe",
-                Path("codex-resources") / "codex-windows-sandbox-setup.exe",
-            ]
-        )
-
-    missing_files = [
-        str(relative_path)
-        for relative_path in required_files
-        if not (package_dir / relative_path).is_file()
-    ]
-    if missing_files:
-        missing = ", ".join(missing_files)
-        raise RuntimeError(f"Missing files in Codex package directory {package_dir}: {missing}")
 
 
 def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
