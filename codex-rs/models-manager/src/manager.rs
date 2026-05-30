@@ -338,7 +338,19 @@ impl OpenAiModelsManager {
                 )
             });
         if should_use_remote_models_only {
-            *self.remote_models.write().await = models;
+            // @cometix: merge remote models into bundled list preserving bundled visibility
+            // and retaining bundled models not present in the remote response.
+            let mut merged = load_remote_models_from_file().unwrap_or_default();
+            for remote_model in models {
+                if let Some(idx) = merged.iter().position(|m| m.slug == remote_model.slug) {
+                    let bundled_vis = merged[idx].visibility;
+                    merged[idx] = remote_model;
+                    merged[idx].visibility = bundled_vis;
+                } else {
+                    merged.push(remote_model);
+                }
+            }
+            *self.remote_models.write().await = merged;
             return;
         }
 

@@ -816,7 +816,6 @@ impl Session {
                     .permissions
                     .legacy_sandbox_policy(session_configuration.cwd.as_path()),
                 mcp_servers.keys().map(String::as_str).collect(),
-                config.active_profile.clone(),
             );
 
             let use_zsh_fork_shell = config.features.enabled(Feature::ShellZshFork);
@@ -1135,15 +1134,13 @@ impl Session {
             })?
             .primary()
             .cloned();
-            let mcp_runtime_environment = match turn_environment {
-                Some(turn_environment) => McpRuntimeEnvironment::new(
-                    Some(Arc::clone(&turn_environment.environment)),
-                    sess.services.environment_manager.try_local_environment(),
+            let mcp_runtime_context = match turn_environment {
+                Some(turn_environment) => McpRuntimeContext::new(
+                    Arc::clone(&sess.services.environment_manager),
                     turn_environment.cwd.to_path_buf(),
                 ),
-                None => McpRuntimeEnvironment::new(
-                    sess.services.environment_manager.default_or_local_environment(),
-                    sess.services.environment_manager.try_local_environment(),
+                None => McpRuntimeContext::new(
+                    Arc::clone(&sess.services.environment_manager),
                     session_configuration.cwd.to_path_buf(),
                 ),
             };
@@ -1155,7 +1152,7 @@ impl Session {
                 INITIAL_SUBMIT_ID.to_owned(),
                 tx_event.clone(),
                 session_configuration.permission_profile(),
-                mcp_runtime_environment,
+                mcp_runtime_context,
                 config.codex_home.to_path_buf(),
                 codex_apps_tools_cache_key(auth),
                 host_owned_codex_apps_enabled,
