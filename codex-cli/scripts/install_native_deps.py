@@ -22,7 +22,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CODEX_CLI_ROOT = SCRIPT_DIR.parent
 DEFAULT_WORKFLOW_URL = "https://github.com/Haleclipse/codex/actions/runs/21107751432"  # rust-v0.87.0-cometix
 VENDOR_DIR_NAME = "vendor"
-RG_MANIFEST = CODEX_CLI_ROOT / "bin" / "rg"
+RG_MANIFEST = CODEX_CLI_ROOT.parent / "scripts" / "codex_package" / "rg"
 BINARY_TARGETS = (
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
