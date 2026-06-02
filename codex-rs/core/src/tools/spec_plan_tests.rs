@@ -20,8 +20,11 @@ use codex_tools::DiscoverablePluginInfo;
 use codex_tools::DiscoverableTool;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
+use codex_tools::ToolCall as ExtensionToolCall;
+use codex_tools::ToolExecutor;
 use codex_tools::ToolExposure;
 use codex_tools::ToolName;
+use codex_tools::ToolOutput;
 use codex_tools::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -37,6 +40,7 @@ struct ToolPlanInputs {
     mcp_tools: Option<Vec<ToolInfo>>,
     deferred_mcp_tools: Option<Vec<ToolInfo>>,
     discoverable_tools: Option<Vec<DiscoverableTool>>,
+    extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     dynamic_tools: Vec<DynamicToolSpec>,
 }
 
@@ -176,7 +180,7 @@ async fn probe_with(
             mcp_tools: inputs.mcp_tools,
             deferred_mcp_tools: inputs.deferred_mcp_tools,
             discoverable_tools: inputs.discoverable_tools,
-            extension_tool_executors: Vec::new(),
+            extension_tool_executors: inputs.extension_tool_executors,
             dynamic_tools: inputs.dynamic_tools.as_slice(),
         },
     );
@@ -251,6 +255,37 @@ fn use_bedrock_provider(turn: &mut TurnContext) {
         config.model_provider = provider_info.clone();
     });
     turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
+}
+
+struct WebRunExtensionTool;
+
+#[async_trait::async_trait]
+impl ToolExecutor<ExtensionToolCall> for WebRunExtensionTool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::namespaced("web", "run")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: "web".to_string(),
+            description: "Test web namespace.".to_string(),
+            tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                name: "run".to_string(),
+                description: "Test standalone web search tool.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })],
+        })
+    }
+
+    async fn handle(
+        &self,
+        _call: ExtensionToolCall,
+    ) -> Result<Box<dyn ToolOutput>, codex_tools::FunctionCallError> {
+        Ok(Box::new(codex_tools::JsonToolOutput::new(json!({}))))
+    }
 }
 
 fn duplicate_primary_environment(turn: &mut TurnContext) {
@@ -447,7 +482,7 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
     let direct_mcp = probe_with(
         |_| {},
         ToolPlanInputs {
-            mcp_tools: Some(vec![mcp_tool("direct", "mcp__direct__", "lookup")]),
+            mcp_tools: Some(vec![mcp_tool("direct", "mcp__direct", "lookup")]),
             ..ToolPlanInputs::default()
         },
     )
@@ -458,12 +493,12 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
         "read_mcp_resource",
     ]);
     assert_eq!(
-        direct_mcp.namespace_function_names("mcp__direct__"),
+        direct_mcp.namespace_function_names("mcp__direct"),
         &["lookup".to_string()]
     );
 
     let searchable_mcp = ToolPlanInputs {
-        deferred_mcp_tools: Some(vec![mcp_tool("searchable", "mcp__searchable__", "lookup")]),
+        deferred_mcp_tools: Some(vec![mcp_tool("searchable", "mcp__searchable", "lookup")]),
         ..ToolPlanInputs::default()
     };
 
@@ -491,7 +526,7 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
         "read_mcp_resource",
     ]);
 
-    let missing_namespace_capability = probe_with(
+    let bedrock_namespace_capability = probe_with(
         |turn| {
             turn.model_info.supports_search_tool = true;
             use_bedrock_provider(turn);
@@ -502,7 +537,7 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
         },
     )
     .await;
-    missing_namespace_capability.assert_visible_lacks(&["tool_search"]);
+    bedrock_namespace_capability.assert_visible_contains(&["tool_search"]);
 
     let enabled = probe_with(
         |turn| {
@@ -512,7 +547,10 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
     )
     .await;
     enabled.assert_visible_contains(&["tool_search"]);
-    enabled.assert_registered_contains(&["tool_search", "mcp__searchable__lookup"]);
+    enabled.assert_registered_contains(&[
+        "tool_search",
+        &ToolName::namespaced("mcp__searchable", "lookup").to_string(),
+    ]);
 }
 
 #[tokio::test]
@@ -520,18 +558,14 @@ async fn invalid_mcp_tools_are_not_registered() {
     let plan = probe_with(
         |_| {},
         ToolPlanInputs {
-            mcp_tools: Some(vec![invalid_mcp_tool(
-                "invalid",
-                "mcp__invalid__",
-                "lookup",
-            )]),
+            mcp_tools: Some(vec![invalid_mcp_tool("invalid", "mcp__invalid", "lookup")]),
             ..ToolPlanInputs::default()
         },
     )
     .await;
 
-    plan.assert_visible_lacks(&["mcp__invalid__"]);
-    plan.assert_registered_lacks(&["mcp__invalid__lookup"]);
+    plan.assert_visible_lacks(&["mcp__invalid"]);
+    plan.assert_registered_lacks(&[&ToolName::namespaced("mcp__invalid", "lookup").to_string()]);
 }
 
 #[tokio::test]
@@ -856,7 +890,7 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_namespace_is_ignored_without_provider_namespace_support() {
+async fn multi_agent_v2_namespace_is_supported_by_bedrock_provider() {
     let plan = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
         update_config(turn, |config| {
@@ -866,15 +900,15 @@ async fn multi_agent_v2_namespace_is_ignored_without_provider_namespace_support(
     })
     .await;
 
-    plan.assert_visible_contains(&["spawn_agent", "send_message", "list_agents"]);
-    plan.assert_visible_lacks(&["agents"]);
-    assert!(
-        plan.registered_names
-            .contains(&ToolName::plain("spawn_agent").to_string())
-    );
+    plan.assert_visible_contains(&["agents"]);
+    plan.assert_visible_lacks(&["spawn_agent", "send_message", "list_agents"]);
     assert!(
         !plan
             .registered_names
+            .contains(&ToolName::plain("spawn_agent").to_string())
+    );
+    assert!(
+        plan.registered_names
             .contains(&ToolName::namespaced("agents", "spawn_agent").to_string())
     );
 }
@@ -947,6 +981,26 @@ async fn hosted_tools_follow_provider_auth_model_and_config_gates() {
             search_content_types: Some(vec!["text".to_string(), "image".to_string()]),
         }
     );
+
+    let standalone_web_search_without_web_run = probe(|turn| {
+        set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+        set_web_search_mode(turn, WebSearchMode::Live);
+    })
+    .await;
+    standalone_web_search_without_web_run.assert_visible_contains(&["web_search"]);
+
+    let standalone_web_search = probe_with(
+        |turn| {
+            set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+            set_web_search_mode(turn, WebSearchMode::Live);
+        },
+        ToolPlanInputs {
+            extension_tool_executors: vec![Arc::new(WebRunExtensionTool)],
+            ..Default::default()
+        },
+    )
+    .await;
+    standalone_web_search.assert_visible_lacks(&["web_search"]);
 
     let unsupported_provider = probe(|turn| {
         set_web_search_mode(turn, WebSearchMode::Live);

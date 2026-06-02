@@ -48,6 +48,7 @@ members = [
     "ext/goal",
     "ext/guardian",
     "ext/memories",
+    "ext/web-search",
     "external-agent-migration",
     "external-agent-sessions",
     "keyring-store",
@@ -58,7 +59,6 @@ members = [
     "login",
     "codex-mcp",
     "mcp-server",
-    "memories/mcp",
     "memories/read",
     "memories/write",
     "model-provider-info",
@@ -117,7 +117,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.134.0"
+version = "0.135.0"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -181,6 +181,7 @@ codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
 codex-message-history = { path = "message-history" }
 codex-memories-extension = { path = "ext/memories" }
+codex-web-search-extension = { path = "ext/web-search" }
 codex-memories-read = { path = "memories/read" }
 codex-memories-write = { path = "memories/write" }
 codex-mcp = { path = "codex-mcp" }
@@ -365,13 +366,14 @@ sha2 = "0.10"
 shlex = "1.3.0"
 similar = "2.7.0"
 socket2 = "0.6.1"
-sqlx = { version = "0.8.6", default-features = false, features = [
+sqlx = { version = "0.9.0", default-features = false, features = [
     "chrono",
     "json",
     "macros",
     "migrate",
-    "runtime-tokio-rustls",
-    "sqlite",
+    "runtime-tokio",
+    "tls-rustls",
+    "sqlite-bundled",
     "time",
     "uuid",
 ] }
