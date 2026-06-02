@@ -1105,6 +1105,7 @@ async fn plugin_list_filters_plugins_for_custom_session_source_products() -> Res
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
+            marketplace_kinds: None,
         })
         .await?;
 
@@ -1184,6 +1185,7 @@ async fn plugin_list_defaults_non_custom_session_source_to_codex_products() -> R
     let request_id = mcp
         .send_plugin_list_request(PluginListParams {
             cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
+            marketplace_kinds: None,
         })
         .await?;
 
