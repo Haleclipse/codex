@@ -518,7 +518,7 @@ fn format_network_unix_socket_permission(
 ) -> &'static str {
     match permission {
         NetworkUnixSocketPermissionToml::Allow => "allow",
-        NetworkUnixSocketPermissionToml::None => "none",
+        NetworkUnixSocketPermissionToml::Deny => "deny",
     }
 }
 
@@ -718,6 +718,7 @@ mod tests {
             allow_managed_hooks_only: Some(true),
             allow_appshots: Some(false),
             computer_use: None,
+            windows: None,
             guardian_policy_config: Some("Use the managed guardian policy.".to_string()),
             feature_requirements: Some(FeatureRequirementsToml {
                 entries: BTreeMap::from([("guardian_approval".to_string(), true)]),
@@ -837,7 +838,7 @@ mod tests {
                             ),
                             (
                                 "/tmp/blocked.sock".to_string(),
-                                NetworkUnixSocketPermissionToml::None,
+                                NetworkUnixSocketPermissionToml::Deny,
                             ),
                         ]),
                     }),
@@ -854,7 +855,7 @@ mod tests {
 
         let rendered = render_to_text(&render_debug_config_lines(&stack));
         assert!(rendered.contains(
-            "experimental_network: unix_sockets={/tmp/blocked.sock=none, /tmp/codex.sock=allow} (source: cloud requirements)"
+            "experimental_network: unix_sockets={/tmp/blocked.sock=deny, /tmp/codex.sock=allow} (source: cloud requirements)"
         ));
     }
 
@@ -936,6 +937,7 @@ approval_policy = "never"
             allow_managed_hooks_only: None,
             allow_appshots: None,
             computer_use: None,
+            windows: None,
             guardian_policy_config: None,
             feature_requirements: None,
             hooks: None,

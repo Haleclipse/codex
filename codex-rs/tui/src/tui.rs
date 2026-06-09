@@ -44,6 +44,8 @@ use crate::insert_history::HistoryLineWrapPolicy;
 use crate::insert_history::InsertHistoryMode;
 use crate::notifications::DesktopNotificationBackend;
 use crate::notifications::detect_backend;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::tui::event_stream::EventBroker;
 use crate::tui::event_stream::TuiEventStream;
 #[cfg(unix)]
@@ -514,7 +516,7 @@ pub struct Tui {
 }
 
 struct PendingHistoryLines {
-    lines: Vec<Line<'static>>,
+    lines: Vec<HyperlinkLine>,
     wrap_policy: HistoryLineWrapPolicy,
 }
 
@@ -741,6 +743,17 @@ impl Tui {
         lines: Vec<Line<'static>>,
         wrap_policy: HistoryLineWrapPolicy,
     ) {
+        self.insert_history_hyperlink_lines_with_wrap_policy(
+            plain_hyperlink_lines(lines),
+            wrap_policy,
+        );
+    }
+
+    pub(crate) fn insert_history_hyperlink_lines_with_wrap_policy(
+        &mut self,
+        lines: Vec<HyperlinkLine>,
+        wrap_policy: HistoryLineWrapPolicy,
+    ) {
         if lines.is_empty() {
             return;
         }
@@ -818,7 +831,7 @@ impl Tui {
             } else {
                 InsertHistoryMode::Standard
             };
-            crate::insert_history::insert_history_lines_with_mode_and_wrap_policy(
+            crate::insert_history::insert_history_hyperlink_lines_with_mode_and_wrap_policy(
                 terminal,
                 batch.lines.clone(),
                 mode,
