@@ -7,6 +7,8 @@ on:
   workflow_dispatch:
 
 # CI builds in debug (dev) for faster signal.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   # --- Detect what changed (always runs) --------------------------------------
