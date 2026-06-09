@@ -159,7 +159,9 @@ jobs:
           target_no_jitter="${target_no_jitter//-/_}"
           echo "${target_no_jitter}=1" >> "$GITHUB_ENV"
 
-      - name: Configure rusty_v8 artifact overrides and verify checksums
+      # @cometix: skip Windows — openai/codex only publishes non-ptrcomp v8 artifacts for Unix targets
+      - if: ${{ !contains(matrix.target, 'windows') }}
+        name: Configure rusty_v8 artifact overrides and verify checksums
         uses: ./.github/actions/setup-rusty-v8
         with:
           target: ${{ matrix.target }}
