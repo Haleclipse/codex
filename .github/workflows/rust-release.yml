@@ -194,10 +194,14 @@ jobs:
       - name: Cargo build
         shell: bash
         run: |
+          target="${{ matrix.target }}"
+          if [[ "$target" == "x86_64-pc-windows-msvc" ]]; then
+            export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          fi
           if [[ "${{ contains(matrix.target, 'windows') }}" == 'true' ]]; then
-            cargo build --target ${{ matrix.target }} --release --timings --bin codex --bin codex-windows-sandbox-setup --bin codex-command-runner
+            cargo build --target "$target" --release --timings --bin codex --bin codex-windows-sandbox-setup --bin codex-command-runner
           else
-            cargo build --target ${{ matrix.target }} --release --timings --bin codex
+            cargo build --target "$target" --release --timings --bin codex
           fi
 
       - name: Upload Cargo timings
