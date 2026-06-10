@@ -1283,6 +1283,11 @@ impl ChatComposer {
         self.draft.textarea.cursor() + if self.draft.is_bash_mode { 1 } else { 0 }
     }
 
+    #[cfg(test)]
+    pub(crate) fn cursor(&self) -> usize {
+        self.current_cursor()
+    }
+
     fn history_navigation_cursor(&self) -> usize {
         if self.draft.is_bash_mode && self.draft.textarea.cursor() == 0 {
             0
@@ -4022,7 +4027,7 @@ impl ChatComposer {
         let ctx = crate::statusline::StatusLineContext {
             model_name: &self.statusline_model,
             cwd: &self.statusline_cwd,
-            reasoning_effort: self.statusline_reasoning_effort,
+            reasoning_effort: self.statusline_reasoning_effort.clone(),
             context_used_tokens: self.statusline_context_used_tokens,
             context_window_size: self.statusline_context_window_size,
             hourly_rate_limit_percent: self.statusline_hourly_rate_limit_percent,

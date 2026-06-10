@@ -19,7 +19,7 @@ impl Segment for ModelSegment {
         let display_name = simplify_model_name(model_name);
 
         // Append reasoning effort suffix if present
-        let display_name = if let Some(effort) = ctx.reasoning_effort {
+        let display_name = if let Some(ref effort) = ctx.reasoning_effort {
             let effort_suffix = reasoning_effort_suffix(effort);
             if effort_suffix.is_empty() {
                 display_name
@@ -39,14 +39,15 @@ impl Segment for ModelSegment {
 }
 
 /// Get short suffix for reasoning effort level
-fn reasoning_effort_suffix(effort: ReasoningEffort) -> &'static str {
+fn reasoning_effort_suffix(effort: &ReasoningEffort) -> &str {
     match effort {
         ReasoningEffort::None => "",
         ReasoningEffort::Minimal => "·min",
-        ReasoningEffort::Low => "·lo",
+        ReasoningEffort::Low => "·low",
         ReasoningEffort::Medium => "·med",
-        ReasoningEffort::High => "·hi",
-        ReasoningEffort::XHigh => "·xhi",
+        ReasoningEffort::High => "·high",
+        ReasoningEffort::XHigh => "·xhigh",
+        ReasoningEffort::Custom(val) => val.as_str(),
     }
 }
 

@@ -120,7 +120,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.137.0"
+version = "0.138.0"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -318,6 +318,7 @@ libc = "0.2.182"
 log = "0.4"
 lru = "0.16.3"
 maplit = "1.0.2"
+memchr = "2.7.6"
 mime_guess = "2.0.5"
 multimap = "0.10.0"
 notify = "8.2.0"
@@ -482,7 +483,6 @@ unwrap_used = "deny"
 [workspace.metadata.cargo-shear]
 ignored = [
     "codex-agent-graph-store",
-    "codex-goal-extension",
     "icu_provider",
     "openssl-sys",
     "codex-v8-poc",
@@ -500,7 +500,7 @@ debug = "none"
 strip = "symbols"
 
 [profile.release]
-lto = "fat"
+lto = "thin"
 split-debuginfo = "off"
 # Because we bundle some of these executables with the TypeScript CLI, we
 # remove everything to make the binary as small as possible.

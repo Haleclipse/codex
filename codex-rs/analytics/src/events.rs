@@ -157,6 +157,7 @@ pub(crate) struct ThreadInitializedEventParams {
     pub(crate) initialization_mode: ThreadInitializationMode,
     pub(crate) subagent_source: Option<String>,
     pub(crate) parent_thread_id: Option<String>,
+    pub(crate) forked_from_thread_id: Option<String>,
     pub(crate) created_at: u64,
 }
 
@@ -816,6 +817,13 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) output_tokens: Option<i64>,
     pub(crate) reasoning_output_tokens: Option<i64>,
     pub(crate) total_tokens: Option<i64>,
+    pub(crate) before_first_sampling_ms: u64,
+    pub(crate) sampling_ms: u64,
+    pub(crate) between_sampling_overhead_ms: u64,
+    pub(crate) tool_blocking_ms: u64,
+    pub(crate) after_last_sampling_ms: u64,
+    pub(crate) sampling_request_count: u32,
+    pub(crate) sampling_retry_count: u32,
     pub(crate) duration_ms: Option<u64>,
     pub(crate) started_at: Option<u64>,
     pub(crate) completed_at: Option<u64>,
@@ -865,6 +873,7 @@ pub(crate) struct CodexPluginMetadata {
 pub(crate) struct CodexPluginUsedMetadata {
     #[serde(flatten)]
     pub(crate) plugin: CodexPluginMetadata,
+    pub(crate) mcp_server_names: Option<Vec<String>>,
     pub(crate) thread_id: Option<String>,
     pub(crate) turn_id: Option<String>,
     pub(crate) model_slug: Option<String>,
@@ -971,8 +980,13 @@ pub(crate) fn codex_plugin_used_metadata(
     tracking: &TrackEventsContext,
     plugin: PluginTelemetryMetadata,
 ) -> CodexPluginUsedMetadata {
+    let mcp_server_names = plugin
+        .capability_summary
+        .as_ref()
+        .map(|summary| summary.mcp_server_names.clone());
     CodexPluginUsedMetadata {
         plugin: codex_plugin_metadata(plugin),
+        mcp_server_names,
         thread_id: Some(tracking.thread_id.clone()),
         turn_id: Some(tracking.turn_id.clone()),
         model_slug: Some(tracking.model_slug.clone()),
@@ -1054,6 +1068,7 @@ pub(crate) fn subagent_thread_started_event_request(
         initialization_mode: ThreadInitializationMode::New,
         subagent_source: Some(subagent_source_name(&input.subagent_source)),
         parent_thread_id: input.parent_thread_id,
+        forked_from_thread_id: input.forked_from_thread_id,
         created_at: input.created_at,
     };
     ThreadInitializedEvent {
