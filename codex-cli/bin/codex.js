@@ -75,7 +75,6 @@ if (!platformPackage) {
   throw new Error(`Unsupported target triple: ${targetTriple}`);
 }
 
-<<<<<<< HEAD
 const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
 const localVendorRoot = path.join(__dirname, "..", "vendor");
 const localBinaryPath = path.join(
@@ -105,27 +104,6 @@ try {
 }
 
 if (!vendorRoot) {
-=======
-function findCodexExecutable() {
-  let vendorRoot;
-  try {
-    const packageJsonPath = require.resolve(`${platformPackage}/package.json`);
-    vendorRoot = path.join(path.dirname(packageJsonPath), "vendor");
-  } catch {
-    vendorRoot = path.join(__dirname, "..", "vendor");
-  }
-
-  const codexExecutable = path.join(
-    vendorRoot,
-    targetTriple,
-    "bin",
-    process.platform === "win32" ? "codex.exe" : "codex",
-  );
-  if (existsSync(codexExecutable)) {
-    return codexExecutable;
-  }
-
->>>>>>> rust-v0.138.0
   const packageManager = detectPackageManager();
   const updateCommand =
     packageManager === "bun"
@@ -136,18 +114,24 @@ function findCodexExecutable() {
   );
 }
 
-<<<<<<< HEAD
 const archRoot = path.join(vendorRoot, targetTriple);
 const binaryPath = path.join(archRoot, "codex", codexBinaryName);
-=======
-const binaryPath = findCodexExecutable();
->>>>>>> rust-v0.138.0
 
 // Use an asynchronous spawn instead of spawnSync so that Node is able to
 // respond to signals (e.g. Ctrl-C / SIGINT) while the native binary is
 // executing. This allows us to forward those signals to the child process
 // and guarantees that when either the child terminates or the parent
 // receives a fatal signal, both processes exit in a predictable manner.
+
+function getUpdatedPath(newDirs) {
+  const pathSep = process.platform === "win32" ? ";" : ":";
+  const existingPath = process.env.PATH || "";
+  const updatedPath = [
+    ...newDirs,
+    ...existingPath.split(pathSep).filter(Boolean),
+  ].join(pathSep);
+  return updatedPath;
+}
 
 /**
  * Use heuristics to detect the package manager that was used to install Codex
@@ -174,7 +158,6 @@ function detectPackageManager() {
   return userAgent ? "npm" : null;
 }
 
-<<<<<<< HEAD
 const additionalDirs = [];
 const pathDir = path.join(archRoot, "path");
 if (existsSync(pathDir)) {
@@ -183,17 +166,12 @@ if (existsSync(pathDir)) {
 const updatedPath = getUpdatedPath(additionalDirs);
 
 const env = { ...process.env, PATH: updatedPath };
-=======
->>>>>>> rust-v0.138.0
 const packageManagerEnvVar =
   detectPackageManager() === "bun"
     ? "CODEX_MANAGED_BY_BUN"
     : "CODEX_MANAGED_BY_NPM";
-const env = {
-  ...process.env,
-  [packageManagerEnvVar]: "1",
-  CODEX_MANAGED_PACKAGE_ROOT: realpathSync(path.join(__dirname, "..")),
-};
+env[packageManagerEnvVar] = "1";
+env.CODEX_MANAGED_PACKAGE_ROOT = realpathSync(path.join(__dirname, ".."));
 
 const child = spawn(binaryPath, process.argv.slice(2), {
   stdio: "inherit",
