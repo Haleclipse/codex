@@ -2433,7 +2433,7 @@ async fn side_defers_subagent_approval_overlay_until_side_exits() -> Result<()> 
     app.side_threads.remove(&side_thread_id);
     app.active_thread_id = Some(main_thread_id);
     app.surface_pending_inactive_thread_interactive_requests()
-        .await;
+        .await?;
 
     assert_eq!(app.chat_widget.has_active_view(), true);
 
@@ -2462,8 +2462,8 @@ async fn inactive_thread_exec_approval_preserves_context() {
             enabled: Some(true),
         }),
         file_system: Some(AdditionalFileSystemPermissions {
-            read: Some(vec![test_absolute_path("/tmp/read-only")]),
-            write: Some(vec![test_absolute_path("/tmp/write")]),
+            read: Some(vec![test_absolute_path("/tmp/read-only").into()]),
+            write: Some(vec![test_absolute_path("/tmp/write").into()]),
             glob_scan_max_depth: None,
             entries: None,
         }),
@@ -2481,6 +2481,7 @@ async fn inactive_thread_exec_approval_preserves_context() {
     })) = app
         .interactive_request_for_thread_request(thread_id, &request)
         .await
+        .expect("valid localized paths")
     else {
         panic!("expected exec approval request");
     };
@@ -2499,8 +2500,8 @@ async fn inactive_thread_exec_approval_preserves_context() {
                 enabled: Some(true),
             }),
             file_system: Some(AdditionalFileSystemPermissions {
-                read: Some(vec![test_absolute_path("/tmp/read-only")]),
-                write: Some(vec![test_absolute_path("/tmp/write")]),
+                read: Some(vec![test_absolute_path("/tmp/read-only").into()]),
+                write: Some(vec![test_absolute_path("/tmp/write").into()]),
                 glob_scan_max_depth: None,
                 entries: None,
             }),
@@ -2542,6 +2543,7 @@ async fn inactive_thread_exec_approval_splits_shell_wrapped_command() {
     let Some(ThreadInteractiveRequest::Approval(ApprovalRequest::Exec { command, .. })) = app
         .interactive_request_for_thread_request(thread_id, &request)
         .await
+        .expect("valid localized paths")
     else {
         panic!("expected exec approval request");
     };
@@ -2595,6 +2597,7 @@ async fn inactive_thread_file_change_approval_recovers_buffered_changes() {
     let request = app
         .interactive_request_for_thread_request(thread_id, &request)
         .await
+        .expect("valid localized paths")
         .expect("expected file change approval request");
 
     let ThreadInteractiveRequest::Approval(ApprovalRequest::ApplyPatch {
@@ -2646,8 +2649,8 @@ async fn inactive_thread_permissions_approval_preserves_file_system_permissions(
                     enabled: Some(true),
                 }),
                 file_system: Some(AdditionalFileSystemPermissions {
-                    read: Some(vec![test_absolute_path("/tmp/read-only")]),
-                    write: Some(vec![test_absolute_path("/tmp/write")]),
+                    read: Some(vec![test_absolute_path("/tmp/read-only").into()]),
+                    write: Some(vec![test_absolute_path("/tmp/write").into()]),
                     glob_scan_max_depth: None,
                     entries: None,
                 }),
@@ -2662,6 +2665,7 @@ async fn inactive_thread_permissions_approval_preserves_file_system_permissions(
     })) = app
         .interactive_request_for_thread_request(thread_id, &request)
         .await
+        .expect("valid localized paths")
     else {
         panic!("expected permissions approval request");
     };
@@ -2703,6 +2707,7 @@ async fn inactive_thread_url_elicitation_routes_to_app_link() {
     let Some(ThreadInteractiveRequest::AppLink(params)) = app
         .interactive_request_for_thread_request(thread_id, &request)
         .await
+        .expect("valid localized paths")
     else {
         panic!("expected app link request");
     };
@@ -2742,6 +2747,7 @@ async fn inactive_thread_invalid_url_elicitation_is_declined() {
     assert!(
         app.interactive_request_for_thread_request(thread_id, &request)
             .await
+            .expect("valid localized paths")
             .is_none()
     );
     assert_matches!(
@@ -4400,13 +4406,6 @@ fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSessionState 
     }
 }
 
-fn enable_terminal_resize_reflow(app: &mut App) {
-    app.config
-        .features
-        .set_enabled(Feature::TerminalResizeReflow, /*enabled*/ true)
-        .expect("feature should be configurable");
-}
-
 fn plain_line_cell(text: impl Into<String>) -> Arc<dyn HistoryCell> {
     Arc::new(PlainHistoryCell::new(vec![Line::from(text.into())])) as Arc<dyn HistoryCell>
 }
@@ -4516,7 +4515,6 @@ async fn uncapped_resize_reflow_renders_all_cells_under_row_limit() {
 #[tokio::test]
 async fn initial_replay_buffer_keeps_recent_rows_when_row_cap_present() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    enable_terminal_resize_reflow(&mut app);
     app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(3);
 
     app.begin_initial_history_replay_buffer();
@@ -4551,7 +4549,6 @@ async fn initial_replay_buffer_keeps_recent_rows_when_row_cap_present() {
 #[tokio::test]
 async fn thread_switch_replay_buffer_uses_transcript_tail_mode_when_row_cap_present() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    enable_terminal_resize_reflow(&mut app);
     app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Limit(3);
 
     app.begin_thread_switch_history_replay_buffer();
@@ -4567,7 +4564,6 @@ async fn thread_switch_replay_buffer_uses_transcript_tail_mode_when_row_cap_pres
 #[tokio::test]
 async fn thread_switch_replay_buffer_is_disabled_without_row_cap() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    enable_terminal_resize_reflow(&mut app);
     app.config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
 
     app.begin_thread_switch_history_replay_buffer();
@@ -4578,7 +4574,6 @@ async fn thread_switch_replay_buffer_is_disabled_without_row_cap() {
 #[tokio::test]
 async fn height_shrink_schedules_resize_reflow() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    enable_terminal_resize_reflow(&mut app);
     let frame_requester = crate::tui::FrameRequester::test_dummy();
 
     assert!(!app.handle_draw_size_change(
@@ -4593,32 +4588,6 @@ async fn height_shrink_schedules_resize_reflow() {
         &frame_requester,
     ));
     assert!(app.transcript_reflow.has_pending_reflow());
-}
-
-#[tokio::test]
-async fn disabled_resize_reflow_preserves_pending_history_cell_refresh() {
-    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
-    let frame_requester = crate::tui::FrameRequester::test_dummy();
-    app.config
-        .features
-        .set_enabled(Feature::TerminalResizeReflow, /*enabled*/ false)
-        .expect("feature should be configurable");
-    assert!(!app.should_handle_draw_pre_render());
-    app.transcript_reflow.schedule_history_cell_refresh();
-    assert!(app.should_handle_draw_pre_render());
-
-    assert!(!app.handle_draw_size_change(
-        ratatui::layout::Size::new(/*width*/ 118, /*height*/ 35),
-        ratatui::layout::Size::new(/*width*/ 118, /*height*/ 35),
-        &frame_requester,
-    ));
-    assert!(app.handle_draw_size_change(
-        ratatui::layout::Size::new(/*width*/ 119, /*height*/ 35),
-        ratatui::layout::Size::new(/*width*/ 118, /*height*/ 35),
-        &frame_requester,
-    ));
-
-    assert!(app.transcript_reflow.history_cell_refresh_requested());
 }
 
 fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItem>) -> Turn {

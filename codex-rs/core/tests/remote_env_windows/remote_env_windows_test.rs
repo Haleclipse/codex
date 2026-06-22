@@ -2,12 +2,15 @@
 
 use anyhow::Context;
 use anyhow::Result;
+use app_test_support::TestAppServer;
+use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::RequestId;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
+use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -23,41 +26,27 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::BufReader;
-use wine_test_support::WineTestCommand;
+use tempfile::TempDir;
+use tokio::time::timeout;
+use wine_exec_server_test_support::WineExecServer;
 
+const APP_SERVER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CALL_ID: &str = "wine-cmd-smoke";
-const COMMAND: &str = "echo WINE_BAZEL_OK&&cd";
+const COMMAND: &str = r#"if ((Get-Location).Path -ne 'C:\windows') { exit 1 }"#;
+const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn windows_exec_server_records_host_shell_mismatch() -> Result<()> {
-    let executable = codex_utils_cargo_bin::cargo_bin("wine-windows-exec-server")?;
-    let mut exec_server = WineTestCommand::new(executable)
-        .env("CODEX_HOME", r"C:\codex-home")
-        .spawn()?;
-    let stdout = exec_server.take_stdout();
-
-    exec_server
-        .scope(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            let exec_server_url = loop {
-                let line = lines
-                    .next_line()
-                    .await?
-                    .context("Wine exec-server exited before reporting its URL")?;
-                if line.starts_with("ws://") {
-                    break line;
-                }
-            };
-
+async fn windows_exec_server_runs_with_native_shell_and_cwd() -> Result<()> {
+    WineExecServer
+        .scope(|exec_server_url| async move {
             let server = start_mock_server().await;
             let arguments = serde_json::to_string(&json!({
                 "cmd": COMMAND,
                 "login": false,
-                "yield_time_ms": 5_000,
+                "yield_time_ms": 10_000,
             }))?;
             let response_mock = mount_sse_sequence(
                 &server,
@@ -93,7 +82,7 @@ async fn windows_exec_server_records_host_shell_mismatch() -> Result<()> {
                 test.config.cwd.clone(),
                 vec![TurnEnvironmentSelection {
                     environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
-                    cwd: test.config.cwd.clone(),
+                    cwd: PathUri::parse("file:///C:/windows")?,
                 }],
             );
 
@@ -126,6 +115,7 @@ async fn windows_exec_server_records_host_shell_mismatch() -> Result<()> {
 
             let mut begin = None;
             let mut end = None;
+            let mut turn_complete = false;
             loop {
                 match wait_for_event(&test.codex, |_| true).await {
                     EventMsg::ExecCommandBegin(event) if event.call_id == CALL_ID => {
@@ -134,72 +124,81 @@ async fn windows_exec_server_records_host_shell_mismatch() -> Result<()> {
                     EventMsg::ExecCommandEnd(event) if event.call_id == CALL_ID => {
                         end = Some(event)
                     }
-                    EventMsg::TurnComplete(_) => break,
+                    EventMsg::TurnComplete(_) => turn_complete = true,
                     _ => {}
+                }
+                if turn_complete && end.is_some() {
+                    break;
                 }
             }
 
             let begin = begin.context("exec_command should emit a begin event")?;
-            let expected_commands = [
-                vec![
-                    "/bin/bash".to_string(),
-                    "-c".to_string(),
-                    COMMAND.to_string(),
-                ],
-                vec!["/bin/sh".to_string(), "-c".to_string(), COMMAND.to_string()],
-            ];
-            // This intentionally records the current cross-OS failure mode: the Linux
-            // orchestrator resolves its own shell before sending the command to the
-            // Windows exec-server, where that Unix shell cannot start.
             assert!(
-                expected_commands.contains(&begin.command),
+                begin.command.first().is_some_and(|command| command
+                    .to_ascii_lowercase()
+                    .ends_with("pwsh.exe")),
                 "unexpected command: {:?}",
-                begin.command,
+                begin.command
             );
             assert_eq!(
-                (begin.cwd.clone(), begin.source),
-                (
-                    test.config.cwd.clone(),
-                    ExecCommandSource::UnifiedExecStartup,
-                ),
+                &begin.command[1..],
+                ["-NoProfile", "-Command", COMMAND]
             );
 
             let end = end.context("exec_command should emit an end event")?;
-            assert_eq!(
-                (
-                    end.command,
-                    end.cwd,
-                    end.source,
-                    end.stdout,
-                    end.stderr,
-                    end.aggregated_output,
-                    end.exit_code,
-                    end.status,
-                ),
-                (
-                    begin.command,
-                    test.config.cwd.clone(),
-                    ExecCommandSource::UnifiedExecStartup,
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    -1,
-                    ExecCommandStatus::Failed,
-                ),
-            );
+            assert_eq!((end.exit_code, end.status), (0, ExecCommandStatus::Completed));
 
             let request = response_mock
                 .last_request()
-                .context("model should receive the failed command output")?;
-            let (output, success) = request
+                .context("model should receive the command output")?;
+            let (_output, success) = request
                 .function_call_output_content_and_success(CALL_ID)
-                .context("failed command output should be present")?;
-            let output = output.context("failed command output should contain text")?;
-            assert!(
-                output.contains("Process exited with code -1"),
-                "unexpected command output: {output:?}",
+                .context("command output should be present")?;
+            assert_ne!(success, Some(false));
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_server_rejects_windows_environment_cwd() -> Result<()> {
+    WineExecServer
+        .scope(|exec_server_url| async move {
+            let codex_home = TempDir::new()?;
+            let mut app_server = TestAppServer::new_with_env(
+                codex_home.path(),
+                &[(
+                    CODEX_EXEC_SERVER_URL_ENV_VAR,
+                    Some(exec_server_url.as_str()),
+                )],
+            )
+            .await?;
+            timeout(APP_SERVER_READ_TIMEOUT, app_server.initialize()).await??;
+
+            let request_id = app_server
+                .send_raw_request(
+                    "thread/start",
+                    Some(json!({
+                        "environments": [{
+                            "environmentId": REMOTE_ENVIRONMENT_ID,
+                            "cwd": r"C:\windows",
+                        }],
+                    })),
+                )
+                .await?;
+            let error: JSONRPCError = timeout(
+                APP_SERVER_READ_TIMEOUT,
+                app_server.read_stream_until_error_message(RequestId::Integer(request_id)),
+            )
+            .await??;
+
+            assert_eq!(error.id, RequestId::Integer(request_id));
+            assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+            assert_eq!(
+                error.error.message,
+                "Invalid request: AbsolutePathBuf deserialized without a base path"
             );
-            assert_ne!(success, Some(true));
 
             Ok(())
         })
