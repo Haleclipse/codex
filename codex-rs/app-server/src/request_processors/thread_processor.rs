@@ -1,5 +1,7 @@
 use super::*;
 use crate::error_code::method_not_found;
+use codex_app_server_protocol::SelectedCapabilityRoot;
+use codex_extension_api::ExtensionDataInit;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 
@@ -323,8 +325,20 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) thread_list_state_permit: Arc<Semaphore>,
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
     pub(super) state_db: Option<StateDbHandle>,
+    pub(super) log_db: Option<LogDbLayer>,
     pub(super) background_tasks: TaskTracker,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
+}
+
+/// Outcome of trying to satisfy a resume request from an already loaded thread.
+enum RunningThreadResumeResult {
+    /// The request was delegated to the loaded thread.
+    Handled,
+    /// No loaded thread handled the request.
+    ///
+    /// The optional stored thread contains the history-bearing probe that cold
+    /// resume can reuse instead of reading the rollout again.
+    NotRunning(Option<Box<StoredThread>>),
 }
 
 impl ThreadRequestProcessor {
@@ -343,6 +357,7 @@ impl ThreadRequestProcessor {
         thread_list_state_permit: Arc<Semaphore>,
         thread_goal_processor: ThreadGoalRequestProcessor,
         state_db: Option<StateDbHandle>,
+        log_db: Option<LogDbLayer>,
         skills_watcher: Arc<SkillsWatcher>,
     ) -> Self {
         Self {
@@ -359,6 +374,7 @@ impl ThreadRequestProcessor {
             thread_list_state_permit,
             thread_goal_processor,
             state_db,
+            log_db,
             background_tasks: TaskTracker::new(),
             skills_watcher,
         }
@@ -491,38 +507,6 @@ impl ThreadRequestProcessor {
         }
     }
 
-    // @cometix: permanently delete a thread (DB rows + rollout file).
-    pub(crate) async fn thread_delete(
-        &self,
-        request_id: ConnectionRequestId,
-        params: ThreadDeleteParams,
-    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
-        let thread_id = match ThreadId::from_string(&params.thread_id) {
-            Ok(id) => id,
-            Err(err) => {
-                return Err(invalid_request(format!("invalid thread id: {err}")));
-            }
-        };
-        let delete_params = codex_thread_store::DeleteThreadParams { thread_id };
-        match self.thread_store.delete_thread(delete_params).await {
-            Ok(()) => {
-                self.outgoing
-                    .send_response(request_id.clone(), ThreadDeleteResponse {})
-                    .await;
-                self.outgoing
-                    .send_server_notification(ServerNotification::ThreadDeleted(
-                        ThreadDeletedNotification {
-                            thread_id: thread_id.to_string(),
-                        },
-                    ))
-                    .await;
-                Ok(None)
-            }
-            Err(err) => Err(internal_error(format!("failed to delete thread: {err}"))),
-        }
-    }
-
     pub(crate) async fn thread_metadata_update(
         &self,
         params: ThreadMetadataUpdateParams,
@@ -584,6 +568,24 @@ impl ThreadRequestProcessor {
         params: ThreadBackgroundTerminalsCleanParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.thread_background_terminals_clean_inner(request_id, params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn thread_background_terminals_list(
+        &self,
+        params: ThreadBackgroundTerminalsListParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_background_terminals_list_inner(params)
+            .await
+            .map(|response| Some(response.into()))
+    }
+
+    pub(crate) async fn thread_background_terminals_terminate(
+        &self,
+        params: ThreadBackgroundTerminalsTerminateParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        self.thread_background_terminals_terminate_inner(params)
             .await
             .map(|response| Some(response.into()))
     }
@@ -697,7 +699,7 @@ impl ThreadRequestProcessor {
 
         Ok((thread_id, thread))
     }
-    async fn acquire_thread_list_state_permit(
+    pub(super) async fn acquire_thread_list_state_permit(
         &self,
     ) -> Result<SemaphorePermit<'_>, JSONRPCErrorError> {
         self.thread_list_state_permit
@@ -769,6 +771,10 @@ impl ThreadRequestProcessor {
     }
 
     async fn prepare_thread_for_archive(&self, thread_id: ThreadId) {
+        self.prepare_thread_for_removal(thread_id, "archive").await;
+    }
+
+    pub(super) async fn prepare_thread_for_removal(&self, thread_id: ThreadId, operation: &str) {
         let removed_conversation = self.thread_manager.remove_thread(&thread_id).await;
         if let Some(conversation) = removed_conversation {
             info!("thread {thread_id} was active; shutting down");
@@ -776,11 +782,11 @@ impl ThreadRequestProcessor {
                 ThreadShutdownResult::Complete => {}
                 ThreadShutdownResult::SubmitFailed => {
                     error!(
-                        "failed to submit Shutdown to thread {thread_id}; proceeding with archive"
+                        "failed to submit Shutdown to thread {thread_id}; proceeding with {operation}"
                     );
                 }
                 ThreadShutdownResult::TimedOut => {
-                    warn!("thread {thread_id} shutdown timed out; proceeding with archive");
+                    warn!("thread {thread_id} shutdown timed out; proceeding with {operation}");
                 }
             }
         }
@@ -854,6 +860,7 @@ impl ThreadRequestProcessor {
             base_instructions,
             developer_instructions,
             dynamic_tools,
+            selected_capability_roots,
             mock_experimental_field: _mock_experimental_field,
             experimental_raw_events,
             personality,
@@ -909,6 +916,7 @@ impl ThreadRequestProcessor {
                 config,
                 typesafe_overrides,
                 dynamic_tools,
+                selected_capability_roots.unwrap_or_default(),
                 session_start_source,
                 thread_source.map(Into::into),
                 environment_selections,
@@ -981,6 +989,7 @@ impl ThreadRequestProcessor {
         config_overrides: Option<HashMap<String, serde_json::Value>>,
         typesafe_overrides: ConfigOverrides,
         dynamic_tools: Option<Vec<ApiDynamicToolSpec>>,
+        selected_capability_roots: Vec<SelectedCapabilityRoot>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
@@ -1082,6 +1091,10 @@ impl ThreadRequestProcessor {
                 .collect()
         };
         let core_dynamic_tool_count = core_dynamic_tools.len();
+        let mut thread_extension_init = ExtensionDataInit::new();
+        if !selected_capability_roots.is_empty() {
+            thread_extension_init.insert(selected_capability_roots);
+        }
         let create_thread_started_at = std::time::Instant::now();
         let NewThread {
             thread_id,
@@ -1104,6 +1117,7 @@ impl ThreadRequestProcessor {
                 metrics_service_name: service_name,
                 parent_trace: request_trace,
                 environments,
+                thread_extension_init,
             })
             .instrument(tracing::info_span!(
                 "app_server.thread_start.create_thread",
@@ -1285,7 +1299,7 @@ impl ThreadRequestProcessor {
         if let Some(environment_selections) = environment_selections.as_ref() {
             self.thread_manager
                 .validate_environment_selections(environment_selections)
-                .map_err(|err| invalid_request(environment_selection_error_message(err)))?;
+                .map_err(environment_selection_error)?;
         }
         Ok(environment_selections)
     }
@@ -1305,23 +1319,7 @@ impl ThreadRequestProcessor {
         let thread_id = ThreadId::from_string(&params.thread_id)
             .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
 
-        let mut thread_ids = vec![thread_id];
-        if let Some(state_db_ctx) = self.state_db.as_ref() {
-            let descendants = state_db_ctx
-                .list_thread_spawn_descendants(thread_id)
-                .await
-                .map_err(|err| {
-                    internal_error(format!(
-                        "failed to list spawned descendants for session {thread_id}: {err}"
-                    ))
-                })?;
-            let mut seen = HashSet::from([thread_id]);
-            for descendant_id in descendants {
-                if seen.insert(descendant_id) {
-                    thread_ids.push(descendant_id);
-                }
-            }
-        }
+        let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
 
         let mut archive_thread_ids = Vec::new();
         match self
@@ -1404,6 +1402,31 @@ impl ThreadRequestProcessor {
         }
 
         Ok((ThreadArchiveResponse {}, archived_thread_ids))
+    }
+
+    pub(super) async fn state_db_spawn_subtree_thread_ids(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<Vec<ThreadId>, JSONRPCErrorError> {
+        let mut thread_ids = vec![thread_id];
+        let Some(state_db_ctx) = self.state_db.as_ref() else {
+            return Ok(thread_ids);
+        };
+        let mut seen = HashSet::from([thread_id]);
+        let descendants = state_db_ctx
+            .list_thread_spawn_descendants(thread_id)
+            .await
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to list spawned descendants for thread id {thread_id}: {err}"
+                ))
+            })?;
+        for descendant_id in descendants {
+            if seen.insert(descendant_id) {
+                thread_ids.push(descendant_id);
+            }
+        }
+        Ok(thread_ids)
     }
 
     async fn thread_increment_elicitation_inner(
@@ -1734,6 +1757,54 @@ impl ThreadRequestProcessor {
                 internal_error(format!("failed to clean background terminals: {err}"))
             })?;
         Ok(ThreadBackgroundTerminalsCleanResponse {})
+    }
+
+    async fn thread_background_terminals_list_inner(
+        &self,
+        params: ThreadBackgroundTerminalsListParams,
+    ) -> Result<ThreadBackgroundTerminalsListResponse, JSONRPCErrorError> {
+        let ThreadBackgroundTerminalsListParams {
+            thread_id,
+            cursor,
+            limit,
+        } = params;
+
+        let (_, thread) = self.load_thread(&thread_id).await?;
+        let terminals = thread
+            .list_background_terminals()
+            .await
+            .into_iter()
+            .map(|terminal| ThreadBackgroundTerminal {
+                item_id: terminal.item_id,
+                process_id: terminal.process_id,
+                command: terminal.command,
+                cwd: terminal.cwd,
+                os_pid: None,
+                cpu_percent: None,
+                rss_kb: None,
+            })
+            .collect::<Vec<_>>();
+
+        let (data, next_cursor) = paginate_background_terminals(&terminals, cursor, limit)?;
+
+        Ok(ThreadBackgroundTerminalsListResponse { data, next_cursor })
+    }
+
+    async fn thread_background_terminals_terminate_inner(
+        &self,
+        params: ThreadBackgroundTerminalsTerminateParams,
+    ) -> Result<ThreadBackgroundTerminalsTerminateResponse, JSONRPCErrorError> {
+        let ThreadBackgroundTerminalsTerminateParams {
+            thread_id,
+            process_id,
+        } = params;
+        let process_id = process_id.parse::<i32>().map_err(|err| {
+            invalid_request(format!("invalid background terminal process id: {err}"))
+        })?;
+
+        let (_, thread) = self.load_thread(&thread_id).await?;
+        let terminated = thread.terminate_background_terminal(process_id).await;
+        Ok(ThreadBackgroundTerminalsTerminateResponse { terminated })
     }
 
     async fn thread_shell_command_inner(
@@ -2451,7 +2522,7 @@ impl ThreadRequestProcessor {
                 return Ok(());
             }
         };
-        match self
+        let stored_thread_from_running_probe = match self
             .resume_running_thread(
                 &request_id,
                 &params,
@@ -2460,13 +2531,13 @@ impl ThreadRequestProcessor {
             )
             .await
         {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
+            Ok(RunningThreadResumeResult::Handled) => return Ok(()),
+            Ok(RunningThreadResumeResult::NotRunning(stored_thread)) => stored_thread,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
                 return Ok(());
             }
-        }
+        };
 
         let ThreadResumeParams {
             thread_id,
@@ -2490,15 +2561,20 @@ impl ThreadRequestProcessor {
         } = params;
         let include_turns = !exclude_turns;
 
-        let (thread_history, resume_source_thread) = match if let Some(history) = history {
+        let resume_result = if let Some(history) = history {
             self.resume_thread_from_history(history.as_slice())
                 .await
                 .map(|thread_history| (thread_history, None))
+        } else if let Some(stored_thread) = stored_thread_from_running_probe {
+            self.stored_thread_to_initial_history(&stored_thread)
+                .await
+                .map(|thread_history| (thread_history, Some(*stored_thread)))
         } else {
             self.resume_thread_from_rollout(&thread_id, path.as_ref())
                 .await
                 .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
-        } {
+        };
+        let (thread_history, resume_source_thread) = match resume_result {
             Ok(value) => value,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -2733,13 +2809,14 @@ impl ThreadRequestProcessor {
         Some(persisted_metadata)
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn resume_running_thread(
         &self,
         request_id: &ConnectionRequestId,
         params: &ThreadResumeParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
-    ) -> Result<bool, JSONRPCErrorError> {
+    ) -> Result<RunningThreadResumeResult, JSONRPCErrorError> {
         let running_thread = if params.history.is_some() {
             if let Ok(existing_thread_id) = ThreadId::from_string(&params.thread_id)
                 && self
@@ -2775,7 +2852,11 @@ impl ThreadRequestProcessor {
             let existing_thread_id = source_thread.thread_id;
             match self.thread_manager.get_thread(existing_thread_id).await {
                 Ok(existing_thread) => Some((existing_thread_id, existing_thread, source_thread)),
-                Err(_) => None,
+                Err(_) => {
+                    return Ok(RunningThreadResumeResult::NotRunning(Some(Box::new(
+                        source_thread,
+                    ))));
+                }
             }
         };
 
@@ -2816,7 +2897,9 @@ impl ThreadRequestProcessor {
                         ThreadShutdownResult::Complete => {
                             self.thread_manager.remove_thread(&existing_thread_id).await;
                             self.finalize_thread_teardown(existing_thread_id).await;
-                            return Ok(false);
+                            // Shutdown can flush newer rollout items, so reload the
+                            // stored thread before starting the replacement session.
+                            return Ok(RunningThreadResumeResult::NotRunning(None));
                         }
                         ThreadShutdownResult::SubmitFailed => {
                             warn!("failed to submit Shutdown to thread {existing_thread_id}");
@@ -2908,11 +2991,12 @@ impl ThreadRequestProcessor {
                     "failed to enqueue running thread resume for thread {existing_thread_id}: thread listener command channel is closed"
                 )));
             }
-            return Ok(true);
+            return Ok(RunningThreadResumeResult::Handled);
         }
-        Ok(false)
+        Ok(RunningThreadResumeResult::NotRunning(None))
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn resume_thread_from_history(
         &self,
         history: &[ResponseItem],
@@ -2929,6 +3013,7 @@ impl ThreadRequestProcessor {
         ))
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn resume_thread_from_rollout(
         &self,
         thread_id: &str,
@@ -2983,6 +3068,7 @@ impl ThreadRequestProcessor {
         Ok(stored_thread)
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn stored_thread_to_initial_history(
         &self,
         stored_thread: &StoredThread,
@@ -3843,7 +3929,7 @@ fn thread_read_view_error(err: ThreadReadViewError) -> JSONRPCErrorError {
     }
 }
 
-fn unsupported_thread_store_operation(operation: &'static str) -> JSONRPCErrorError {
+pub(super) fn unsupported_thread_store_operation(operation: &'static str) -> JSONRPCErrorError {
     method_not_found(format!("{operation} is not supported yet"))
 }
 
@@ -3964,7 +4050,7 @@ fn conversation_summary_rollout_path_read_error(
     }
 }
 
-fn core_thread_write_error(operation: &str, err: CodexErr) -> JSONRPCErrorError {
+pub(super) fn core_thread_write_error(operation: &str, err: CodexErr) -> JSONRPCErrorError {
     match err {
         CodexErr::ThreadNotFound(thread_id) => {
             invalid_request(format!("thread not found: {thread_id}"))
@@ -4154,7 +4240,7 @@ fn summary_from_thread_metadata(metadata: &ThreadMetadata) -> ConversationSummar
         metadata.cwd.clone(),
         metadata.cli_version.clone(),
         metadata.source.clone(),
-        metadata.thread_source,
+        metadata.thread_source.clone(),
         metadata.agent_nickname.clone(),
         metadata.agent_role.clone(),
         metadata.git_sha.clone(),
@@ -4243,11 +4329,39 @@ fn build_thread_from_snapshot(
         agent_nickname: config_snapshot.session_source.get_nickname(),
         agent_role: config_snapshot.session_source.get_agent_role(),
         source: config_snapshot.session_source.clone().into(),
-        thread_source: config_snapshot.thread_source.map(Into::into),
+        thread_source: config_snapshot.thread_source.clone().map(Into::into),
         git_info: None,
         name: None,
         turns: Vec::new(),
     }
+}
+
+fn paginate_background_terminals(
+    terminals: &[ThreadBackgroundTerminal],
+    cursor: Option<String>,
+    limit: Option<u32>,
+) -> Result<(Vec<ThreadBackgroundTerminal>, Option<String>), JSONRPCErrorError> {
+    let start = match cursor {
+        Some(cursor) => {
+            let cursor = cursor
+                .parse::<i32>()
+                .map_err(|err| invalid_request(format!("invalid cursor: {err}")))?;
+            terminals
+                .iter()
+                .position(|terminal| {
+                    terminal
+                        .process_id
+                        .parse::<i32>()
+                        .is_ok_and(|process_id| process_id > cursor)
+                })
+                .unwrap_or(terminals.len())
+        }
+        None => 0,
+    };
+    let effective_limit = limit.unwrap_or(terminals.len() as u32).max(1) as usize;
+    let end = start.saturating_add(effective_limit).min(terminals.len());
+    let next_cursor = (end < terminals.len()).then(|| terminals[end - 1].process_id.clone());
+    Ok((terminals[start..end].to_vec(), next_cursor))
 }
 
 fn build_thread_from_loaded_snapshot(

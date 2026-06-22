@@ -6,6 +6,7 @@ use codex_protocol::models::ResponseItem;
 pub fn is_persisted_rollout_item(item: &RolloutItem) -> bool {
     match item {
         RolloutItem::ResponseItem(item) => should_persist_response_item(item),
+        RolloutItem::InterAgentCommunication(_) => true,
         RolloutItem::EventMsg(ev) => should_persist_event_msg(ev),
         // Persist Codex executive markers so we can analyze flows (e.g., compaction, API turns).
         RolloutItem::Compacted(_) | RolloutItem::TurnContext(_) | RolloutItem::SessionMeta(_) => {
@@ -91,7 +92,8 @@ pub fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::TurnStarted(_)
         | EventMsg::TurnComplete(_)
         | EventMsg::WebSearchEnd(_)
-        | EventMsg::ImageGenerationEnd(_) => true,
+        | EventMsg::ImageGenerationEnd(_)
+        | EventMsg::SubAgentActivity(_) => true,
         EventMsg::ItemCompleted(event) => {
             // Plan items are derived from streaming tags and are not part of the
             // raw ResponseItem history, so we persist their completion to replay

@@ -5,7 +5,7 @@ use crate::loader::PluginHookLoadOutcome;
 use crate::loader::configured_curated_plugin_ids_from_codex_home;
 use crate::loader::curated_plugin_cache_version;
 use crate::loader::installed_plugin_telemetry_metadata;
-use crate::loader::load_plugin_apps;
+use crate::loader::load_plugin_app_metadata;
 use crate::loader::load_plugin_hooks;
 use crate::loader::load_plugin_hooks_from_layer_stack;
 use crate::loader::load_plugin_mcp_servers;
@@ -38,7 +38,6 @@ use crate::marketplace_upgrade::configured_git_marketplace_names;
 use crate::marketplace_upgrade::upgrade_configured_git_marketplaces;
 use crate::remote::RemoteInstalledPlugin;
 use crate::remote::RemotePluginCatalogError;
-use crate::remote::RemotePluginScope;
 use crate::remote::RemotePluginServiceConfig;
 use crate::remote_legacy::RemotePluginFetchError;
 use crate::remote_legacy::RemotePluginMutationError;
@@ -49,6 +48,7 @@ use crate::store::PluginInstallResult as StorePluginInstallResult;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
 use codex_analytics::AnalyticsEventsClient;
+use codex_app_server_protocol::AuthMode;
 use codex_config::ConfigLayerStack;
 use codex_config::clear_user_plugin;
 use codex_config::set_user_plugin_enabled;
@@ -77,6 +77,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::Semaphore;
+use tracing::instrument;
 use tracing::warn;
 
 static CURATED_REPO_SYNC_STARTED: AtomicBool = AtomicBool::new(false);
@@ -204,6 +205,24 @@ fn featured_plugin_ids_cache_key(
     }
 }
 
+fn project_plugin_load_outcome_for_auth(
+    outcome: PluginLoadOutcome,
+    auth_mode: Option<AuthMode>,
+) -> PluginLoadOutcome {
+    let apps_route_available = auth_mode.is_some_and(AuthMode::uses_codex_backend);
+    let mut plugins = outcome.plugins().to_vec();
+    for plugin in &mut plugins {
+        if apps_route_available {
+            if plugin.is_active() && !plugin.apps.is_empty() {
+                plugin.mcp_servers.clear();
+            }
+        } else {
+            plugin.apps.clear();
+        }
+    }
+    PluginLoadOutcome::from_plugins(plugins)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginInstallRequest {
     pub plugin_name: String,
@@ -247,6 +266,7 @@ pub struct PluginDetail {
     pub disabled_skill_paths: HashSet<AbsolutePathBuf>,
     pub hooks: Vec<PluginHookSummary>,
     pub apps: Vec<AppConnectorId>,
+    pub app_category_by_id: HashMap<String, String>,
     pub mcp_server_names: Vec<String>,
     pub details_unavailable_reason: Option<PluginDetailsUnavailableReason>,
 }
@@ -320,6 +340,7 @@ pub struct PluginsManager {
     remote_installed_plugins_cache_refresh_state: RwLock<RemoteInstalledPluginsCacheRefreshState>,
     global_remote_catalog_cache_refresh_state: RwLock<GlobalRemoteCatalogCacheRefreshState>,
     restriction_product: Option<Product>,
+    auth_mode: RwLock<Option<AuthMode>>,
     analytics_events_client: RwLock<Option<AnalyticsEventsClient>>,
 }
 
@@ -344,12 +365,13 @@ struct PluginLoadCacheKey {
 
 impl PluginsManager {
     pub fn new(codex_home: PathBuf) -> Self {
-        Self::new_with_restriction_product(codex_home, Some(Product::Codex))
+        Self::new_with_options(codex_home, Some(Product::Codex), /*auth_mode*/ None)
     }
 
-    pub fn new_with_restriction_product(
+    pub fn new_with_options(
         codex_home: PathBuf,
         restriction_product: Option<Product>,
+        auth_mode: Option<AuthMode>,
     ) -> Self {
         // Product restrictions are enforced at marketplace admission time for a given CODEX_HOME:
         // listing, install, and curated refresh all consult this restriction context before new
@@ -376,7 +398,27 @@ impl PluginsManager {
                 GlobalRemoteCatalogCacheRefreshState::default(),
             ),
             restriction_product,
+            auth_mode: RwLock::new(auth_mode),
             analytics_events_client: RwLock::new(None),
+        }
+    }
+
+    pub fn set_auth_mode(&self, auth_mode: Option<AuthMode>) -> bool {
+        let mut stored_auth_mode = match self.auth_mode.write() {
+            Ok(auth_mode_guard) => auth_mode_guard,
+            Err(err) => err.into_inner(),
+        };
+        if *stored_auth_mode == auth_mode {
+            return false;
+        }
+        *stored_auth_mode = auth_mode;
+        true
+    }
+
+    pub fn auth_mode(&self) -> Option<AuthMode> {
+        match self.auth_mode.read() {
+            Ok(auth_mode_guard) => *auth_mode_guard,
+            Err(err) => *err.into_inner(),
         }
     }
 
@@ -403,6 +445,11 @@ impl PluginsManager {
             .await
     }
 
+    #[instrument(
+        level = "trace",
+        skip_all,
+        fields(force_reload, plugins_enabled = config.plugins_enabled)
+    )]
     pub(crate) async fn plugins_for_config_with_force_reload(
         &self,
         config: &PluginsConfigInput,
@@ -418,7 +465,7 @@ impl PluginsManager {
             remote_plugin_enabled: config.remote_plugin_enabled,
         };
         if !force_reload && let Some(outcome) = self.cached_enabled_outcome(&cache_key) {
-            return outcome;
+            return self.project_plugins_for_auth(outcome);
         }
 
         let Ok(_load_permit) = self.enabled_outcome_load_semaphore.acquire().await else {
@@ -426,7 +473,7 @@ impl PluginsManager {
             return PluginLoadOutcome::default();
         };
         if !force_reload && let Some(outcome) = self.cached_enabled_outcome(&cache_key) {
-            return outcome;
+            return self.project_plugins_for_auth(outcome);
         }
         let cache_generation = self.enabled_outcome_cache_generation();
         let outcome = load_plugins_from_layer_stack(
@@ -439,7 +486,11 @@ impl PluginsManager {
         .await;
         log_plugin_load_errors(&outcome);
         self.cache_enabled_outcome_if_current(cache_generation, cache_key, outcome.clone());
-        outcome
+        self.project_plugins_for_auth(outcome)
+    }
+
+    fn project_plugins_for_auth(&self, outcome: PluginLoadOutcome) -> PluginLoadOutcome {
+        project_plugin_load_outcome_for_auth(outcome, self.auth_mode())
     }
 
     pub fn clear_cache(&self) {
@@ -469,14 +520,15 @@ impl PluginsManager {
         if !config.plugins_enabled {
             return PluginLoadOutcome::default();
         }
-        load_plugins_from_layer_stack(
+        let outcome = load_plugins_from_layer_stack(
             config_layer_stack,
             self.remote_installed_plugin_configs(),
             &self.store,
             self.restriction_product,
             config.remote_plugin_enabled,
         )
-        .await
+        .await;
+        self.project_plugins_for_auth(outcome)
     }
 
     /// Resolve plugin hooks for a config layer stack without loading other plugin capabilities.
@@ -560,14 +612,19 @@ impl PluginsManager {
 
     pub fn build_remote_installed_plugin_marketplaces_from_cache(
         &self,
-        visible_scopes: &[RemotePluginScope],
+        visible_marketplaces: &[&str],
     ) -> Option<Vec<crate::remote::RemoteMarketplace>> {
         let cache = match self.remote_installed_plugins_cache.read() {
             Ok(cache) => cache,
             Err(err) => err.into_inner(),
         };
         let plugins = cache.as_ref()?;
-        Some(crate::remote::group_remote_installed_plugins_by_marketplaces(plugins, visible_scopes))
+        Some(
+            crate::remote::group_remote_installed_plugins_by_marketplaces(
+                plugins,
+                visible_marketplaces,
+            ),
+        )
     }
 
     pub fn cached_global_remote_discoverable_plugins_for_config(
@@ -599,7 +656,7 @@ impl PluginsManager {
         &self,
         config: &PluginsConfigInput,
         auth: Option<&CodexAuth>,
-        visible_scopes: &[RemotePluginScope],
+        visible_marketplaces: &[&str],
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) -> Result<Vec<crate::remote::RemoteMarketplace>, RemotePluginCatalogError> {
         let plugins = crate::remote::fetch_remote_installed_plugins(
@@ -607,8 +664,10 @@ impl PluginsManager {
             auth,
         )
         .await?;
-        let marketplaces =
-            crate::remote::group_remote_installed_plugins_by_marketplaces(&plugins, visible_scopes);
+        let marketplaces = crate::remote::group_remote_installed_plugins_by_marketplaces(
+            &plugins,
+            visible_marketplaces,
+        );
         let changed = self.write_remote_installed_plugins_cache(plugins);
         if changed && let Some(on_effective_plugins_changed) = on_effective_plugins_changed {
             on_effective_plugins_changed();
@@ -986,14 +1045,19 @@ impl PluginsManager {
         &self,
         config: &PluginsConfigInput,
         additional_roots: &[AbsolutePathBuf],
+        include_openai_curated: bool,
     ) -> Result<ConfiguredMarketplaceListOutcome, MarketplaceError> {
         if !config.plugins_enabled {
             return Ok(ConfiguredMarketplaceListOutcome::default());
         }
 
         let (installed_plugins, enabled_plugins) = self.configured_plugin_states(config);
-        let marketplace_outcome =
-            self.discover_marketplaces_for_config(config, additional_roots)?;
+        let mut marketplace_roots = self.marketplace_roots(config, additional_roots);
+        if !include_openai_curated {
+            let curated_repo_root = curated_plugins_repo_path(self.codex_home.as_path());
+            marketplace_roots.retain(|root| root.as_path() != curated_repo_root.as_path());
+        }
+        let marketplace_outcome = list_marketplaces(&marketplace_roots)?;
         let mut seen_plugin_keys = HashSet::new();
         let marketplaces = marketplace_outcome
             .marketplaces
@@ -1142,6 +1206,7 @@ impl PluginsManager {
         })
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub async fn read_plugin_detail_for_marketplace_plugin(
         &self,
         config: &PluginsConfigInput,
@@ -1179,6 +1244,7 @@ impl PluginsManager {
                 disabled_skill_paths: HashSet::new(),
                 hooks: Vec::new(),
                 apps: Vec::new(),
+                app_category_by_id: HashMap::new(),
                 mcp_server_names: Vec::new(),
                 details_unavailable_reason: Some(
                     PluginDetailsUnavailableReason::InstallRequiredForRemoteSource,
@@ -1245,7 +1311,12 @@ impl PluginsManager {
                 event_name: hook.event_name,
             })
             .collect();
-        let apps = load_plugin_apps(source_path.as_path()).await;
+        let app_metadata = load_plugin_app_metadata(source_path.as_path()).await;
+        let apps = app_metadata.iter().map(|app| app.id.clone()).collect();
+        let app_category_by_id = app_metadata
+            .into_iter()
+            .filter_map(|app| app.category.map(|category| (app.id.0, category)))
+            .collect();
         let mut mcp_server_names = load_plugin_mcp_servers(source_path.as_path())
             .await
             .into_keys()
@@ -1268,6 +1339,7 @@ impl PluginsManager {
             disabled_skill_paths: resolved_skills.disabled_skill_paths,
             hooks,
             apps,
+            app_category_by_id,
             mcp_server_names,
             details_unavailable_reason: None,
         })

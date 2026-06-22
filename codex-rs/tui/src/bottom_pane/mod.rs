@@ -328,6 +328,11 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub fn set_token_activity_command_enabled(&mut self, enabled: bool) {
+        self.composer.set_token_activity_command_enabled(enabled);
+        self.request_redraw();
+    }
+
     pub fn set_mentions_v2_enabled(&mut self, enabled: bool) {
         self.composer.set_mentions_v2_enabled(enabled);
         self.request_redraw();
@@ -426,16 +431,6 @@ impl BottomPane {
 
     pub fn set_goal_command_enabled(&mut self, enabled: bool) {
         self.composer.set_goal_command_enabled(enabled);
-        self.request_redraw();
-    }
-
-    pub fn set_realtime_conversation_enabled(&mut self, enabled: bool) {
-        self.composer.set_realtime_conversation_enabled(enabled);
-        self.request_redraw();
-    }
-
-    pub fn set_audio_device_selection_enabled(&mut self, enabled: bool) {
-        self.composer.set_audio_device_selection_enabled(enabled);
         self.request_redraw();
     }
 
@@ -841,7 +836,6 @@ impl BottomPane {
         self.composer.text_elements()
     }
 
-    #[cfg(test)]
     pub(crate) fn composer_local_images(&self) -> Vec<LocalImageAttachment> {
         self.composer.local_images()
     }
@@ -891,7 +885,6 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    #[cfg(test)]
     pub(crate) fn remote_image_urls(&self) -> Vec<String> {
         self.composer.remote_image_urls()
     }
@@ -1795,31 +1788,6 @@ impl Renderable for ChatComposerRightReserveRenderable<'_> {
 
     fn cursor_style(&self, area: Rect) -> crossterm::cursor::SetCursorStyle {
         self.composer.cursor_style(area)
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-impl BottomPane {
-    pub(crate) fn insert_recording_meter_placeholder(&mut self, text: &str) -> String {
-        let id = self.composer.insert_recording_meter_placeholder(text);
-        self.composer.sync_popups();
-        self.request_redraw();
-        id
-    }
-
-    pub(crate) fn update_recording_meter_in_place(&mut self, id: &str, text: &str) -> bool {
-        let updated = self.composer.update_recording_meter_in_place(id, text);
-        if updated {
-            self.composer.sync_popups();
-            self.request_redraw();
-        }
-        updated
-    }
-
-    pub(crate) fn remove_recording_meter_placeholder(&mut self, id: &str) {
-        self.composer.remove_recording_meter_placeholder(id);
-        self.composer.sync_popups();
-        self.request_redraw();
     }
 }
 

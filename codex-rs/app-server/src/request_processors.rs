@@ -171,8 +171,13 @@ use codex_app_server_protocol::ThreadApproveGuardianDeniedActionResponse;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
+use codex_app_server_protocol::ThreadBackgroundTerminal;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminalsListParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsListResponse;
+use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateResponse;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
@@ -284,6 +289,7 @@ use codex_config::types::McpServerTransportConfig;
 use codex_core::CodexThread;
 use codex_core::CodexThreadSettingsOverrides;
 use codex_core::ForkSnapshot;
+use codex_core::McpManager;
 use codex_core::NewThread;
 #[cfg(test)]
 use codex_core::SessionMeta;
@@ -417,6 +423,7 @@ use codex_rollout::state_db::reconcile_rollout;
 use codex_state::ThreadMetadata;
 use codex_state::log_db::LogDbLayer;
 use codex_thread_store::ArchiveThreadParams as StoreArchiveThreadParams;
+use codex_thread_store::DeleteThreadParams as StoreDeleteThreadParams;
 use codex_thread_store::GitInfoPatch as StoreGitInfoPatch;
 use codex_thread_store::ListThreadsParams as StoreListThreadsParams;
 use codex_thread_store::LocalThreadStore;
@@ -537,6 +544,7 @@ fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec
 
 mod config_errors;
 mod request_errors;
+mod thread_delete;
 mod thread_goal_processor;
 mod thread_lifecycle;
 mod thread_resume_redaction;
