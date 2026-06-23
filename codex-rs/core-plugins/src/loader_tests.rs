@@ -160,6 +160,7 @@ enabled = true
         &stack,
         HashMap::new(),
         &store,
+        /*plugin_skill_snapshots*/ None,
         Some(Product::Codex),
         /*prefer_remote_curated_conflicts*/ false,
     )
@@ -173,9 +174,8 @@ enabled = true
     )
     .await;
 
-    let validation_state = |outcome: &PluginLoadOutcome<McpServerConfig>| {
-        outcome
-            .plugins()
+    let validation_state = |plugins: &[LoadedPlugin<McpServerConfig>]| {
+        plugins
             .iter()
             .map(|plugin| {
                 (
@@ -183,22 +183,15 @@ enabled = true
                     plugin.enabled,
                     plugin.root.clone(),
                     plugin.error.clone(),
+                    plugin.hook_sources.clone(),
+                    plugin.hook_load_warnings.clone(),
                 )
             })
             .collect::<Vec<_>>()
     };
     assert_eq!(validation_state(&hooks_only), validation_state(&full));
-    assert_eq!(
-        hooks_only.effective_plugin_hook_sources(),
-        full.effective_plugin_hook_sources()
-    );
-    assert_eq!(
-        hooks_only.effective_plugin_hook_warnings(),
-        full.effective_plugin_hook_warnings()
-    );
 
     let full_valid = full
-        .plugins()
         .iter()
         .find(|plugin| plugin.config_name == "valid@test")
         .expect("full load should include valid plugin");
@@ -208,7 +201,6 @@ enabled = true
     assert!(!full_valid.apps.is_empty());
 
     let hooks_only_valid = hooks_only
-        .plugins()
         .iter()
         .find(|plugin| plugin.config_name == "valid@test")
         .expect("hooks-only load should include valid plugin");

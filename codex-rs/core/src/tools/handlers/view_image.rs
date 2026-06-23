@@ -1,4 +1,3 @@
-use codex_features::Feature;
 use codex_protocol::items::ImageViewItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
@@ -8,9 +7,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
-use codex_utils_image::PromptImageMode;
 use codex_utils_image::data_url_from_bytes;
-use codex_utils_image::load_for_prompt_bytes;
 use serde::Deserialize;
 
 use crate::function_tool::FunctionCallError;
@@ -143,11 +140,18 @@ impl ViewImageHandler {
                 "view_image is unavailable in this session".to_string(),
             ));
         };
-        let cwd = turn_environment.cwd().clone();
+        // TODO(anp): Resolve tool paths using the selected environment's native path convention
+        // so view_image can support relative paths in foreign environments.
+        let cwd = turn_environment.cwd().to_abs_path().map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "environment cwd `{}` is not native to the Codex host: {err}",
+                turn_environment.cwd()
+            ))
+        })?;
         let abs_path = cwd.join(path);
         let sandbox = turn.file_system_sandbox_context(
             /*additional_permissions*/ None,
-            turn_environment.cwd_uri(),
+            turn_environment.cwd(),
         );
         let fs = turn_environment.environment.get_filesystem();
         let path_uri = PathUri::from_abs_path(&abs_path);
@@ -188,24 +192,8 @@ impl ViewImageHandler {
             DEFAULT_IMAGE_DETAIL
         };
 
-        let image_url = if turn.features.enabled(Feature::ResizeAllImages) {
-            // The history insertion path owns image decoding and resizing when this is enabled.
-            data_url_from_bytes("application/octet-stream", &file_bytes)
-        } else {
-            let image_mode = if use_original_detail {
-                PromptImageMode::Original
-            } else {
-                PromptImageMode::ResizeToFit
-            };
-            load_for_prompt_bytes(abs_path.as_path(), file_bytes, image_mode)
-                .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!(
-                        "unable to process image at `{}`: {error}",
-                        abs_path.display()
-                    ))
-                })?
-                .into_data_url()
-        };
+        // The history insertion path owns image decoding and resizing.
+        let image_url = data_url_from_bytes("application/octet-stream", &file_bytes);
 
         let item = TurnItem::ImageView(ImageViewItem {
             id: call_id,
@@ -272,6 +260,7 @@ mod tests {
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::models::PermissionProfile;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
     use core_test_support::TempDirExt;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -288,7 +277,7 @@ mod tests {
         turn.environments.turn_environments[0] = TurnEnvironment::new(
             current.environment_id,
             current.environment,
-            cwd,
+            PathUri::from_abs_path(&cwd),
             current.shell,
         );
     }
@@ -412,9 +401,6 @@ mod tests {
             })
             .await;
 
-        let Err(FunctionCallError::RespondToModel(message)) = result else {
-            panic!("expected image processing error");
-        };
-        assert!(message.contains("unable to process image"), "{message}");
+        result.expect("explicit high detail should be accepted");
     }
 }
