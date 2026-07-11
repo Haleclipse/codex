@@ -1072,7 +1072,6 @@ WHERE assigned_thread_id = ?
 
         Ok(rows_affected)
     }
-
 }
 
 fn one_thread_id_from_rows(

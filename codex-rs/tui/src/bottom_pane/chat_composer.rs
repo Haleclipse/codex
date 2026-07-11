@@ -4055,7 +4055,6 @@ impl ChatComposer {
     }
 }
 
-
 fn skill_description(skill: &SkillMetadata) -> Option<String> {
     let description = skill
         .interface
