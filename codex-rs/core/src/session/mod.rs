@@ -32,6 +32,7 @@ use crate::context::NetworkRuleSaved;
 use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
 use crate::context::RecommendedPluginsInstructions;
+use crate::context::world_state::WorldState;
 use crate::current_time::TimeProvider;
 use crate::default_skill_metadata_budget;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -207,6 +208,7 @@ use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
+mod code_mode_warning;
 mod config_lock;
 mod handlers;
 mod inject;
@@ -223,6 +225,8 @@ pub(crate) mod time_reminder;
 mod token_budget;
 pub(crate) mod turn;
 pub(crate) mod turn_context;
+mod world_state;
+use self::code_mode_warning::unsupported_code_mode_warning;
 use self::config_lock::export_config_lock_if_configured;
 use self::config_lock::validate_config_lock_if_configured;
 #[cfg(test)]
@@ -243,6 +247,9 @@ use self::turn::collect_explicit_app_ids_from_skill_items;
 use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
 use self::turn_context::TurnSkillsContext;
+use self::world_state::build_world_state_from_environment_snapshot;
+use self::world_state::build_world_state_from_turn_context;
+use self::world_state::build_world_state_from_turn_context_item;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 
@@ -447,7 +454,6 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
-    pub(crate) initial_multi_agent_mode: Option<MultiAgentMode>,
 }
 
 pub(crate) fn resolve_multi_agent_version(
@@ -532,7 +538,6 @@ impl Codex {
             attestation_provider,
             external_time_provider,
             inherited_multi_agent_version,
-            initial_multi_agent_mode,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
@@ -587,7 +592,6 @@ impl Codex {
             .await;
         let multi_agent_version =
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version);
-        let multi_agent_mode = initial_multi_agent_mode.unwrap_or_default();
         config
             .validate_multi_agent_v2_config()
             .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
@@ -621,7 +625,6 @@ impl Codex {
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
-            multi_agent_mode,
             model_reasoning_summary: config.model_reasoning_summary,
             service_tier,
             developer_instructions: config.developer_instructions.clone(),
@@ -1385,9 +1388,15 @@ impl Session {
         // will be processed again if the rollout is reconstructed in a future session.
         // This meets image resizing requirements without modifying persisted rollouts.
         prepare_response_items(&mut history);
+        let world_state_baseline = reference_context_item
+            .as_ref()
+            .map(build_world_state_from_turn_context_item);
         {
             let mut state = self.state.lock().await;
             state.replace_history(history, reference_context_item);
+            if let Some(world_state) = world_state_baseline {
+                state.history.set_world_state_baseline(world_state);
+            }
             let fallback_ids = state.auto_compact_window_ids();
             let window_id = window_id.unwrap_or(fallback_ids.window_id);
             state.restore_auto_compact_window(
@@ -1682,19 +1691,17 @@ impl Session {
     ) -> Vec<ResponseItem> {
         // TODO: Make context updates a pure diff of persisted previous/current TurnContextItem
         // state so replay/backtracking is deterministic. Runtime inputs that affect model-visible
-        // context (shell, exec policy, feature gates, previous-turn bridge) should be persisted
+        // context (exec policy, feature gates, previous-turn bridge) should be persisted
         // state or explicit non-state replay events.
         let previous_turn_settings = {
             let state = self.state.lock().await;
             state.previous_turn_settings()
         };
-        let shell = self.user_shell();
         let exec_policy = self.services.exec_policy.current();
         crate::context_manager::updates::build_settings_update_items(
             reference_context_item,
             previous_turn_settings.as_ref(),
             current_context,
-            shell.as_ref(),
             exec_policy.as_ref(),
             self.features.enabled(Feature::Personality),
         )
@@ -2692,6 +2699,10 @@ impl Session {
     ) -> Cow<'a, [ResponseItem]> {
         let mut items = Cow::Borrowed(items);
         prepare_response_items(items.to_mut());
+        // Most response items get their passthrough turn ID at the durable history boundary.
+        for item in items.to_mut() {
+            item.set_turn_id_if_missing(&turn_context.sub_id);
+        }
         if turn_context.config.features.enabled(Feature::ItemIds) {
             Self::assign_missing_response_item_ids(items)
         } else {
@@ -2765,31 +2776,27 @@ impl Session {
             return;
         }
 
-        let shell = self.user_shell();
-        let Some(environment_context) =
-            crate::context::EnvironmentContext::from_step_context(step_context, shell.as_ref())
-        else {
-            return;
-        };
-        let changed = {
+        let world_state =
+            build_world_state_from_environment_snapshot(turn_context, &step_context.environments);
+        let items = {
             let mut state = self.state.lock().await;
-            state
-                .history
-                .update_environment_context_baseline(&environment_context)
+            crate::context_manager::updates::merge_contextual_fragments(
+                state.history.update_world_state(world_state),
+            )
         };
-        if !changed {
+        if items.is_empty() {
             return;
         }
 
-        let item = ContextualUserFragment::into(environment_context);
-        self.record_conversation_items(turn_context, &[item]).await;
+        self.record_conversation_items(turn_context, &items).await;
     }
 
     pub(crate) async fn record_inter_agent_communication(
         &self,
         turn_context: &TurnContext,
-        communication: InterAgentCommunication,
+        mut communication: InterAgentCommunication,
     ) {
+        communication.set_turn_id_if_missing(&turn_context.sub_id);
         let response_item = communication.to_model_input_item();
         let items = self.prepare_conversation_items_for_history(
             turn_context,
@@ -2894,9 +2901,17 @@ impl Session {
             replacement_history: Some(items.clone()),
             ..compacted_item
         };
+        let world_state_baseline = if reference_context_item.is_some() {
+            Some(self.build_world_state(turn_context).await)
+        } else {
+            None
+        };
         {
             let mut state = self.state.lock().await;
             state.replace_history(items, reference_context_item.clone());
+            if let Some(world_state) = world_state_baseline {
+                state.history.set_world_state_baseline(world_state);
+            }
         }
 
         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
@@ -3025,6 +3040,28 @@ impl Session {
     pub(crate) async fn build_initial_context(
         &self,
         turn_context: &TurnContext,
+    ) -> Vec<ResponseItem> {
+        let world_state = self.build_world_state(turn_context).await;
+        self.build_initial_context_with_world_state(turn_context, &world_state)
+            .await
+    }
+
+    async fn build_world_state(&self, turn_context: &TurnContext) -> WorldState {
+        let environment_subagents = if turn_context.config.include_environment_context {
+            self.services
+                .agent_control
+                .format_environment_context_subagents(self.thread_id)
+                .await
+        } else {
+            String::new()
+        };
+        build_world_state_from_turn_context(turn_context, &environment_subagents)
+    }
+
+    async fn build_initial_context_with_world_state(
+        &self,
+        turn_context: &TurnContext,
+        world_state: &WorldState,
     ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
@@ -3265,18 +3302,12 @@ impl Session {
                 .render(),
             );
         }
-        if turn_context.config.include_environment_context {
-            let shell = self.user_shell();
-            let subagents = self
-                .services
-                .agent_control
-                .format_environment_context_subagents(self.thread_id)
-                .await;
-            contextual_user_sections.push(
-                crate::context::EnvironmentContext::from_turn_context(turn_context, shell.as_ref())
-                    .with_subagents(subagents)
-                    .render(),
-            );
+        for fragment in world_state.render_full() {
+            match fragment.role() {
+                "developer" => developer_sections.push(fragment.render()),
+                "user" => contextual_user_sections.push(fragment.render()),
+                _ => {}
+            }
         }
 
         let multi_agent_v2_usage_hint_text =
@@ -3303,11 +3334,7 @@ impl Session {
         {
             items.push(usage_hint_message);
         }
-        match multi_agents::effective_multi_agent_mode(
-            turn_context.multi_agent_version,
-            &session_source,
-            turn_context.multi_agent_mode,
-        ) {
+        match multi_agents::effective_multi_agent_mode(turn_context) {
             Some(
                 multi_agent_mode
                 @ (MultiAgentMode::ExplicitRequestOnly | MultiAgentMode::Proactive),
@@ -3334,6 +3361,10 @@ impl Session {
                 ])
         {
             items.push(guardian_developer_message);
+        }
+        // New context windows and compaction install these items directly into replacement history.
+        for item in &mut items {
+            item.set_turn_id_if_missing(&turn_context.sub_id);
         }
         items
     }
@@ -3378,12 +3409,16 @@ impl Session {
             state.start_new_context_window_if_requested()
         };
         let (window_number, window_ids) = window?;
-        let context_items = self.build_initial_context(turn_context).await;
+        let world_state = self.build_world_state(turn_context).await;
+        let context_items = self
+            .build_initial_context_with_world_state(turn_context, &world_state)
+            .await;
         let turn_context_item = turn_context.to_turn_context_item();
         let replacement_history = context_items;
         {
             let mut state = self.state.lock().await;
             state.replace_history(replacement_history.clone(), Some(turn_context_item.clone()));
+            state.history.set_world_state_baseline(world_state);
         };
         self.persist_rollout_items(&[
             RolloutItem::Compacted(CompactedItem {
@@ -3414,15 +3449,15 @@ impl Session {
     /// steady-state turns that emit model-visible context updates.
     ///
     /// When the reference snapshot is missing, this injects full initial context. Otherwise, it
-    /// emits only settings diff items.
+    /// emits only context diffs.
     ///
     /// If full context is injected and a model switch occurred, this prepends the
     /// `<model_switch>` developer message so model-specific instructions are not lost.
     ///
     /// This is the normal runtime path that establishes a new `reference_context_item`.
-    /// Mid-turn compaction is the other path that can re-establish that baseline when it
-    /// reinjects full initial context into replacement history. Other non-regular tasks
-    /// intentionally do not update the baseline.
+    /// Mid-turn compaction is the other path that can re-establish that reference when it
+    /// reinjects full initial context into replacement history. Live world-state changes may
+    /// independently advance their in-memory baseline within a turn.
     #[instrument(level = "trace", skip_all)]
     pub(crate) async fn record_context_updates_and_set_reference_context_item(
         &self,
@@ -3433,40 +3468,43 @@ impl Session {
             state.reference_context_item()
         };
         let turn_context_item = turn_context.to_turn_context_item();
-        if reference_context_item.as_ref() == Some(&turn_context_item) {
-            return;
-        }
+        let turn_context_changed = reference_context_item.as_ref() != Some(&turn_context_item);
         let should_inject_full_context = reference_context_item.is_none();
+        let world_state = self.build_world_state(turn_context).await;
         let mut context_items = if should_inject_full_context {
-            self.build_initial_context(turn_context).await
+            let context_items = self
+                .build_initial_context_with_world_state(turn_context, &world_state)
+                .await;
+            self.state
+                .lock()
+                .await
+                .history
+                .set_world_state_baseline(world_state);
+            context_items
         } else {
             // Steady-state path: append only built-in context diffs here; turn-scoped extension
             // context is added below.
-            self.build_settings_update_items(reference_context_item.as_ref(), turn_context)
-                .await
+            let mut context_items = self
+                .build_settings_update_items(reference_context_item.as_ref(), turn_context)
+                .await;
+            let world_state_items = {
+                let mut state = self.state.lock().await;
+                crate::context_manager::updates::merge_contextual_fragments(
+                    state.history.update_world_state(world_state),
+                )
+            };
+            context_items.extend(world_state_items);
+            context_items
         };
-        if !should_inject_full_context {
+        if !should_inject_full_context && turn_context_changed {
             context_items.extend(
                 self.build_turn_context_contribution_items(turn_context)
                     .await,
             );
         }
-        let initial_environment_context = if should_inject_full_context
-            && !context_items.is_empty()
-            && turn_context.config.include_environment_context
-            && turn_context
-                .config
-                .features
-                .enabled(Feature::DeferredExecutor)
-        {
-            let shell = self.user_shell();
-            crate::context::EnvironmentContext::from_attached_environments(
-                &turn_context.environments.turn_environments,
-                shell.as_ref(),
-            )
-        } else {
-            None
-        };
+        if !turn_context_changed && context_items.is_empty() {
+            return;
+        }
         if !context_items.is_empty() {
             self.record_conversation_items(turn_context, &context_items)
                 .await;
@@ -3476,15 +3514,10 @@ impl Session {
         self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item.clone())])
             .await;
 
-        // Advance the in-memory diff baseline even when this turn emitted no model-visible
-        // context items. This keeps later runtime diffing aligned with the current turn state.
+        // Advance the persisted-settings baseline even when this turn emitted no model-visible
+        // context items.
         let mut state = self.state.lock().await;
         state.set_reference_context_item(Some(turn_context_item));
-        if let Some(environment_context) = initial_environment_context {
-            state
-                .history
-                .update_environment_context_baseline(&environment_context);
-        }
     }
 
     pub(crate) async fn update_token_usage_info(

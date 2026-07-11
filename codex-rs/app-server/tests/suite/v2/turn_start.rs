@@ -106,6 +106,7 @@ const TINY_PNG_BYTES: &[u8] = &[
     0, 0, 31, 21, 196, 137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 0, 2, 0, 0, 5, 0, 1,
     122, 94, 171, 63, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
+const TINY_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
 fn body_contains(req: &wiremock::Request, text: &str) -> bool {
     String::from_utf8(req.body.clone())
@@ -888,7 +889,7 @@ async fn turn_start_tracks_turn_event_analytics() -> Result<()> {
             thread_id: thread.id.clone(),
             client_user_message_id: None,
             input: vec![V2UserInput::Image {
-                url: "https://example.com/a.png".to_string(),
+                url: TINY_PNG_DATA_URL.to_string(),
                 detail: None,
             }],
             responsesapi_client_metadata: Some(HashMap::from([(
@@ -1752,7 +1753,7 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
 }
 
 #[tokio::test]
-async fn turn_start_accepts_multi_agent_mode_v2() -> Result<()> {
+async fn turn_start_ignores_deprecated_multi_agent_mode() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1815,18 +1816,19 @@ async fn turn_start_accepts_multi_agent_mode_v2() -> Result<()> {
         .single_request()
         .message_input_texts("developer");
     assert!(developer_texts.iter().any(|text| {
-        text.contains("<multi_agent_mode>")
-            && text.contains("Proactive multi-agent delegation is active.")
-    }));
-    assert!(!developer_texts.iter().any(|text| {
         text.contains("Do not spawn sub-agents unless the user explicitly asks for sub-agents")
     }));
+    assert!(
+        !developer_texts
+            .iter()
+            .any(|text| text.contains("Proactive multi-agent delegation is active."))
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn thread_start_multi_agent_mode_initializes_first_turn() -> Result<()> {
+async fn thread_start_ignores_deprecated_multi_agent_mode() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -1865,7 +1867,7 @@ async fn thread_start_multi_agent_mode_initializes_first_turn() -> Result<()> {
         multi_agent_mode,
         ..
     } = to_response::<ThreadStartResponse>(thread_resp)?;
-    assert_eq!(multi_agent_mode, MultiAgentMode::Proactive);
+    assert_eq!(multi_agent_mode, MultiAgentMode::ExplicitRequestOnly);
 
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
@@ -1893,67 +1895,16 @@ async fn thread_start_multi_agent_mode_initializes_first_turn() -> Result<()> {
     let developer_texts = response_mock
         .single_request()
         .message_input_texts("developer");
+    assert!(developer_texts.iter().any(|text| {
+        text.contains(MULTI_AGENT_MODE_OPEN_TAG)
+            && text
+                .contains("Do not spawn sub-agents unless the user explicitly asks for sub-agents")
+    }));
     assert!(
-        developer_texts.iter().any(|text| {
-            text.contains(MULTI_AGENT_MODE_OPEN_TAG)
-                && text.contains("Proactive multi-agent delegation is active.")
-        }),
-        "expected proactive multi-agent mode instructions in developer input, got {developer_texts:?}"
+        !developer_texts
+            .iter()
+            .any(|text| text.contains("Proactive multi-agent delegation is active."))
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn thread_start_reports_multi_agent_mode() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let cases = [
-        (
-            BTreeMap::from([(Feature::MultiAgentV2, true)]),
-            Some(MultiAgentMode::Proactive),
-            MultiAgentMode::Proactive,
-        ),
-        (
-            BTreeMap::from([(Feature::MultiAgentV2, true)]),
-            Some(MultiAgentMode::None),
-            MultiAgentMode::None,
-        ),
-        (
-            BTreeMap::new(),
-            Some(MultiAgentMode::Proactive),
-            MultiAgentMode::Proactive,
-        ),
-        (
-            BTreeMap::from([(Feature::MultiAgentV2, true)]),
-            None,
-            MultiAgentMode::ExplicitRequestOnly,
-        ),
-    ];
-
-    for (features, requested_multi_agent_mode, expected_multi_agent_mode) in cases {
-        let server = responses::start_mock_server().await;
-        let codex_home = TempDir::new()?;
-        create_config_toml(codex_home.path(), &server.uri(), "never", &features)?;
-
-        let mut mcp = TestAppServer::new(codex_home.path()).await?;
-        timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-        let thread_req = mcp
-            .send_thread_start_request(ThreadStartParams {
-                model: Some("mock-model".to_string()),
-                multi_agent_mode: requested_multi_agent_mode,
-                ..Default::default()
-            })
-            .await?;
-        let thread_resp: JSONRPCResponse = timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-        )
-        .await??;
-        let response = to_response::<ThreadStartResponse>(thread_resp)?;
-
-        assert_eq!(response.multi_agent_mode, expected_multi_agent_mode);
-    }
 
     Ok(())
 }
