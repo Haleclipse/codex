@@ -11,6 +11,7 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
+const codexPackageRoot = realpathSync(path.join(__dirname, ".."));
 
 // @cometix: use @cometix scope for platform packages
 const PLATFORM_PACKAGE_BY_TARGET = {
@@ -56,7 +57,7 @@ switch (platform) {
         targetTriple = "x86_64-pc-windows-msvc";
         break;
       case "arm64":
-        targetTriple = "aarch64-pc-windows-msvc";
+        // No dedicated arm64 Windows package yet; fall through to unsupported.
         break;
       default:
         break;
@@ -93,24 +94,16 @@ try {
     vendorRoot = localVendorRoot;
   } else {
     const packageManager = detectPackageManager();
-    const updateCommand =
-      packageManager === "bun"
-        ? "bun install -g @cometix/codex@latest"
-        : "npm install -g @cometix/codex@latest";
     throw new Error(
-      `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
+      `Missing optional dependency ${platformPackage}. Reinstall Codex: ${reinstallCommand(packageManager)}`,
     );
   }
 }
 
 if (!vendorRoot) {
   const packageManager = detectPackageManager();
-  const updateCommand =
-    packageManager === "bun"
-      ? "bun install -g @cometix/codex@latest"
-      : "npm install -g @cometix/codex@latest";
   throw new Error(
-    `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
+    `Missing optional dependency ${platformPackage}. Reinstall Codex: ${reinstallCommand(packageManager)}`,
   );
 }
 
@@ -133,11 +126,48 @@ function getUpdatedPath(newDirs) {
   return updatedPath;
 }
 
+function isPnpmOwnedCodexInstall(nodeModulesDir) {
+  if (!existsSync(path.join(nodeModulesDir, ".modules.yaml"))) {
+    return false;
+  }
+
+  try {
+    // @cometix: package scope is @cometix/codex
+    return (
+      realpathSync(path.join(nodeModulesDir, "@cometix", "codex")) ===
+      codexPackageRoot
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Use heuristics to detect the package manager that was used to install Codex
  * in order to give the user a hint about how to update it.
  */
 function detectPackageManager() {
+  // pnpm's owning node_modules directory can be several parents above the
+  // package in isolated global layouts. Search ancestors of both the canonical
+  // package root and lexical entrypoint because pnpm may link either path.
+  const entrypointDir = path.dirname(path.resolve(process.argv[1]));
+  for (const startDir of new Set([codexPackageRoot, entrypointDir])) {
+    const filesystemRoot = path.parse(startDir).root;
+    for (
+      let currentDir = startDir;
+      currentDir !== filesystemRoot;
+      currentDir = path.dirname(currentDir)
+    ) {
+      if (isPnpmOwnedCodexInstall(path.join(currentDir, "node_modules"))) {
+        return "pnpm";
+      }
+    }
+
+    if (isPnpmOwnedCodexInstall(path.join(filesystemRoot, "node_modules"))) {
+      return "pnpm";
+    }
+  }
+
   const userAgent = process.env.npm_config_user_agent || "";
   if (/\bbun\//.test(userAgent)) {
     return "bun";
@@ -158,6 +188,16 @@ function detectPackageManager() {
   return userAgent ? "npm" : null;
 }
 
+function reinstallCommand(packageManager) {
+  if (packageManager === "bun") {
+    return "bun install -g @cometix/codex@latest";
+  }
+  if (packageManager === "pnpm") {
+    return "pnpm add -g @cometix/codex@latest";
+  }
+  return "npm install -g @cometix/codex@latest";
+}
+
 const additionalDirs = [];
 const pathDir = path.join(archRoot, "path");
 if (existsSync(pathDir)) {
@@ -165,13 +205,22 @@ if (existsSync(pathDir)) {
 }
 const updatedPath = getUpdatedPath(additionalDirs);
 
-const env = { ...process.env, PATH: updatedPath };
+const packageManager = detectPackageManager();
 const packageManagerEnvVar =
-  detectPackageManager() === "bun"
+  packageManager === "bun"
     ? "CODEX_MANAGED_BY_BUN"
-    : "CODEX_MANAGED_BY_NPM";
+    : packageManager === "pnpm"
+      ? "CODEX_MANAGED_BY_PNPM"
+      : "CODEX_MANAGED_BY_NPM";
+const env = {
+  ...process.env,
+  PATH: updatedPath,
+  CODEX_MANAGED_PACKAGE_ROOT: codexPackageRoot,
+};
+delete env.CODEX_MANAGED_BY_NPM;
+delete env.CODEX_MANAGED_BY_BUN;
+delete env.CODEX_MANAGED_BY_PNPM;
 env[packageManagerEnvVar] = "1";
-env.CODEX_MANAGED_PACKAGE_ROOT = realpathSync(path.join(__dirname, ".."));
 
 const child = spawn(binaryPath, process.argv.slice(2), {
   stdio: "inherit",
