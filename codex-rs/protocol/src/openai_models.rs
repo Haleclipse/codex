@@ -754,7 +754,6 @@ mod tests {
         assert_eq!(
             (
                 "high".parse(),
-                "ultra".parse(),
                 "max".parse(),
                 "ultra".parse(),
                 "future".parse(),
