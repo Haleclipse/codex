@@ -1272,8 +1272,12 @@ async fn plugin_list_filters_plugins_for_custom_session_source_products() -> Res
 }"#,
     )?;
 
-    let mut mcp =
-        TestAppServer::new_with_args(codex_home.path(), &["--session-source", "chatgpt"]).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_args(&["--session-source", "chatgpt"])
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -1353,7 +1357,11 @@ async fn plugin_list_defaults_non_custom_session_source_to_codex_products() -> R
 }"#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp

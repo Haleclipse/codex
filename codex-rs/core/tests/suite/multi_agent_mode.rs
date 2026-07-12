@@ -54,28 +54,6 @@ fn configure_ultra(config: &mut Config) {
     config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
 }
 
-fn add_ultra_reasoning(model_info: &mut ModelInfo) {
-    model_info.supports_reasoning_summaries = true;
-    model_info
-        .supported_reasoning_levels
-        .push(ReasoningEffortPreset {
-            effort: ReasoningEffort::Ultra,
-            description: "Ultra".to_string(),
-        });
-}
-
-fn configure_multi_agent_v2(config: &mut Config) {
-    config
-        .features
-        .enable(Feature::MultiAgentV2)
-        .expect("test config should allow feature update");
-}
-
-fn configure_ultra(config: &mut Config) {
-    configure_multi_agent_v2(config);
-    config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
-}
-
 fn developer_texts(input: &[Value]) -> Vec<&str> {
     input
         .iter()
