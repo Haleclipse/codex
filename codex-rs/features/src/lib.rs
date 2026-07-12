@@ -18,6 +18,7 @@ mod feature_configs;
 mod legacy;
 pub use feature_configs::CodeModeConfigToml;
 pub use feature_configs::CurrentTimeReminderConfigToml;
+pub use feature_configs::CurrentTimeReminderDeliveryMode;
 pub use feature_configs::CurrentTimeSource;
 pub use feature_configs::MultiAgentV2ConfigToml;
 pub use feature_configs::NetworkProxyConfigToml;
@@ -91,6 +92,8 @@ pub enum Feature {
     // Experimental
     /// Enable JavaScript code mode backed by the in-process V8 runtime.
     CodeMode,
+    /// Run JavaScript code mode in the standalone host process.
+    CodeModeHost,
     /// Restrict model-visible tools to code mode entrypoints (`exec`, `wait`).
     CodeModeOnly,
     /// Use the single unified PTY-backed exec tool.
@@ -187,7 +190,7 @@ pub enum Feature {
     ///
     /// Requirements-only gate: this should be set from requirements, not user config.
     ComputerUse,
-    /// Temporary internal-only flag for PS-backed remote plugin catalog development.
+    /// Enable the PS-backed remote plugin catalog.
     RemotePlugin,
     /// Enable remote plugin sharing flows.
     PluginSharing,
@@ -201,6 +204,8 @@ pub enum Feature {
     ResizeAllImages,
     /// Generate Responses API item IDs for client-created history items.
     ItemIds,
+    /// Request sequential cutoff reasoning summary delivery.
+    ConcurrentReasoningSummaries,
     /// Allow prompting and installing missing MCP dependencies.
     SkillMcpDependencyInstall,
     /// Removed compatibility flag for deleted skill env var dependency prompting.
@@ -219,8 +224,6 @@ pub enum Feature {
     RolloutBudget,
     /// Add current-time reminders to model-visible context.
     CurrentTimeReminder,
-    /// Expose an input-interruptible sleep tool.
-    SleepTool,
     /// Route MCP tool approval prompts through the MCP elicitation request path.
     ToolCallMcpElicitation,
     /// Prompt Codex Apps connector auth failures through MCP URL elicitations.
@@ -235,8 +238,6 @@ pub enum Feature {
     RealtimeConversation,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
-    /// Enable automatic context compaction before or during a turn.
-    AutoCompaction,
     /// Enable remote compaction v2 over the normal Responses API.
     RemoteCompactionV2,
     /// Use Agent Identity for ChatGPT-authenticated sessions.
@@ -854,6 +855,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::CodeModeHost,
+        key: "code_mode_host",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::CodeModeOnly,
         key: "code_mode_only",
         stage: Stage::UnderDevelopment,
@@ -1140,8 +1147,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RemotePlugin,
         key: "remote_plugin",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::PluginSharing,
@@ -1176,6 +1183,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ItemIds,
         key: "item_ids",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ConcurrentReasoningSummaries,
+        key: "concurrent_reasoning_summaries",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1242,12 +1255,6 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::CurrentTimeReminder,
         key: "current_time_reminder",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::SleepTool,
-        key: "sleep_tool",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1346,12 +1353,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "responses_websockets_v2",
         stage: Stage::Removed,
         default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::AutoCompaction,
-        key: "auto_compaction",
-        stage: Stage::Stable,
-        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::RemoteCompactionV2,

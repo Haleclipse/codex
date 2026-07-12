@@ -57,6 +57,7 @@ fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONR
         | ResponseItem::Compaction { .. }
         | ResponseItem::CompactionTrigger { .. }
         | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::AdditionalTools { .. }
         | ResponseItem::Other => false,
     }) {
         return Err(invalid_request(REMOTE_IMAGE_URL_ERROR));
@@ -1001,6 +1002,9 @@ impl TurnRequestProcessor {
             thread.as_ref(),
             Op::RealtimeConversationStart(ConversationStartParams {
                 client_managed_handoffs: params.client_managed_handoffs.unwrap_or(false),
+                flush_transcript_tail_on_session_end: params
+                    .flush_transcript_tail_on_session_end
+                    .unwrap_or(false),
                 codex_responses_as_items: params.codex_responses_as_items.unwrap_or(false),
                 codex_response_item_prefix: params.codex_response_item_prefix,
                 codex_response_handoff_prefix: params.codex_response_handoff_prefix,
@@ -1228,7 +1232,7 @@ impl TurnRequestProcessor {
                 config.clone(),
                 InitialHistory::Resumed(ResumedHistory {
                     conversation_id: parent_thread_id,
-                    history: parent_history.items,
+                    history: Arc::new(parent_history.items),
                     rollout_path: parent_thread.rollout_path(),
                 }),
                 /*thread_source*/ None,

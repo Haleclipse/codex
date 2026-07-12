@@ -7,6 +7,7 @@
 use super::plugin_mentions::fetch_plugin_mentions;
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
+use crate::app_info::app_info_from_api;
 use crate::config_update::format_config_error;
 use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
@@ -797,7 +798,10 @@ pub(super) async fn consume_rate_limit_reset_credit_request(
     request_handle
         .request_typed(ClientRequest::ConsumeAccountRateLimitResetCredit {
             request_id,
-            params: ConsumeAccountRateLimitResetCreditParams { idempotency_key },
+            params: ConsumeAccountRateLimitResetCreditParams {
+                idempotency_key,
+                credit_id: None,
+            },
         })
         .await
         .wrap_err("account/rateLimitResetCredit/consume failed in TUI")
@@ -870,7 +874,7 @@ pub(super) async fn fetch_connectors_list(
         .await
         .wrap_err("app/list failed in TUI")?;
     Ok(ConnectorsSnapshot {
-        connectors: response.data,
+        connectors: response.data.into_iter().map(app_info_from_api).collect(),
     })
 }
 
