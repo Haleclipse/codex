@@ -95,8 +95,10 @@ impl ChatWidget {
     pub(crate) fn refresh_status_line(&mut self) {
         self.refresh_status_surfaces();
         // @cometix: also push cxline data on every status refresh
-        self.update_cxline_data();
-        self.request_cxline_git_preview();
+        if self.get_statusline_config().enabled {
+            self.update_cxline_data();
+            self.request_cxline_git_preview();
+        }
     }
 
     // @cometix: push runtime data to cxline statusline in bottom_pane

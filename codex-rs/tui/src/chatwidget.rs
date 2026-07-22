@@ -2029,7 +2029,6 @@ impl ChatWidget {
     ) {
         self.cxline_git_preview_pending = false;
         self.bottom_pane.set_statusline_git_preview(preview);
-        self.refresh_status_line();
     }
 
     pub(crate) fn set_translation_config(&mut self, config: crate::translation::TranslationConfig) {
