@@ -2228,6 +2228,28 @@ async fn status_line_invalid_items_warn_once() {
 }
 
 #[tokio::test]
+async fn cxline_git_preview_update_does_not_schedule_another_preview() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.cxline_git_preview_pending = true;
+
+    chat.set_statusline_git_preview(crate::statusline::GitPreviewData::empty());
+
+    assert!(!chat.cxline_git_preview_pending);
+}
+
+#[tokio::test]
+async fn disabled_cxline_does_not_request_git_preview_on_status_refresh() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut config = chat.get_statusline_config();
+    config.enabled = false;
+    chat.bottom_pane.set_statusline_config(config);
+
+    chat.refresh_status_line();
+
+    assert!(!chat.cxline_git_preview_pending);
+}
+
+#[tokio::test]
 async fn status_line_context_used_renders_labeled_percent() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
