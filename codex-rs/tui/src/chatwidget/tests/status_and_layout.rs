@@ -2243,6 +2243,10 @@ async fn disabled_cxline_does_not_request_git_preview_on_status_refresh() {
     let mut config = chat.get_statusline_config();
     config.enabled = false;
     chat.bottom_pane.set_statusline_config(config);
+    // Widget construction already refreshes the status line once, so clear the
+    // flag it left behind; otherwise this asserts on startup state instead of
+    // on what `refresh_status_line` does while cxline is disabled.
+    chat.cxline_git_preview_pending = false;
 
     chat.refresh_status_line();
 
