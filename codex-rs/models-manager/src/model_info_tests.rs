@@ -1,6 +1,7 @@
 use super::*;
 use crate::ModelsManagerConfig;
 use codex_protocol::openai_models::ApprovalMessages;
+use codex_protocol::openai_models::AutoReviewMessages;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -60,6 +61,7 @@ fn base_instruction_override_preserves_catalog_approval_messages() {
             personality_pragmatic: Some("pragmatic".to_string()),
         }),
         approvals: Some(approvals.clone()),
+        auto_review: None,
     });
     let config = ModelsManagerConfig {
         base_instructions: Some("override".to_string()),
@@ -74,6 +76,7 @@ fn base_instruction_override_preserves_catalog_approval_messages() {
             instructions_template: None,
             instructions_variables: None,
             approvals: Some(approvals),
+            auto_review: None,
         })
     );
 }
@@ -89,6 +92,7 @@ fn disabled_personality_preserves_catalog_approval_messages() {
         instructions_template: Some("template".to_string()),
         instructions_variables: None,
         approvals: Some(approvals.clone()),
+        auto_review: None,
     });
     let config = ModelsManagerConfig {
         personality_enabled: false,
@@ -103,6 +107,37 @@ fn disabled_personality_preserves_catalog_approval_messages() {
             instructions_template: None,
             instructions_variables: None,
             approvals: Some(approvals),
+            auto_review: None,
+        })
+    );
+}
+
+#[test]
+fn base_instruction_override_preserves_catalog_auto_review_messages() {
+    let mut model = model_info_from_slug("unknown-model");
+    let auto_review = AutoReviewMessages {
+        policy: Some("review policy".to_string()),
+    };
+    model.model_messages = Some(ModelMessages {
+        instructions_template: Some("template".to_string()),
+        instructions_variables: None,
+        approvals: None,
+        auto_review: Some(auto_review.clone()),
+    });
+    let config = ModelsManagerConfig {
+        base_instructions: Some("override".to_string()),
+        ..Default::default()
+    };
+
+    let updated = with_config_overrides(model, &config);
+
+    assert_eq!(
+        updated.model_messages,
+        Some(ModelMessages {
+            instructions_template: None,
+            instructions_variables: None,
+            approvals: None,
+            auto_review: Some(auto_review),
         })
     );
 }
