@@ -13,7 +13,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 # @cometix: use system git for fetching git dependencies — Cargo's built-in
 # libgit2 SecureTransport backend fails intermittently on GitHub-hosted macOS
@@ -38,6 +38,7 @@ jobs:
           # 1. Must be a tag and match the regex
           [[ "${GITHUB_REF_TYPE}" == "tag" ]] \
             || { echo "❌  Not a tag push"; exit 1; }
+          # @cometix: tag regex additionally accepts the -cometix suffix
           [[ "${GITHUB_REF_NAME}" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|cometix)(\.[0-9]+)?)?$ ]] \
             || { echo "❌  Tag '${GITHUB_REF_NAME}' doesn't match expected format"; exit 1; }
 
@@ -319,6 +320,8 @@ jobs:
     outputs:
       version: ${{ steps.release_name.outputs.name }}
       tag: ${{ github.ref_name }}
+      make_latest: ${{ steps.release_name.outputs.make_latest }}
+      prerelease: ${{ steps.release_name.outputs.prerelease }}
       should_publish_npm: ${{ steps.npm_publish_settings.outputs.should_publish }}
       npm_tag: ${{ steps.npm_publish_settings.outputs.npm_tag }}
 
@@ -379,6 +382,13 @@ jobs:
           # "rust-v0.1.0".
           version="${GITHUB_REF_NAME#rust-v}"
           echo "name=${version}" >> $GITHUB_OUTPUT
+          if [[ "${version}" == *-* ]]; then
+            echo "make_latest=false" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "make_latest=true" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Determine npm publish settings
         id: npm_publish_settings
@@ -391,7 +401,7 @@ jobs:
           if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
             echo "npm_tag=" >> "$GITHUB_OUTPUT"
-          elif [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
+          elif [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+(\.[0-9]+)?$ ]]; then
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
             echo "npm_tag=alpha" >> "$GITHUB_OUTPUT"
           elif [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-cometix(\.[0-9]+)?$ ]]; then
@@ -433,19 +443,26 @@ jobs:
           tag_name: ${{ github.ref_name }}
           body_path: ${{ steps.release_notes.outputs.path }}
           files: dist/**
+          overwrite_files: true
+          make_latest: ${{ steps.release_name.outputs.make_latest }}
           # Mark as prerelease only when the version has a suffix after x.y.z
           # (e.g. -alpha, -beta). Otherwise publish a normal release.
-          prerelease: ${{ contains(steps.release_name.outputs.name, '-') }}
+          prerelease: ${{ steps.release_name.outputs.prerelease }}
 
-      # @cometix: removed dotslash-publish-release and developers.openai.com deploy
-      # (not applicable to fork)
+      # @cometix: removed dotslash-publish-release, publish-r2, and
+      # developers.openai.com deploy (not applicable to fork)
 
   # Publish to npm using OIDC authentication.
   # July 31, 2025: https://github.blog/changelog/2025-07-31-npm-trusted-publishing-with-oidc-is-generally-available/
   # npm docs: https://docs.npmjs.com/trusted-publishers
   publish-npm:
-    # Publish to npm for stable releases and alpha pre-releases with numeric suffixes.
-    if: ${{ needs.release.outputs.should_publish_npm == 'true' }}
+    # Publish to npm for stable releases, numbered alphas, and alpha hotfixes.
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.release.result == 'success' &&
+        needs.release.outputs.should_publish_npm == 'true'
+      }}
     name: publish-npm
     needs: release
     runs-on: ubuntu-latest
