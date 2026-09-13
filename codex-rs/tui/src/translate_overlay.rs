@@ -302,12 +302,12 @@ impl TranslateOverlay {
                     tui.frame_requester().schedule_frame();
                 }
             }
-            TuiEvent::Draw => {
+            TuiEvent::Draw | TuiEvent::Resume => {
                 tui.draw(u16::MAX, |frame| {
                     self.render(frame.area(), frame.buffer_mut());
                 })?;
             }
-            TuiEvent::Resize => {}
+            TuiEvent::Resize(_) => {}
         }
         Ok(())
     }

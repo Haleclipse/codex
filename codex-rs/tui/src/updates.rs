@@ -4,7 +4,10 @@ use crate::legacy_core::config::Config;
 use chrono::DateTime;
 use chrono::Duration;
 use chrono::Utc;
-use codex_login::default_client::create_client;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
+use codex_login::default_client::default_headers;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::Path;
@@ -24,11 +27,12 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
         None => true,
         Some(info) => info.last_checked_at < Utc::now() - Duration::hours(20),
     } {
+        let http_client_factory = config.http_client_factory();
         // Refresh the cached latest version in the background so TUI startup
         // isn't blocked by a network call. The UI reads the previously cached
         // value (if any) for this run; the next run shows the banner if needed.
         tokio::spawn(async move {
-            check_for_update(&version_file)
+            check_for_update(&version_file, http_client_factory)
                 .await
                 .inspect_err(|e| tracing::error!("Failed to update version: {e}"))
         });
@@ -78,10 +82,20 @@ fn read_version_info(version_file: &Path) -> anyhow::Result<VersionInfo> {
     Ok(serde_json::from_str(&contents)?)
 }
 
-async fn check_for_update(version_file: &Path) -> anyhow::Result<()> {
-    // Fetch latest version from npm registry
-    let npm_info: NpmPackageInfo = create_client()
+// @cometix: check the fork's npm registry instead of upstream GitHub releases,
+// routed through the shared client pool so proxy settings are honored.
+async fn check_for_update(
+    version_file: &Path,
+    http_client_factory: HttpClientFactory,
+) -> anyhow::Result<()> {
+    let client_pool = RouteAwareClientPool::with_chatgpt_cloudflare_cookies(
+        http_client_factory,
+        ClientRouteClass::Other,
+    )
+    .with_legacy_custom_ca_fallback();
+    let npm_info: NpmPackageInfo = client_pool
         .get(NPM_REGISTRY_URL)
+        .headers(default_headers())
         .send()
         .await?
         .error_for_status()?

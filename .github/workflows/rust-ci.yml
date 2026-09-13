@@ -129,9 +129,18 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy
 
+      # @cometix: since 0.147.0 the v8 crate is a hard dependency of
+      # code-mode-runtime, so excluding codex-v8-poc no longer avoids it.
+      # denoland/rusty_v8 does not publish ptrcomp_sandbox archives, so pull the
+      # Codex-built artifacts the same way rust-release.yml does.
+      - name: Setup rusty_v8 artifacts
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+
       - name: cargo clippy
-        # @cometix: exclude v8-poc (requires pre-built V8 binaries not available via cargo)
-        # @cometix: --workspace without --all-features to avoid pulling in v8-poc's v8 dependency
+        # @cometix: exclude v8-poc (a standalone demo crate the fork does not ship)
+        # @cometix: --workspace without --all-features to keep optional features off
         run: cargo clippy --workspace --target ${{ matrix.target }} --tests --profile ${{ matrix.profile }} --exclude codex-v8-poc -- -D warnings
 
   # --- Gatherer job (the ONLY required status check) --------------------------

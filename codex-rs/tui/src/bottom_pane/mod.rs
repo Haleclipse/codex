@@ -27,8 +27,9 @@ use crate::bottom_pane::unified_exec_footer::UnifiedExecFooter;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
+use crate::keymap::KeymapContext;
+use crate::keymap::KeymapContextSet;
 use crate::keymap::RuntimeKeymap;
-use crate::keymap::primary_binding;
 use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableItem;
@@ -400,7 +401,7 @@ impl BottomPane {
     pub fn set_keymap_bindings(&mut self, keymap: &RuntimeKeymap) {
         self.keymap = keymap.clone();
         self.composer.set_keymap_bindings(keymap);
-        let interrupt_binding = primary_binding(&keymap.chat.interrupt_turn);
+        let interrupt_binding = keymap.primary_hint(KeymapContext::Chat, "interrupt_turn");
         self.pending_input_preview
             .set_interrupt_binding(interrupt_binding);
         if let Some(status) = self.status.as_mut() {
@@ -487,7 +488,10 @@ impl BottomPane {
 
     /// Update the key hint shown next to queued messages so it matches the
     /// binding that `ChatWidget` actually listens for.
-    pub(crate) fn set_queued_message_edit_binding(&mut self, binding: Option<KeyBinding>) {
+    pub(crate) fn set_queued_message_edit_binding(
+        &mut self,
+        binding: Option<crate::key_hint::ShortcutHint>,
+    ) {
         self.pending_input_preview.set_edit_binding(binding);
         self.request_redraw();
     }
@@ -692,6 +696,15 @@ impl BottomPane {
                 self.request_redraw_in(ChatComposer::recommended_paste_flush_delay());
             }
             input_result
+        }
+    }
+
+    /// Return the contexts whose ordinary handlers can consume the next key.
+    pub(crate) fn keymap_contexts(&self) -> KeymapContextSet {
+        if let Some(view) = self.view_stack.last() {
+            view.keymap_contexts()
+        } else {
+            self.composer.keymap_contexts()
         }
     }
 
@@ -1049,7 +1062,10 @@ impl BottomPane {
                 }
                 if let Some(status) = self.status.as_mut() {
                     status.set_interrupt_hint_visible(/*visible*/ true);
-                    status.set_interrupt_binding(primary_binding(&self.keymap.chat.interrupt_turn));
+                    status.set_interrupt_binding(
+                        self.keymap
+                            .primary_hint(KeymapContext::Chat, "interrupt_turn"),
+                    );
                 }
                 self.sync_status_inline_message();
                 self.request_redraw();
@@ -1079,7 +1095,10 @@ impl BottomPane {
                 self.animations_enabled,
             ));
             if let Some(status) = self.status.as_mut() {
-                status.set_interrupt_binding(primary_binding(&self.keymap.chat.interrupt_turn));
+                status.set_interrupt_binding(
+                    self.keymap
+                        .primary_hint(KeymapContext::Chat, "interrupt_turn"),
+                );
             }
             self.sync_status_inline_message();
             self.request_redraw();
@@ -1150,6 +1169,11 @@ impl BottomPane {
             weekly_rate_limit_percent,
             weekly_rate_limit_resets_at,
         );
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_context_window_pending(&mut self, pending: bool) {
+        self.composer.set_context_window_pending(pending);
         self.request_redraw();
     }
 
@@ -1282,6 +1306,13 @@ impl BottomPane {
         self.view_stack
             .last()
             .filter(|view| view.view_id() == Some(view_id))
+            .and_then(|view| view.selected_index())
+    }
+
+    pub(crate) fn selected_index_for_present_view(&self, view_id: &'static str) -> Option<usize> {
+        self.view_stack
+            .iter()
+            .rfind(|view| view.view_id() == Some(view_id))
             .and_then(|view| view.selected_index())
     }
 
@@ -1595,7 +1626,7 @@ impl BottomPane {
             self.has_input_focus,
             self.enhanced_keys_supported,
             self.disable_paste_burst,
-            self.keymap.list.clone(),
+            self.keymap.clone(),
         );
         self.pause_status_timer_for_modal();
         self.set_composer_input_enabled(

@@ -1,8 +1,10 @@
 use super::*;
 use crate::config::ConfigBuilder;
+use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::TurnEnvironmentState;
+use crate::session::turn_context::EnvironmentConfig;
 use crate::session::turn_context::TurnEnvironment;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerStack;
@@ -20,6 +22,7 @@ use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::RemoveOptions;
 use codex_extension_api::UserInstructions;
 use codex_features::Feature;
+use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
@@ -337,6 +340,12 @@ fn resolved_local_environments<const N: usize>(
                     PathUri::from_abs_path(&cwd),
                     Vec::new(),
                     /*shell*/ None,
+                    EnvironmentConfig {
+                        allow_login_shell: true,
+                        permission_profile: PermissionProfileSnapshot::legacy(
+                            PermissionProfile::read_only(),
+                        ),
+                    },
                 ))
             })
             .collect(),
