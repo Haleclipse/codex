@@ -16,6 +16,11 @@ tracing = { workspace = true }
 [lints]
 workspace = true
 
+# @cometix: `record_retry!` in src/retry.rs calls `::tracing::event!` from inside
+# a macro body, which cargo-shear's static analysis cannot see.
+[package.metadata.cargo-shear]
+ignored = ["tracing"]
+
 [lib]
 doctest = false
 test = false
