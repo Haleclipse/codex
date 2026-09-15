@@ -6,5 +6,4 @@ expression: normalized_backend_snapshot(terminal.backend())
 "────────────────────────────────────────────────────────────────────────────────"
 "❯ Ask Codex to do anything                                                      "
 "────────────────────────────────────────────────────────────────────────────────"
-"   GPT 5.3 Codex │ 󰉋 tui │  - · - tokens                                      "
-"  Fast on                                                                       "
+"   GPT 5.2 ·high │ 󰉋 project │  - · - tokens                                  "

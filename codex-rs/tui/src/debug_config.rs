@@ -953,12 +953,15 @@ interrupt_message = false
             allow_managed_hooks_only: Some(true),
             allow_appshots: Some(false),
             allow_remote_control: Some(false),
+            allow_browser_and_computer_use: None,
             computer_use: None,
             browser_use: None,
+            in_app_browser: None,
             windows: Some(WindowsRequirementsToml {
                 allowed_sandbox_implementations: None,
                 sandbox_private_desktop: Some(false),
             }),
+            additional_developer_instructions: None,
             guardian_policy_config: Some("Use the managed guardian policy.".to_string()),
             feature_requirements: Some(FeatureRequirementsToml {
                 entries: BTreeMap::from([("guardian_approval".to_string(), true)]),

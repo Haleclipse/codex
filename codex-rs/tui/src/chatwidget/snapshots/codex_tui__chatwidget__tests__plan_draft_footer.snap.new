@@ -1,0 +1,9 @@
+---
+source: tui/src/chatwidget/tests/plan_mode.rs
+assertion_line: 75
+expression: "normalize_snapshot_paths(render_bottom_popup(&chat, 80))"
+---
+────────────────────────────────────────────────────────────────────────────────
+❯ make a plan
+────────────────────────────────────────────────────────────────────────────────
+   GPT 5 │ 󰉋 project │  - · - tokens

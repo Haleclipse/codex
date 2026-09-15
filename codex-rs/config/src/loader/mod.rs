@@ -38,7 +38,10 @@ use crate::thread_config::ThreadConfigContext;
 use crate::thread_config::ThreadConfigLoader;
 use codex_file_system::ExecutorFileSystem;
 use codex_git_utils::resolve_root_git_project_for_trust;
+use codex_network_proxy::credential_broker_provider_context_env_keys;
+use codex_network_proxy::is_credential_broker_provider_env_key;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::protocol::AskForApproval;
@@ -47,6 +50,7 @@ use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
 use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 #[cfg(windows)]
@@ -386,9 +390,14 @@ pub async fn load_config_layers_state(
                 return Err(err);
             }
         };
-        let project_trust_context = match project_trust_context(
+        let mut project_trust_context = match project_trust_context(
             fs,
             &merged_so_far,
+            &credential_broker_trusted_config(
+                &merged_so_far,
+                &thread_config_layers,
+                &loaded_config_layers,
+            ),
             &cwd,
             &project_root_markers,
             codex_home,
@@ -412,6 +421,7 @@ pub async fn load_config_layers_state(
                 return Err(err);
             }
         };
+        apply_credential_broker_requirements(&mut project_trust_context, &config_requirements_toml);
         let project_layers = load_project_layers(
             fs,
             &cwd,
@@ -986,6 +996,38 @@ fn toml_value_from_serializable<T: serde::Serialize>(value: T) -> io::Result<Tom
     TomlValue::try_from(value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialBrokerProjectState {
+    Unconfigured,
+    Disabled,
+    Enabled,
+}
+
+fn apply_credential_broker_requirements(
+    context: &mut ProjectTrustContext,
+    requirements: &crate::ConfigRequirementsWithSources,
+) {
+    if context.credential_broker == CredentialBrokerProjectState::Unconfigured {
+        return;
+    }
+    let enabled = requirements
+        .feature_requirements
+        .as_ref()
+        .and_then(|requirements| requirements.entries.get("network_proxy"))
+        .copied()
+        .unwrap_or(context.credential_broker == CredentialBrokerProjectState::Enabled);
+    context.credential_broker = if enabled
+        && requirements
+            .network
+            .as_ref()
+            .is_none_or(|network| network.enabled != Some(false))
+    {
+        CredentialBrokerProjectState::Enabled
+    } else {
+        CredentialBrokerProjectState::Disabled
+    };
+}
+
 struct ProjectTrustContext {
     project_root: AbsolutePathBuf,
     project_root_key: String,
@@ -996,6 +1038,8 @@ struct ProjectTrustContext {
     repo_root_lookup_keys: Option<Vec<String>>,
     projects_trust: std::collections::HashMap<String, TrustLevel>,
     user_config_file: AbsolutePathBuf,
+    credential_broker: CredentialBrokerProjectState,
+    credential_broker_binding_env: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -1111,21 +1155,140 @@ fn project_layer_entry(
     entry.with_hooks_config_folder_override(hooks_config_folder_override)
 }
 
-fn sanitize_project_config(config: &mut TomlValue) -> Vec<String> {
+fn sanitize_project_config(
+    config: &mut TomlValue,
+    credential_broker: CredentialBrokerProjectState,
+    trusted_binding_env: &HashMap<String, String>,
+) -> Vec<String> {
     let Some(table) = config.as_table_mut() else {
         return Vec::new();
     };
 
+    let credential_broker_configured =
+        credential_broker != CredentialBrokerProjectState::Unconfigured;
     let mut ignored_keys = Vec::new();
     for key in PROJECT_LOCAL_CONFIG_DENYLIST {
         if table.remove(*key).is_some() {
             ignored_keys.push((*key).to_string());
         }
     }
-    if let Some(features) = table.get_mut("features").and_then(TomlValue::as_table_mut)
-        && features.remove("respect_system_proxy").is_some()
+    if let Some(features) = table.get_mut("features").and_then(TomlValue::as_table_mut) {
+        if credential_broker == CredentialBrokerProjectState::Enabled
+            && features.remove("shell_snapshot").is_some()
+        {
+            ignored_keys.push("features.shell_snapshot".to_string());
+        }
+        if features.remove("respect_system_proxy").is_some() {
+            ignored_keys.push("features.respect_system_proxy".to_string());
+        }
+        if credential_broker_configured
+            && features
+                .get("network_proxy")
+                .is_some_and(|network_proxy| network_proxy.as_bool().is_some())
+        {
+            features.remove("network_proxy");
+            ignored_keys.push("features.network_proxy".to_string());
+        } else if let Some(network_proxy) = features
+            .get_mut("network_proxy")
+            .and_then(TomlValue::as_table_mut)
+        {
+            if network_proxy.remove("credential_broker").is_some() {
+                ignored_keys.push("features.network_proxy.credential_broker".to_string());
+            }
+            if credential_broker_configured && network_proxy.remove("enabled").is_some() {
+                ignored_keys.push("features.network_proxy.enabled".to_string());
+            }
+        }
+    }
+    if credential_broker == CredentialBrokerProjectState::Enabled
+        && let Some(policy) = table
+            .get_mut("shell_environment_policy")
+            .and_then(TomlValue::as_table_mut)
     {
-        ignored_keys.push("features.respect_system_proxy".to_string());
+        if policy.remove("experimental_use_profile").is_some() {
+            ignored_keys.push("shell_environment_policy.experimental_use_profile".to_string());
+        }
+        let binding_keys = credential_broker_provider_context_env_keys().collect::<Vec<_>>();
+        if let Some(overrides) = policy.get_mut("set").and_then(TomlValue::as_table_mut) {
+            overrides.retain(|key, _| {
+                if key.eq_ignore_ascii_case("ZDOTDIR")
+                    || key.eq_ignore_ascii_case("BASH_ENV")
+                    || is_credential_broker_provider_env_key(key)
+                    || binding_keys
+                        .iter()
+                        .any(|binding_key| key.eq_ignore_ascii_case(binding_key))
+                {
+                    ignored_keys.push(format!("shell_environment_policy.set.{key}"));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        if let Some(include_only) = policy
+            .get_mut("include_only")
+            .and_then(TomlValue::as_array_mut)
+            && !include_only.is_empty()
+        {
+            for binding_key in &binding_keys {
+                if !include_only.iter().any(|pattern| {
+                    pattern.as_str().is_some_and(|pattern| {
+                        EnvironmentVariablePattern::new_case_insensitive(pattern)
+                            .matches(binding_key)
+                    })
+                }) {
+                    include_only.push(TomlValue::String(binding_key.to_string()));
+                }
+            }
+        }
+
+        if let Some(filters) = policy.get_mut("filters").and_then(TomlValue::as_table_mut)
+            && filters
+                .values()
+                .any(|action| action.as_str() == Some("include"))
+        {
+            for binding_key in &binding_keys {
+                if !filters.iter().any(|(pattern, action)| {
+                    action.as_str() == Some("include")
+                        && EnvironmentVariablePattern::new_case_insensitive(pattern)
+                            .matches(binding_key)
+                }) {
+                    filters.insert(
+                        binding_key.to_string(),
+                        TomlValue::String("include".to_string()),
+                    );
+                }
+            }
+        }
+
+        if !trusted_binding_env.is_empty()
+            && ["inherit", "exclude", "include_only", "filters"]
+                .iter()
+                .any(|key| policy.contains_key(*key))
+        {
+            let overrides = policy
+                .entry("set".to_string())
+                .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+            if let Some(overrides) = overrides.as_table_mut() {
+                for (key, value) in trusted_binding_env {
+                    overrides.insert(key.clone(), TomlValue::String(value.clone()));
+                }
+            }
+        }
+    }
+    // Repository contents must not turn an ordinary key into a permission increase.
+    if let Some(chat) = table
+        .get_mut("tui")
+        .and_then(|tui| tui.get_mut("keymap"))
+        .and_then(|keymap| keymap.get_mut("chat"))
+        .and_then(TomlValue::as_table_mut)
+    {
+        for key in ["previous_permission_mode", "next_permission_mode"] {
+            if chat.remove(key).is_some() {
+                ignored_keys.push(format!("tui.keymap.chat.{key}"));
+            }
+        }
     }
 
     ignored_keys
@@ -1151,6 +1314,7 @@ fn project_ignored_config_keys_warning(
 async fn project_trust_context(
     fs: &dyn ExecutorFileSystem,
     merged_config: &TomlValue,
+    trusted_broker_config: &TomlValue,
     cwd: &AbsolutePathBuf,
     project_root_markers: &[String],
     config_base_dir: &Path,
@@ -1185,6 +1349,58 @@ async fn project_trust_context(
         .into_iter()
         .filter_map(|(key, project)| project.trust_level.map(|trust_level| (key, trust_level)))
         .collect();
+    let network_proxy = trusted_broker_config
+        .get("features")
+        .and_then(|features| features.get("network_proxy"))
+        .and_then(TomlValue::as_table);
+    let credential_broker_configured = network_proxy.is_some_and(|network_proxy| {
+        network_proxy.get("credential_broker") == Some(&TomlValue::Boolean(true))
+    });
+    let credential_broker = if credential_broker_configured {
+        if network_proxy
+            .and_then(|network_proxy| network_proxy.get("enabled"))
+            .and_then(TomlValue::as_bool)
+            .unwrap_or(false)
+        {
+            CredentialBrokerProjectState::Enabled
+        } else {
+            CredentialBrokerProjectState::Disabled
+        }
+    } else {
+        CredentialBrokerProjectState::Unconfigured
+    };
+    let credential_broker_binding_env = if credential_broker_configured {
+        let trusted_policy_overrides = trusted_broker_config
+            .get("shell_environment_policy")
+            .and_then(|policy| policy.get("set"))
+            .and_then(TomlValue::as_table);
+        credential_broker_provider_context_env_keys()
+            .filter_map(|key| {
+                let trusted_override = trusted_policy_overrides
+                    .and_then(|overrides| {
+                        overrides.iter().find(|(candidate, _)| {
+                            if cfg!(windows) {
+                                candidate.eq_ignore_ascii_case(key)
+                            } else {
+                                candidate.as_str() == key
+                            }
+                        })
+                    })
+                    .and_then(|(name, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (name.clone(), value.to_string()))
+                    });
+                trusted_override.or_else(|| {
+                    std::env::var(key)
+                        .ok()
+                        .map(|value| (key.to_string(), value))
+                })
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
     Ok(ProjectTrustContext {
         project_root,
@@ -1196,7 +1412,27 @@ async fn project_trust_context(
         repo_root_lookup_keys,
         projects_trust,
         user_config_file: user_config_file.clone(),
+        credential_broker,
+        credential_broker_binding_env,
     })
+}
+
+fn credential_broker_trusted_config(
+    merged_config: &TomlValue,
+    thread_config_layers: &[ConfigLayerEntry],
+    loaded_config_layers: &LoadedConfigLayers,
+) -> TomlValue {
+    let mut trusted_config = merged_config.clone();
+    for layer in thread_config_layers {
+        merge_toml_values(&mut trusted_config, &layer.config);
+    }
+    if let Some(config) = loaded_config_layers.managed_config.as_ref() {
+        merge_toml_values(&mut trusted_config, &config.managed_config);
+    }
+    if let Some(config) = loaded_config_layers.managed_config_from_mdm.as_ref() {
+        merge_toml_values(&mut trusted_config, &config.managed_config);
+    }
+    trusted_config
 }
 
 /// Canonicalize the path and convert it to a string to be used as a key in the
@@ -1543,7 +1779,11 @@ async fn discover_project_layers(
                         dot_codex_abs.as_path(),
                     )?;
                 }
-                let ignored_project_config_keys = sanitize_project_config(&mut config);
+                let ignored_project_config_keys = sanitize_project_config(
+                    &mut config,
+                    trust_context.credential_broker,
+                    &trust_context.credential_broker_binding_env,
+                );
                 if disabled_reason.is_none() && !ignored_project_config_keys.is_empty() {
                     startup_warnings.push(project_ignored_config_keys_warning(
                         &dot_codex_abs,

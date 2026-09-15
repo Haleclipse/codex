@@ -125,11 +125,17 @@ use crate::rpc::RpcClient;
 use crate::rpc_server_requests::MAX_IN_FLIGHT_SERVER_CALLS;
 use codex_http_client::HttpClientFactory;
 
+#[path = "client/accepted.rs"]
+pub(crate) mod accepted;
 pub(crate) mod http_client;
 mod network_policy_audit;
 #[path = "client_recovery.rs"]
 mod recovery;
+#[cfg(test)]
+pub(crate) use recovery::is_environment_offline_error;
 pub(crate) use recovery::is_retryable_recovery_error;
+pub(crate) use recovery::is_retryable_registry_error;
+pub(crate) use recovery::registry_recovery_retry_delay;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -258,6 +264,8 @@ struct Inner {
     // Keep admission shared while recovered transports finish older requests.
     rpc_inbound_request_slots: Arc<Semaphore>,
     session_id: OnceLock<String>,
+    /// Caches metadata from initialization or the first successful info request for this client's lifetime.
+    environment_info: OnceCell<EnvironmentInfo>,
     reconnect_strategy: Option<ExecServerReconnectStrategy>,
 }
 
@@ -343,7 +351,7 @@ type ConnectionAttempt = OnceCell<ConnectionResult>;
 
 #[derive(Clone)]
 pub(crate) struct LazyRemoteExecServerClient {
-    pub(crate) transport_params: ExecServerTransportParams,
+    transport_params: Option<ExecServerTransportParams>,
     http_client_factory: HttpClientFactory,
     recovery_policy: RecoveryPolicy,
     // Saves the first startup result so callers share it; retryable failures use reconnect.
@@ -360,7 +368,7 @@ impl LazyRemoteExecServerClient {
         http_client_factory: HttpClientFactory,
     ) -> Self {
         Self {
-            transport_params,
+            transport_params: Some(transport_params),
             http_client_factory,
             recovery_policy: RecoveryPolicy::Wait,
             startup: Arc::new(ConnectionAttempt::new()),
@@ -381,7 +389,7 @@ impl LazyRemoteExecServerClient {
         // Stdio starts a process, so keep it lazy until the environment is used.
         if matches!(
             self.transport_params,
-            ExecServerTransportParams::StdioCommand { .. }
+            Some(ExecServerTransportParams::StdioCommand { .. })
         ) {
             return None;
         }
@@ -563,16 +571,23 @@ impl LazyRemoteExecServerClient {
     fn can_reconnect(&self) -> bool {
         matches!(
             self.transport_params,
-            ExecServerTransportParams::Deferred(_)
-                | ExecServerTransportParams::WebSocketUrl { .. }
-                | ExecServerTransportParams::NoiseRendezvous { .. }
+            Some(
+                ExecServerTransportParams::Deferred(_)
+                    | ExecServerTransportParams::WebSocketUrl { .. }
+                    | ExecServerTransportParams::NoiseRendezvous { .. }
+            )
         )
     }
 
     #[tracing::instrument(name = "codex.exec_server.remote.connect", skip_all)]
     async fn connect_once(&self) -> ConnectionResult {
+        let transport_params = self.transport_params.as_ref().ok_or_else(|| {
+            Arc::new(ExecServerError::Protocol(
+                "missing transport params for lazy exec-server connection".to_string(),
+            ))
+        })?;
         let result = ExecServerClient::connect_for_transport(
-            self.transport_params.clone(),
+            transport_params.clone(),
             self.http_client_factory.clone(),
         )
         .await
@@ -752,7 +767,18 @@ impl ExecServerClient {
         self.call(EXEC_METHOD, &params).await
     }
 
+    /// Returns cached executor metadata, fetching it lazily if initialization omitted it.
     pub async fn environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
+        self.inner
+            .environment_info
+            .get_or_try_init(|| self.force_environment_info())
+            .await
+            .cloned()
+    }
+
+    /// Fetches executor metadata over RPC without reading or updating the cache.
+    // TODO: Remove after app-server migrates off this call.
+    pub async fn force_environment_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
         let rpc_client = self.rpc_client().await?;
         map_rpc_call_result(
             rpc_client
@@ -1104,6 +1130,7 @@ impl ExecServerClient {
             http_body_stream_next_id: AtomicU64::new(1),
             rpc_inbound_request_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_SERVER_CALLS)),
             session_id,
+            environment_info: OnceCell::new(),
             reconnect_strategy,
         });
         let client = Self {
@@ -1114,7 +1141,13 @@ impl ExecServerClient {
         // before initialize returns. Drain them immediately so a burst cannot
         // fill the bounded event channel and block the initialize response.
         client.spawn_rpc_reader(&rpc_client, events_rx);
-        client.initialize_rpc(&rpc_client, options).await?;
+        let initialize_response = client.initialize_rpc(&rpc_client, options).await?;
+        if let Some(info) = initialize_response.environment_info {
+            assert!(
+                client.inner.environment_info.set(info).is_ok(),
+                "new client metadata cache must be empty"
+            );
+        }
         Ok(client)
     }
 
@@ -1727,6 +1760,7 @@ mod tests {
     use crate::protocol::EXEC_OUTPUT_DELTA_METHOD;
     use crate::protocol::EXEC_READ_METHOD;
     use crate::protocol::EXEC_WRITE_METHOD;
+    use crate::protocol::EnvironmentInfo;
     use crate::protocol::ExecClosedNotification;
     use crate::protocol::ExecExitedNotification;
     use crate::protocol::ExecOutputDeltaNotification;
@@ -1783,6 +1817,7 @@ mod tests {
                     id: initialize.id,
                     result: serde_json::to_value(InitializeResponse {
                         session_id: "trace-test".to_string(),
+                        environment_info: None,
                     })
                     .expect("initialize response should serialize"),
                 }),
@@ -1850,6 +1885,7 @@ mod tests {
                     argv: vec!["true".to_string()],
                     cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                         .expect("cwd URI"),
+                    shell_snapshot: None,
                     env_policy: None,
                     env: HashMap::new(),
                     tty: false,
@@ -1929,6 +1965,21 @@ mod tests {
         session_id: &str,
         expected_resume_session_id: Option<&str>,
     ) {
+        complete_websocket_initialize_with_environment_info(
+            websocket,
+            session_id,
+            expected_resume_session_id,
+            /*environment_info*/ None,
+        )
+        .await;
+    }
+
+    async fn complete_websocket_initialize_with_environment_info(
+        websocket: &mut WebSocketStream<TcpStream>,
+        session_id: &str,
+        expected_resume_session_id: Option<&str>,
+        environment_info: Option<EnvironmentInfo>,
+    ) {
         let initialize = read_jsonrpc_websocket(websocket).await;
         let request = match initialize {
             JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => request,
@@ -1947,6 +1998,7 @@ mod tests {
                 id: request.id,
                 result: serde_json::to_value(InitializeResponse {
                     session_id: session_id.to_string(),
+                    environment_info,
                 })
                 .expect("initialize response should serialize"),
             }),
@@ -2170,6 +2222,7 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(InitializeResponse {
                         session_id: "session-1".to_string(),
+                        environment_info: None,
                     })
                     .expect("initialize response should serialize"),
                 }),
@@ -2315,6 +2368,7 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(InitializeResponse {
                         session_id: "session-1".to_string(),
+                        environment_info: None,
                     })
                     .expect("initialize response should serialize"),
                 }),
@@ -2381,6 +2435,61 @@ mod tests {
 
         drop(client);
         server.await.expect("server task should finish");
+    }
+
+    #[test_case::test_case(Some(EnvironmentInfo::local()); "from_initialize")]
+    #[test_case::test_case(None; "legacy_server")]
+    #[tokio::test]
+    async fn environment_info_is_cached(
+        initial_environment_info: Option<EnvironmentInfo>,
+    ) -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let websocket_url = format!("ws://{}", listener.local_addr()?);
+        let expected_info = initial_environment_info
+            .clone()
+            .unwrap_or_else(EnvironmentInfo::local);
+        let server_info = expected_info.clone();
+        let server = tokio::spawn(async move {
+            let mut websocket = accept_websocket(&listener).await;
+            complete_websocket_initialize_with_environment_info(
+                &mut websocket,
+                "session-1",
+                /*expected_resume_session_id*/ None,
+                initial_environment_info.clone(),
+            )
+            .await;
+            if initial_environment_info.is_none() {
+                let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut websocket).await
+                else {
+                    panic!("expected environment info request");
+                };
+                assert_eq!(request.method, "environment/info");
+                write_jsonrpc_websocket(
+                    &mut websocket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result: serde_json::to_value(server_info)
+                            .expect("environment info should serialize"),
+                    }),
+                )
+                .await;
+            }
+        });
+        let client = ExecServerClient::connect_websocket(RemoteExecServerConnectArgs {
+            websocket_url,
+            client_name: "metadata-test".to_string(),
+            connect_timeout: Duration::from_secs(1),
+            initialize_timeout: Duration::from_secs(1),
+            resume_session_id: None,
+            http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        })
+        .await?;
+
+        assert_eq!(client.environment_info().await?, expected_info);
+        server.await?;
+        // The server is gone, so a cloned client must use the shared cache.
+        assert_eq!(client.clone().environment_info().await?, expected_info);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2601,6 +2710,7 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(InitializeResponse {
                         session_id: "session-1".to_string(),
+                        environment_info: None,
                     })
                     .expect("initialize response should serialize"),
                 }),
@@ -2918,6 +3028,7 @@ mod tests {
                     id: request.id,
                     result: serde_json::to_value(InitializeResponse {
                         session_id: "session-1".to_string(),
+                        environment_info: None,
                     })
                     .expect("initialize response should serialize"),
                 }),

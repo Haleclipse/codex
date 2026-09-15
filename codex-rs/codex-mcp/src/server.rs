@@ -335,6 +335,7 @@ fn referenced_environment_variables(config: &McpServerConfig) -> Vec<(String, Op
             ..
         } => bearer_token_env_var
             .iter()
+            .filter(|name| config.is_local_environment() || std::env::var_os(name).is_some())
             .chain(env_http_headers.iter().flat_map(|headers| headers.values()))
             .cloned()
             .collect(),
@@ -418,3 +419,7 @@ impl From<&EffectiveMcpServer> for McpServerMetadata {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;

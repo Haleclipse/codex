@@ -1,5 +1,6 @@
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
+use crate::realtime_history::RealtimeHistoryState;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
@@ -17,6 +18,7 @@ use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::user_input::UserInput;
 use codex_rollout::RolloutItem;
 use codex_rollout::state_db::StateDbHandle;
 use codex_utils_path_uri::LegacyAppPathString;
@@ -36,6 +38,8 @@ type PendingInterruptQueue = Vec<ConnectionRequestId>;
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
     pub(crate) history_items: Vec<RolloutItem>,
+    /// Usage attribution already resolved while cold-loading a paginated child.
+    pub(crate) cold_resume_token_usage_turn_id: Option<String>,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
     pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
@@ -79,6 +83,10 @@ pub(crate) enum ThreadListenerCommand {
         request_id: RequestId,
         completion_tx: oneshot::Sender<()>,
     },
+    SealRealtimeUserInput {
+        input: Vec<UserInput>,
+        completion_tx: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Per-conversation accumulation of the latest states e.g. error message while a turn runs.
@@ -102,6 +110,7 @@ pub(crate) struct ThreadState {
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
+    pub(crate) realtime_history: RealtimeHistoryState,
     last_thread_settings: Option<ThreadSettings>,
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,

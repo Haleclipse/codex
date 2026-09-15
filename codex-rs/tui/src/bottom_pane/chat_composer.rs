@@ -3,11 +3,17 @@
 //! It is responsible for:
 //!
 //! - Editing the input buffer (a [`TextArea`]), including placeholder "elements" for attachments.
-//! - Routing keys to the active popup (slash commands, file search, skill/apps mentions).
+//! - Routing keys to the active popup (slash commands, file search, skill/apps/task mentions).
 //! - Promoting typed slash commands into atomic elements when the command name is completed.
 //! - Handling submit vs newline on Enter.
 //! - Turning raw key streams into explicit paste operations on platforms where terminals
 //!   don't provide reliable bracketed paste (notably Windows).
+//!
+//! # Mention Menus
+//!
+//! By default, `@` lists plugins, filesystem entries, and skills. Skills are hidden when their
+//! owning plugin is listed. `$` lists individual skills and apps, but not plugins.
+//! Disabling `mentions_v2` restores file-only `@` search and adds plugins back to `$`.
 //!
 //! # Key Event Routing
 //!
@@ -41,12 +47,13 @@
 //!
 //! The Up/Down history path is managed by [`ChatComposerHistory`]. It merges:
 //!
-//! - Persistent cross-session history (text-only; no element ranges or attachments).
+//! - Persistent cross-session history (text-only storage; task links recover element ranges and
+//!   mention bindings, but attachments cannot be restored).
 //! - Local in-session history (full text + text elements + local/remote image attachments).
 //!
 //! When recalling a local entry, the composer rehydrates text elements and both attachment kinds
 //! (local image paths + remote image URLs).
-//! When recalling a persistent entry, only the text is restored.
+//! When recalling a persistent entry, encoded task links restore atomic elements and bindings.
 //! Recalled entries move the cursor to end-of-line so repeated Up/Down presses keep shell-like
 //! history traversal semantics instead of dropping to column 0.
 //! `Ctrl+R` opens a reverse incremental search mode. The footer becomes the search input; once the
@@ -499,6 +506,7 @@ pub(crate) struct ChatComposer {
     pending_slash_command_history: Option<HistoryEntry>,
     skills: Option<Vec<SkillMetadata>>,
     plugins: Option<Vec<PluginCapabilitySummary>>,
+    task_mentions: Option<Vec<crate::task_mentions::TaskMention>>,
     connectors_snapshot: Option<ConnectorsSnapshot>,
     collaboration_modes_enabled: bool,
     config: ChatComposerConfig,
@@ -567,19 +575,6 @@ pub(crate) struct ComposerDraftSnapshot {
 }
 
 const FOOTER_SPACING_HEIGHT: u16 = 0;
-
-/// Builds the one-line nudge that replaces the ambient footer without adding layout height.
-fn plan_mode_nudge_line() -> Line<'static> {
-    Line::from(vec![
-        "Create a plan?".magenta(),
-        "  ".into(),
-        key_hint::shift(KeyCode::Tab).into(),
-        " use Plan mode".into(),
-        "   ".into(),
-        key_hint::plain(KeyCode::Esc).into(),
-        " dismiss".into(),
-    ])
-}
 
 impl ChatComposer {
     fn slash_input(&self) -> SlashInput<'_> {
@@ -651,7 +646,6 @@ impl ChatComposer {
                 use_shift_enter_hint,
                 mode: FooterMode::ComposerEmpty,
                 hint_override: None,
-                plan_mode_nudge_visible: false,
                 flash: None,
                 context_window_percent: None,
                 context_window_used_tokens: None,
@@ -698,6 +692,7 @@ impl ChatComposer {
             pending_slash_command_history: None,
             skills: None,
             plugins: None,
+            task_mentions: None,
             connectors_snapshot: None,
             collaboration_modes_enabled: false,
             config,
@@ -770,7 +765,6 @@ impl ChatComposer {
             self.effort_ignition = Some(EffortIgnition::new(tier, style));
             self.effort_animation_style = Some(style);
             if self.footer.status_line_enabled
-                && !self.footer.plan_mode_nudge_visible
                 && let Some(previous) = passive_footer_status_line(&self.footer_props())
             {
                 self.effort_status_line_transition =
@@ -806,6 +800,47 @@ impl ChatComposer {
         self.sync_popups();
     }
 
+    pub(crate) fn set_task_mentions_enabled(&mut self, enabled: bool) {
+        self.task_mentions = enabled.then(Vec::new);
+        self.refresh_mentions_v2_popup_candidates();
+        if enabled
+            && matches!(self.popups.active, ActivePopup::MentionV2(_))
+            && let Some(query) = self.current_mentions_v2_token()
+            && !query.is_empty()
+        {
+            self.app_event_tx.send(AppEvent::StartFileSearch(query));
+        }
+    }
+
+    pub(crate) fn task_mentions_enabled(&self) -> bool {
+        self.task_mentions.is_some()
+    }
+
+    pub(crate) fn on_task_search_result(
+        &mut self,
+        query: &str,
+        mut matches: Vec<crate::task_mentions::TaskMention>,
+    ) {
+        if self.current_mentions_v2_token().as_deref() != Some(query) {
+            return;
+        }
+        let mentioned_ids = self
+            .current_mention_elements()
+            .into_iter()
+            .filter_map(|(id, _, _)| self.draft.mention_bindings.get(&id))
+            .filter_map(|binding| crate::task_mentions::valid_thread_path(&binding.path))
+            .collect::<std::collections::HashSet<_>>();
+        matches.retain(|task| {
+            mentioned_ids.len() < crate::task_mentions::MAX_REFERENCED_TASKS
+                && !mentioned_ids.contains(task.thread_id.as_str())
+        });
+        let Some(task_mentions) = &mut self.task_mentions else {
+            return;
+        };
+        *task_mentions = matches;
+        self.refresh_mentions_v2_popup_candidates();
+    }
+
     /// Refreshes an open mention catalog when skill or plugin metadata changes.
     fn refresh_mentions_v2_popup_candidates(&mut self) {
         let ActivePopup::MentionV2(popup) = &mut self.popups.active else {
@@ -814,6 +849,7 @@ impl ChatComposer {
         popup.set_candidates(super::mentions_v2::build_search_catalog(
             self.skills.as_deref(),
             self.plugins.as_deref(),
+            self.task_mentions.as_deref().unwrap_or_default(),
         ));
     }
 
@@ -1463,23 +1499,6 @@ impl ChatComposer {
     /// `None` restores the default shortcut footer.
     pub(crate) fn set_footer_hint_override(&mut self, items: Option<Vec<(String, String)>>) {
         self.footer.hint_override = items;
-    }
-
-    /// Updates whether the Plan-mode nudge replaces the ambient footer row.
-    ///
-    /// Returns `true` only when the rendered footer can change so callers can avoid scheduling
-    /// redundant redraws while reevaluating nudge policy on routine composer updates.
-    pub(crate) fn set_plan_mode_nudge_visible(&mut self, visible: bool) -> bool {
-        if self.footer.plan_mode_nudge_visible == visible {
-            return false;
-        }
-        self.footer.plan_mode_nudge_visible = visible;
-        true
-    }
-
-    #[cfg(test)]
-    pub(crate) fn plan_mode_nudge_visible(&self) -> bool {
-        self.footer.plan_mode_nudge_visible
     }
 
     pub(crate) fn set_remote_image_urls(&mut self, urls: Vec<String>) {
@@ -2784,9 +2803,18 @@ impl ChatComposer {
         let id = self.draft.textarea.insert_element(insert_text);
         let inserted_range = start_idx..start_idx.saturating_add(insert_text.len());
 
-        if let (Some(path), Some((sigil, mention))) =
-            (path, Self::mention_token_from_insert_text(insert_text))
+        let mention = if path
+            .and_then(crate::task_mentions::valid_thread_path)
+            .is_some()
         {
+            insert_text
+                .strip_prefix('@')
+                .filter(|name| !name.is_empty())
+                .map(|name| ('@', name.to_string()))
+        } else {
+            Self::mention_token_from_insert_text(insert_text)
+        };
+        if let (Some(path), Some((sigil, mention))) = (path, mention) {
             self.draft.mention_bindings.insert(
                 id,
                 ComposerMentionBinding {
@@ -2795,6 +2823,13 @@ impl ChatComposer {
                     path: path.to_string(),
                 },
             );
+        }
+        if path
+            .and_then(crate::task_mentions::valid_thread_path)
+            .is_some()
+            && let Some(task_mentions) = &mut self.task_mentions
+        {
+            task_mentions.clear();
         }
 
         self.advance_past_completion_separator();
@@ -2853,6 +2888,12 @@ impl ChatComposer {
             .text_element_snapshots()
             .into_iter()
             .filter_map(|snapshot| {
+                if let Some(binding) = self.draft.mention_bindings.get(&snapshot.id)
+                    && crate::task_mentions::valid_thread_path(&binding.path).is_some()
+                    && snapshot.text == format!("{}{}", binding.sigil, binding.mention)
+                {
+                    return Some((snapshot.id, binding.sigil, binding.mention.clone()));
+                }
                 Self::mention_token_from_insert_text(snapshot.text.as_str())
                     .map(|(sigil, mention)| (snapshot.id, sigil, mention))
             })
@@ -2886,9 +2927,17 @@ impl ChatComposer {
         let mut scan_from = 0usize;
         for binding in mention_bindings {
             let token = format!("{}{}", binding.sigil, binding.mention);
-            let Some(range) =
+            let range = if crate::task_mentions::valid_thread_path(&binding.path).is_some() {
+                self.draft
+                    .textarea
+                    .text_element_snapshots()
+                    .into_iter()
+                    .find(|element| element.range.start >= scan_from && element.text == token)
+                    .map(|element| element.range)
+            } else {
                 find_next_mention_token_range(text.as_str(), token.as_str(), scan_from)
-            else {
+            };
+            let Some(range) = range else {
                 continue;
             };
 
@@ -4160,6 +4209,7 @@ impl ChatComposer {
                 let candidates = super::mentions_v2::build_search_catalog(
                     self.skills.as_deref(),
                     self.plugins.as_deref(),
+                    self.task_mentions.as_deref().unwrap_or_default(),
                 );
                 self.popups.active =
                     ActivePopup::MentionV2(MentionV2Popup::new(candidates, &query));
@@ -4193,7 +4243,9 @@ impl ChatComposer {
             }
         }
 
-        if let Some(plugins) = self.plugins.as_ref() {
+        if !self.mentions_v2_enabled
+            && let Some(plugins) = self.plugins.as_ref()
+        {
             for plugin in plugins {
                 let (plugin_name, marketplace_name) = plugin
                     .config_name
@@ -4305,7 +4357,6 @@ impl ChatComposer {
         self.footer.quit_shortcut_expires_at = None;
         self.footer.mode = FooterMode::ComposerEmpty;
         self.footer.hint_override = Some(Vec::new());
-        self.footer.plan_mode_nudge_visible = false;
         self.footer.flash = None;
     }
 
@@ -4679,17 +4730,6 @@ impl ChatComposer {
                 };
                 if let Some(line) = self.history_search_footer_line() {
                     render_footer_line(hint_rect, buf, line);
-                } else if self.footer.plan_mode_nudge_visible {
-                    let available_width =
-                        hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
-                    render_footer_line(
-                        hint_rect,
-                        buf,
-                        truncate_line_with_ellipsis_if_overflow(
-                            plan_mode_nudge_line(),
-                            available_width,
-                        ),
-                    );
                 } else {
                     let available_width =
                         hint_rect.width.saturating_sub(FOOTER_INDENT_COLS as u16) as usize;
@@ -6935,6 +6975,7 @@ mod tests {
             path: test_path_buf(&format!("/tmp/{name}/SKILL.md")).abs(),
             scope: crate::test_support::skill_scope_user(),
             enabled: true,
+            plugin_id: None,
         }
     }
 
@@ -7586,6 +7627,7 @@ mod tests {
             path: skill_path.clone(),
             scope: crate::test_support::skill_scope_user(),
             enabled: true,
+            plugin_id: None,
         }]));
 
         let ActivePopup::Skill(popup) = &composer.popups.active else {
@@ -7599,7 +7641,7 @@ mod tests {
     }
 
     #[test]
-    fn mention_items_show_plugin_owned_skill_and_app_duplicates() {
+    fn mention_items_keep_direct_skills_and_apps_with_unified_mentions() {
         let skill_path = test_path_buf("/tmp/repo/google-calendar/SKILL.md").abs();
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let sender = AppEventSender::new(tx);
@@ -7630,6 +7672,7 @@ mod tests {
             path: skill_path.clone(),
             scope: crate::test_support::skill_scope_repo(),
             enabled: true,
+            plugin_id: Some("google-calendar@debug".to_string()),
         }]));
         composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
             config_name: "google-calendar@debug".to_string(),
@@ -7675,6 +7718,25 @@ mod tests {
         );
         assert_eq!(mentions[2].category_tag, Some("[App]".to_string()));
         assert_eq!(mentions[2].path, Some("app://google_calendar".to_string()));
+
+        composer.set_mentions_v2_enabled(/*enabled*/ true);
+        assert_eq!(
+            composer
+                .mention_items()
+                .into_iter()
+                .map(|mention| (mention.insert_text, mention.path))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "$google-calendar:availability".to_string(),
+                    Some(skill_path.display().to_string()),
+                ),
+                (
+                    "$google-calendar".to_string(),
+                    Some("app://google_calendar".to_string()),
+                ),
+            ],
+        );
     }
 
     #[test]
@@ -7709,17 +7771,144 @@ mod tests {
                 let features = codex_features::Features::with_defaults();
                 composer
                     .set_mentions_v2_enabled(features.enabled(codex_features::Feature::MentionsV2));
+                composer.set_skill_mentions(Some(vec![
+                    SkillMetadata {
+                        name: "sample-tools:search".to_string(),
+                        plugin_id: Some("sample@test".to_string()),
+                        ..test_skill_metadata("sample-search")
+                    },
+                    SkillMetadata {
+                        name: "sample:summarize".to_string(),
+                        plugin_id: Some("sample@test".to_string()),
+                        ..test_skill_metadata("sample-summarize")
+                    },
+                    SkillMetadata {
+                        name: "sample:notes".to_string(),
+                        ..test_skill_metadata("sample-notes")
+                    },
+                    SkillMetadata {
+                        name: "sample:other".to_string(),
+                        plugin_id: Some("sample@other-marketplace".to_string()),
+                        ..test_skill_metadata("sample-other")
+                    },
+                ]));
                 composer.set_text_content("@sa".to_string(), Vec::new(), Vec::new());
                 composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
                     config_name: "sample@test".to_string(),
                     display_name: "Sample Plugin".to_string(),
-                    plugin_namespace: None,
+                    plugin_namespace: Some("sample".to_string()),
                     description: Some("Plugin with skills and an MCP server".to_string()),
                     has_skills: true,
                     mcp_server_names: vec!["sample".to_string()],
                     app_connector_ids: Vec::new(),
                 }]));
             },
+        );
+    }
+
+    #[test]
+    fn task_mention_popup_and_selected_composer_snapshots() {
+        for selected in [false, true] {
+            snapshot_composer_state(
+                if selected {
+                    "task_mention_selected_composer"
+                } else {
+                    "task_mention_popup"
+                },
+                /*enhanced_keys_supported*/ false,
+                |composer| {
+                    composer.set_mentions_v2_enabled(/*enabled*/ true);
+                    composer.set_task_mentions_enabled(/*enabled*/ true);
+                    composer.set_text_content("@migr".to_string(), Vec::new(), Vec::new());
+                    composer.on_task_search_result(
+                        "migr",
+                        vec![
+                            crate::task_mentions::TaskMention {
+                                thread_id: "task-123".to_string(),
+                                title: "Review database migration".to_string(),
+                                cwd: "/workspace/project".to_string(),
+                                snippet: "database migration".to_string(),
+                            },
+                            crate::task_mentions::TaskMention {
+                                thread_id: "task-456".to_string(),
+                                title: "migration".to_string(),
+                                cwd: "/another/project".to_string(),
+                                snippet: "migration".to_string(),
+                            },
+                        ],
+                    );
+                    if selected {
+                        composer
+                            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                        assert!(matches!(composer.mention_bindings().as_slice(),
+                            [MentionBinding { mention, path, .. }]
+                                if mention == "Review database migration"
+                                    && path == "thread://task-123"));
+                        assert!(composer.task_mentions.as_ref().is_some_and(Vec::is_empty));
+                        let area = Rect::new(0, 0, 40, 5);
+                        let mut buf = Buffer::empty(area);
+                        composer.render(area, &mut buf);
+                        assert_eq!(buf[(2, 1)].style().fg, Some(Color::Cyan));
+                    }
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn task_mention_titles_are_normalized_and_bounded_before_insertion() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_mentions_v2_enabled(/*enabled*/ true);
+        composer.set_task_mentions_enabled(/*enabled*/ true);
+        composer.set_text_content("@task".to_string(), Vec::new(), Vec::new());
+        let task = crate::task_mentions::TaskMention {
+            thread_id: "task-123".to_string(),
+            title: format!("task\n\t{}é{}", "a".repeat(154), "é".repeat(200)),
+            cwd: "/workspace/project".to_string(),
+            snippet: String::new(),
+        };
+        composer.on_task_search_result("task", vec![task.clone()]);
+        composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            composer.mention_bindings(),
+            vec![MentionBinding {
+                sigil: '@',
+                mention: format!("task {}é", "a".repeat(154)),
+                path: "thread://task-123".to_string(),
+            }]
+        );
+        composer.draft.textarea.set_text_clearing_elements("@task");
+        composer.sync_popups();
+        composer.on_task_search_result("task", vec![task]);
+        assert!(matches!(&composer.popups.active,
+            ActivePopup::MentionV2(popup) if popup.selected().is_some()));
+
+        let history = HistoryEntry::new(
+            "[@sample](plugin://sample@test) @sample [@sample](thread://task-123)x".to_string(),
+        );
+        composer.set_text_content_with_mention_bindings(
+            history.text,
+            history.text_elements,
+            Vec::new(),
+            history.mention_bindings,
+        );
+        assert_eq!(
+            composer.mention_bindings(),
+            ["plugin://sample@test", "thread://task-123"]
+                .into_iter()
+                .map(|path| MentionBinding {
+                    sigil: '@',
+                    mention: "sample".to_string(),
+                    path: path.to_string(),
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            composer.draft.textarea.text_element_snapshots()[1]
+                .range
+                .start,
+            "@sample @sample ".len()
         );
     }
 
@@ -7797,6 +7986,7 @@ mod tests {
             /*width*/ 72,
             /*enhanced_keys_supported*/ false,
             |composer| {
+                composer.set_mentions_v2_enabled(/*enabled*/ true);
                 composer.set_connectors_enabled(/*enabled*/ true);
                 composer.set_text_content("$goog".to_string(), Vec::new(), Vec::new());
                 composer.set_skill_mentions(Some(vec![SkillMetadata {
@@ -7817,6 +8007,7 @@ mod tests {
                     path: test_path_buf("/tmp/repo/google-calendar/SKILL.md").abs(),
                     scope: crate::test_support::skill_scope_repo(),
                     enabled: true,
+                    plugin_id: None,
                 }]));
                 composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
                 config_name: "google-calendar@debug".to_string(),

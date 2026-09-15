@@ -14,6 +14,7 @@ use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::CurrentTimeReminderConfig;
 use codex_core::sandboxing::SandboxPermissions;
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
@@ -25,8 +26,10 @@ use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
+use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -38,8 +41,10 @@ use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::user_input::UserInput;
 use core_test_support::fs_wait;
@@ -396,6 +401,14 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
         Some("guardian")
     );
     assert_eq!(guardian_review["model"].as_str(), Some(expected_model));
+    for request in [guardian_prewarm, &guardian_review] {
+        let metadata: serde_json::Value = serde_json::from_str(
+            request["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("guardian turn metadata"),
+        )?;
+        assert_eq!(metadata["thread_source"], "guardian_review");
+    }
     assert_eq!(
         guardian_review["client_metadata"]["thread_id"].as_str(),
         Some(guardian_thread_id)
@@ -440,10 +453,18 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
         .await
         .expect("guardian trunk rollout path");
     test.codex.shutdown_and_wait().await?;
-    let guardian_context_windows = fs::read_to_string(guardian_rollout_path)?
+    let guardian_rollout = fs::read_to_string(guardian_rollout_path)?
         .lines()
         .map(serde_json::from_str::<RolloutLine>)
-        .collect::<serde_json::Result<Vec<_>>>()?
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    assert_eq!(
+        guardian_rollout.iter().find_map(|line| match &line.item {
+            RolloutItem::SessionMeta(meta) => meta.meta.thread_source.as_ref(),
+            _ => None,
+        }),
+        Some(&ThreadSource::GuardianReview)
+    );
+    let guardian_context_windows = guardian_rollout
         .into_iter()
         .filter_map(|line| match line.item {
             RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => Some(event.model_context_window),
@@ -456,10 +477,16 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case("first_node"; "injects_policy_for_first_node_action")]
-#[test_case("shell_then_nodes"; "reuses_shell_reviewer_and_injects_policy_once")]
-#[test_case("ineligible_node"; "omits_policy_for_ineligible_parent_model")]
-async fn guardian_node_repl_policy_follows_production_approval_path(scenario: &str) -> Result<()> {
+#[test_case("first_node", "node_repl"; "injects_policy_for_first_node_action")]
+#[test_case("shell_then_nodes", "node_repl"; "reuses_shell_reviewer_and_injects_policy_once")]
+#[test_case("ineligible_node", "node_repl"; "omits_policy_for_ineligible_parent_model")]
+#[test_case("first_node", "cua_repl"; "injects_policy_for_first_cua_action")]
+#[test_case("shell_then_nodes", "cua_repl"; "reuses_shell_reviewer_and_injects_cua_policy_once")]
+#[test_case("ineligible_node", "cua_repl"; "omits_cua_policy_for_ineligible_parent_model")]
+async fn guardian_node_repl_policy_follows_production_approval_path(
+    scenario: &str,
+    repl_server: &'static str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_wine_exec!(
@@ -477,24 +504,20 @@ async fn guardian_node_repl_policy_follows_production_approval_path(scenario: &s
         .with_config(move |config| {
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
-            let node_repl: McpServerConfig = serde_json::from_value(json!({
+            let repl: McpServerConfig = serde_json::from_value(json!({
                 "command": mcp_server_bin,
                 "environment_id": remote_aware_environment_id(),
                 "default_tools_approval_mode": "prompt",
                 "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" }
             }))
-            .expect("valid Node REPL MCP test server");
+            .expect("valid REPL MCP test server");
             config
                 .mcp_servers
-                .set(
-                    [(String::from("node_repl"), node_repl)]
-                        .into_iter()
-                        .collect(),
-                )
-                .expect("configure Node REPL MCP test server");
+                .set([(String::from(repl_server), repl)].into_iter().collect())
+                .expect("configure REPL MCP test server");
         });
     let test = builder.build_with_auto_env(&server).await?;
-    wait_for_mcp_server(&test.codex, "node_repl").await?;
+    wait_for_mcp_server(&test.codex, repl_server).await?;
 
     let actions: &[&str] = if scenario == "shell_then_nodes" {
         &["shell", "node-first", "node-second"]
@@ -518,7 +541,7 @@ async fn guardian_node_repl_policy_follows_production_approval_path(scenario: &s
         } else {
             ev_function_call_with_namespace(
                 &call_id,
-                "mcp__node_repl",
+                &format!("mcp__{repl_server}"),
                 "js",
                 r#"{"code":"nodeRepl.empty()"}"#,
             )
@@ -540,7 +563,7 @@ async fn guardian_node_repl_policy_follows_production_approval_path(scenario: &s
     responses.push(sse(vec![ev_completed("parent-complete")]));
     let response_mock = mount_sse_sequence(&server, responses).await;
 
-    test.submit_text_turn("Inspect the browser with Node REPL.")
+    test.submit_text_turn(&format!("Inspect the browser with {repl_server}."))
         .await?;
 
     let requests = response_mock.requests();
@@ -747,6 +770,9 @@ async fn guardian_session_is_reused_for_consecutive_tool_reviews_without_prewarm
             test.config.permissions.permission_profile().clone(),
         ),
         shell_environment_policy: Default::default(),
+        windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+        windows_sandbox_private_desktop: test.config.permissions.windows_sandbox_private_desktop,
+        use_legacy_landlock: test.config.features.use_legacy_landlock(),
         exec_policy: None,
         mcp_policy: None,
         network_policy: None,
@@ -971,7 +997,12 @@ async fn interrupted_guardian_tool_review_aborts_without_executing_the_command()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_denial_rejects_tool_call_with_rationale() -> Result<()> {
+#[test_case(None; "legacy_fallback")]
+#[test_case(Some("Acting model rejection instructions."); "catalog_override")]
+#[test_case(Some(""); "empty_override")]
+async fn guardian_denial_rejects_tool_call_with_rationale(
+    rejection_instructions: Option<&'static str>,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_wine_exec!(
@@ -989,12 +1020,38 @@ async fn guardian_denial_rejects_tool_call_with_rationale() -> Result<()> {
     };
     let sandbox_policy_for_config = sandbox_policy.clone();
 
-    let mut builder = test_codex().with_config(move |config| {
-        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
-        config
-            .set_legacy_sandbox_policy(sandbox_policy_for_config)
-            .expect("set sandbox policy");
-    });
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.6-luna", |model| {
+            model
+                .model_messages
+                .as_mut()
+                .expect("reviewer model messages")
+                .auto_review = Some(AutoReviewMessages {
+                policy: None,
+                policy_template: None,
+                rejection_instructions: Some("Reviewer-only rejection instructions.".to_string()),
+                timeout_instructions: None,
+            });
+        })
+        .with_model_info_override("gpt-5.5", move |model| {
+            model.auto_review_model_override = Some("gpt-5.6-luna".to_string());
+            model
+                .model_messages
+                .as_mut()
+                .expect("acting model messages")
+                .auto_review = Some(AutoReviewMessages {
+                policy: None,
+                policy_template: None,
+                rejection_instructions: rejection_instructions.map(str::to_string),
+                timeout_instructions: None,
+            });
+        })
+        .with_config(move |config| {
+            config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+            config
+                .set_legacy_sandbox_policy(sandbox_policy_for_config)
+                .expect("set sandbox policy");
+        });
     let test = builder.build_with_auto_env(&server).await?;
 
     let output_file = test.cwd.path().join("guardian-denied.txt");
@@ -1065,6 +1122,7 @@ async fn guardian_denial_rejects_tool_call_with_rationale() -> Result<()> {
         .find(|request| request.body_contains_text("Exercise Guardian denial routing."))
         .expect("expected Guardian review request");
     assert!(guardian_request.body_contains_text(&command));
+    assert_eq!(guardian_request.body_json()["model"], "gpt-5.6-luna");
 
     let tool_output = requests
         .iter()
@@ -1074,11 +1132,130 @@ async fn guardian_denial_rejects_tool_call_with_rationale() -> Result<()> {
         tool_output.contains("The requested write has unacceptable test risk."),
         "Guardian rationale missing from rejected tool output: {tool_output}"
     );
+    assert_eq!(
+        tool_output.contains("The agent must not attempt to achieve the same outcome"),
+        rejection_instructions.is_none(),
+        "legacy rejection instructions should only be used when absent: {tool_output}"
+    );
+    if let Some(rejection_instructions) = rejection_instructions {
+        assert!(tool_output.contains(rejection_instructions));
+    }
+    assert!(!tool_output.contains("Reviewer-only rejection instructions."));
     assert!(
         !output_file.exists(),
         "Guardian-denied command unexpectedly executed"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case(None; "legacy_fallback")]
+#[test_case(Some("Acting model timeout instructions."); "catalog_override")]
+#[test_case(Some(""); "empty_override")]
+async fn guardian_timeout_rejects_tool_call_with_acting_model_instructions(
+    timeout_instructions: Option<&'static str>,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "Guardian approval actions require host-native paths"
+    );
+
+    struct TimedOutReviewContributor;
+
+    impl codex_extension_api::ApprovalReviewContributor for TimedOutReviewContributor {
+        fn fast_decision<'a>(
+            &'a self,
+            _session_store: &'a codex_extension_api::ExtensionData,
+            _thread_store: &'a codex_extension_api::ExtensionData,
+            _prompt: &'a str,
+            _extension_metrics: Option<Arc<dyn codex_extension_api::ExtensionMetrics>>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Option<ReviewDecision>> {
+            Box::pin(async { Some(ReviewDecision::TimedOut) })
+        }
+    }
+
+    let server = start_mock_server().await;
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.approval_review_contributor(Arc::new(TimedOutReviewContributor));
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_model_info_override("gpt-5.5", move |model| {
+            model
+                .model_messages
+                .as_mut()
+                .expect("acting model messages")
+                .auto_review = Some(AutoReviewMessages {
+                policy: None,
+                policy_template: None,
+                rejection_instructions: None,
+                timeout_instructions: timeout_instructions.map(str::to_string),
+            });
+        })
+        .with_config(|config| {
+            let rules_dir = config.codex_home.join("rules");
+            fs::create_dir_all(&rules_dir).expect("create execution policy directory");
+            fs::write(
+                rules_dir.join("default.rules"),
+                r#"prefix_rule(pattern=["touch"], decision="prompt")"#,
+            )
+            .expect("write execution policy rule");
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let output_file = test.cwd.path().join("guardian-timed-out.txt");
+    let tool_args = json!({
+        "cmd": format!("touch {}", output_file.display()),
+        "sandbox_permissions": SandboxPermissions::UseDefault,
+    });
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_function_call(
+                    "exec-call-timed-out",
+                    "exec_command",
+                    &tool_args.to_string(),
+                ),
+                ev_completed("parent-tool"),
+            ]),
+            sse(vec![ev_completed("parent-complete")]),
+        ],
+    )
+    .await;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "run a command whose approval review will time out".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = responses.requests();
+    let tool_output = requests
+        .iter()
+        .find_map(|request| request.function_call_output_text("exec-call-timed-out"))
+        .expect("expected timed-out tool output to be returned to the parent model");
+    assert_eq!(
+        tool_output.contains("did not finish before its deadline"),
+        timeout_instructions.is_none(),
+        "legacy timeout instructions should only be used when absent: {tool_output}"
+    );
+    if let Some(timeout_instructions) = timeout_instructions {
+        assert!(tool_output.contains(timeout_instructions));
+    }
+    assert!(!tool_output.contains("unacceptable risk"));
+    assert!(
+        !output_file.exists(),
+        "command whose approval timed out unexpectedly executed"
+    );
     Ok(())
 }
 

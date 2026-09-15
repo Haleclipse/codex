@@ -1,6 +1,6 @@
 use anyhow::Result;
 use codex_core::TurnInputRequest;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use codex_core::shell::get_shell_by_model_provided_path;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
@@ -20,6 +20,8 @@ use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+#[cfg(unix)]
+use core_test_support::skip_if_remote;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -127,11 +129,6 @@ async fn run_snapshot_command_with_options(
         shell_environment_set,
     } = options;
     let builder = test_codex().with_config(move |config| {
-        config.use_experimental_unified_exec_tool = true;
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
         config
             .features
             .enable(Feature::ShellSnapshot)
@@ -170,101 +167,6 @@ async fn run_snapshot_command_with_options(
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run unified exec with shell snapshot".into(),
-                text_elements: Vec::new(),
-            }])
-            .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd)),
-                approval_policy: Some(AskForApproval::Never),
-                sandbox_policy: Some(sandbox_policy),
-                permission_profile,
-                collaboration_mode: Some(CollaborationMode {
-                    mode: ModeKind::Default,
-                    settings: Settings {
-                        model: session_model,
-                        reasoning_effort: None,
-                        developer_instructions: None,
-                    },
-                }),
-                ..Default::default()
-            }),
-        )
-        .await?;
-
-    let begin = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::ExecCommandBegin(ev) if ev.call_id == call_id => Some(ev.clone()),
-        _ => None,
-    })
-    .await;
-    let snapshot_path = wait_for_snapshot(&codex_home).await?;
-    let snapshot_content = fs::read_to_string(&snapshot_path).await?;
-
-    let end = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::ExecCommandEnd(ev) if ev.call_id == call_id => Some(ev.clone()),
-        _ => None,
-    })
-    .await;
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    Ok(SnapshotRun {
-        begin,
-        end,
-        snapshot_path,
-        snapshot_content,
-        codex_home,
-    })
-}
-
-async fn run_shell_command_snapshot(command: &str) -> Result<SnapshotRun> {
-    run_shell_command_snapshot_with_options(command, SnapshotRunOptions::default()).await
-}
-
-async fn run_shell_command_snapshot_with_options(
-    command: &str,
-    options: SnapshotRunOptions,
-) -> Result<SnapshotRun> {
-    let SnapshotRunOptions {
-        shell_environment_set,
-    } = options;
-    let builder = test_codex().with_config(move |config| {
-        config
-            .features
-            .enable(Feature::ShellSnapshot)
-            .expect("test config should allow feature update");
-        config.permissions.shell_environment_policy.r#set = shell_environment_set;
-    });
-    let harness = TestCodexHarness::with_builder(builder).await?;
-    let args = json!({
-        "command": command,
-        "timeout_ms": 1000,
-    });
-    let call_id = "shell-snapshot-command";
-    let responses = vec![
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-1"),
-        ]),
-        sse(vec![
-            ev_response_created("resp-2"),
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-2"),
-        ]),
-    ];
-    mount_sse_sequence(harness.server(), responses).await;
-
-    let test = harness.test();
-    let codex = test.codex.clone();
-    let codex_home = test.home.path().to_path_buf();
-    let session_model = test.session_configured.model.clone();
-    let cwd = test.config.cwd.clone();
-    let (sandbox_policy, permission_profile) =
-        turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
-
-    codex
-        .start_or_steer_turn(
-            TurnInputRequest::user_input(vec![UserInput::Text {
-                text: "run shell_command with shell snapshot".into(),
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
@@ -390,6 +292,112 @@ fn assert_posix_snapshot_sections(snapshot: &str) {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_snapshot_v2_filters_profile_secrets_without_creating_files() -> Result<()> {
+    skip_if_remote!(Ok(()), "profile fixture uses a host-local HOME directory");
+    let profile_home = tempfile::tempdir()?;
+    fs::write(
+        profile_home.path().join(".bashrc"),
+        "printf x >> \"$HOME/captures\"\nexport PATH=\"$HOME/profile-bin:$PATH\"\nexport PROFILE_ALLOWED=profile\nexport PROFILE_SECRET=secret\nprofile_helper() { printf helper; }\n",
+    )
+    .await?;
+    fs::write(
+        profile_home.path().join(".bash_profile"),
+        "export PROFILE_SECRET=secret\n",
+    )
+    .await?;
+    let configured_home = profile_home.path().to_string_lossy().into_owned();
+    let shell = get_shell_by_model_provided_path(&PathBuf::from("/bin/sh"));
+    let builder = test_codex()
+        .with_user_shell(shell)
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::UnifiedExec)
+                .expect("test config should enable unified exec");
+            config
+                .features
+                .enable(Feature::ShellSnapshotV2)
+                .expect("test config should enable in-memory snapshots");
+            config
+                .permissions
+                .shell_environment_policy
+                .ignore_default_excludes = false;
+            config.permissions.shell_environment_policy.r#set = HashMap::from([
+                ("HOME".to_string(), configured_home),
+                ("PROFILE_ALLOWED".to_string(), "policy".to_string()),
+            ]);
+        });
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+
+    for attempt in 0..2 {
+        let end = run_tool_turn_on_harness(
+            &harness,
+            "run an in-memory shell snapshot",
+            &format!("shell-snapshot-v2-{attempt}"),
+            "exec_command",
+            json!({
+                "cmd": "profile_helper; case \":$PATH:\" in *\":$HOME/profile-bin:\"*) printf '|path';; *) printf '|missing';; esac; printf '|%s|%s' \"$PROFILE_ALLOWED\" \"${PROFILE_SECRET-missing}\"",
+                "shell": "/bin/bash",
+                "yield_time_ms": 1_000,
+            }),
+        )
+        .await?;
+
+        assert_eq!(end.exit_code, 0);
+        assert_eq!(
+            normalize_newlines(&end.stdout).trim(),
+            "helper|path|policy|missing"
+        );
+    }
+
+    assert_eq!(
+        fs::read_to_string(profile_home.path().join("captures")).await?,
+        "x"
+    );
+    assert!(!harness.test().home.path().join("shell_snapshots").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_snapshot_v2_preserves_legacy_snapshots_for_user_shell() -> Result<()> {
+    skip_if_remote!(Ok(()), "legacy shell snapshots require a local environment");
+    let builder = test_codex().with_config(|config| {
+        config
+            .features
+            .disable(Feature::ShellTool)
+            .expect("test config should disable model shell tools");
+        config
+            .features
+            .enable(Feature::ShellSnapshot)
+            .expect("test config should enable legacy snapshots");
+        config
+            .features
+            .enable(Feature::ShellSnapshotV2)
+            .expect("test config should enable in-memory snapshots");
+    });
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    let snapshot_path = wait_for_snapshot(harness.test().home.path()).await?;
+    assert_posix_snapshot_sections(&fs::read_to_string(snapshot_path).await?);
+    let codex = &harness.test().codex;
+    codex
+        .submit(Op::RunUserShellCommand {
+            command: "printf legacy".to_string(),
+        })
+        .await?;
+    let end = wait_for_event_match(codex, |event| match event {
+        EventMsg::ExecCommandEnd(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(end.exit_code, 0);
+    assert_eq!(normalize_newlines(&end.stdout).trim(), "legacy");
+    Ok(())
+}
+
 #[cfg_attr(not(target_os = "linux"), ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linux_unified_exec_uses_shell_snapshot() -> Result<()> {
@@ -413,82 +421,8 @@ async fn linux_unified_exec_uses_shell_snapshot() -> Result<()> {
 
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn linux_shell_command_uses_shell_snapshot() -> Result<()> {
-    let command = "echo shell-command-snapshot-linux";
-    let run = run_shell_command_snapshot(command).await?;
-
-    assert_eq!(run.begin.command.get(1).map(String::as_str), Some("-lc"));
-    assert_eq!(run.begin.command.get(2).map(String::as_str), Some(command));
-    assert_eq!(run.begin.command.len(), 3);
-    assert!(run.snapshot_path.starts_with(&run.codex_home));
-    assert_posix_snapshot_sections(&run.snapshot_content);
-    assert_eq!(
-        normalize_newlines(&run.end.stdout).trim(),
-        "shell-command-snapshot-linux"
-    );
-    assert_eq!(run.end.exit_code, 0);
-
-    Ok(())
-}
-
-#[cfg_attr(target_os = "windows", ignore)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shell_command_snapshot_preserves_shell_environment_policy_set() -> Result<()> {
+async fn unified_exec_snapshot_preserves_shell_environment_policy_set() -> Result<()> {
     let builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::ShellSnapshot)
-            .expect("test config should allow feature update");
-        config.permissions.shell_environment_policy.r#set = policy_set_path_for_test();
-    });
-    let harness = TestCodexHarness::with_builder(builder).await?;
-    let codex_home = harness.test().home.path().to_path_buf();
-    run_tool_turn_on_harness(
-        &harness,
-        "warm up shell snapshot",
-        "shell-snapshot-policy-warmup",
-        "shell_command",
-        json!({
-            "command": "printf warmup",
-            "timeout_ms": 1_000,
-        }),
-    )
-    .await?;
-    let snapshot_path = wait_for_snapshot(&codex_home).await?;
-    fs::write(&snapshot_path, snapshot_override_content_for_policy_test()).await?;
-
-    let command = command_asserting_policy_after_snapshot();
-    let end = run_tool_turn_on_harness(
-        &harness,
-        "verify shell policy after snapshot",
-        "shell-snapshot-policy-assert",
-        "shell_command",
-        json!({
-            "command": command,
-            "timeout_ms": 1_000,
-        }),
-    )
-    .await?;
-
-    assert_eq!(
-        normalize_newlines(&end.stdout).trim(),
-        POLICY_SUCCESS_OUTPUT
-    );
-    assert_eq!(end.exit_code, 0);
-    assert!(snapshot_path.starts_with(codex_home));
-
-    Ok(())
-}
-
-#[cfg_attr(not(target_os = "linux"), ignore)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn linux_unified_exec_snapshot_preserves_shell_environment_policy_set() -> Result<()> {
-    let builder = test_codex().with_config(|config| {
-        config.use_experimental_unified_exec_tool = true;
-        config
-            .features
-            .enable(Feature::UnifiedExec)
-            .expect("test config should allow feature update");
         config
             .features
             .enable(Feature::ShellSnapshot)
@@ -536,7 +470,7 @@ async fn linux_unified_exec_snapshot_preserves_shell_environment_policy_set() ->
 
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
+async fn unified_exec_snapshot_still_intercepts_apply_patch() -> Result<()> {
     let builder = test_codex().with_config(|config| {
         config
             .features
@@ -553,17 +487,17 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
 
     let script = "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: snapshot-apply.txt\n+hello from snapshot\n*** End Patch\nEOF\n";
     let args = json!({
-        "command": script,
+        "cmd": script,
         // Keep this above the default because intercepted apply_patch still
         // performs filesystem work that can be slow in Bazel macOS test
         // environments.
-        "timeout_ms": 5_000,
+        "yield_time_ms": 5_000,
     });
     let call_id = "shell-snapshot-apply-patch";
     let responses = vec![
         sse(vec![
             ev_response_created("resp-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
             ev_completed("resp-1"),
         ]),
         sse(vec![
@@ -580,7 +514,7 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
     codex
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![UserInput::Text {
-                text: "apply patch via shell_command with snapshot".into(),
+                text: "apply patch via unified_exec with snapshot".into(),
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
@@ -675,7 +609,7 @@ async fn shell_snapshot_deleted_after_shutdown_with_skills() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn macos_shell_command_resolves_command_from_tied_path_snapshot() -> Result<()> {
+async fn macos_unified_exec_resolves_command_from_tied_path_snapshot() -> Result<()> {
     let builder = test_codex()
         .with_user_shell(get_shell_by_model_provided_path(&PathBuf::from("/bin/zsh")))
         .with_config(|config| {
@@ -702,10 +636,10 @@ async fn macos_shell_command_resolves_command_from_tied_path_snapshot() -> Resul
         &harness,
         "warm up the tied PATH shell snapshot",
         "shell-snapshot-tied-path-warmup",
-        "shell_command",
+        "exec_command",
         json!({
-            "command": "printf warmup",
-            "timeout_ms": 5_000,
+            "cmd": "printf warmup",
+            "yield_time_ms": 5_000,
         }),
     )
     .await?;
@@ -723,10 +657,10 @@ async fn macos_shell_command_resolves_command_from_tied_path_snapshot() -> Resul
         &harness,
         "resolve a command from the tied PATH snapshot",
         "shell-snapshot-tied-path",
-        "shell_command",
+        "exec_command",
         json!({
-            "command": "snapshot-only-command",
-            "timeout_ms": 5_000,
+            "cmd": "snapshot-only-command",
+            "yield_time_ms": 5_000,
         }),
     )
     .await?;

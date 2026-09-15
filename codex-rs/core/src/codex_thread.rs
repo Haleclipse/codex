@@ -1,16 +1,20 @@
 use crate::agent::AgentStatus;
 use crate::config::ConstraintResult;
+use crate::context::ContextualUserFragment;
 use crate::elicitation::ElicitationRegistration;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
+use crate::session::new_submission_id;
 use crate::session::session::Session;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_exec_server::SelectedCapabilityRootsStatus;
+use codex_extension_api::ConversationHistorySnapshot;
 use codex_extension_api::ThreadIdleCause;
 use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_otel::SessionTelemetry;
+use codex_otel::current_span_w3c_trace_context;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
@@ -22,7 +26,6 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ActivePermissionProfile;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -35,6 +38,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
@@ -46,6 +50,7 @@ use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::turn_input::RecoverTurnRequest;
 use codex_protocol::turn_input::StartIfIdleSubmission;
 use codex_protocol::turn_input::SteerSubmission;
+use codex_protocol::turn_input::SuspendTurnOutcome;
 use codex_protocol::turn_input::TurnInputMode;
 use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
@@ -62,6 +67,7 @@ use rmcp::model::ReadResourceRequestParams;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -142,6 +148,57 @@ pub struct CodexThreadSettingsOverrides {
     pub personality: Option<Personality>,
 }
 
+/// One root conversation message exposed only to a worker's Guardian reviewers.
+#[derive(Debug, Eq, PartialEq)]
+pub enum GuardianRootMessage {
+    /// Genuine root-user input that can establish or revoke authorization.
+    User(String),
+    /// Root assistant final output that provides untrusted conversational context.
+    Assistant(String),
+}
+
+impl GuardianRootMessage {
+    /// Renders every line with its original role so message content cannot impersonate another role.
+    pub fn render(self) -> String {
+        let (role, text) = match self {
+            Self::User(text) => ("user", text),
+            Self::Assistant(text) => ("assistant", text),
+        };
+        text.lines()
+            .map(|line| format!("{role}: {line}\n"))
+            .collect()
+    }
+}
+
+/// Authorization state that changes on history rewrites or genuine user messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianAuthorizationVersion {
+    /// Conversation-history rewrite generation.
+    pub history_version: u64,
+    /// Number of genuine user messages in the conversation snapshot.
+    pub user_message_count: usize,
+}
+
+impl GuardianAuthorizationVersion {
+    /// Captures history replacement and genuine user input from the same snapshot.
+    pub fn from_history(history: &dyn ConversationHistorySnapshot) -> Self {
+        Self {
+            history_version: history.history_version(),
+            user_message_count: history
+                .items()
+                .filter(|item| item.is_user_message())
+                .count(),
+        }
+    }
+}
+
+/// Bounded root conversation and authorization state from one history snapshot.
+#[derive(Debug, Eq, PartialEq)]
+pub struct GuardianRootSnapshot {
+    pub authorization_version: GuardianAuthorizationVersion,
+    pub messages: Vec<GuardianRootMessage>,
+}
+
 pub struct CodexThread {
     pub(crate) session: Arc<Session>,
     pub(crate) io: SessionIo,
@@ -208,6 +265,25 @@ impl CodexThread {
     /// Wait until the underlying session loop has terminated.
     pub async fn wait_until_terminated(&self) {
         self.io.session_loop_termination.clone().await;
+    }
+
+    pub(crate) async fn emit_thread_ready_lifecycle(&self) {
+        let config = self.config().await;
+        for contributor in self
+            .session
+            .services
+            .extensions
+            .thread_lifecycle_contributors()
+        {
+            contributor
+                .on_thread_ready(codex_extension_api::ThreadReadyInput {
+                    config: config.as_ref(),
+                    session_source: &self.session_source,
+                    session_store: &self.session.services.session_extension_data,
+                    thread_store: &self.session.services.thread_extension_data,
+                })
+                .await;
+        }
     }
 
     pub(crate) async fn emit_thread_resume_lifecycle(&self) {
@@ -324,6 +400,47 @@ impl CodexThread {
                 unreachable!("recovered turn submission cannot steer")
             }
         }
+    }
+
+    /// Stops the active unfinished root turn without recording TurnAborted or
+    /// TurnComplete, so another worker can recover its original turn ID.
+    ///
+    /// Suspension is refused while a currently loaded descendant exists. Past
+    /// descendants do not prevent recovery, and concurrent descendant admission
+    /// is not sealed. Queued user input and outstanding approval, elicitation,
+    /// or server-request waiters remain best effort and may be discarded.
+    ///
+    /// The session processes an accepted request even if its caller disconnects.
+    /// Callers must not transfer ownership until suspension succeeds, which
+    /// requires stopping execution, flushing history, and closing its writer.
+    pub async fn suspend_turn_and_shutdown(&self) -> CodexResult<SuspendTurnOutcome> {
+        if self.session_source.is_non_root_agent() {
+            return Err(CodexErr::UnsupportedOperation(
+                "turn suspension requires the owning root thread".to_string(),
+            ));
+        }
+
+        // The session owns accepted suspension, so dropping this caller cannot interrupt
+        // cancellation, persistence, or writer shutdown halfway through a handoff.
+        let (reply, result) = oneshot::channel();
+        self.io
+            .tx_sub
+            .send(Submission {
+                id: new_submission_id(),
+                op: Op::SuspendTurnAndShutdown { reply },
+                trace: current_span_w3c_trace_context(),
+                parent_turn_id: None,
+                root_turn_id: None,
+            })
+            .await
+            .map_err(|_| CodexErr::Fatal("thread session has stopped".to_string()))?;
+        let outcome = result
+            .await
+            .map_err(|_| CodexErr::Fatal("thread suspension reply was lost".to_string()))??;
+        if matches!(&outcome, SuspendTurnOutcome::Suspended { .. }) {
+            self.io.session_loop_termination.clone().await;
+        }
+        Ok(outcome)
     }
 
     /// Steers only if `expected_turn_id` is still the active regular turn.
@@ -495,15 +612,9 @@ impl CodexThread {
         self.session.token_info_and_rate_limits().await
     }
 
-    /// Records a user-role session-prefix message without creating a new user turn boundary.
-    pub(crate) async fn inject_user_message_without_turn(&self, message: String) {
-        let item = ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText { text: message }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        };
+    /// Records a context fragment without creating a new user turn boundary.
+    pub(crate) async fn inject_fragment_without_turn(&self, fragment: impl ContextualUserFragment) {
+        let item = ContextualUserFragment::into(fragment);
         self.session
             .inject_no_new_turn(vec![item], /*current_turn_context*/ None)
             .await;
@@ -662,6 +773,18 @@ impl CodexThread {
         self.session.get_config().await
     }
 
+    /// Observes this thread's published MCP connections that match the requested config.
+    pub async fn mcp_connection_statuses(
+        &self,
+        config: &codex_mcp::McpConfig,
+    ) -> std::collections::HashMap<String, codex_protocol::mcp::McpServerConnectionStatus> {
+        self.session
+            .services
+            .mcp_runtime
+            .connection_statuses(config)
+            .await
+    }
+
     /// Resolves MCP configuration and environment bindings from the same config snapshot.
     pub async fn runtime_mcp_config_and_context(
         &self,
@@ -681,6 +804,15 @@ impl CodexThread {
 
     pub fn multi_agent_version(&self) -> Option<MultiAgentVersion> {
         self.session.multi_agent_version()
+    }
+
+    /// Returns bounded root conversation evidence and its authorization version atomically.
+    pub async fn guardian_root_snapshot(&self) -> Option<GuardianRootSnapshot> {
+        self.session
+            .services
+            .agent_control
+            .root_user_authorization(self.session.thread_id)
+            .await
     }
 
     /// Refresh the thread's layer-backed user config state from a caller-supplied
@@ -755,6 +887,26 @@ impl CodexThread {
         Ok(serde_json::to_value(result)?)
     }
 
+    pub async fn start_mcp_event_stream(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        meta: Option<serde_json::Value>,
+    ) -> anyhow::Result<codex_mcp::McpEventStream> {
+        let meta = match meta.as_ref() {
+            Some(serde_json::Value::Object(meta)) => Some(meta),
+            Some(other) => {
+                anyhow::bail!("MCP event request _meta must be a JSON object, got {other}")
+            }
+            None => None,
+        };
+        let _ = self.session.services.auth_manager.auth().await;
+        self.session.refresh_mcp_if_dirty().await;
+        codex_mcp::McpResourceClient::new(Arc::clone(&self.session.services.mcp_runtime))
+            .open_event_stream(name, &arguments, meta)
+            .await
+    }
+
     pub async fn call_mcp_tool(
         &self,
         server: &str,
@@ -767,8 +919,8 @@ impl CodexThread {
             .services
             .mcp_runtime
             .latest_call_tool(
-                server, tool, arguments, meta, /*requested_timeout*/ None,
-                /*wait_for_server*/ true,
+                server, tool, /*environment_id*/ None, arguments, meta,
+                /*requested_timeout*/ None, /*wait_for_server*/ true,
             )
             .await
     }

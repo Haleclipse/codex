@@ -12,18 +12,19 @@ use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
+use crate::context::SubagentNotification;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::rollout_budget::RolloutBudget;
 use crate::session::emit_subagent_session_started;
 use crate::session::multi_agents::ResolvedMultiAgentV2UsageHints;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
-use crate::session_prefix::format_subagent_notification_message;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadIdGenerator;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_manager::default_thread_id_generator;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
+use crate::turn_timing::now_unix_timestamp_ms;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
@@ -33,11 +34,17 @@ use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::items::SubAgentActivityItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
@@ -65,6 +72,7 @@ mod execution;
 mod legacy;
 mod residency;
 mod spawn;
+mod user_authorization;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnAgentForkMode {
@@ -230,6 +238,55 @@ impl AgentControl {
             root_turn_id,
         )
         .await
+    }
+
+    pub(crate) async fn emit_sub_agent_activity(
+        &self,
+        thread_id: ThreadId,
+        turn_id: String,
+        item: SubAgentActivityItem,
+    ) -> CodexResult<()> {
+        let state = self.upgrade()?;
+        let thread = state.get_thread(thread_id).await?;
+        let started_at_ms = now_unix_timestamp_ms();
+        let item = TurnItem::SubAgentActivity(item);
+        thread
+            .session
+            .send_event_raw(Event {
+                id: turn_id.clone(),
+                msg: EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id,
+                    turn_id: turn_id.clone(),
+                    item: item.clone(),
+                    started_at_ms,
+                }),
+            })
+            .await;
+        let completed_at_ms = now_unix_timestamp_ms();
+        let completed = ItemCompletedEvent {
+            thread_id,
+            turn_id: turn_id.clone(),
+            item,
+            started_at_ms: Some(started_at_ms),
+            completed_at_ms,
+        };
+        thread
+            .session
+            .send_event_raw(Event {
+                id: turn_id.clone(),
+                msg: EventMsg::ItemCompleted(completed.clone()),
+            })
+            .await;
+        for legacy in completed.as_legacy_events(/*show_raw_agent_reasoning*/ false) {
+            thread
+                .session
+                .send_event_raw(Event {
+                    id: turn_id.clone(),
+                    msg: legacy,
+                })
+                .await;
+        }
+        Ok(())
     }
 
     async fn send_inter_agent_communication_after_capacity_check(
@@ -591,12 +648,14 @@ impl AgentControl {
                     .await;
                 return;
             }
-            let message = format_subagent_notification_message(child_reference.as_str(), &status);
             let Ok(parent_thread) = state.get_thread(parent_thread_id).await else {
                 return;
             };
             parent_thread
-                .inject_user_message_without_turn(message)
+                .inject_fragment_without_turn(SubagentNotification::new(
+                    child_reference.as_str(),
+                    status,
+                ))
                 .await;
         });
     }

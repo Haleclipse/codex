@@ -1852,6 +1852,41 @@
           ],
           "title": "AmazonBedrockLoginAccountParams",
           "type": "object"
+        },
+        {
+          "description": "[UNSTABLE] Managed Amazon Bedrock AWS access key login is experimental.",
+          "properties": {
+            "accessKeyId": {
+              "type": "string"
+            },
+            "region": {
+              "type": "string"
+            },
+            "secretAccessKey": {
+              "type": "string"
+            },
+            "sessionToken": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "amazonBedrockAccessKeys"
+              ],
+              "title": "AmazonBedrockAccessKeysLoginAccountParamsType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "accessKeyId",
+            "region",
+            "secretAccessKey",
+            "type"
+          ],
+          "title": "AmazonBedrockAccessKeysLoginAccountParams",
+          "type": "object"
         }
       ]
     },
@@ -3051,7 +3086,10 @@
         {
           "properties": {
             "call_id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "id": {
               "type": [
@@ -3069,6 +3107,18 @@
                 }
               ]
             },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "namespace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "output": {
               "$ref": "#/definitions/FunctionCallOutputBody"
             },
@@ -3081,7 +3131,6 @@
             }
           },
           "required": [
-            "call_id",
             "output",
             "type"
           ],
@@ -4511,6 +4560,27 @@
             "type"
           ],
           "title": "WebrtcThreadRealtimeStartTransport",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "callId": {
+              "description": "Identifier of a realtime call already created and negotiated by the client.",
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "existingCall"
+              ],
+              "title": "ExistingCallThreadRealtimeStartTransportType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "callId",
+            "type"
+          ],
+          "title": "ExistingCallThreadRealtimeStartTransport",
           "type": "object"
         }
       ]

@@ -82,6 +82,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use toml_edit::value;
 use tracing::Instrument;
 use tracing::Span;
@@ -108,9 +109,11 @@ const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call
 /// item lifecycle events to the `Session`.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn handle_mcp_tool_call(
     sess: Arc<Session>,
     step_context: &Arc<StepContext>,
+    cancellation_token: &CancellationToken,
     call_id: String,
     tool_info: &ToolInfo,
     hook_tool_name: HookToolName,
@@ -233,6 +236,7 @@ pub(crate) async fn handle_mcp_tool_call(
     if let Some(decision) = maybe_request_mcp_tool_approval(
         &sess,
         step_context,
+        cancellation_token,
         &call_id,
         &invocation,
         &invocation_tool_name,
@@ -283,7 +287,7 @@ pub(crate) async fn handle_mcp_tool_call(
                     &call_id,
                     invocation,
                     item_metadata.clone(),
-                    crate::guardian::guardian_timeout_message(),
+                    crate::guardian::guardian_timeout_message(&turn_context.model_info),
                     /*already_started*/ true,
                 )
                 .await
@@ -769,6 +773,8 @@ async fn augment_mcp_tool_request_meta_with_sandbox_state(
     else {
         return Ok(meta);
     };
+    // TODO(anp): Build this metadata from the server's captured
+    // TurnEnvironment::sandbox_context instead of the runtime-wide Landlock value.
     let permission_profile = prepared_call.config().permission_profile.clone();
     let sandbox_state = serde_json::to_value(SandboxState {
         permission_profile,
@@ -1288,6 +1294,7 @@ fn mcp_tool_approval_prompt_options(
 async fn maybe_request_mcp_tool_approval(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,
+    cancellation_token: &CancellationToken,
     call_id: &str,
     invocation: &McpInvocation,
     invocation_tool_name: &ToolName,
@@ -1375,6 +1382,7 @@ async fn maybe_request_mcp_tool_approval(
     };
     let approval_context = ApprovalContext {
         review_context: GuardianReviewContext::from(step_context),
+        cancellation_token: Some(cancellation_token.clone()),
         call_id: call_id.to_string(),
         tool_name: invocation_tool_name.clone(),
         strict_auto_review,

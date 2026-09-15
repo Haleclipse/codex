@@ -5,6 +5,7 @@ use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::EnvironmentConfig;
 use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Policy;
 use codex_execpolicy::RequirementsExecPolicy;
@@ -13,6 +14,7 @@ use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
@@ -246,15 +248,15 @@ async fn granular_complex_forced_rm_denial_explains_why_the_command_was_rejected
     let test = builder.build_with_auto_env(&server).await?;
     let call_id = "forced-rm-denied";
     let args = json!({
-        "command": COMPLEX_FORCED_RM_COMMAND,
-        "timeout_ms": 1_000,
+        "cmd": COMPLEX_FORCED_RM_COMMAND,
+        "yield_time_ms": 1_000,
     });
 
     mount_sse_once(
         &server,
         sse(vec![
             ev_response_created("resp-forced-rm-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
             ev_completed("resp-forced-rm-1"),
         ]),
     )
@@ -310,15 +312,15 @@ async fn granular_complex_forced_rm_requests_approval_when_allowed() -> Result<(
     let test = builder.build_with_auto_env(&server).await?;
     let call_id = "forced-rm-approval";
     let args = json!({
-        "command": COMPLEX_FORCED_RM_COMMAND,
-        "timeout_ms": 1_000,
+        "cmd": COMPLEX_FORCED_RM_COMMAND,
+        "yield_time_ms": 1_000,
     });
 
     mount_sse_once(
         &server,
         sse(vec![
             ev_response_created("resp-forced-rm-approval-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
             ev_completed("resp-forced-rm-approval-1"),
         ]),
     )
@@ -389,15 +391,15 @@ async fn deeply_nested_forced_rm_is_rejected_before_execution_when_approvals_are
     fs::write(&sentinel, "must not be deleted")?;
     let call_id = "deeply-nested-forced-rm";
     let args = json!({
-        "command": "env env env env env env env env env rm -rf forced-rm-sentinel",
-        "timeout_ms": 1_000,
+        "cmd": "env env env env env env env env env rm -rf forced-rm-sentinel",
+        "yield_time_ms": 1_000,
     });
 
     mount_sse_once(
         &server,
         sse(vec![
             ev_response_created("resp-deeply-nested-forced-rm-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
             ev_completed("resp-deeply-nested-forced-rm-1"),
         ]),
     )
@@ -532,20 +534,20 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
 
     let call_id = "shell-forbidden";
     let args = json!({
-        "command": "echo blocked",
-        "timeout_ms": 1_000,
+        "cmd": "echo blocked",
+        "yield_time_ms": 1_000,
     });
 
     mount_sse_once(
         &server,
         sse(vec![
             ev_response_created("resp-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
             ev_completed("resp-1"),
         ]),
     )
     .await;
-    mount_sse_once(
+    let results_mock = mount_sse_once(
         &server,
         sse(vec![
             ev_assistant_message("msg-1", "done"),
@@ -581,23 +583,18 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
         )
         .await?;
 
-    let EventMsg::ExecCommandEnd(end) = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::ExecCommandEnd(_))
-    })
-    .await
-    else {
-        unreachable!()
-    };
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
 
+    let output = results_mock
+        .single_request()
+        .function_call_output_text(call_id)
+        .expect("forbidden command should produce a tool response");
     assert!(
-        end.aggregated_output
-            .contains("policy forbids commands starting with `echo`"),
-        "unexpected output: {}",
-        end.aggregated_output
+        output.contains("policy forbids commands starting with `echo`"),
+        "unexpected output: {output}"
     );
 
     Ok(())
@@ -721,6 +718,12 @@ async fn environment_command_restrictions_override_saved_prefix_approvals() -> R
                 allow_login_shell: true,
                 permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
                 shell_environment_policy: Default::default(),
+                windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+                windows_sandbox_private_desktop: test
+                    .config
+                    .permissions
+                    .windows_sandbox_private_desktop,
+                use_legacy_landlock: test.config.features.use_legacy_landlock(),
                 exec_policy: Some(RequirementsExecPolicy::new(invalid_policy)),
                 mcp_policy: None,
                 network_policy: None,
@@ -744,6 +747,12 @@ async fn environment_command_restrictions_override_saved_prefix_approvals() -> R
                 allow_login_shell: true,
                 permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
                 shell_environment_policy: Default::default(),
+                windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+                windows_sandbox_private_desktop: test
+                    .config
+                    .permissions
+                    .windows_sandbox_private_desktop,
+                use_legacy_landlock: test.config.features.use_legacy_landlock(),
                 exec_policy: Some(RequirementsExecPolicy::new(environment_policy)),
                 mcp_policy: None,
                 network_policy: None,
@@ -848,6 +857,12 @@ async fn environment_command_policy_changes_invalidate_session_approvals() -> Re
                             PermissionProfile::Disabled,
                         ),
                         shell_environment_policy: Default::default(),
+                        windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+                        windows_sandbox_private_desktop: test
+                            .config
+                            .permissions
+                            .windows_sandbox_private_desktop,
+                        use_legacy_landlock: test.config.features.use_legacy_landlock(),
                         exec_policy: Some(RequirementsExecPolicy::new(policy)),
                         mcp_policy: None,
                         network_policy: None,
@@ -909,61 +924,6 @@ async fn environment_command_policy_changes_invalidate_session_approvals() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shell_command_empty_script_with_collaboration_mode_does_not_panic() -> Result<()> {
-    let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
-        config
-            .features
-            .enable(Feature::CollaborationModes)
-            .expect("test config should allow feature update");
-    });
-    let test = builder.build(&server).await?;
-    let call_id = "shell-empty-script-collab";
-    let args = json!({
-        "command": "",
-        "timeout_ms": 1_000,
-    });
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-empty-shell-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-empty-shell-1"),
-        ]),
-    )
-    .await;
-    let results_mock = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-empty-shell-1", "done"),
-            ev_completed("resp-empty-shell-2"),
-        ]),
-    )
-    .await;
-
-    let collaboration_mode = collaboration_mode_for_model(test.session_configured.model.clone());
-    submit_user_turn(
-        &test,
-        "run an empty shell command",
-        AskForApproval::OnRequest,
-        PermissionProfile::Disabled,
-        Some(collaboration_mode),
-    )
-    .await?;
-
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let output_item = results_mock.single_request().function_call_output(call_id);
-    assert_no_matched_rules_invariant(&output_item);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unified_exec_empty_script_with_collaboration_mode_does_not_panic() -> Result<()> {
     let server = start_mock_server().await;
     let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
@@ -1005,61 +965,6 @@ async fn unified_exec_empty_script_with_collaboration_mode_does_not_panic() -> R
     submit_user_turn(
         &test,
         "run empty unified exec command",
-        AskForApproval::OnRequest,
-        PermissionProfile::Disabled,
-        Some(collaboration_mode),
-    )
-    .await?;
-
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    let output_item = results_mock.single_request().function_call_output(call_id);
-    assert_no_matched_rules_invariant(&output_item);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shell_command_whitespace_script_with_collaboration_mode_does_not_panic() -> Result<()> {
-    let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
-        config
-            .features
-            .enable(Feature::CollaborationModes)
-            .expect("test config should allow feature update");
-    });
-    let test = builder.build(&server).await?;
-    let call_id = "shell-whitespace-script-collab";
-    let args = json!({
-        "command": "  \n\t  ",
-        "timeout_ms": 1_000,
-    });
-
-    mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-whitespace-shell-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
-            ev_completed("resp-whitespace-shell-1"),
-        ]),
-    )
-    .await;
-    let results_mock = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_assistant_message("msg-whitespace-shell-1", "done"),
-            ev_completed("resp-whitespace-shell-2"),
-        ]),
-    )
-    .await;
-
-    let collaboration_mode = collaboration_mode_for_model(test.session_configured.model.clone());
-    submit_user_turn(
-        &test,
-        "run whitespace shell command",
         AskForApproval::OnRequest,
         PermissionProfile::Disabled,
         Some(collaboration_mode),

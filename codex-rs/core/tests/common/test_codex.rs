@@ -308,7 +308,7 @@ fn docker_command_capture_stdout<const N: usize>(args: [&str; N]) -> Result<Stri
 /// Non-default apply_patch model output shapes used by compatibility tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ApplyPatchModelOutput {
-    ShellCommandViaHeredoc,
+    ExecCommandViaHeredoc,
 }
 
 /// Returns the permission fields required by test thread-settings overrides.
@@ -1339,6 +1339,10 @@ pub fn test_codex() -> TestCodexBuilder {
                 .features
                 .disable(Feature::ShellSnapshot)
                 .expect("test config should allow ShellSnapshot override");
+            config
+                .features
+                .enable(Feature::ContentItemKinds)
+                .expect("test config should allow ContentItemKinds override");
         })],
         auth: CodexAuth::from_api_key("dummy"),
         pre_build_hooks: vec![],

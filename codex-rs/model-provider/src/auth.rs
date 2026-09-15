@@ -206,7 +206,10 @@ pub(crate) fn resolve_provider_auth(
         return Ok(unauthenticated_auth_provider());
     }
 
-    if matches!(auth, Some(CodexAuth::BedrockApiKey(_))) {
+    if matches!(
+        auth,
+        Some(CodexAuth::BedrockApiKey(_) | CodexAuth::BedrockAccessKeys(_))
+    ) {
         return Err(CodexErr::UnsupportedOperation(
             BEDROCK_API_KEY_UNSUPPORTED_MESSAGE.to_string(),
         ));
@@ -294,7 +297,7 @@ fn bearer_auth_for_provider(
     }
 
     if let Some(token) = provider.experimental_bearer_token.clone() {
-        return Ok(Some(BearerAuthProvider::new(token)));
+        return Ok(Some(BearerAuthProvider::new(token.into_inner())));
     }
 
     Ok(None)
@@ -307,7 +310,9 @@ pub fn auth_provider_from_auth(auth: &CodexAuth) -> SharedAuthProvider {
             Arc::new(AgentIdentityAuthProvider { auth: auth.clone() })
         }
         CodexAuth::Headers(auth) => Arc::new(HeaderAuthProvider { auth: auth.clone() }),
-        CodexAuth::BedrockApiKey(_) => unreachable!("{BEDROCK_API_KEY_UNSUPPORTED_MESSAGE}"),
+        CodexAuth::BedrockApiKey(_) | CodexAuth::BedrockAccessKeys(_) => {
+            unreachable!("{BEDROCK_API_KEY_UNSUPPORTED_MESSAGE}")
+        }
         CodexAuth::ApiKey(_)
         | CodexAuth::Chatgpt(_)
         | CodexAuth::ChatgptAuthTokens(_)
@@ -512,7 +517,7 @@ mod tests {
     fn custom_provider_uses_explicit_bearer_instead_of_ambient_auth() {
         let mut provider =
             create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses);
-        provider.experimental_bearer_token = Some("provider-token".to_string());
+        provider.experimental_bearer_token = Some("provider-token".into());
         let ambient_auth = CodexAuth::BedrockApiKey(BedrockApiKeyAuth {
             api_key: "bedrock-api-key-test".to_string(),
             region: "us-east-1".to_string(),

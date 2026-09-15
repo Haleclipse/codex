@@ -28,6 +28,7 @@ use crate::StoredOAuthTokens;
 use crate::WrappedOAuthTokenResponse;
 use crate::http_client_adapter::StreamableHttpRedirectMode;
 use crate::oauth::compute_expires_at_millis;
+use crate::oauth::validate_authorization_server_endpoints;
 use crate::oauth_client_registration::McpOAuthClientRegistration;
 use crate::oauth_client_registration::PreparedOAuthLogin;
 use crate::oauth_client_registration::start_authorization as start_client_registration;
@@ -710,6 +711,7 @@ async fn start_authorization(
         AuthorizationManager::new_with_oauth_http_client(server_url, http_client).await?;
     auth_manager.set_allow_missing_issuer(true);
     let metadata = auth_manager.resolve_metadata().await?.metadata;
+    validate_authorization_server_endpoints(&metadata)?;
     let authorization_server_issuer = metadata.issuer.clone();
     auth_manager.set_metadata(metadata);
     auth_manager.configure_client(
@@ -1111,6 +1113,18 @@ mod tests {
                 expected_token_requests
             );
             assert_eq!(result.is_ok(), expected_token_requests == 1);
+
+            if expected_token_requests == 0 {
+                state
+                    .handle_callback_with_issuer(
+                        "legitimate-code",
+                        &csrf_state,
+                        Some(authorization_issuer.as_str()),
+                    )
+                    .await
+                    .expect("issuer validation failures must preserve OAuth authorization state");
+                assert_eq!(token_requests.load(Ordering::SeqCst), 1);
+            }
             server.abort();
         }
     }

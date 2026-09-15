@@ -963,7 +963,7 @@ async fn live_app_server_sub_agent_activity_renders_once() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let activity = AppServerThreadItem::SubAgentActivity {
         id: "activity-1".to_string(),
-        kind: codex_app_server_protocol::SubAgentActivityKind::Interacted,
+        kind: codex_app_server_protocol::SubAgentActivityKind::Completed,
         agent_thread_id: ThreadId::new().to_string(),
         agent_path: "/root/researcher".to_string(),
     };
@@ -1556,6 +1556,100 @@ async fn live_app_server_thread_name_update_shows_resume_hint() {
     assert_eq!(cells.len(), 1);
     let rendered = lines_to_single_string(&cells[0]);
     assert_chatwidget_snapshot!("thread_name_update_resume_hint", rendered);
+}
+
+#[tokio::test]
+async fn live_app_server_automatic_thread_name_update_is_silent() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    for title in ["Provisional title", "Generated title"] {
+        chat.expect_automatic_thread_name(title.to_string());
+        assert_eq!(chat.thread_name(), Some(title.to_string()));
+
+        chat.handle_server_notification(
+            ServerNotification::ThreadNameUpdated(
+                codex_app_server_protocol::ThreadNameUpdatedNotification {
+                    thread_id: thread_id.to_string(),
+                    thread_name: Some(title.to_string()),
+                },
+            ),
+            /*replay_kind*/ None,
+        );
+
+        assert_eq!(chat.thread_name, Some(title.to_string()));
+        assert!(drain_insert_history(&mut rx).is_empty());
+    }
+
+    chat.handle_server_notification(
+        ServerNotification::ThreadNameUpdated(
+            codex_app_server_protocol::ThreadNameUpdatedNotification {
+                thread_id: thread_id.to_string(),
+                thread_name: Some("Manual title".to_string()),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    assert_eq!(chat.thread_name, Some("Manual title".to_string()));
+    assert_eq!(drain_insert_history(&mut rx).len(), 1);
+}
+
+#[tokio::test]
+async fn live_app_server_manual_thread_name_is_visible_before_notification() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.expect_automatic_thread_name("Provisional title".to_string());
+
+    chat.expect_manual_thread_name(thread_id, "Manual title".to_string());
+
+    assert_eq!(chat.thread_name(), Some("Manual title".to_string()));
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.handle_server_notification(
+        ServerNotification::ThreadNameUpdated(
+            codex_app_server_protocol::ThreadNameUpdatedNotification {
+                thread_id: thread_id.to_string(),
+                thread_name: Some("Manual title".to_string()),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    assert_eq!(chat.thread_name(), Some("Manual title".to_string()));
+    assert_eq!(drain_insert_history(&mut rx).len(), 1);
+}
+
+#[tokio::test]
+async fn thread_name_suggestion_requires_matching_thread_and_request() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    let request_id = uuid::Uuid::new_v4();
+    chat.thread_id = Some(thread_id);
+
+    let view = CustomPromptView::new(
+        "Rename thread".to_string(),
+        "Type a name and press Enter".to_string(),
+        /*initial_text*/ String::new(),
+        /*context_label*/ None,
+        Box::new(|_| {}),
+    )
+    .with_text_suggestion(request_id, "Loading".into(), "Ready".into());
+    chat.bottom_pane.show_text_prompt(view);
+
+    chat.apply_thread_name_suggestion(ThreadId::new(), request_id, Some("Wrong thread"));
+    chat.apply_thread_name_suggestion(thread_id, uuid::Uuid::new_v4(), Some("Wrong request"));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Loading"));
+    assert!(!popup.contains("Wrong"));
+
+    chat.apply_thread_name_suggestion(thread_id, request_id, Some("Suggested title"));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Ready"));
+    assert!(popup.contains("Suggested title"));
 }
 
 #[tokio::test]

@@ -20,6 +20,8 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadSource;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::SubAgentSource;
 
 impl App {
@@ -87,6 +89,35 @@ impl App {
         app_server_client: &AppServerSession,
         notification: ServerNotification,
     ) {
+        if let ServerNotification::ThreadStatusChanged(status) = &notification {
+            let _ = self.dynamic_tool_status_updates.send(status.clone());
+        }
+
+        if let ServerNotification::ThreadStarted(started) = &notification
+            && started.thread.ephemeral
+            && matches!(
+                started.thread.thread_source.as_ref(),
+                Some(ThreadSource::Feature(feature)) if feature == "system"
+            )
+        {
+            return;
+        }
+        // Hidden helper threads must not enter visible thread routing or overview refreshes.
+        if let ServerNotificationThreadTarget::Thread(thread_id) =
+            server_notification_thread_target(&notification)
+            && let Some(sender) = self.temporary_structured_requests.get(&thread_id)
+        {
+            if matches!(
+                &notification,
+                ServerNotification::ItemCompleted(_) | ServerNotification::TurnCompleted(_)
+            ) && sender.send(notification).is_err()
+            {
+                self.temporary_structured_requests.remove(&thread_id);
+            }
+
+            return;
+        }
+
         if let ServerNotification::ThreadStarted(started) = &notification
             && let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id, ..
@@ -116,6 +147,9 @@ impl App {
         }
         match &notification {
             ServerNotification::ServerRequestResolved(notification) => {
+                if let Some((_, task)) = self.dynamic_tool_tasks.remove(&notification.request_id) {
+                    task.abort();
+                }
                 let notification_thread_id =
                     codex_protocol::ThreadId::from_string(&notification.thread_id).ok();
                 self.pending_primary_events.retain(|event| {
@@ -291,6 +325,94 @@ impl App {
         app_server_client: &AppServerSession,
         request: ServerRequest,
     ) {
+        if let ServerRequest::DynamicToolCall { request_id, params } = &request {
+            if self.dynamic_tool_tasks.contains_key(request_id)
+                || (params.namespace.as_deref() != Some(crate::dynamic_tools::NAMESPACE)
+                    && !app_server_client.uses_embedded_app_server())
+            {
+                return;
+            }
+
+            let requires_mcp = crate::dynamic_tools::DELEGATION_TOOLS
+                .contains(&params.tool.as_str())
+                || matches!(
+                    app_server_client.thread_tool_transport(),
+                    crate::dynamic_tools_mcp::ThreadToolTransport::Mcp(_)
+                );
+            if app_server_client.uses_embedded_app_server()
+                || requires_mcp
+                || codex_protocol::ThreadId::from_string(&params.thread_id)
+                    .is_ok_and(|thread_id| self.abandoned_side_threads.contains(&thread_id))
+            {
+                let response = crate::dynamic_tools::failure_response(if requires_mcp {
+                    "TUI task tools require the approval-gated MCP server"
+                } else {
+                    "TUI dynamic tools require an active external task"
+                });
+                self.app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                    request_id: request_id.clone(),
+                    response,
+                });
+                return;
+            }
+
+            let request_handle = app_server_client.request_handle();
+            let app_event_tx = self.app_event_tx.clone();
+            let status_updates = self.dynamic_tool_status_updates.subscribe();
+            let request_id = request_id.clone();
+            let task_request_id = request_id.clone();
+            let source_thread_id = params.thread_id.clone();
+            let inherits_task_tools = params.tool == "fork_thread"
+                && params
+                    .arguments
+                    .get("threadId")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|thread_id| ThreadId::from_string(thread_id).ok())
+                    .is_none_or(|thread_id| app_server_client.task_tools_available(thread_id));
+            let params = params.clone();
+            let mut thread_start_params =
+                crate::app_server_session::thread_start_params_from_config(
+                    &self.config,
+                    app_server_client.thread_params_mode(),
+                    app_server_client.remote_cwd_override(),
+                    /*session_start_source*/ None,
+                );
+            app_server_client
+                .thread_tool_transport()
+                .configure(&mut thread_start_params);
+            let task = tokio::spawn(async move {
+                let response = crate::dynamic_tools::execute(
+                    request_handle,
+                    params,
+                    thread_start_params,
+                    status_updates,
+                    Some(&app_event_tx),
+                )
+                .await;
+                if inherits_task_tools
+                    && response.success
+                    && let [
+                        codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
+                            text,
+                        },
+                    ] = response.content_items.as_slice()
+                    && let Ok(result) = serde_json::from_str::<serde_json::Value>(text)
+                    && let Some(thread_id) =
+                        result.get("threadId").and_then(serde_json::Value::as_str)
+                    && let Ok(thread_id) = ThreadId::from_string(thread_id)
+                {
+                    app_event_tx.send(AppEvent::TaskToolsAvailable { thread_id });
+                }
+                app_event_tx.send(AppEvent::DynamicToolCallCompleted {
+                    request_id,
+                    response,
+                });
+            });
+            self.dynamic_tool_tasks
+                .insert(task_request_id, (source_thread_id, task));
+            return;
+        }
+
         let thread_id = server_request_thread_id(&request);
         if thread_id.is_some_and(|thread_id| self.abandoned_side_threads.contains(&thread_id)) {
             if let Err(err) = self

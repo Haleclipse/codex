@@ -1,0 +1,14 @@
+---
+source: tui/src/bottom_pane/chat_composer.rs
+assertion_line: 5366
+expression: terminal.backend()
+---
+"────────────────────────────────────────────────────────────────────────────────────────────────────"
+"❯ $1x  $plugin:d                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"────────────────────────────────────────────────────────────────────────────────────────────────────"
+"  deploy (plugin)  [Skill] Example skill used in tests.                                             "
+"                                                                                                    "
+"  Press enter to insert or esc to close                                                             "

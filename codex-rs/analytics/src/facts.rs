@@ -28,11 +28,13 @@ use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct TrackEventsContext {
@@ -63,7 +65,7 @@ pub struct ArtifactOperation {
     pub execution_backend: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum CodeModeToolCallFact {
     CellStarted {
         thread_id: String,
@@ -91,6 +93,7 @@ pub enum CodeModeToolCallFact {
     Completed {
         thread_id: String,
         turn_id: String,
+        turn_metadata: Arc<dyn TurnAnalyticsMetadata>,
         call_id: String,
         cell_id: Option<String>,
         tool_name: String,
@@ -107,10 +110,11 @@ pub enum CodeModeToolCallStatus {
     Interrupted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ControlToolCallFact {
     pub thread_id: String,
     pub turn_id: String,
+    pub turn_metadata: Arc<dyn TurnAnalyticsMetadata>,
     pub call_id: String,
     pub cell_id: Option<String>,
     pub tool_name: String,
@@ -181,6 +185,7 @@ pub enum TurnSubmissionType {
 pub struct TurnResolvedConfigFact {
     pub turn_id: String,
     pub thread_id: String,
+    pub turn_metadata: Arc<dyn TurnAnalyticsMetadata>,
     pub num_input_images: usize,
     pub submission_type: Option<TurnSubmissionType>,
     pub ephemeral: bool,
@@ -199,6 +204,15 @@ pub struct TurnResolvedConfigFact {
     pub personality: Option<Personality>,
     pub workspace_kind: Option<String>,
     pub is_first_turn: bool,
+}
+
+/// A live, read-only view of a turn's trusted analytics provenance.
+///
+/// Implementations must return `None` for unknown or ambiguous roots. The reducer
+/// reads this when constructing each event because steering can invalidate a root
+/// after the turn's configuration has been resolved.
+pub trait TurnAnalyticsMetadata: Send + Sync {
+    fn root_turn_id(&self) -> Option<String>;
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -388,6 +402,7 @@ pub struct SubAgentThreadStartedInput {
     pub client_version: String,
     pub model: String,
     pub ephemeral: bool,
+    pub thread_source: Option<ThreadSource>,
     pub subagent_source: SubAgentSource,
     pub created_at: u64,
 }

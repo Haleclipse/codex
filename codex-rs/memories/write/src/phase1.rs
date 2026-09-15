@@ -416,6 +416,7 @@ mod job {
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::RealtimeItem(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => None,
@@ -758,7 +759,9 @@ mod tests {
             job::serialize_filtered_rollout_response_items(&[RolloutItem::ResponseItem(
                 ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id: "call_123".to_string(),
+                    call_id: Some("call_123".to_string()),
+                    name: None,
+                    namespace: None,
                     output: codex_protocol::models::FunctionCallOutputPayload {
                         body: codex_protocol::models::FunctionCallOutputBody::Text(
                             r#"{"token":"sk-abcdefghijklmnopqrstuvwxyz123456"}"#.to_string(),

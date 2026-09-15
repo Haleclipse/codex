@@ -1,8 +1,12 @@
 use super::*;
 use crate::extensions::send_thread_warning;
+use crate::realtime_event_handling::apply_realtime_event_effects;
+use crate::realtime_event_handling::persist_realtime_items;
+use crate::realtime_history::RealtimeEventEffects;
 use codex_app_server_protocol::ThreadQueueChangedNotification;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::config_types::MultiAgentMode;
+use codex_protocol::protocol::ThreadHistoryMode;
 
 pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(30 * 60);
 
@@ -242,8 +246,10 @@ pub(super) async fn ensure_listener_task_running(
             &environments,
         )
         .await;
-    let thread_settings_baseline =
-        thread_settings_from_config_snapshot(&conversation.config_snapshot().await);
+    let config_snapshot = conversation.config_snapshot().await;
+    let realtime_history_enabled =
+        matches!(config_snapshot.history_mode, ThreadHistoryMode::Paginated);
+    let thread_settings_baseline = thread_settings_from_config_snapshot(&config_snapshot);
     let (mut listener_command_rx, listener_generation) = {
         let mut thread_state = thread_state.lock().await;
         if thread_state.listener_matches(&conversation) {
@@ -314,18 +320,31 @@ pub(super) async fn ensure_listener_task_running(
                     };
 
                     if let Some(worker) = &turn_cost_worker {
-                        worker.observe_event(conversation_id, &event, || {
-                            conversation.session_telemetry()
-                        });
+                        worker.observe_event(
+                            conversation_id,
+                            config.as_ref(),
+                            &event,
+                            || conversation.session_telemetry(),
+                        );
                     }
 
                     // Track the event before emitting any typed translations
                     // so thread-local state such as raw event opt-in stays
                     // synchronized with the conversation.
-                    let raw_events_enabled = {
+                    let (raw_events_enabled, realtime_effects) = {
                         let mut thread_state = thread_state.lock().await;
                         thread_state.track_current_turn_event(&event.id, &event.msg);
-                        thread_state.experimental_raw_events
+                        let realtime_effects = if realtime_history_enabled
+                            && thread_state.realtime_history.should_observe(&event.msg)
+                        {
+                            let active_turn_id = thread_state.active_turn_snapshot().map(|turn| turn.id);
+                            thread_state
+                                .realtime_history
+                                .observe(&event.msg, active_turn_id.as_deref())
+                        } else {
+                            RealtimeEventEffects::default()
+                        };
+                        (thread_state.experimental_raw_events, realtime_effects)
                     };
                     if matches!(
                         &event.msg,
@@ -342,6 +361,14 @@ pub(super) async fn ensure_listener_task_running(
                         subscribed_connection_ids,
                         conversation_id,
                     );
+
+                    apply_realtime_event_effects(
+                        conversation.as_ref(),
+                        &thread_outgoing,
+                        conversation_id,
+                        realtime_effects,
+                    )
+                    .await;
 
                     apply_bespoke_event_handling(
                         event.clone(),
@@ -555,6 +582,32 @@ pub(super) async fn handle_thread_listener_command(
             .await;
             let _ = completion_tx.send(());
         }
+        ThreadListenerCommand::SealRealtimeUserInput {
+            input,
+            completion_tx,
+        } => {
+            let items = thread_state
+                .lock()
+                .await
+                .realtime_history
+                .seal_user_input(&input);
+            let subscribed_connection_ids = thread_state_manager
+                .subscribed_connection_ids(conversation_id)
+                .await;
+            let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
+                outgoing.clone(),
+                subscribed_connection_ids,
+                conversation_id,
+            );
+            let result = persist_realtime_items(
+                conversation.as_ref(),
+                &thread_outgoing,
+                &conversation_id.to_string(),
+                items,
+            )
+            .await;
+            let _ = completion_tx.send(result);
+        }
     }
 }
 
@@ -658,9 +711,11 @@ pub(super) async fn handle_pending_thread_resume_request(
     } else {
         None
     };
-    let token_usage_turn_id = pending
-        .include_turns
-        .then(|| restored_token_usage_turn_id(&pending.history_items, thread.turns.as_slice()));
+    let token_usage_turn_id = pending.cold_resume_token_usage_turn_id.or_else(|| {
+        pending
+            .include_turns
+            .then(|| restored_token_usage_turn_id(&pending.history_items, thread.turns.as_slice()))
+    });
     if pending.initial_turns_page.is_none() {
         initial_turns_page = None;
     }
@@ -759,8 +814,8 @@ pub(super) async fn handle_pending_thread_resume_request(
     outgoing
         .send_response_with_thread_originator(request_id, response, originator)
         .await;
-    // Match cold resume: metadata-only resume should attach the listener without
-    // paying the cost of turn reconstruction for historical usage replay.
+    // Warm metadata-only resumes skip history reconstruction. Cold paginated children can
+    // replay usage using attribution captured before the listener was attached.
     if let Some(token_usage_turn_id) = token_usage_turn_id {
         // Rejoining a loaded thread has the same UI contract as a cold resume, but
         // uses the live conversation state instead of reconstructing a new session.

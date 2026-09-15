@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::responses_metadata::AUTO_REVIEW_ENABLED_KEY;
+use crate::responses_metadata::CONTEXT_WINDOW_ID_KEY;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_metadata::INSTALLATION_ID_KEY;
@@ -125,22 +126,10 @@ async fn create_clean_git_repo(repo_name: &str) -> (TempDir, AbsolutePathBuf) {
 }
 
 async fn wait_for_git_enrichment(state: &TurnMetadataState) -> Value {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let header = test_turn_metadata_header(state);
-            let json: Value = serde_json::from_str(&header).expect("json");
-            if json
-                .get("workspaces")
-                .and_then(Value::as_object)
-                .is_some_and(|workspaces| !workspaces.is_empty())
-            {
-                return json;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("git enrichment should complete")
+    tokio::time::timeout(Duration::from_secs(2), state.wait_for_git_enrichment())
+        .await
+        .expect("git enrichment should complete");
+    serde_json::from_str(&test_turn_metadata_header(state)).expect("json")
 }
 
 #[tokio::test]
@@ -743,6 +732,10 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
         ),
         ("turn_id".to_string(), "client-supplied".to_string()),
         (WINDOW_ID_KEY.to_string(), "client-supplied".to_string()),
+        (
+            CONTEXT_WINDOW_ID_KEY.to_string(),
+            "client-supplied".to_string(),
+        ),
         ("thread_source".to_string(), "client-supplied".to_string()),
         ("request_kind".to_string(), "client-supplied".to_string()),
         (
@@ -824,6 +817,7 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
     assert_eq!(json["turn_id"].as_str(), Some("turn-a"));
     assert!(json.get("request_kind").is_none());
     assert!(json.get(WINDOW_ID_KEY).is_none());
+    assert!(json.get(CONTEXT_WINDOW_ID_KEY).is_none());
     assert_eq!(
         json["turn_started_at_unix_ms"].as_i64(),
         Some(1_700_000_000_123)
@@ -959,12 +953,14 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
 
 #[test]
 fn responses_api_metadata_rejects_reserved_keys() {
-    assert_eq!(
-        validate_extra_metadata(
-            BTreeMap::from([("thread_source".to_string(), "sdk".to_string())]).iter()
-        ),
-        Err("responses_api_metadata contains a reserved key")
-    );
+    for reserved_key in ["thread_source", WINDOW_ID_KEY, CONTEXT_WINDOW_ID_KEY] {
+        assert_eq!(
+            validate_extra_metadata(
+                BTreeMap::from([(reserved_key.to_string(), "sdk".to_string())]).iter()
+            ),
+            Err("responses_api_metadata contains a reserved key")
+        );
+    }
 }
 
 #[tokio::test]
@@ -1103,6 +1099,9 @@ async fn turn_metadata_state_git_enrichment_cancellation_is_retryable_and_errors
             .expect("enrichment task lock")
             .is_none()
     );
+    tokio::time::timeout(Duration::from_secs(2), state.wait_for_git_enrichment())
+        .await
+        .expect("cancelled git enrichment should unblock waiters");
     assert!(state.current_workspaces().is_empty());
 
     state.spawn_git_enrichment_task();
@@ -1135,20 +1134,10 @@ async fn turn_metadata_state_git_enrichment_cancellation_is_retryable_and_errors
         &model_info_from_slug("gpt-5.4"),
     ));
     invalid_state.spawn_git_enrichment_task();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if invalid_state
-                .enrichment_task
-                .lock()
-                .expect("enrichment task lock")
-                .as_ref()
-                .is_some_and(tokio::task::JoinHandle::is_finished)
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        invalid_state.wait_for_git_enrichment(),
+    )
     .await
     .expect("failed git enrichment should complete");
     assert!(invalid_state.current_workspaces().is_empty());

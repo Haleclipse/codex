@@ -12,7 +12,10 @@ pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
 pub(crate) use history::HistoryHydrationScope;
 pub(crate) use history::thread_items_page_params;
 
+use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::FeedbackAudience;
+use crate::dynamic_tools_mcp::DynamicToolMcpServer;
+use crate::dynamic_tools_mcp::ThreadToolTransport;
 use crate::legacy_core::config::Config;
 use crate::service_tier_resolution;
 use crate::session_state::MessageHistoryMetadata;
@@ -103,6 +106,7 @@ use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartSource;
+use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnarchiveResponse;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
@@ -115,6 +119,7 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
+use codex_config::ConfigLayerSource;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::GuardianAssessmentEvent;
@@ -135,8 +140,11 @@ use color_eyre::eyre::ContextCompat;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -161,7 +169,7 @@ enum ForkPresentation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ThreadHistorySupport {
+pub(crate) enum ThreadHistorySupport {
     Paginated,
     LegacyOnly,
 }
@@ -199,35 +207,57 @@ pub(crate) fn is_history_pagination_unsupported(source: &JSONRPCErrorError) -> b
                 .any(|error| message.contains(error)))
 }
 
-async fn request_thread_start_with_history_fallback(
+pub(crate) async fn request_thread_start_with_history_fallback(
     request_handle: &AppServerRequestHandle,
-    request_id: RequestId,
+    mut request_id: RequestId,
     mut params: ThreadStartParams,
-) -> std::result::Result<(ThreadStartResponse, ThreadHistorySupport), TypedRequestError> {
-    match request_handle
-        .request_typed(ClientRequest::ThreadStart {
-            request_id,
-            params: params.clone(),
-        })
-        .await
-    {
-        Ok(response) => Ok((response, ThreadHistorySupport::Paginated)),
-        Err(TypedRequestError::Server { source, .. })
-            if params.history_mode.is_some() && is_history_pagination_unsupported(&source) =>
+) -> std::result::Result<(ThreadStartResponse, ThreadHistorySupport, bool), TypedRequestError> {
+    let mut history_support = ThreadHistorySupport::Paginated;
+    loop {
+        match request_handle
+            .request_typed(ClientRequest::ThreadStart {
+                request_id,
+                params: params.clone(),
+            })
+            .await
         {
-            params.history_mode = None;
-            let response = request_handle
-                .request_typed(ClientRequest::ThreadStart {
-                    request_id: RequestId::String(format!(
-                        "legacy-thread-start-{}",
-                        Uuid::new_v4()
-                    )),
-                    params,
-                })
-                .await?;
-            Ok((response, ThreadHistorySupport::LegacyOnly))
+            Ok(response) => {
+                let task_tools_available = params.dynamic_tools.is_some()
+                    || params
+                        .config
+                        .as_ref()
+                        .is_some_and(|config| config.contains_key("mcp_servers.codex_tui"));
+                return Ok((response, history_support, task_tools_available));
+            }
+            Err(TypedRequestError::Server { source, .. })
+                if params.history_mode.is_some() && is_history_pagination_unsupported(&source) =>
+            {
+                params.history_mode = None;
+                history_support = ThreadHistorySupport::LegacyOnly;
+                request_id = RequestId::String(format!("legacy-thread-start-{}", Uuid::new_v4()));
+            }
+            Err(TypedRequestError::Server { source, .. })
+                if params.dynamic_tools.is_some()
+                    && matches!(
+                        source.code,
+                        JSONRPC_INVALID_REQUEST | JSONRPC_INVALID_PARAMS
+                    )
+                    && {
+                        let message = source.message.to_ascii_lowercase();
+                        ["dynamictools", "dynamic tool", "namespace", "inputschema"]
+                            .into_iter()
+                            .any(|field| message.contains(field))
+                    } =>
+            {
+                tracing::warn!(
+                    error = %source.message,
+                    "app server does not support TUI dynamic tools; starting without them"
+                );
+                params.dynamic_tools = None;
+                request_id = RequestId::String(format!("legacy-thread-start-{}", Uuid::new_v4()));
+            }
+            Err(err) => return Err(err),
         }
-        Err(err) => Err(err),
     }
 }
 
@@ -263,6 +293,9 @@ pub(crate) struct AppServerSession {
     client: AppServerClient,
     next_request_id: i64,
     history_pagination: HashMap<ThreadId, history::ThreadHistoryPagination>,
+    task_tool_threads: HashSet<ThreadId>,
+    task_tool_capabilities_dir: Option<AbsolutePathBuf>,
+    task_search_generation: Arc<AtomicU64>,
     remote_cwd_override: Option<PathBuf>,
     thread_params_mode: ThreadParamsMode,
     background_rollout_migration_enabled: bool,
@@ -272,6 +305,7 @@ pub(crate) struct AppServerSession {
     available_models: Vec<ModelPreset>,
     managed_new_thread_defaults: Option<NewThreadModelDefaults>,
     external_agent_config_import_completion_pending: AtomicBool,
+    dynamic_tool_mcp: Option<Arc<DynamicToolMcpServer>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +339,7 @@ pub(crate) struct AppServerStartedThread {
     pub(crate) session: ThreadSessionState,
     pub(crate) turns: Vec<Turn>,
     pub(crate) blocks_direct_input: bool,
+    pub(crate) task_tools_available: bool,
 }
 
 pub(crate) fn source_agent_path(source: &SessionSource) -> Option<String> {
@@ -346,6 +381,9 @@ impl AppServerSession {
             client,
             next_request_id: 1,
             history_pagination: HashMap::new(),
+            task_tool_threads: HashSet::new(),
+            task_tool_capabilities_dir: None,
+            task_search_generation: Arc::new(AtomicU64::new(0)),
             remote_cwd_override: None,
             thread_params_mode,
             background_rollout_migration_enabled: true,
@@ -355,6 +393,72 @@ impl AppServerSession {
             available_models: Vec::new(),
             managed_new_thread_defaults: None,
             external_agent_config_import_completion_pending: AtomicBool::new(false),
+            dynamic_tool_mcp: None,
+        }
+    }
+
+    pub(crate) async fn start_dynamic_tool_mcp(
+        &mut self,
+        config: Config,
+        app_event_tx: AppEventSender,
+        status_updates: tokio::sync::broadcast::Sender<ThreadStatusChangedNotification>,
+    ) -> std::io::Result<()> {
+        if self.uses_embedded_app_server() {
+            return Ok(());
+        }
+        if config
+            .mcp_servers
+            .get()
+            .contains_key(crate::dynamic_tools::NAMESPACE)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "a user-configured MCP server already owns the codex_tui namespace",
+            ));
+        }
+        let managed_requirement = config
+            .config_layer_stack
+            .requirements()
+            .mcp_servers
+            .as_ref()
+            .map(|requirements| {
+                requirements
+                    .value
+                    .get(crate::dynamic_tools::NAMESPACE)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "managed MCP requirements do not permit the TUI task-tools server",
+                        )
+                    })
+            })
+            .transpose()?;
+        let thread_start_params = thread_start_params_from_config(
+            &config,
+            self.thread_params_mode(),
+            self.remote_cwd_override(),
+            /*session_start_source*/ None,
+        );
+        self.dynamic_tool_mcp = Some(Arc::new(
+            DynamicToolMcpServer::start(
+                self.request_handle(),
+                thread_start_params,
+                app_event_tx,
+                status_updates,
+                managed_requirement,
+            )
+            .await?,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn thread_tool_transport(&self) -> ThreadToolTransport {
+        if self.uses_embedded_app_server() {
+            ThreadToolTransport::Disabled
+        } else if let Some(server) = self.dynamic_tool_mcp.as_ref() {
+            ThreadToolTransport::Mcp(Arc::clone(server))
+        } else {
+            ThreadToolTransport::Dynamic
         }
     }
 
@@ -373,6 +477,28 @@ impl AppServerSession {
 
     pub(crate) fn uses_embedded_app_server(&self) -> bool {
         matches!(&self.client, AppServerClient::InProcess(_))
+    }
+
+    pub(crate) fn task_tools_available(&self, thread_id: ThreadId) -> bool {
+        self.task_tool_threads.contains(&thread_id)
+            || self
+                .task_tool_capabilities_dir
+                .as_ref()
+                .is_some_and(|directory| directory.join(thread_id.to_string()).is_file())
+    }
+
+    pub(crate) fn remember_task_tool_thread(&mut self, thread_id: ThreadId) {
+        if self.task_tool_threads.insert(thread_id)
+            && let Some(directory) = &self.task_tool_capabilities_dir
+            && let Err(error) = std::fs::create_dir_all(directory)
+                .and_then(|()| std::fs::write(directory.join(thread_id.to_string()), []))
+        {
+            tracing::warn!(%error, %thread_id, "failed to persist task-reference capability");
+        }
+    }
+
+    pub(crate) fn task_search_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.task_search_generation)
     }
 
     pub(crate) fn codex_home_path(
@@ -630,8 +756,9 @@ impl AppServerSession {
         if self.history_support == ThreadHistorySupport::LegacyOnly {
             params.history_mode = None;
         }
+        self.thread_tool_transport().configure(&mut params);
         let request_handle = self.request_handle();
-        let (response, history_support) =
+        let (response, history_support, task_tools_available) =
             request_thread_start_with_history_fallback(&request_handle, request_id, params)
                 .await
                 .map_err(|err| {
@@ -640,7 +767,13 @@ impl AppServerSession {
         if history_support == ThreadHistorySupport::LegacyOnly {
             self.history_support = ThreadHistorySupport::LegacyOnly;
         }
-        started_thread_from_start_response(response, config, self.thread_params_mode()).await
+        let mut started =
+            started_thread_from_start_response(response, config, self.thread_params_mode()).await?;
+        started.task_tools_available = task_tools_available;
+        if task_tools_available {
+            self.remember_task_tool_thread(started.session.thread_id);
+        }
+        Ok(started)
     }
 
     pub(crate) async fn fork_thread(
@@ -728,6 +861,8 @@ impl AppServerSession {
                 self.remote_cwd_override.as_deref(),
             )
         };
+        self.thread_tool_transport()
+            .configure_mcp(&mut params.config);
         let response: ThreadForkResponse = match self
             .client
             .request_typed(ClientRequest::ThreadFork {
@@ -779,6 +914,10 @@ impl AppServerSession {
         let mut started =
             started_thread_from_fork_response(response, &config, self.thread_params_mode()).await?;
         started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
+        if self.task_tools_available(thread_id) {
+            started.task_tools_available = true;
+            self.remember_task_tool_thread(started.session.thread_id);
+        }
         Ok(started)
     }
 
@@ -1442,21 +1581,26 @@ pub(crate) async fn start_thread_with_request_handle(
     config: Config,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<PathBuf>,
+    thread_tool_transport: ThreadToolTransport,
 ) -> Result<AppServerStartedThread> {
     let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
-    let params = thread_start_params_from_config(
+    let mut params = thread_start_params_from_config(
         &config,
         thread_params_mode,
         remote_cwd_override.as_deref(),
         /*session_start_source*/ None,
     );
-    let (response, _history_support) =
+    thread_tool_transport.configure(&mut params);
+    let (response, _history_support, task_tools_available) =
         request_thread_start_with_history_fallback(&request_handle, request_id, params)
             .await
             .map_err(|err| {
                 bootstrap_request_error("thread/start failed during TUI bootstrap", err)
             })?;
-    started_thread_from_start_response(response, &config, thread_params_mode).await
+    let mut started =
+        started_thread_from_start_response(response, &config, thread_params_mode).await?;
+    started.task_tools_available = task_tools_available;
+    Ok(started)
 }
 
 pub(crate) fn status_account_display_from_auth_mode(
@@ -1472,7 +1616,9 @@ pub(crate) fn status_account_display_from_auth_mode(
             email: None,
             plan: plan_type.map(plan_type_display_name),
         }),
-        Some(AuthMode::Headers) | Some(AuthMode::BedrockApiKey) => None,
+        Some(AuthMode::Headers)
+        | Some(AuthMode::BedrockApiKey)
+        | Some(AuthMode::BedrockAccessKeys) => None,
         None => None,
     }
 }
@@ -1549,7 +1695,34 @@ fn approvals_reviewer_override_from_config(
 fn config_request_overrides_from_config(
     config: &Config,
 ) -> Option<HashMap<String, serde_json::Value>> {
-    let mut overrides = HashMap::new();
+    let mut session_config = toml::Value::Table(toml::Table::new());
+    for layer in config.config_layer_stack.layers_low_to_high() {
+        if matches!(&layer.name, ConfigLayerSource::SessionFlags) {
+            codex_config::merge_toml_values(&mut session_config, &layer.config);
+        }
+    }
+    let mut overrides: HashMap<_, _> = session_config
+        .as_table()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "allow_login_shell"
+                    | "default_permissions"
+                    | "features"
+                    | "network"
+                    | "permissions"
+                    | "sandbox_workspace_write"
+                    | "shell_environment_policy"
+            )
+        })
+        .filter_map(|(key, value)| {
+            serde_json::to_value(value)
+                .ok()
+                .map(|value| (key.clone(), value))
+        })
+        .collect();
     let mut insert = |key: &str, value: Option<String>| {
         if let Some(value) = value {
             overrides.insert(key.to_string(), serde_json::Value::String(value));
@@ -1672,7 +1845,7 @@ fn permissions_selection_from_config(
         .map(permission_profile_id_from_active_profile)
 }
 
-fn thread_start_params_from_config(
+pub(crate) fn thread_start_params_from_config(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<&std::path::Path>,
@@ -1841,6 +2014,7 @@ async fn started_thread_from_start_response(
         session,
         turns: response.thread.turns,
         blocks_direct_input,
+        task_tools_available: false,
     })
 }
 
@@ -1858,6 +2032,7 @@ async fn started_thread_from_resume_response(
         session,
         turns: response.thread.turns,
         blocks_direct_input,
+        task_tools_available: false,
     })
 }
 
@@ -1875,6 +2050,7 @@ async fn started_thread_from_fork_response(
         session,
         turns: response.thread.turns,
         blocks_direct_input,
+        task_tools_available: false,
     })
 }
 
@@ -2386,6 +2562,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_thread_start_preserves_explicit_session_overrides() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let workspace = codex_home.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "sandbox_mode = \"workspace-write\"\n[sandbox_workspace_write]\nnetwork_access = true\n",
+        )?;
+        let server_config = build_config(&codex_home).await;
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .harness_overrides(ConfigOverrides {
+                cwd: Some(workspace.clone()),
+                ..ConfigOverrides::default()
+            })
+            .cli_overrides(vec![
+                (
+                    "features.multi_agent_mode".to_string(),
+                    toml::Value::Boolean(true),
+                ),
+                (
+                    "sandbox_workspace_write.network_access".to_string(),
+                    toml::Value::Boolean(false),
+                ),
+                (
+                    "instructions".to_string(),
+                    toml::Value::String("unsafe ".repeat(10_000)),
+                ),
+                ("model".to_string(), "gpt-5".into()),
+                ("approval_policy".to_string(), "never".into()),
+            ])
+            .build()
+            .await?;
+
+        let params = thread_start_params_from_config(
+            &config,
+            ThreadParamsMode::Remote,
+            /*remote_cwd_override*/ None,
+            /*session_start_source*/ None,
+        );
+
+        let overrides = params.config.expect("config overrides");
+        assert_eq!(
+            (
+                overrides.get("features").cloned(),
+                overrides.get("sandbox_workspace_write").cloned(),
+                overrides.get("instructions").cloned(),
+            ),
+            (
+                Some(serde_json::json!({ "multi_agent_mode": true })),
+                Some(serde_json::json!({ "network_access": false })),
+                None,
+            )
+        );
+        for mode in [ThreadParamsMode::Embedded, ThreadParamsMode::Remote] {
+            let mut app_server =
+                crate::start_embedded_app_server_for_picker(&server_config).await?;
+            app_server.thread_params_mode = mode;
+            app_server.remote_cwd_override = Some(workspace.clone());
+
+            let started = app_server.start_thread(&config).await?;
+
+            assert_eq!(
+                (
+                    started.session.permission_profile.network_sandbox_policy(),
+                    started.session.model.as_str(),
+                    started.session.approval_policy,
+                    started.session.cwd.as_path(),
+                ),
+                (
+                    NetworkSandboxPolicy::Restricted,
+                    "gpt-5",
+                    AskForApproval::Never,
+                    workspace.as_path(),
+                )
+            );
+            app_server.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn thread_start_params_include_cwd_for_embedded_sessions() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config = ConfigBuilder::default()
@@ -2420,6 +2678,7 @@ mod tests {
         );
         assert_eq!(params.model_provider, Some(config.model_provider_id));
         assert_eq!(params.thread_source, Some(ThreadSource::User));
+        assert_eq!(params.dynamic_tools, None);
     }
 
     #[tokio::test]
@@ -3616,7 +3875,7 @@ mod tests {
             Some(StatusAccountDisplay::ChatGpt {
                 email: None,
                 plan: Some(ref plan),
-            }) if plan == "Business"
+            }) if plan == "Business Premium"
         ));
     }
 }

@@ -1,32 +1,60 @@
 use codex_features::GuardianV2ConfigToml;
 use codex_features::GuardianV2ReviewScopeConfigToml;
+use codex_features::GuardianV2TranscriptConfigToml;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
+use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::TruncationPolicy;
 use pretty_assertions::assert_eq;
 
+use super::CLASSIFICATION_OUTPUT_INSTRUCTIONS;
 use super::DEFAULT_CLASSIFIER_INSTRUCTIONS;
 use super::GuardianV2Config;
+use super::GuardianV2ReviewScope;
 use crate::async_scorer::transcript::truncate_entry;
 
 #[test]
 fn sandboxed_exec_commands_are_excluded_by_default() {
     let config = GuardianV2Config::from_overrides(GuardianV2ConfigToml::default()).unwrap();
 
-    assert!(!config.sandboxed_exec_commands);
+    assert_eq!(
+        config.review_scope,
+        GuardianV2ReviewScope::Standard {
+            sandboxed_exec_commands: false,
+        }
+    );
 }
 
 #[test]
 fn sandboxed_exec_commands_can_be_included() {
     let config = GuardianV2Config::from_overrides(GuardianV2ConfigToml {
         review_scope: Some(GuardianV2ReviewScopeConfigToml {
+            computer_use_only: None,
             sandboxed_exec_commands: Some(true),
         }),
         ..Default::default()
     })
     .unwrap();
 
-    assert!(config.sandboxed_exec_commands);
+    assert_eq!(
+        config.review_scope,
+        GuardianV2ReviewScope::Standard {
+            sandboxed_exec_commands: true,
+        }
+    );
+}
+
+#[test]
+fn computer_use_only_takes_precedence_over_sandboxed_exec_commands() {
+    let config = GuardianV2Config::from_overrides(GuardianV2ConfigToml {
+        review_scope: Some(GuardianV2ReviewScopeConfigToml {
+            computer_use_only: Some(true),
+            sandboxed_exec_commands: Some(true),
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(config.review_scope, GuardianV2ReviewScope::ComputerUseOnly);
 }
 
 #[test]
@@ -64,7 +92,7 @@ fn evaluated_configuration_preserves_rendered_prompt_and_gate() {
     .unwrap();
     assert_eq!(config.review_threshold, 0.5);
     assert_eq!(config.reasoning_effort, ReasoningEffort::Low);
-    assert_eq!(config.max_classifier_instruction_tokens, 30_000);
+    assert_eq!(config.max_classifier_instruction_tokens, Some(30_000));
     assert_eq!(
         config.classifier_instructions,
         DEFAULT_CLASSIFIER_INSTRUCTIONS
@@ -79,30 +107,6 @@ fn evaluated_configuration_preserves_rendered_prompt_and_gate() {
         );
         assert_eq!(config.render_classifier_instructions(&policy), previous);
     }
-}
-
-#[test]
-fn legacy_custom_prompt_keeps_its_rendering_and_threshold() {
-    let template = "legacy instructions ".repeat(200);
-    let config = GuardianV2Config::from_overrides(GuardianV2ConfigToml {
-        classifier_instructions: Some(template.clone()),
-        max_classifier_instruction_tokens: Some(256),
-        ..Default::default()
-    })
-    .unwrap();
-    assert_eq!(config.review_threshold, 0.8);
-    let expected = truncate_entry(
-        &format!(
-            "{}\n\n# Security Policy\nTenant policy.",
-            truncate_entry(&template, /*max_tokens*/ 256),
-        ),
-        /*max_tokens*/ 256,
-    );
-    assert_eq!(
-        config.render_classifier_instructions("Tenant policy."),
-        expected
-    );
-    assert!(expected.len() <= TruncationPolicy::Tokens(256).byte_budget());
 }
 
 #[test]
@@ -143,5 +147,106 @@ fn model_prompt_and_explicit_threshold_precedence_are_preserved() {
             .unwrap()
             .review_threshold,
         0.5,
+    );
+}
+
+#[test]
+fn legacy_classifier_prompts_keep_the_output_contract_after_truncation() {
+    let prompt = "Return a JSON action_risk score. ".repeat(200);
+    let policy = "Require approval for unsafe actions.";
+    let model_defaults = GuardianV2ModelConfig {
+        classifier_instructions: Some(prompt.clone()),
+        max_classifier_instruction_tokens: Some(100),
+        ..Default::default()
+    };
+    let local_override = GuardianV2Config::from_overrides(GuardianV2ConfigToml {
+        classifier_instructions: Some(prompt.clone()),
+        max_classifier_instruction_tokens: Some(100),
+        ..Default::default()
+    })
+    .unwrap();
+    let model_override = GuardianV2Config::from_overrides(GuardianV2ConfigToml::default())
+        .unwrap()
+        .with_model_defaults(Some(&model_defaults))
+        .unwrap();
+
+    for config in [local_override, model_override] {
+        let rendered = config.render_classifier_instructions(policy);
+        assert_eq!(
+            rendered,
+            truncate_entry(
+                &format!(
+                    "{prompt}\n\n# Security Policy\n{policy}\n\n{CLASSIFICATION_OUTPUT_INSTRUCTIONS}"
+                ),
+                /*max_tokens*/ 100,
+            )
+        );
+        assert!(rendered.ends_with(CLASSIFICATION_OUTPUT_INSTRUCTIONS));
+    }
+}
+
+#[test]
+fn model_runtime_settings_preserve_local_overrides() {
+    let prompt = "legacy instructions ".repeat(3_000);
+    let defaults = GuardianV2ModelConfig {
+        classifier_instructions: Some(prompt.clone()),
+        max_classifier_instruction_tokens: Some(256),
+        max_tool_call_lag: Some(1),
+        reuse_parent_compaction: Some(false),
+        transcript: Some(GuardianV2TranscriptModelConfig {
+            include_images: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let inherited = GuardianV2Config::from_overrides(GuardianV2ConfigToml::default())
+        .unwrap()
+        .with_model_defaults(Some(&defaults))
+        .unwrap();
+    assert_eq!(
+        (
+            inherited.max_classifier_instruction_tokens,
+            inherited.max_tool_call_lag,
+            inherited.reuse_parent_compaction,
+            inherited.transcript.include_images,
+        ),
+        (Some(256), 1, false, true)
+    );
+
+    let overridden = GuardianV2Config::from_overrides(GuardianV2ConfigToml {
+        max_classifier_instruction_tokens: Some(512),
+        max_tool_call_lag: Some(4),
+        reuse_parent_compaction: Some(true),
+        transcript: Some(GuardianV2TranscriptConfigToml {
+            include_images: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap()
+    .with_model_defaults(Some(&defaults))
+    .unwrap();
+    assert_eq!(
+        (
+            overridden.max_classifier_instruction_tokens,
+            overridden.max_tool_call_lag,
+            overridden.reuse_parent_compaction,
+            overridden.transcript.include_images,
+        ),
+        (Some(512), 4, true, false)
+    );
+
+    let uncapped_defaults = GuardianV2ModelConfig {
+        max_classifier_instruction_tokens: None,
+        ..defaults
+    };
+    let uncapped = inherited
+        .with_model_defaults(Some(&uncapped_defaults))
+        .unwrap();
+    assert_eq!(
+        uncapped.render_classifier_instructions("Tenant policy."),
+        format!(
+            "{prompt}\n\n# Security Policy\nTenant policy.\n\n{CLASSIFICATION_OUTPUT_INSTRUCTIONS}"
+        )
     );
 }

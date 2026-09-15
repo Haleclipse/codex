@@ -85,12 +85,6 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
         )
     }
 
-    /// Whether cancellation should let the handler finish teardown before the
-    /// host returns an aborted tool response.
-    fn waits_for_runtime_cancellation(&self) -> bool {
-        false
-    }
-
     fn telemetry_tags(&self, _invocation: &ToolInvocation) -> ToolTelemetryTags {
         Vec::new()
     }
@@ -221,8 +215,8 @@ struct PostToolUseFeedbackOutput {
 }
 
 impl ToolOutput for PostToolUseFeedbackOutput {
-    fn log_preview(&self) -> String {
-        self.original.log_preview()
+    fn log_output(&self) -> String {
+        self.original.log_output()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -350,7 +344,9 @@ impl ToolRegistry {
         exposure: ToolExposure,
     ) -> bool {
         let tool_name = runtime.tool_name().with_default_namespace();
-        if tool_name.is_default_namespace() && tool_name.name == "shell_command" {
+        if tool_name.is_default_namespace()
+            && matches!(tool_name.name.as_str(), "exec_command" | "shell_command")
+        {
             tracing::warn!(tool_name = %tool_name, "skipping external tool with reserved name");
             if self.tools.contains_key(&tool_name) {
                 self.record_collision(tool_name);
@@ -476,11 +472,6 @@ impl ToolRegistry {
         Some(tool.exposure != ToolExposure::Hidden && tool.runtime.supports_parallel_tool_calls())
     }
 
-    pub(crate) fn waits_for_runtime_cancellation(&self, name: &ToolName) -> Option<bool> {
-        let tool = self.tool(name)?;
-        Some(tool.waits_for_runtime_cancellation())
-    }
-
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "tool dispatch must keep active-turn accounting atomic"
@@ -491,10 +482,11 @@ impl ToolRegistry {
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
-        let tool_name_flat = flat_tool_name(&tool_name);
         let call_id_owned = invocation.call_id.clone();
         let otel = invocation.turn.session_telemetry.clone();
         let permission_profile = invocation.turn.permission_profile();
+        // TODO(anp): Reconcile these tags with TurnEnvironment::sandbox_context
+        // instead of reporting the thread-wide backend for environment-scoped tools.
         let base_tool_result_tags = [
             (
                 "sandbox",
@@ -529,7 +521,7 @@ impl ToolRegistry {
                 let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
                 let log_payload = tool_log_payload(&invocation.payload, &invocation.source);
                 otel.tool_result_with_tags(
-                    tool_name_flat.as_ref(),
+                    &tool_name,
                     &call_id_owned,
                     log_payload.as_ref(),
                     Duration::ZERO,
@@ -559,7 +551,7 @@ impl ToolRegistry {
             let message = format!("tool {tool_name} invoked with incompatible payload");
             let log_payload = tool_log_payload(&invocation.payload, &invocation.source);
             otel.tool_result_with_tags(
-                tool_name_flat.as_ref(),
+                &tool_name,
                 &call_id_owned,
                 log_payload.as_ref(),
                 Duration::ZERO,
@@ -648,37 +640,26 @@ impl ToolRegistry {
             tool_result_tags.push(("command_category", category));
         }
 
-        let response_cell = tokio::sync::Mutex::new(None);
-        let invocation_for_tool = invocation.clone();
         let log_payload = tool_log_payload(&invocation.payload, &invocation.source);
 
         let result = otel
             .log_tool_result_with_tags(
-                tool_name_flat.as_ref(),
+                &tool_name,
                 &call_id_owned,
                 log_payload.as_ref(),
                 &tool_result_tags,
                 &extra_trace_fields,
-                || {
-                    let tool = tool.clone();
-                    let response_cell = &response_cell;
-                    async move {
-                        match handle_any_tool(tool.as_ref(), invocation_for_tool).await {
-                            Ok(result) => {
-                                let preview = result.result.log_preview();
-                                let success = result.result.success_for_logging();
-                                let mut guard = response_cell.lock().await;
-                                *guard = Some(result);
-                                Ok((preview, success))
-                            }
-                            Err(err) => Err(err),
-                        }
-                    }
+                || handle_any_tool(tool.as_ref(), invocation.clone()),
+                |result| {
+                    (
+                        result.result.log_output(),
+                        result.result.success_for_logging(),
+                    )
                 },
             )
             .await;
         let success = match &result {
-            Ok((_, success)) => *success,
+            Ok(result) => result.result.success_for_logging(),
             Err(_) => false,
         };
         if let Some(analytics) = control_tool_analytics.as_mut() {
@@ -690,9 +671,9 @@ impl ToolRegistry {
         }
         emit_metric_for_tool_read(&invocation, success);
         let post_tool_use_payload = if success {
-            let guard = response_cell.lock().await;
-            guard
+            result
                 .as_ref()
+                .ok()
                 .and_then(|result| result.post_tool_use_payload.clone())
         } else {
             None
@@ -724,17 +705,7 @@ impl ToolRegistry {
 
         // A PostToolUse block rejects the result, not the already-completed tool execution.
         let lifecycle_outcome = match &result {
-            Ok(_) => {
-                let guard = response_cell.lock().await;
-                match guard.as_ref() {
-                    Some(result) => ToolCallOutcome::Completed {
-                        success: result.result.success_for_logging(),
-                    },
-                    None => ToolCallOutcome::Failed {
-                        handler_executed: true,
-                    },
-                }
-            }
+            Ok(_) => ToolCallOutcome::Completed { success },
             Err(_) => ToolCallOutcome::Failed {
                 handler_executed: true,
             },
@@ -747,11 +718,7 @@ impl ToolRegistry {
         .await;
 
         match result {
-            Ok(_) => {
-                let mut guard = response_cell.lock().await;
-                let mut result = guard.take().ok_or_else(|| {
-                    FunctionCallError::Fatal("tool produced no output".to_string())
-                })?;
+            Ok(mut result) => {
                 if let Some(outcome) = post_tool_use_outcome {
                     if outcome.should_block {
                         let message = outcome.feedback_message.unwrap_or_else(|| {

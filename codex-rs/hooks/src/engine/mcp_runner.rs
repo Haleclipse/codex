@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::ConfiguredHandler;
 use super::HandlerRunResult;
+use super::HandlerSourcePath;
 use crate::mcp::HookMcpCall;
 use crate::mcp::HookMcpExecutor;
 
@@ -30,6 +31,7 @@ pub(crate) async fn run_mcp_tool(
     tool: &str,
     argument_template: &Map<String, Value>,
     hook_event_json: &str,
+    metadata: Option<&Map<String, Value>>,
 ) -> HandlerRunResult {
     let started_at = chrono::Utc::now().timestamp();
     let started = Instant::now();
@@ -41,6 +43,13 @@ pub(crate) async fn run_mcp_tool(
             .execute(HookMcpCall {
                 server: server.to_string(),
                 tool: tool.to_string(),
+                environment_id: match &handler.source_path {
+                    HandlerSourcePath::Local(_) => None,
+                    HandlerSourcePath::ExecutorScoped { environment_id, .. } => {
+                        Some(environment_id.clone())
+                    }
+                },
+                metadata: metadata.cloned(),
                 input,
                 timeout: Duration::from_secs(handler.timeout_sec),
             })
@@ -69,7 +78,7 @@ pub(crate) async fn run_mcp_tool(
 /// text is rendered as a string. Missing fields fail the hook instead of passing unresolved
 /// arguments to the server. For example, the template `{"count":"${tool_input.count}"}`
 /// becomes `{"count":3}` when the event contains `{"tool_input":{"count":3}}`.
-fn expand_mcp_argument_template(
+pub(crate) fn expand_mcp_argument_template(
     argument_template: &Map<String, Value>,
     hook_event: &Value,
 ) -> Result<Map<String, Value>> {

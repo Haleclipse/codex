@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::ser::Serializer;
+use serde_with::serde_as;
 use ts_rs::TS;
 
 use crate::local_media::audio_mime_for_path;
@@ -32,6 +33,7 @@ use crate::mcp::CallToolResult;
 use codex_utils_path_uri::PathUri;
 
 mod executed_tool_calls;
+mod item_metadata;
 
 pub use crate::local_media::MAX_PROMPT_AUDIO_INPUT_BYTES;
 pub use crate::local_media::snapshot_local_user_input;
@@ -42,6 +44,7 @@ pub use executed_tool_calls::ExecutedToolCallTruncation;
 pub use executed_tool_calls::bound_executed_tool_calls_for_prompt;
 pub use executed_tool_calls::bound_executed_tool_calls_for_prompt_prioritizing_recent;
 pub use executed_tool_calls::executed_tool_call_metadata_bytes;
+pub use item_metadata::ContentItemKind;
 
 /// Controls the per-command sandbox override requested by a shell-like tool call.
 #[derive(
@@ -904,6 +907,7 @@ pub enum MessagePhase {
 ///
 /// Responses API strongly types this payload. Do not modify it without first getting API
 /// approval and making the corresponding Responses API change.
+#[serde_as]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct InternalChatMessageMetadataPassthrough {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -914,6 +918,12 @@ pub struct InternalChatMessageMetadataPassthrough {
     #[schemars(skip)]
     #[ts(skip)]
     pub create_time: Option<serde_json::Number>,
+    /// Harness-owned classifications aligned with the item's content entries.
+    #[serde_as(deserialize_as = "serde_with::DefaultOnError")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub content_item_kinds: Option<Vec<ContentItemKind>>,
     /// Warehouse-only Responses metadata, not part of the public app-server protocol.
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     #[schemars(skip)]
@@ -1043,7 +1053,15 @@ pub enum ResponseItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         id: Option<ResponseItemId>,
-        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        namespace: Option<String>,
         #[ts(as = "FunctionCallOutputBody")]
         #[schemars(with = "FunctionCallOutputBody")]
         output: FunctionCallOutputPayload,
@@ -1294,6 +1312,21 @@ impl ResponseItem {
     /// not accept it.
     pub fn clear_internal_chat_message_metadata_passthrough(&mut self) {
         if let Some(metadata) = self.internal_chat_message_metadata_passthrough_mut() {
+            *metadata = None;
+        }
+    }
+
+    /// Removes content item classifications while preserving other passthrough metadata.
+    pub fn clear_content_item_kinds(&mut self) {
+        let Some(metadata) = self.internal_chat_message_metadata_passthrough_mut() else {
+            return;
+        };
+        let Some(metadata_value) = metadata else {
+            return;
+        };
+
+        metadata_value.content_item_kinds = None;
+        if metadata_value == &InternalChatMessageMetadataPassthrough::default() {
             *metadata = None;
         }
     }
@@ -1776,7 +1809,9 @@ impl From<ResponseInputItem> for ResponseItem {
             },
             ResponseInputItem::FunctionCallOutput { call_id, output } => Self::FunctionCallOutput {
                 id: None,
-                call_id,
+                call_id: Some(call_id),
+                name: None,
+                namespace: None,
                 output,
                 internal_chat_message_metadata_passthrough: None,
             },
@@ -1784,7 +1819,9 @@ impl From<ResponseInputItem> for ResponseItem {
                 let output = output.into_function_call_output_payload();
                 Self::FunctionCallOutput {
                     id: None,
-                    call_id,
+                    call_id: Some(call_id),
+                    name: None,
+                    namespace: None,
                     output,
                     internal_chat_message_metadata_passthrough: None,
                 }
@@ -1969,32 +2006,6 @@ pub struct SearchToolCallParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub limit: Option<usize>,
-}
-
-/// If the `name` of a `ResponseItem::FunctionCall` is `shell_command`, the
-/// `arguments` field should deserialize to this struct.
-#[derive(Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-pub struct ShellCommandToolCallParams {
-    pub command: String,
-    pub workdir: Option<String>,
-
-    /// Whether to run the shell with login shell semantics
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub login: Option<bool>,
-    /// This is the maximum time in milliseconds that the command is allowed to run.
-    #[serde(alias = "timeout")]
-    pub timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub sandbox_permissions: Option<SandboxPermissions>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub prefix_rule: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub additional_permissions: Option<AdditionalPermissionProfile>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub justification: Option<String>,
 }
 
 /// Responses API compatible content items that can be returned by a tool call.
@@ -3123,6 +3134,55 @@ mod tests {
                 internal_chat_message_metadata_passthrough: None,
             }
         );
+    }
+
+    #[test]
+    fn paired_function_call_output_preserves_existing_wire_shape() {
+        let value = serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "done",
+        });
+        let item: ResponseItem = serde_json::from_value(value.clone())
+            .expect("paired function call output should deserialize");
+
+        assert_eq!(
+            item,
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("call-1".to_string()),
+                name: None,
+                namespace: None,
+                output: FunctionCallOutputPayload::from_text("done".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(item).expect("serialize item"), value);
+    }
+
+    #[test]
+    fn named_unpaired_function_call_output_round_trips_without_call_id() {
+        let value = serde_json::json!({
+            "type": "function_call_output",
+            "name": "notifications",
+            "namespace": "slack",
+            "output": "Alice mentioned you.",
+        });
+        let item: ResponseItem = serde_json::from_value(value.clone())
+            .expect("named unpaired function call output should deserialize");
+
+        assert_eq!(
+            item,
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: None,
+                name: Some("notifications".to_string()),
+                namespace: Some("slack".to_string()),
+                output: FunctionCallOutputPayload::from_text("Alice mentioned you.".to_string()),
+                internal_chat_message_metadata_passthrough: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(item).expect("serialize item"), value);
     }
 
     #[test]

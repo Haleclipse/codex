@@ -711,6 +711,7 @@ fn protocol_headers(headers: &HeaderMap) -> Vec<HttpHeader> {
             Some(HttpHeader {
                 name: name.as_str().to_string(),
                 value: std::str::from_utf8(value.as_bytes()).ok()?.to_string(),
+                value_env_var: None,
             })
         })
         .collect()
@@ -802,7 +803,7 @@ fn legacy_discovery_fallback_response(
     {
         return ServerJsonRpcMessage::error(
             ErrorData::new(
-                ErrorCode::INVALID_REQUEST,
+                ErrorCode::HEADER_MISMATCH,
                 "server/discover method-not-found response did not match its request ID",
                 None,
             ),
@@ -855,6 +856,20 @@ fn legacy_discovery_fallback_response(
             Some(request.id.clone()),
         )
     } else {
+        let mut response = response;
+        if let JsonRpcMessage::Error(error) = &mut response
+            && !matches!(
+                error.error.code,
+                ErrorCode::METHOD_NOT_FOUND
+                    | ErrorCode::UNSUPPORTED_PROTOCOL_VERSION
+                    | ErrorCode::HEADER_MISMATCH
+                    | ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY
+            )
+        {
+            // rmcp 3.1.3 falls back on other discovery errors, so mark unproven
+            // rejections as modern failures while preserving their diagnostics.
+            error.error.code = ErrorCode::HEADER_MISMATCH;
+        }
         response
     }
 }

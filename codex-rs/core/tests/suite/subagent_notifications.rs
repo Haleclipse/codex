@@ -9,6 +9,8 @@ use codex_history::RolloutItem;
 use codex_models_manager::bundled_models_response;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::items::SubAgentActivityItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::MultiAgentMessages;
 use codex_protocol::openai_models::MultiAgentRoleMessages;
@@ -20,6 +22,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentActivityKind;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
@@ -59,6 +62,7 @@ use std::time::Duration;
 use test_case::test_case;
 use tokio::time::Instant;
 use tokio::time::sleep;
+use tokio::time::timeout;
 use tracing::Level;
 use tracing_test::internal::MockWriter;
 use wiremock::MockServer;
@@ -84,6 +88,8 @@ const SUBAGENT_START_CONTEXT: &str = "subagent start context reaches child";
 const SUBAGENT_STOP_CONTINUATION: &str = "continue only the child";
 const INTERNAL_SUBAGENT_PROMPT: &str = "internal subagent: review";
 const FULL_HISTORY_MULTI_AGENT_MODE_HINT: &str = "Delegate independent work to another agent.";
+const FULL_HISTORY_SUBAGENT_DEVELOPER_INSTRUCTIONS: &str =
+    "Child-only developer instructions preserve their classification.";
 const FULL_HISTORY_SHARED_USAGE_HINT: &str = "Shared delegation guidance.";
 const FULL_HISTORY_PROACTIVE_PROMPT: &str = "switch to proactive delegation";
 const FULL_HISTORY_EXPLICIT_PROMPT: &str = "restore explicit-only delegation";
@@ -129,12 +135,6 @@ fn log_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     line.split_ascii_whitespace()
         .find_map(|field| field.strip_prefix(&prefix))
         .map(|value| value.trim_matches('"'))
-}
-
-fn has_subagent_notification(req: &ResponsesRequest) -> bool {
-    req.message_input_texts("user")
-        .iter()
-        .any(|text| text.contains("<subagent_notification>"))
 }
 
 fn tool_parameter_description(tool: &Value, parameter_name: &str) -> Option<String> {
@@ -884,7 +884,11 @@ async fn subagent_notification_is_included_without_wait() -> Result<()> {
     test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
 
     let turn2_requests = wait_for_requests(&turn2).await?;
-    assert!(turn2_requests.iter().any(has_subagent_notification));
+    assert!(
+        turn2_requests
+            .iter()
+            .any(|request| request.has_content_kinds(&["multi_agent.subagent_notification"]))
+    );
 
     Ok(())
 }
@@ -977,6 +981,12 @@ async fn spawned_child_receives_forked_parent_context(
     let child_request = wait_for_request_with_model(&child_request_log, REQUESTED_MODEL).await?;
     assert!(child_request.body_contains_text(TURN_0_FORK_PROMPT));
     let child_body = child_request.body_json();
+    let child_metadata: serde_json::Value = serde_json::from_str(
+        child_body["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("child turn metadata"),
+    )?;
+    assert_eq!(child_metadata["thread_source"], "subagent");
     let original_parent_turn_id = parent_body["client_metadata"]["turn_id"]
         .as_str()
         .expect("legacy spawn parent turn id");
@@ -1225,6 +1235,11 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
                 .expect("test config should allow feature update");
             config.model_context_window = Some(128_000);
         }
+        if matches!(selection, FullHistoryV2ModelSelection::ConfiguredDefault) {
+            config.developer_instructions = None;
+            config.multi_agent_v2.subagent_developer_instructions =
+                Some(FULL_HISTORY_SUBAGENT_DEVELOPER_INSTRUCTIONS.to_string());
+        }
         if matches!(selection, FullHistoryV2ModelSelection::CurrentTimeReminders) {
             config
                 .features
@@ -1322,11 +1337,39 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
 
     let child_request = wait_for_request_with_model(&child_request_log, expected_model).await?;
     assert!(child_request.body_contains_text(TURN_0_FORK_PROMPT));
+    let misaligned_child_messages = child_request
+        .inputs_of_type("message")
+        .into_iter()
+        .filter(|message| {
+            message["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                .as_array()
+                .is_some_and(|kinds| {
+                    message["content"]
+                        .as_array()
+                        .is_none_or(|content| content.len() != kinds.len())
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(misaligned_child_messages, Vec::<Value>::new());
     let child_developer_messages = child_request.message_input_texts("developer");
+    if matches!(selection, FullHistoryV2ModelSelection::ConfiguredDefault) {
+        assert_eq!(
+            (
+                parent_request.body_contains_text(FULL_HISTORY_SUBAGENT_DEVELOPER_INSTRUCTIONS),
+                child_request.has_content_kinds(&["generic.developer_instructions"]),
+                child_developer_messages
+                    .iter()
+                    .filter(|text| text.as_str() == FULL_HISTORY_SUBAGENT_DEVELOPER_INSTRUCTIONS)
+                    .count(),
+            ),
+            (false, true, 1)
+        );
+    }
     if !matches!(
         selection,
         FullHistoryV2ModelSelection::MultiAgentModeTransitions
     ) {
+        assert!(child_request.has_content_kinds(&["multi_agent.role_instructions"]));
         assert_eq!(
             child_developer_messages
                 .iter()
@@ -1943,11 +1986,25 @@ enum CompletionScenario {
     TerminalError,
 }
 
-#[test_case(CompletionScenario::Completed ; "completed")]
-#[test_case(CompletionScenario::TerminalError ; "terminal_error")]
+#[test_case(
+    CompletionScenario::Completed,
+    ThreadHistoryMode::Paginated;
+    "completed_paginated"
+)]
+#[test_case(
+    CompletionScenario::Completed,
+    ThreadHistoryMode::Legacy;
+    "completed_legacy"
+)]
+#[test_case(
+    CompletionScenario::TerminalError,
+    ThreadHistoryMode::Paginated;
+    "terminal_error"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     scenario: CompletionScenario,
+    history_mode: ThreadHistoryMode,
 ) -> Result<()> {
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
@@ -1979,14 +2036,28 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     };
     let child_request = mount_response_once_match(
         &server,
-        |req: &wiremock::Request| request_has_input_type(req, "agent_message"),
+        |req: &wiremock::Request| {
+            request_has_input_type(req, "agent_message")
+                && decoded_body(req)
+                    .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                    .and_then(|body| {
+                        body["client_metadata"]["x-codex-turn-metadata"]
+                            .as_str()
+                            .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
+                    })
+                    .is_some_and(|metadata| {
+                        metadata.get("parent_turn_id").is_some_and(Value::is_string)
+                    })
+        },
         sse_response(sse(child_events)).set_delay(Duration::from_secs(1)),
     )
     .await;
     mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            body_contains(req, SPAWN_CALL_ID) && !body_contains(req, "Message Type: FINAL_ANSWER")
+            body_contains(req, SPAWN_CALL_ID)
+                && !request_has_input_type(req, "agent_message")
+                && !body_contains(req, "Message Type: FINAL_ANSWER")
         },
         sse(vec![
             ev_response_created("resp-parent-2"),
@@ -2057,12 +2128,106 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
             config.model_provider.stream_max_retries = Some(0);
             config.model_provider.supports_websockets = false;
         })
+        .with_history_mode(history_mode)
         .build(&server)
         .await?;
 
     test.submit_turn(TURN_1_PROMPT).await?;
-    let _ = wait_for_requests(&child_request).await?;
-    test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (child_request, child_turn_metadata) = loop {
+        let child_request = child_request.requests().into_iter().find_map(|request| {
+            let body = request.body_json();
+            let turn_metadata: Value =
+                serde_json::from_str(body["client_metadata"]["x-codex-turn-metadata"].as_str()?)
+                    .ok()?;
+            turn_metadata
+                .get("parent_turn_id")
+                .and_then(Value::as_str)?;
+            Some((request, turn_metadata))
+        });
+        if let Some(child_request) = child_request {
+            break child_request;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for child request"
+        );
+        sleep(Duration::from_millis(10)).await;
+    };
+    let expected_completed_activity = if matches!(scenario, CompletionScenario::Completed) {
+        let child_body = child_request.body_json();
+        let parent_turn_id = child_turn_metadata["parent_turn_id"]
+            .as_str()
+            .expect("child parent turn ID")
+            .to_string();
+        let child_turn_id = child_body["client_metadata"]["turn_id"]
+            .as_str()
+            .expect("child turn ID")
+            .to_string();
+        let child_thread_id = ThreadId::from_string(
+            child_body["client_metadata"]["thread_id"]
+                .as_str()
+                .expect("child thread ID"),
+        )?;
+        Some((parent_turn_id, child_turn_id, child_thread_id))
+    } else {
+        None
+    };
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: TURN_2_NO_WAIT_PROMPT.to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let (completed_activity_started, completed_activity_completed) =
+        timeout(Duration::from_secs(5), async {
+            let mut active_turn_id = None;
+            let mut completed_activity_started = None;
+            let mut completed_activity_completed = None;
+            loop {
+                let event = test
+                    .codex
+                    .next_event()
+                    .await
+                    .expect("event stream should remain open");
+                match event.msg {
+                    EventMsg::TurnStarted(event) => {
+                        active_turn_id = Some(event.turn_id);
+                    }
+                    EventMsg::ItemStarted(event)
+                        if matches!(
+                            &event.item,
+                            TurnItem::SubAgentActivity(SubAgentActivityItem {
+                                kind: SubAgentActivityKind::Completed,
+                                ..
+                            })
+                        ) =>
+                    {
+                        completed_activity_started = Some(event);
+                    }
+                    EventMsg::ItemCompleted(event)
+                        if matches!(
+                            &event.item,
+                            TurnItem::SubAgentActivity(SubAgentActivityItem {
+                                kind: SubAgentActivityKind::Completed,
+                                ..
+                            })
+                        ) =>
+                    {
+                        completed_activity_completed = Some(event);
+                    }
+                    EventMsg::TurnComplete(event)
+                        if active_turn_id.as_deref() == Some(event.turn_id.as_str()) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            (completed_activity_started, completed_activity_completed)
+        })
+        .await
+        .expect("timed out waiting for parent turn completion");
 
     let request = wait_for_requests(&agent_request)
         .await?
@@ -2081,6 +2246,375 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
                 "text": notification,
             }],
         })])
+    );
+
+    if let Some((parent_turn_id, child_turn_id, child_thread_id)) = expected_completed_activity {
+        let started = completed_activity_started.expect("completed activity start event");
+        let completed_event =
+            completed_activity_completed.expect("completed activity completion event");
+        let TurnItem::SubAgentActivity(started_item) = &started.item else {
+            panic!("expected started sub-agent activity");
+        };
+        let TurnItem::SubAgentActivity(completed_event_item) = &completed_event.item else {
+            panic!("expected completed sub-agent activity");
+        };
+        assert_eq!(
+            (
+                started.thread_id,
+                &started.turn_id,
+                started_item,
+                Some(started.started_at_ms),
+            ),
+            (
+                completed_event.thread_id,
+                &completed_event.turn_id,
+                completed_event_item,
+                completed_event.started_at_ms,
+            )
+        );
+        assert_eq!(started.turn_id, parent_turn_id);
+
+        test.codex.ensure_rollout_materialized().await;
+        test.codex.flush_rollout().await?;
+        let rollout = codex_rollout::RolloutRecorder::get_rollout_history(
+            &test.codex.rollout_path().expect("parent rollout path"),
+        )
+        .await?;
+        assert!(
+            !rollout.get_rollout_items().iter().any(|item| matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::SubAgentActivity(activity))
+                    if activity.kind == SubAgentActivityKind::Completed
+            )),
+            "legacy completed activity should not be persisted without its parent turn ID"
+        );
+        let completed = rollout
+            .get_rollout_items()
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(completed))
+                    if matches!(
+                        &completed.item,
+                        TurnItem::SubAgentActivity(SubAgentActivityItem {
+                            kind: SubAgentActivityKind::Completed,
+                            ..
+                        })
+                    ) =>
+                {
+                    Some(completed)
+                }
+                _ => None,
+            })
+            .expect("persisted completed sub-agent activity");
+
+        assert_eq!(completed.turn_id, parent_turn_id);
+        let TurnItem::SubAgentActivity(completed_item) = &completed.item else {
+            panic!("expected completed sub-agent activity");
+        };
+        assert_eq!(
+            completed_item,
+            &SubAgentActivityItem {
+                id: format!("subagent-completed-{child_turn_id}"),
+                kind: SubAgentActivityKind::Completed,
+                agent_thread_id: child_thread_id,
+                agent_path: codex_protocol::AgentPath::root()
+                    .join("worker")
+                    .expect("worker path"),
+            }
+        );
+    } else {
+        assert!(completed_activity_started.is_none());
+        assert!(completed_activity_completed.is_none());
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> Result<()> {
+    const SPAWN_WORKER_PROMPT: &str = "spawn the completion-routing worker";
+    const SPAWN_REQUESTER_PROMPT: &str = "spawn the completion-routing requester";
+    const READ_RESULT_PROMPT: &str = "read the completion-routing worker result";
+    const WORKER_INITIAL_TASK: &str = "finish the worker initial task";
+    const REQUESTER_TASK: &str = "ask the sibling worker to do more";
+    const WORKER_FOLLOWUP_TASK: &str = "finish the peer-requested worker task";
+    const WORKER_CALL_ID: &str = "spawn-routing-worker";
+    const REQUESTER_CALL_ID: &str = "spawn-routing-requester";
+    const FOLLOWUP_CALL_ID: &str = "request-peer-followup";
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model("gpt-5.6-sol")
+        .with_config(|config| {
+            for feature in [Feature::Collab, Feature::MultiAgentV2] {
+                config
+                    .features
+                    .enable(feature)
+                    .expect("test config should allow feature update");
+            }
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            config.model_provider.supports_websockets = false;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let root_thread_id = test.session_configured.thread_id;
+    let mut created_threads = test.thread_manager.subscribe_thread_created();
+
+    let worker_spawn_args = serde_json::to_string(&json!({
+        "message": WORKER_INITIAL_TASK,
+        "task_name": "worker",
+        "fork_turns": "none",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, SPAWN_WORKER_PROMPT) && !body_contains(request, WORKER_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("resp-spawn-routing-worker"),
+            ev_function_call_with_namespace(
+                WORKER_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &worker_spawn_args,
+            ),
+            ev_completed("resp-spawn-routing-worker"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, WORKER_INITIAL_TASK)
+                && request_has_input_type(request, "agent_message")
+                && !body_contains(request, WORKER_FOLLOWUP_TASK)
+        },
+        sse(vec![
+            ev_response_created("resp-routing-worker-initial"),
+            ev_assistant_message("msg-routing-worker-initial", "initial worker finished"),
+            ev_completed("resp-routing-worker-initial"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, WORKER_CALL_ID)
+                && body_contains(request, SPAWN_WORKER_PROMPT)
+                && !body_contains(request, SPAWN_REQUESTER_PROMPT)
+        },
+        sse(vec![
+            ev_response_created("resp-routing-worker-spawned"),
+            ev_assistant_message("msg-routing-worker-spawned", "worker spawned"),
+            ev_completed("resp-routing-worker-spawned"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn(SPAWN_WORKER_PROMPT).await?;
+    let worker_thread_id = created_threads.recv().await?;
+    let worker_thread = test.thread_manager.get_thread(worker_thread_id).await?;
+    wait_for_event(worker_thread.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requester_spawn_args = serde_json::to_string(&json!({
+        "message": REQUESTER_TASK,
+        "task_name": "requester",
+        "fork_turns": "none",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, SPAWN_REQUESTER_PROMPT)
+                && !body_contains(request, REQUESTER_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("resp-spawn-routing-requester"),
+            ev_function_call_with_namespace(
+                REQUESTER_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &requester_spawn_args,
+            ),
+            ev_completed("resp-spawn-routing-requester"),
+        ]),
+    )
+    .await;
+    let followup_args = serde_json::to_string(&json!({
+        "target": "/root/worker",
+        "message": WORKER_FOLLOWUP_TASK,
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, REQUESTER_TASK)
+                && request_has_input_type(request, "agent_message")
+                && !body_contains(request, SPAWN_REQUESTER_PROMPT)
+                && !body_contains(request, FOLLOWUP_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("resp-routing-requester"),
+            ev_function_call_with_namespace(
+                FOLLOWUP_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "followup_task",
+                &followup_args,
+            ),
+            ev_completed("resp-routing-requester"),
+        ]),
+    )
+    .await;
+    let worker_followup_request = mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, WORKER_FOLLOWUP_TASK)
+                && request_has_input_type(request, "agent_message")
+                && !body_contains(request, FOLLOWUP_CALL_ID)
+        },
+        sse_response(sse(vec![
+            ev_response_created("resp-routing-worker-followup"),
+            ev_assistant_message("msg-routing-worker-followup", "peer follow-up finished"),
+            ev_completed("resp-routing-worker-followup"),
+        ]))
+        .set_delay(Duration::from_millis(250)),
+    )
+    .await;
+    let mut collaboration_responses = Vec::new();
+    for (call_id, prompt, response_id) in [
+        (
+            REQUESTER_CALL_ID,
+            SPAWN_REQUESTER_PROMPT,
+            "resp-routing-requester-spawned",
+        ),
+        (
+            FOLLOWUP_CALL_ID,
+            REQUESTER_TASK,
+            "resp-routing-followup-requested",
+        ),
+    ] {
+        collaboration_responses.push(
+            mount_sse_once_match(
+                &server,
+                move |request: &wiremock::Request| {
+                    body_contains(request, call_id) && body_contains(request, prompt)
+                },
+                sse(vec![
+                    ev_response_created(response_id),
+                    ev_assistant_message(response_id, "request accepted"),
+                    ev_completed(response_id),
+                ]),
+            )
+            .await,
+        );
+    }
+
+    test.submit_turn(SPAWN_REQUESTER_PROMPT).await?;
+    let requester_thread_id = created_threads.recv().await?;
+    let requester_thread = test.thread_manager.get_thread(requester_thread_id).await?;
+    let requester_turn_id = wait_for_event_match(requester_thread.as_ref(), |event| match event {
+        EventMsg::TurnStarted(started) => Some(started.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_event(requester_thread.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let followup_output = collaboration_responses[1]
+        .function_call_output_text(FOLLOWUP_CALL_ID)
+        .expect("requester follow-up tool output");
+    assert_eq!(followup_output, "");
+    wait_for_event(worker_thread.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let worker_followup_turn_id = worker_followup_request
+        .requests()
+        .into_iter()
+        .find_map(|request| {
+            let body = request.body_json();
+            (body["client_metadata"]["thread_id"] == json!(worker_thread_id)
+                && request.body_contains_text(WORKER_FOLLOWUP_TASK))
+            .then(|| {
+                body["client_metadata"]["turn_id"]
+                    .as_str()
+                    .expect("worker follow-up turn ID")
+                    .to_string()
+            })
+        })
+        .expect("worker follow-up model request");
+    let completed = timeout(
+        Duration::from_secs(5),
+        wait_for_event_match(requester_thread.as_ref(), |event| match event {
+            EventMsg::ItemCompleted(completed)
+                if matches!(
+                    &completed.item,
+                    TurnItem::SubAgentActivity(activity)
+                        if activity.kind == SubAgentActivityKind::Completed
+                            && activity.agent_thread_id == worker_thread_id
+                ) =>
+            {
+                Some(completed.clone())
+            }
+            _ => None,
+        }),
+    )
+    .await?;
+    let TurnItem::SubAgentActivity(completed_item) = completed.item else {
+        unreachable!("completion event should contain sub-agent activity");
+    };
+    assert_eq!(
+        (completed.thread_id, completed.turn_id, completed_item),
+        (
+            requester_thread_id,
+            requester_turn_id,
+            SubAgentActivityItem {
+                id: format!("subagent-completed-{worker_followup_turn_id}"),
+                kind: SubAgentActivityKind::Completed,
+                agent_thread_id: worker_thread_id,
+                agent_path: codex_protocol::AgentPath::root()
+                    .join("worker")
+                    .expect("worker path"),
+            },
+        )
+    );
+
+    let root_result_request = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, READ_RESULT_PROMPT)
+                && body_contains(request, "Sender: /root/worker")
+                && body_contains(request, "peer follow-up finished")
+        },
+        sse(vec![
+            ev_response_created("resp-routing-root-result"),
+            ev_assistant_message("msg-routing-root-result", "result received"),
+            ev_completed("resp-routing-root-result"),
+        ]),
+    )
+    .await;
+    test.submit_turn(READ_RESULT_PROMPT).await?;
+    let root_request = root_result_request
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request.body_json()["client_metadata"]["thread_id"] == json!(root_thread_id)
+                && request.body_contains_text(READ_RESULT_PROMPT)
+                && request.body_contains_text("peer follow-up finished")
+        })
+        .expect("root result request");
+    assert!(
+        root_request
+            .inputs_of_type("agent_message")
+            .iter()
+            .any(|item| {
+                item["author"] == "/root/worker"
+                    && item["recipient"] == "/root"
+                    && item.to_string().contains("peer follow-up finished")
+            })
     );
 
     Ok(())

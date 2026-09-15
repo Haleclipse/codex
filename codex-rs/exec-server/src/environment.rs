@@ -38,15 +38,16 @@ use crate::local_file_system::LocalFileSystem;
 use crate::local_process::LocalProcess;
 use crate::process::ExecBackend;
 use crate::protocol::EnvironmentInfo;
-use crate::protocol::FsCreateDirectoryParams;
 use crate::remote::NoiseRendezvousEnvironmentConfig;
 use crate::remote_file_system::RemoteFileSystem;
 use crate::remote_process::RemoteProcess;
-use codex_utils_path_uri::PathUri;
 use tokio::sync::watch;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
+
+#[path = "environment/accepted.rs"]
+mod accepted;
 
 pub const CODEX_EXEC_SERVER_URL_ENV_VAR: &str = "CODEX_EXEC_SERVER_URL";
 pub const CODEX_EXEC_SERVER_NOISE_REGISTRY_URL_ENV_VAR: &str =
@@ -772,6 +773,13 @@ impl Environment {
         http_client_factory: HttpClientFactory,
     ) -> Self {
         let client = LazyRemoteExecServerClient::new(remote_transport, http_client_factory);
+        Self::remote_with_client(client, local_runtime_paths)
+    }
+
+    pub(crate) fn remote_with_client(
+        client: LazyRemoteExecServerClient,
+        local_runtime_paths: Option<ExecServerRuntimePaths>,
+    ) -> Self {
         let exec_backend: Arc<dyn ExecBackend> = Arc::new(RemoteProcess::new(client.clone()));
         let filesystem: Arc<dyn ExecutorFileSystem> =
             Arc::new(RemoteFileSystem::new(client.clone()));
@@ -881,6 +889,7 @@ impl Environment {
     }
 
     /// Returns environment information from the selected execution/filesystem environment.
+    /// Remote metadata is cached for the current client's lifetime.
     #[tracing::instrument(
         name = "exec_server.environment.info",
         skip_all,
@@ -889,6 +898,20 @@ impl Environment {
     pub async fn info(&self) -> Result<EnvironmentInfo, ExecServerError> {
         match &self.remote_client {
             Some(client) => client.environment_info().await,
+            None => Ok(EnvironmentInfo::local()),
+        }
+    }
+
+    /// Fetches uncached metadata, connecting or waiting for recovery as needed.
+    // TODO: Remove after app-server migrates off of force_environment_info.
+    #[tracing::instrument(
+        name = "exec_server.environment.force_info",
+        skip_all,
+        fields(remote = self.is_remote())
+    )]
+    pub async fn force_info(&self) -> Result<EnvironmentInfo, ExecServerError> {
+        match &self.remote_client {
+            Some(client) => client.get().await?.force_environment_info().await,
             None => Ok(EnvironmentInfo::local()),
         }
     }
@@ -904,27 +927,6 @@ impl Environment {
                 .await
                 .map_err(|error| ExecServerError::Protocol(error.to_string())),
         }
-    }
-
-    /// Atomically creates an owner-private directory on a remote executor.
-    pub async fn create_private_directory(&self, path: &PathUri) -> Result<(), ExecServerError> {
-        let Some(client) = &self.remote_client else {
-            return Err(ExecServerError::Protocol(
-                "private executor directory creation requires a remote environment".to_string(),
-            ));
-        };
-        client
-            .get()
-            .await?
-            .fs_create_directory(FsCreateDirectoryParams {
-                path: path.clone(),
-                recursive: Some(false),
-                follow_symlinks: None,
-                sandbox: None,
-                private: Some(true),
-            })
-            .await?;
-        Ok(())
     }
 
     /// Discovers plugin and skill manifests through the environment's high-level discovery API.
@@ -1760,6 +1762,7 @@ mod tests {
                     std::env::current_dir().expect("read current dir"),
                 )
                 .expect("cwd URI"),
+                shell_snapshot: None,
                 env_policy: None,
                 env: Default::default(),
                 tty: false,
@@ -1801,6 +1804,7 @@ mod tests {
                     std::env::current_dir().expect("read current dir"),
                 )
                 .expect("cwd URI"),
+                shell_snapshot: None,
                 env_policy: None,
                 env: Default::default(),
                 tty: false,

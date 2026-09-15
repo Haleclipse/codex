@@ -4,9 +4,9 @@ expression: terminal.backend()
 ---
 "────────────────────────────────────────────────────────────────────────"
 "❯ $goog                                                                 "
+"                                                                        "
+"                                                                        "
 "────────────────────────────────────────────────────────────────────────"
-"   - · - tokens                                                        "
-"  Google Calendar  [Plugin] Connect Google Calendar for scheduling, ava…"
 "  Google Calendar  [Skill] Find availability and plan event changes     "
 "  Google Calendar  [App] Look up events and availability                "
 "                                                                        "

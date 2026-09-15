@@ -27,6 +27,7 @@ use codex_login::CodexAuth;
 use codex_login::ExternalAuth;
 use codex_login::ExternalAuthFuture;
 use codex_login::ExternalAuthRefreshContext;
+use codex_login::auth::BedrockAccessKeysAuth;
 use codex_login::auth::BedrockApiKeyAuth;
 use codex_login::test_support::auth_manager_from_optional_auth;
 use codex_protocol::auth::AuthMode;
@@ -89,7 +90,11 @@ pub(crate) fn test_auth_manager(auth_mode: Option<AuthMode>) -> Arc<AuthManager>
 }
 
 pub(crate) async fn set_test_auth_mode(auth_manager: &AuthManager, auth_mode: Option<AuthMode>) {
-    let Some(auth) = test_codex_auth(auth_mode) else {
+    set_test_auth(auth_manager, test_codex_auth(auth_mode)).await;
+}
+
+pub(crate) async fn set_test_auth(auth_manager: &AuthManager, auth: Option<CodexAuth>) {
+    let Some(auth) = auth else {
         auth_manager.clear_external_auth();
         return;
     };
@@ -113,6 +118,11 @@ fn test_codex_auth(auth_mode: Option<AuthMode>) -> Option<CodexAuth> {
         AuthMode::BedrockApiKey => CodexAuth::BedrockApiKey(BedrockApiKeyAuth {
             api_key: "test-api-key".to_string(),
             region: "us-east-1".to_string(),
+        }),
+        AuthMode::BedrockAccessKeys => CodexAuth::BedrockAccessKeys(BedrockAccessKeysAuth {
+            access_key_id: "test-access-key-id".to_string(),
+            secret_access_key: "test-secret-access-key".to_string(),
+            session_token: None,
         }),
         AuthMode::AgentIdentity | AuthMode::PersonalAccessToken => {
             panic!("test auth mode requires a purpose-built CodexAuth")

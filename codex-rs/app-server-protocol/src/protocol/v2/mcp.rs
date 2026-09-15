@@ -30,6 +30,19 @@ v2_enum_from_core!(
     }
 );
 
+v2_enum_from_core!(
+    #[ts(rename_all = "camelCase")]
+    pub enum McpServerConnectionStatus from codex_protocol::mcp::McpServerConnectionStatus {
+        NotStarted,
+        Starting,
+        Connected,
+        AuthenticationRequired,
+        Failed,
+        Cancelled,
+        Disabled
+    }
+);
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -61,6 +74,8 @@ pub enum McpServerStatusDetail {
 #[ts(export_to = "v2/")]
 pub struct McpServerStatus {
     pub name: String,
+    /// Current thread-runtime connection state; null when unavailable or the configuration changed.
+    pub runtime_status: Option<McpServerConnectionStatus>,
     pub plugin_id: Option<String>,
     pub server_info: Option<McpServerInfo>,
     pub tools: std::collections::HashMap<String, McpTool>,
@@ -101,6 +116,53 @@ pub struct McpResourceReadResponse {
     pub contents: Vec<McpResourceContent>,
     /// Originating call when the server applied app-specific resource scoping.
     pub origin_call_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamStartParams {
+    pub thread_id: String,
+    pub server: String,
+    pub subscription_id: String,
+    pub name: String,
+    pub arguments: JsonValue,
+    #[serde(rename = "_meta")]
+    #[ts(rename = "_meta", optional = nullable)]
+    pub meta: Option<JsonValue>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamStartResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamStopParams {
+    pub subscription_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamStopResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventNotification {
+    pub method: String,
+    pub params: JsonValue,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct McpServerEventStreamNotification {
+    pub subscription_id: String,
+    pub notification: McpServerEventNotification,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

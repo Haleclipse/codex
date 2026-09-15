@@ -239,6 +239,8 @@ define_runtime_action_bindings! {
         interrupt_turn,
         decrease_reasoning_effort,
         increase_reasoning_effort,
+        previous_permission_mode,
+        next_permission_mode,
         edit_queued_message,
     ],
     "composer" => Composer, composer, composer [
@@ -285,6 +287,7 @@ define_runtime_action_bindings! {
         move_line_end,
         delete_char,
         replace_char,
+        repeat_last_change,
         substitute_char,
         delete_to_line_end,
         change_to_line_end,

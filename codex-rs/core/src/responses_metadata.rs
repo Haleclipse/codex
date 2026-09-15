@@ -7,7 +7,6 @@ use codex_analytics::CompactionReason;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
@@ -16,6 +15,7 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::client::X_CODEX_INSTALLATION_ID_HEADER;
 use crate::client::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -29,6 +29,7 @@ pub(crate) const THREAD_ID_KEY: &str = "thread_id";
 pub(crate) const AGENT_NAME_KEY: &str = "agent_name";
 pub(crate) const TURN_ID_KEY: &str = "turn_id";
 pub(crate) const WINDOW_ID_KEY: &str = "window_id";
+pub(crate) const CONTEXT_WINDOW_ID_KEY: &str = "context_window_id";
 pub(crate) const REQUEST_KIND_KEY: &str = "request_kind";
 pub(crate) const COMPACTION_KEY: &str = "compaction";
 // Keep the removed inventory reserved so callers cannot reintroduce oversized metadata.
@@ -59,6 +60,7 @@ const RESERVED_METADATA_KEYS: &[&str] = &[
     AGENT_NAME_KEY,
     TURN_ID_KEY,
     WINDOW_ID_KEY,
+    CONTEXT_WINDOW_ID_KEY,
     X_CODEX_WINDOW_ID_HEADER,
     X_CODEX_TURN_METADATA_HEADER,
     X_CODEX_PARENT_THREAD_ID_HEADER,
@@ -209,6 +211,7 @@ pub struct CodexResponsesMetadata {
     pub(crate) turn_id: Option<String>,
     pub(crate) routing_hint: Option<HeaderValue>,
     pub(crate) window_id: String,
+    pub(crate) context_window_id: Option<Uuid>,
     pub(crate) request_kind: Option<CodexResponsesRequestKind>,
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
@@ -243,6 +246,7 @@ impl CodexResponsesMetadata {
             turn_id: None,
             routing_hint: None,
             window_id,
+            context_window_id: None,
             request_kind: None,
             forked_from_thread_id: None,
             parent_thread_id: None,
@@ -365,6 +369,9 @@ impl CodexResponsesMetadata {
                 .then_some(self.turn_id.as_deref())
                 .flatten(),
             window_id: has_request_identity.then_some(self.window_id.as_str()),
+            context_window_id: has_request_identity
+                .then_some(self.context_window_id)
+                .flatten(),
             request_kind: request_kind_value,
             forked_from_thread_id: self.forked_from_thread_id,
             parent_thread_id: self.parent_thread_id,
@@ -398,9 +405,7 @@ pub(crate) fn subagent_header_value(session_source: &SessionSource) -> Option<St
             SubAgentSource::ThreadSpawn { .. } => Some("collab_spawn".to_string()),
             SubAgentSource::Other(label) => Some(label.clone()),
         },
-        SessionSource::Internal(InternalSessionSource::MemoryConsolidation) => {
-            Some("memory_consolidation".to_string())
-        }
+        SessionSource::Internal(source) => Some(source.to_string()),
         SessionSource::Cli
         | SessionSource::VSCode
         | SessionSource::Exec
@@ -486,6 +491,8 @@ struct CodexTurnMetadataPayload<'a> {
     turn_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_id: Option<&'a str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_kind: Option<&'static str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

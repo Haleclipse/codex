@@ -173,18 +173,18 @@ Example with notification opt-out:
 - `threadSection/update` — rename an existing custom section and optionally replace its `appearance`; omit appearance to preserve it or pass `null` to clear it. The built-in pinned section cannot be updated.
 - `threadSection/delete` — delete an existing custom section and atomically return its member threads to the unsectioned list; returns `{}`. The built-in pinned section cannot be deleted.
 - `thread/loaded/list` — list the thread ids currently loaded in memory.
-- `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded. For loaded threads, experimental clients can use `canAcceptDirectInput` to determine whether `turn/start` and `turn/steer` are accepted; unloaded stored threads report `null` when that capability is unavailable.
+- `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded. For loaded threads, experimental clients can use `canAcceptDirectInput` to determine whether `turn/start` and `turn/steer` are accepted (`false` for parent-owned Multi-Agent V2 subagents); unloaded stored threads report `null` when that capability is unavailable.
 - `thread/turns/list` — experimental; page through a stored thread’s turn history without resuming it; supports cursor-based pagination with `sortDirection`, `itemsView`, `nextCursor`, and `backwardsCursor`.
 - `thread/items/list` — experimental; page through persisted thread items without resuming the thread. Pass `turnId` to restrict results to one turn, or omit it to page items across the thread. The active thread store must support item pagination.
 - `thread/searchOccurrences` — experimental; find literal, case-insensitive matches in visible user messages and summary-selected final assistant messages within one paginated thread.
 - `thread/metadata/update` — patch stored thread metadata in sqlite; supports updating persisted `gitInfo` fields and experimental `projectId`, then returns the refreshed `thread`. Omit `projectId` to preserve assignment and pass an empty string to clear it.
 - `thread/section/move` — atomically move a thread into the section identified by `sectionId`, before another thread or at the end when `beforeThreadId` is `null`. Reordering within the same section preserves `sectionEnteredAt`; entering a different section resets it. Set `sectionId` to `null` to remove the thread from its section. Returns `{}` on success.
-- `thread/settings/update` — experimental; queue a partial update to a loaded thread’s next-turn settings without starting a turn or adding transcript items. Omitted fields leave settings unchanged; `serviceTier: null` clears the tier; deprecated `multiAgentMode` is ignored, while Ultra reasoning effort enables proactive multi-agent behavior; `sandboxPolicy` and `permissions` cannot be combined. Returns `{}` when the update is accepted and emits `thread/settings/updated` with the full effective settings only if they actually change. `turn/start` settings overrides emit the same notification when they change the stored settings.
+- `thread/settings/update` — experimental; queue a partial update to a loaded thread’s next-turn settings without starting a turn or adding transcript items. Omitted fields leave settings unchanged; `serviceTier: null` clears the tier; deprecated `multiAgentMode` is ignored, while Ultra reasoning effort enables proactive multi-agent behavior; `sandboxPolicy` and `permissions` cannot be combined. Parent-owned Multi-Agent V2 subagents reject direct settings updates. Returns `{}` when the update is accepted and emits `thread/settings/updated` with the full effective settings only if they actually change. `turn/start` settings overrides emit the same notification when they change the stored settings.
 - `thread/memoryMode/set` — experimental; set a thread’s persisted memory eligibility to `"enabled"` or `"disabled"` for either a loaded thread or a stored rollout; returns `{}` on success.
 - `memory/reset` — experimental; clear the current `CODEX_HOME/memories` directory and reset persisted memory stage data in sqlite while preserving existing thread memory modes; returns `{}` on success.
-- `thread/goal/set` — create or update the single persisted goal for a materialized thread; returns the current goal and emits `thread/goal/updated`.
-- `thread/goal/get` — fetch the current persisted goal for a materialized thread; returns `goal: null` when no goal exists.
-- `thread/goal/clear` — clear the current persisted goal for a materialized thread; returns whether a goal was removed and emits `thread/goal/cleared` when state changes.
+- `thread/goal/set` — create or update the single persisted goal for a materialized thread; returns the current goal and emits `thread/goal/updated`. Parent-owned Multi-Agent V2 subagents reject goal updates, including while unloaded.
+- `thread/goal/get` — fetch the current persisted goal for a materialized thread; returns `goal: null` when no goal exists. Available even for parent-owned Multi-Agent V2 subagents.
+- `thread/goal/clear` — clear the current persisted goal for a materialized thread; returns whether a goal was removed and emits `thread/goal/cleared` when state changes. Parent-owned Multi-Agent V2 subagents reject goal clearing, including while unloaded.
 - `thread/goal/updated` — notification emitted whenever a thread goal changes; includes the full current goal.
 - `thread/goal/cleared` — notification emitted whenever a thread goal is removed.
 - `thread/queue/add` — experimental; persist a user turn for automatic FIFO submission when the thread next becomes idle.
@@ -201,23 +201,25 @@ Example with notification opt-out:
 - `thread/unsubscribe` — unsubscribe this connection from thread turn/item events. If this was the last subscriber, the server keeps the thread loaded and unloads it only after it has had no subscribers and no thread activity for 30 minutes, runs `SessionEnd` hooks, then emits `thread/closed`.
 - `thread/name/set` — set or update a thread’s user-facing name for either a loaded thread or a persisted rollout; returns `{}` on success and emits `thread/name/updated` to initialized, opted-in clients. Thread names are not required to be unique; name lookups resolve to the most recently updated thread.
 - `thread/unarchive` — move an archived rollout file back into the sessions directory; returns the restored `thread` on success and emits `thread/unarchived`.
-- `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications.
-- `thread/shellCommand` — run a user-initiated `!` shell command against a thread; this runs unsandboxed with full access rather than inheriting the thread sandbox policy. Returns `{}` immediately while progress streams through standard turn/item notifications and any active turn receives the formatted output in its message stream.
+- `thread/compact/start` — trigger conversation history compaction for a thread; returns `{}` immediately while progress streams through standard turn/item notifications. Parent-owned Multi-Agent V2 subagents reject direct compaction requests.
+- `thread/shellCommand` — run a user-initiated `!` shell command against a thread; this runs unsandboxed with full access rather than inheriting the thread sandbox policy. Parent-owned Multi-Agent V2 subagents reject direct shell commands. Returns `{}` immediately while progress streams through standard turn/item notifications and any active turn receives the formatted output in its message stream.
+- `thread/approveGuardianDeniedAction` — manually approve a previously denied Guardian action; parent-owned Multi-Agent V2 subagents reject direct approvals. Replies to pending server-issued approval requests are unaffected.
 - `thread/backgroundTerminals/clean` — terminate all running background terminals for a thread (experimental; requires `capabilities.experimentalApi`); returns `{}` when the cleanup request is accepted.
 - `thread/backgroundTerminals/list` — list running background terminals for a loaded thread (experimental; requires `capabilities.experimentalApi`); returns `data` with the running terminal ids.
 - `thread/backgroundTerminals/terminate` — terminate one running background terminal by app-server `processId` (experimental; requires `capabilities.experimentalApi`); returns whether a process was terminated.
-- `thread/rollback` — deprecated and will be removed soon. Drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success. Paginated threads do not support rollback.
-- `thread/revert` — experimental. Replace a loaded paginated thread's durable history with the prefix strictly before `beforeTurnId` while preserving its thread id. The operation interrupts an active turn if needed, leaves older rollout files immutable, reloads the thread, returns updated thread metadata with empty `turns` plus pagination cursors, and emits `thread/reverted`. It does not revert local file changes.
-- `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Experimental `runtimeWorkspaceRoots` supplies the default roots for newly resolved environment selections. Explicit `environments[].runtimeWorkspaceRoots` override that fallback with environment-native absolute paths. Prefer experimental `permissions` profile selection by id for permission overrides; the legacy `sandboxPolicy` field is still accepted but cannot be combined with `permissions`. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode". Deprecated experimental `multiAgentMode` is ignored; Ultra reasoning effort selects proactive behavior.
-- `thread/inject_items` — append raw Responses API items to a loaded thread’s model-visible history without starting a user turn; returns `{}` on success.
-- `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Review and manual compaction turns reject `turn/steer`.
-- `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
-- `thread/realtime/start` — start a thread-scoped realtime session (experimental); pass `outputModality: "text"` or `outputModality: "audio"` to choose model output, optionally pass `model` and `version` to override configured realtime selection for this session only, pass `includeStartupContext: false` to omit Codex's generated startup context, and optionally pass `initialItems` to seed V3 with complete role-bearing text messages at session creation. Pass `realtimeStartInstructions` and `realtimeEndInstructions` to control the developer instructions given to the backing Codex model when this session starts and ends. Version `"v1"` uses legacy Bidi `conversation.handoff.*`, `"v2"` uses the Realtime Voice API, and `"v3"` preserves V1 Codex Voice behavior while using Frameless Bidi `delegation.*`. For V3 automatic Codex text, `codexResponseHandoffMode` accepts `"thinking"` (the default; all output uses channel-less thinking appends), `"commentary"` (all output uses the commentary channel), or `"bemTags"` (the raw BEM envelope selects the API channel: BEM `analysis` and `commentary` use `commentary`, while BEM `final` and unparsable output use `speakable`). The BEM envelope remains in the appended text for the frontend model to interpret. V1 and V2 ignore this setting. For V3, pass `delegationAckFiller: false` to suppress the Realtime API's delegation acknowledgement filler or `true` to restore it; omitting the field preserves the Realtime API's default. V1 and V2 ignore `delegationAckFiller`. V3 handoffs do not prepend the legacy `"Agent Final Message"` label. Pass `clientManagedHandoffs: true` to disable automatic Codex response delivery so only the client's explicit append calls produce handoffs. Pass `codexResponsesAsItems: true` to send automatic Codex responses as realtime conversation items instead, and optionally pass `codexResponseItemPrefix` to prepend experiment instructions to those items. Returns `{}` and streams `thread/realtime/*` notifications. Omit `transport` for the websocket transport, or pass `{ "type": "webrtc", "sdp": "..." }` to create a Bidi WebRTC session from a browser-generated SDP offer; the remote answer SDP is emitted as `thread/realtime/sdp`. Conversation `version: "v2"` requests remain unsupported for WebRTC.
-- `thread/realtime/appendAudio` — append an input audio chunk to the active realtime session (experimental); returns `{}`.
-- `thread/realtime/appendText` — append text input to the active realtime session with a required `role` of `user`, `developer`, or `assistant` (experimental); returns `{}`. Older clients that omit `role` default to `user`.
-- `thread/realtime/appendSpeech` — append text that the realtime model should speak to the user (experimental); returns `{}`.
-- `thread/realtime/stop` — stop the active realtime session for the thread (experimental); returns `{}`.
-- `review/start` — kick off Codex’s automated reviewer for a thread; responds like `turn/start`. Inline reviews emit `item/started`/`item/completed` notifications with `enteredReviewMode` and `exitedReviewMode` items, plus a final assistant `agentMessage` containing the review. Detached reviews stream ordinary turn items on the new review thread.
+- `thread/rollback` — deprecated and will be removed soon. Drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success. Paginated threads do not support rollback. Parent-owned Multi-Agent V2 subagents reject direct rollback requests.
+- `thread/revert` — experimental. Replace a loaded paginated thread's durable history with the prefix strictly before `beforeTurnId` while preserving its thread id. The operation interrupts an active turn if needed, leaves older rollout files immutable, reloads the thread, returns updated thread metadata with empty `turns` plus pagination cursors, and emits `thread/reverted`. It does not revert local file changes. Parent-owned Multi-Agent V2 subagents reject direct revert requests.
+- `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Experimental `runtimeWorkspaceRoots` supplies the default roots for newly resolved environment selections. Explicit `environments[].runtimeWorkspaceRoots` override that fallback with environment-native absolute paths. Prefer experimental `permissions` profile selection by id for permission overrides; the legacy `sandboxPolicy` field is still accepted but cannot be combined with `permissions`. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode". Deprecated experimental `multiAgentMode` is ignored; Ultra reasoning effort selects proactive behavior. Parent-owned Multi-Agent V2 subagents reject direct turns.
+- `thread/inject_items` — append raw Responses API items to a loaded thread’s model-visible history without starting a user turn; returns `{}` on success. Parent-owned Multi-Agent V2 subagents reject direct item injection.
+- `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Review and manual compaction turns reject `turn/steer`. Parent-owned Multi-Agent V2 subagents reject direct steering.
+- `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`. Also available for parent-owned Multi-Agent V2 subagents.
+- `thread/realtime/start` — start a thread-scoped realtime session (experimental); pass `outputModality: "text"` or `outputModality: "audio"` to choose model output, optionally pass `model` and `version` to override configured realtime selection for this session only, pass `includeStartupContext: false` to omit Codex's generated startup context, and optionally pass `initialItems` to seed V3 with complete role-bearing text messages at session creation. Pass `realtimeStartInstructions` and `realtimeEndInstructions` to control the developer instructions given to the backing Codex model when this session starts and ends. Version `"v1"` uses legacy Bidi `conversation.handoff.*`, `"v2"` uses the Realtime Voice API, and `"v3"` preserves V1 Codex Voice behavior while using Frameless Bidi `delegation.*`. For V3 automatic Codex text, `codexResponseHandoffMode` accepts `"thinking"` (the default; all output uses channel-less thinking appends), `"commentary"` (all output uses the commentary channel), or `"bemTags"` (the raw BEM envelope selects the API channel: BEM `analysis` and `commentary` use `commentary`, while BEM `final` and unparsable output use `speakable`). The BEM envelope remains in the appended text for the frontend model to interpret. V1 and V2 ignore this setting. For V3, pass `delegationAckFiller: false` to suppress the Realtime API's delegation acknowledgement filler or `true` to restore it; omitting the field preserves the Realtime API's default. V1 and V2 ignore `delegationAckFiller`. V3 handoffs do not prepend the legacy `"Agent Final Message"` label. Pass `clientManagedHandoffs: true` to disable automatic Codex response delivery so only the client's explicit append calls produce handoffs. Pass `codexResponsesAsItems: true` to send automatic Codex responses as realtime conversation items instead, and optionally pass `codexResponseItemPrefix` to prepend experiment instructions to those items. Returns `{}` and streams `thread/realtime/*` notifications. Omit `transport` for the websocket transport, or pass `{ "type": "webrtc", "sdp": "..." }` to create a Bidi WebRTC session from a browser-generated SDP offer; the remote answer SDP is emitted as `thread/realtime/sdp`. Conversation `version: "v2"` requests remain unsupported for WebRTC. Parent-owned Multi-Agent V2 subagents reject this request.
+- `thread/realtime/appendAudio` — append an input audio chunk to the active realtime session (experimental); returns `{}`. Parent-owned Multi-Agent V2 subagents reject this request.
+- `thread/realtime/appendText` — append text input to the active realtime session with a required `role` of `user`, `developer`, or `assistant` (experimental); returns `{}`. Older clients that omit `role` default to `user`. Parent-owned Multi-Agent V2 subagents reject this request.
+- `thread/realtime/appendSpeech` — append text that the realtime model should speak to the user (experimental); returns `{}`. Parent-owned Multi-Agent V2 subagents reject this request.
+- `thread/realtime/stop` — stop the active realtime session for the thread (experimental); returns `{}`. Parent-owned Multi-Agent V2 subagents reject this request.
+- `thread/timeline/list` — page ordinary turn items, durable realtime facts, and turn boundaries together in rollout order (experimental). Entries are tagged `item`, `realtime`, `turnStarted`, or `turnCompleted`. Turn boundaries carry lifecycle metadata without duplicating the turn's items; completed boundaries also cover interrupted and failed turns. Each response contains an opaque continuation cursor and `activeRealtimeSessionAtPageStart`, allowing clients to render any bounded page without loading earlier thread history. Entries at the same rollout position have stable ordering and can span pages. Existing `thread/items/list` remains unchanged.
+- `review/start` — kick off Codex’s automated reviewer for a thread; responds like `turn/start`. Inline reviews emit `item/started`/`item/completed` notifications with `enteredReviewMode` and `exitedReviewMode` items, plus a final assistant `agentMessage` containing the review. Detached reviews stream ordinary turn items on the new review thread. Parent-owned Multi-Agent V2 subagents reject both inline and detached reviews.
 - `command/exec` — run a single command under the server sandbox without starting a thread/turn (handy for utilities and validation).
 - `command/exec/write` — write base64-decoded stdin bytes to a running `command/exec` session or close stdin; returns `{}`.
 - `command/exec/resize` — resize a running PTY-backed `command/exec` session by `processId`; returns `{}`.
@@ -277,9 +279,11 @@ Example with notification opt-out:
 - `mcpServer/oauth/login` — start an OAuth login for a configured MCP server; pass `threadId` to resolve servers from that thread's selected plugins and executor, optionally pass `clientRegistration` (`auto`, `cimd`, or `dcr`) to override client registration for this login only, and receive an `authorization_url` followed by `mcpServer/oauthLogin/completed` once the browser flow finishes. Omitting `clientRegistration` automatically discovers the authorization server's supported registration methods; the override is never persisted in server configuration.
 - `tool/requestUserInput` — prompt the user with 1–3 short questions for a tool call and return their answers (experimental).
 - `config/mcpServer/reload` — reload MCP server config from disk and queue a refresh for loaded threads (applied on each thread's next active turn); returns `{}`. Use this after editing `config.toml` without restarting the server.
-- `mcpServerStatus/list` — enumerate configured MCP servers with their tools, auth status, server info, owning `pluginId` (`null` for servers not contributed by a plugin), plus resources/resource templates for `full` detail; supports optional `threadId` and cursor+limit pagination. If `threadId` is omitted, the server reads from the latest global config directly. If `detail` is omitted, the server defaults to `full`. An `unknown` auth status means OAuth support could not be determined; `unsupported` means OAuth is known not to be supported.
+- `mcpServerStatus/list` — enumerate configured MCP servers with their tools, auth status, server info, owning `pluginId` (`null` for servers not contributed by a plugin), and nullable `runtimeStatus` from the current thread’s published connections, plus resources/resource templates for `full` detail; supports optional `threadId` and cursor+limit pagination. If `threadId` is omitted, the server reads from the latest global config directly and `runtimeStatus` is `null`. Runtime status is also `null` when the latest server registration differs from the thread’s published configuration. Runtime status is observed without starting or reconnecting the thread’s servers; it can be `notStarted`, `starting`, `connected`, `authenticationRequired`, `failed`, `cancelled`, or `disabled`. Inventory may be cached or collected separately and does not prove that the thread is connected. Older servers omit `runtimeStatus`; clients should treat that as unknown. If `detail` is omitted, the server defaults to `full`. An `unknown` auth status means OAuth support could not be determined; `unsupported` means OAuth is known not to be supported.
 - `mcpServer/resource/read` — read a resource from a configured MCP server by optional `threadId`, `server`, and `uri`, returning text/blob resource `contents`. Pass `originCallId` with `threadId` to scope a Codex app widget to the app and account of the completed tool call that produced it; successful scoped reads return the same `originCallId`. Optional `connectorId` restricts other hosted app resources to their originating connector. If `threadId` is omitted, the server reads from the latest MCP config directly.
-- `mcpServer/tool/call` — call a tool on a thread's configured MCP server by `threadId`, `server`, `tool`, optional `arguments`, and optional `_meta`, returning the MCP tool result.
+- `mcpServer/event/stream/start` (experimental) — subscribe to an MCP event by `threadId`, `server`, `subscriptionId`, event `name`, `arguments`, and optional `_meta`.
+- `mcpServer/event/stream/stop` (experimental) — stop the caller's event subscription by `subscriptionId`.
+- `mcpServer/tool/call` — call a tool on a thread's configured MCP server by `threadId`, `server`, `tool`, optional `arguments`, and optional `_meta`, returning the MCP tool result. Parent-owned Multi-Agent V2 subagents reject direct tool calls.
 - `windowsSandbox/setupStart` — start Windows sandbox setup for the selected mode (`elevated` or `unelevated`); accepts an optional absolute `cwd` to target setup for a specific workspace, returns `{ started: true }` immediately, and later emits `windowsSandbox/setupCompleted`.
 - `feedback/upload` — submit a feedback report (classification + optional reason/logs, conversation_id, and optional `extraLogFiles` attachments array); returns the tracking thread id.
 - `config/read` — fetch the runtime-effective config after resolving config layering and managed requirements, including opaque `desktop` values stored in `config.toml`. When configured, the `packagedDefaults` layer has the lowest precedence.
@@ -288,7 +292,7 @@ Example with notification opt-out:
 - `externalAgentConfig/import/readHistories` — read completed import histories and connector candidates detected from successfully imported session histories. Successful session entries include the original imported title when one was available. Connector candidates include a normalized display `name`, the number of imported sessions that used the connector, and the source metadata field used for detection.
 - `config/value/write` — write a single config key/value to the user's config.toml on disk; dotted paths such as `desktop.someKey` use the same generic write surface. Writes that overlap a managed requirement are rejected with `configRequirementReadonly`.
 - `config/batchWrite` — apply multiple config edits atomically to the user's config.toml on disk, with optional `reloadUserConfig: true` to hot-reload loaded threads, including multiple `desktop.*` edits. Session-static model, reasoning-effort, Plan-mode reasoning-effort, service-tier, and personality defaults do not reload existing threads.
-- `configRequirements/read` — fetch loaded requirements constraints from `requirements.toml` and/or MDM (or `null` if none are configured), including exact managed values (`cliAuthCredentialsStore`, `chatgptBaseUrl`, `sqliteHome`, `logDir`, `modelCatalogJson`, `checkForUpdateOnStartup`, `allowLoginShell`, `feedback.enabled`, and `windowsSandboxPrivateDesktop`), allow-lists (`allowedApprovalPolicies`, `allowedSandboxModes`, `allowedWebSearchModes`), the layered permission-profile allow map (`allowedPermissionProfiles`), the managed permission-profile default (`defaultPermissions`), lifecycle hook lockdown (`allowManagedHooksOnly`), remote-control policy (`allowRemoteControl`; `false` force-disables remote control while `true` or `null` preserves existing behavior), computer use policy (`computerUse`), Browser Use policy (`browserUse.disableAutoReview`), pinned feature values (`featureRequirements`, including the default-allowed `in_app_updates` policy that administrators can set to `false`), managed lifecycle hooks (`hooks`, including command handlers with optional `additionalContextLimit` and `mcp_tool` handlers with `server`, `tool`, `input`, `timeoutSec`, and `statusMessage`), `enforceResidency`, managed automatic review (`autoReview.requiredOnModels` and `autoReview.ignoreRules`), model defaults (`models.newThread.model`, `models.newThread.modelReasoningEffort`, and `models.newThread.serviceTier`), and `network` constraints such as canonical domain/socket permissions plus `managedAllowedDomainsOnly` and `dangerFullAccessDenylistOnly`.
+- `configRequirements/read` — fetch loaded requirements constraints from `requirements.toml` and/or MDM (or `null` if none are configured), including exact managed values (`cliAuthCredentialsStore`, `chatgptBaseUrl`, `sqliteHome`, `logDir`, `modelCatalogJson`, `checkForUpdateOnStartup`, `allowLoginShell`, `feedback.enabled`, and `windowsSandboxPrivateDesktop`), requirements-only developer instructions (`additionalDeveloperInstructions`, supplied independently of ordinary developer instructions), allow-lists (`allowedApprovalPolicies`, `allowedSandboxModes`, `allowedWebSearchModes`), the layered permission-profile allow map (`allowedPermissionProfiles`), the managed permission-profile default (`defaultPermissions`), lifecycle hook lockdown (`allowManagedHooksOnly`), remote-control policy (`allowRemoteControl`; `false` force-disables remote control while `true` or `null` preserves existing behavior), the Browser/Computer Use umbrella policy (`allowBrowserAndComputerUse`), computer use policy (`computerUse`, including persistent approval, default application access, and per-platform application rules), Browser Use policy (`browserUse`, including history access, origin rules, auto-review, and approval controls), interactive browser import policy (`inAppBrowser.allowExternalBrowserSettingsImport`), pinned feature values (`featureRequirements`, including the default-allowed `in_app_updates` policy that administrators can set to `false`), managed lifecycle hooks (`hooks`, including command handlers with optional `additionalContextLimit` and `mcp_tool` handlers with `server`, `tool`, `input`, `timeoutSec`, and `statusMessage`), `enforceResidency`, managed automatic review (`autoReview.requiredOnModels` and `autoReview.ignoreRules`), model defaults (`models.newThread.model`, `models.newThread.modelReasoningEffort`, and `models.newThread.serviceTier`), and `network` constraints such as canonical domain/socket permissions plus `managedAllowedDomainsOnly` and `dangerFullAccessDenylistOnly`.
 
 ### Example: Start or resume a thread
 
@@ -359,6 +363,8 @@ Start a fresh thread when you need a new Codex conversation.
 Valid `personality` values are `"friendly"`, `"pragmatic"`, and `"none"`. When `"none"` is selected, the personality placeholder is replaced with an empty string.
 
 To continue a stored session, call `thread/resume` with the `thread.id` you previously recorded. The response shape matches `thread/start`. When the stored session includes persisted token usage, the server emits `thread/tokenUsage/updated` immediately after the response so clients can render restored usage before the next turn starts. You can also pass the same configuration overrides supported by `thread/start`, including `approvalsReviewer`. On cold resume, approval policy and the active permission-profile ID select a source in this order: request override, latest persisted thread setting, current configured default. The persisted profile ID is resolved through the same config and requirements path as a `permissions` override. Threads without an active profile ID use current config instead of restoring their concrete historical permissions.
+
+Parent-owned Multi-Agent V2 children are an exception: `thread/resume` ignores configuration overrides and reattaches to the existing child. An unloaded child is reloaded through its actual, currently loaded parent using parent-derived configuration. If that owner-controlled reload cannot be performed, the request returns JSON-RPC error `-32600`; resume the parent first, or use `thread/read` or `thread/turns/list` to inspect the child's stored history without loading it. This policy follows the child's multi-agent runtime, including leaf workers whose models cannot delegate further.
 
 By default, `thread/resume` includes the reconstructed turn history in `thread.turns`. Experimental clients can pass `excludeTurns: true` to return only thread metadata and live resume state, then call `thread/turns/list` separately if they want to page the turn history over the network. A cold paginated resume can still replay persisted `thread/tokenUsage/updated` when it can identify the corresponding stored turn; resuming an already-loaded thread waits for the next live update.
 
@@ -1016,7 +1022,7 @@ Invoke a plugin by including a UI mention token such as `@sample` in the text in
 
 ### Example: Inject raw history items
 
-Use `thread/inject_items` to append prebuilt Responses API items to a loaded thread’s prompt history without starting a user turn. These items are persisted to the rollout and included in subsequent model requests. Any `input_image` items must use inline data URLs; remote HTTP(S) image URLs are rejected.
+Use `thread/inject_items` to append prebuilt Responses API items to a loaded thread’s prompt history without starting a user turn. These items are persisted to the rollout and included in subsequent model requests. A standalone `function_call_output` can omit `call_id` when it has a nonempty `name`; `namespace` is optional, and the output retains tool-tier authority. Any `input_image` items must use inline data URLs; remote HTTP(S) image URLs are rejected.
 
 ```json
 { "method": "thread/inject_items", "id": 36, "params": {
@@ -1026,6 +1032,12 @@ Use `thread/inject_items` to append prebuilt Responses API items to a loaded thr
             "type": "message",
             "role": "assistant",
             "content": [{ "type": "output_text", "text": "Previously computed context." }]
+        },
+        {
+            "type": "function_call_output",
+            "name": "send_message_to_thread",
+            "namespace": "codex_app",
+            "output": "Another agent delegated this task."
         }
     ]
 } }
@@ -1070,6 +1082,27 @@ Then send `offer.sdp` to app-server. Core uses `experimental_realtime_ws_backend
     "sdp": "v=0\r\no=..."
 } }
 ```
+
+Clients that create and negotiate the realtime call themselves can instead pass its call ID:
+
+```json
+{ "method": "thread/realtime/start", "id": 41, "params": {
+    "threadId": "thr_123",
+    "outputModality": "audio",
+    "version": "v3",
+    "realtimeSessionId": "sess_123",
+    "transport": { "type": "existingCall", "callId": "rtc_123" }
+} }
+{ "id": 41, "result": {} }
+```
+
+The existing-call transport attaches Codex to the call over its sideband WebSocket without creating
+another call or emitting `thread/realtime/sdp`. The client owns the SDP negotiation and the initial
+realtime session configuration. Codex startup context is disabled by default for existing calls;
+`includeStartupContext: true`, `prompt`, nonempty `initialItems`, `model`, `voice`, and
+`delegationAckFiller` are rejected because they would change the client-owned session. Supply
+`realtimeSessionId` when the upstream session ID is known; otherwise the
+`thread/realtime/started` notification reports `realtimeSessionId: null`.
 
 Omit `prompt` to use Codex's default realtime backend prompt. Send `prompt: null` or
 `prompt: ""` when the session should start without that default backend prompt.
@@ -1533,7 +1566,9 @@ All filesystem paths in this section must be absolute.
 
 Event notifications are the server-initiated event stream for thread lifecycles, turn lifecycles, and the items within them. After you start or resume a thread, keep reading stdout for `thread/started`, `thread/archived`, `thread/unarchived`, `thread/closed`, `turn/*`, and `item/*` notifications.
 
-Thread realtime uses a separate thread-scoped notification surface. `thread/realtime/*` notifications are ephemeral transport events, not `ThreadItem`s, and are not returned by `thread/read`, `thread/resume`, or `thread/fork`.
+Thread realtime publishes thread-scoped timeline item lifecycle notifications for paginated threads alongside its existing realtime notifications. Completed timeline items are durably interleaved with ordinary turn items by `thread/timeline/list`. Neither surface changes `ThreadItem`, `thread/read`, `thread/resume`, or `thread/fork`; clients ignore notification methods they do not recognize.
+
+Each realtime item has an `id`, a `realtimeSessionId`, and one of four types: `realtimeSessionStarted`, `transcriptSegment`, `bemItemPromoted`, or `realtimeSessionClosed`. A `bemItemPromoted` item references an existing backing-agent item by `turnId` and `itemId`; its `presentation` is `wholeItem`, `inlineMarkdown`, or `inlineVisualization` with an `index`.
 
 Recoverable configuration and initialization warnings use the existing `configWarning` notification: `{ summary, details?, path?, range? }`. App-server may emit it during initialization for config parsing and related setup diagnostics, or to the requesting connection during `thread/start` when that thread's exec-policy rules fail to parse.
 
@@ -1568,6 +1603,9 @@ The thread realtime API emits thread-scoped notifications for session lifecycle 
 - `thread/realtime/itemAdded` — `{ threadId, item }` for raw non-audio realtime items that do not have a dedicated typed app-server notification, including `handoff_request` (experimental). `item` is forwarded as raw JSON while the upstream websocket item schema remains unstable.
 - `thread/realtime/transcript/delta` — `{ threadId, role, delta }` for live realtime transcript deltas (experimental).
 - `thread/realtime/transcript/done` — `{ threadId, role, text }` when realtime emits the final full text for a transcript part (experimental).
+- `thread/realtime/item/started` — `{ threadId, item }` when a realtime item begins. Session boundaries and artifacts complete immediately; transcript segment IDs remain stable through streaming and persistence (experimental).
+- `thread/realtime/item/transcript/delta` — `{ threadId, itemId, delta }` for text appended to a started transcript segment (experimental).
+- `thread/realtime/item/completed` — `{ threadId, item }` after a session boundary, transcript segment, or promoted backing-agent artifact has been durably committed (experimental).
 - `thread/realtime/outputAudio/delta` — `{ threadId, audio }` for streamed output audio chunks (experimental). `audio` uses camelCase fields (`data`, `sampleRate`, `numChannels`, `samplesPerChannel`).
 - `thread/realtime/error` — `{ threadId, message }` when realtime encounters a transport or backend error (experimental).
 - `thread/realtime/closed` — `{ threadId, reason }` when the realtime transport closes (experimental).
@@ -1611,6 +1649,13 @@ The app-server streams JSON-RPC notifications while a turn is running. Each turn
 - `fileChange` — `{id, changes, status}` describing proposed edits; `changes` list `{path, kind, diff}` and `status` is `inProgress`, `completed`, `failed`, or `declined`.
 - `mcpToolCall` — `{id, server, tool, status, arguments, appContext, mcpAppResourceUri?, pluginId, readOnlyHint, result?, error?}` describing MCP calls; `appContext` is `{connectorId, linkId, resourceUri, appName, actionName}` for calls through a trusted MCP app, where `connectorId` identifies the connector that owns the tool, `linkId` identifies the app link, `resourceUri` points to the widget template, `appName` is the connector's display name, and `actionName` is the stable connector `Action.name`. `readOnlyHint` is `true` for read-only tools, `false` for write-capable tools, and `null` when the annotation is unavailable, including older rollout entries. The hint describes tool capability, not whether an invocation succeeded or performed a write; use `status`, `result`, and `error` to determine the execution outcome. `appName` and `actionName` may be null for older rollout entries. The top-level `mcpAppResourceUri` is deprecated and temporarily duplicated for client migration. `tool` identifies the raw MCP tool. `status` is `inProgress`, `completed`, or `failed`.
 - `collabToolCall` — `{id, tool, status, senderThreadId, receiverThreadId?, newThreadId?, prompt?, agentStatus?}` describing collab tool calls (`spawn_agent`, `send_input`, `resume_agent`, `wait`, `close_agent`); `status` is `inProgress`, `completed`, or `failed`.
+- `subAgentActivity` — `{id, kind, agentThreadId, agentPath}` describing Multi-Agent V2 lifecycle activity; `kind` is `started`, `interacted`, `interrupted`, or `completed`. A successful child completion is attributed to the parent turn that spawned it, so its `item/completed` notification may arrive after that turn's `turn/completed` notification and is included with that turn when history is read.
+
+  The `CollabAgentTool` schema also includes `sendMessage`, `followupTask`, `interruptAgent`, and
+  `listAgents` for private Multi-Agent V2 analytics. These calls do not emit public collaborator tool
+  items; their existing `subAgentActivity` notifications are unchanged, and `list_agents` emits no
+  activity item. Calls cancelled during handler execution are recorded privately with status
+  `interrupted`, distinct from tool failures.
 - `webSearch` — `{id, query, action?, results?}` for a web search request issued by the agent; `action` mirrors the Responses API web_search action payload (`search`, `open_page`, `find_in_page`) and may be omitted until completion. For standalone web search, `results` contains the out-of-band structured result DTOs returned by `/v1/alpha/search`; clients should ignore result types and fields they do not understand.
 - `imageGeneration` — `{id, status, revisedPrompt, result, transparentBackground, savedPath?}` for a generated image. `transparentBackground` is `true` when the Images API reports a transparent background, `false` when it reports an opaque background, and `null` when the background is automatic, unavailable, or the item has not completed. The field is always present on v2 item payloads, including persisted and resumed items.
 - `imageView` — `{id, path}` emitted when the agent invokes the image viewer tool.
@@ -1628,7 +1673,7 @@ All items emit shared lifecycle events:
 - `item/autoApprovalReview/completed` — [UNSTABLE] temporary auto-review notification carrying `{threadId, turnId, targetItemId, review, action}` when approval auto-review resolves. This shape is expected to change soon.
 - `autoApprovalReview/strictReviewRequired` — experimental notification carrying `{threadId, turnId, startedAtMs}` whenever elevated or stale Guardian v2 risk requires synchronous approval review.
 
-`review` is [UNSTABLE] and currently has `{status, riskLevel?, userAuthorization?, rationale?}`, where `status` is one of `inProgress`, `approved`, `denied`, or `aborted`. `riskLevel` is one of `"low"`, `"medium"`, `"high"`, or `"critical"` when present. `userAuthorization` is one of `"unknown"`, `"low"`, `"medium"`, or `"high"` when present. `action` is a tagged union with `type: "command" | "execve" | "applyPatch" | "networkAccess" | "mcpToolCall"`. Command-like actions include a `source` discriminator (`"shell"` or `"unifiedExec"`). These notifications are separate from the target item's own `item/completed` lifecycle and are intentionally temporary while the auto-review app protocol is still being designed.
+`review` is [UNSTABLE] and currently has `{status, riskLevel?, userAuthorization?, rationale?}`, where `status` is one of `inProgress`, `approved`, `denied`, or `aborted`. `riskLevel` is one of `"low"`, `"medium"`, `"high"`, or `"critical"` when present. `userAuthorization` is one of `"unknown"`, `"low"`, `"medium"`, or `"high"` when present. `action` is a tagged union with `type: "command" | "execve" | "writeStdin" | "applyPatch" | "networkAccess" | "mcpToolCall" | "requestPermissions"`. Command-like actions include a `source` discriminator (`"shell"` or `"unifiedExec"`). A `writeStdin` action carries `approvalId`, `processId`, `stdin`, and `cwd`; it reviews input to an existing command item without changing that parent item's lifecycle. These notifications are separate from the target item's own `item/completed` lifecycle and are intentionally temporary while the auto-review app protocol is still being designed.
 
 There are additional item-specific events:
 
@@ -1657,6 +1702,8 @@ There are additional item-specific events:
 - `item/fileChange/outputDelta` - deprecated legacy protocol entry for `apply_patch` text output; retained for compatibility but no longer emitted by the server.
 
 ### Errors
+
+Ownership rejections for parent-owned Multi-Agent V2 subagents return JSON-RPC error code `-32600` with message `direct app-server input is not allowed for multi-agent v2 sub-agents`.
 
 `error` event is emitted whenever the server hits an error mid-turn (for example, upstream model errors or quota limits). Carries the same `{ error: { message, codexErrorInfo?, additionalDetails? } }` payload as `turn.status: "failed"` and may precede that terminal notification.
 
@@ -1692,10 +1739,12 @@ Certain actions (shell commands or modifying files) may require explicit user ap
 Order of messages:
 
 1. `item/started` — shows the pending `commandExecution` item with `command`, `cwd`, and other fields so you can render the proposed action.
-2. `item/commandExecution/requestApproval` (request) — carries the same `itemId`, `threadId`, `turnId`, the nullable `environmentId` where the command will run, optionally `approvalId` (for subcommand callbacks), and `reason`. New shell and unified-exec approvals set `environmentId`; older events that do not provide one are exposed as `null`. For normal command approvals, the request also includes `command`, `cwd`, and `commandActions` for friendly display. When `initialize.params.capabilities.experimentalApi = true`, it may also include experimental `additionalPermissions` describing requested per-command sandbox access; any filesystem paths in that payload are absolute on the wire, and network access is represented as `additionalPermissions.network.enabled`. For network-only approvals, those command fields may be omitted and `networkApprovalContext` is provided instead. Optional persistence hints may also be included via `proposedExecpolicyAmendment` and `proposedNetworkPolicyAmendments`. Clients can prefer `availableDecisions` when present to render the exact set of choices the server wants to expose, while still falling back to the older heuristics if it is omitted.
+2. `item/commandExecution/requestApproval` (request) — carries the same `itemId`, `threadId`, `turnId`, the nullable `environmentId` where the command will run, `kind` (`command` or `writeStdin`), optionally `approvalId` (for subcommand callbacks or stdin writes), and `reason`. New shell and unified-exec approvals set `environmentId`; older events that do not provide one are exposed as `null`. For normal command approvals, the request also includes `command`, `cwd`, and `commandActions` for friendly display. When `initialize.params.capabilities.experimentalApi = true`, it may also include experimental `additionalPermissions` describing requested per-command sandbox access; any filesystem paths in that payload are absolute on the wire, and network access is represented as `additionalPermissions.network.enabled`. For network-only approvals, those command fields may be omitted and `networkApprovalContext` is provided instead. Optional persistence hints may also be included via `proposedExecpolicyAmendment` and `proposedNetworkPolicyAmendments`. Clients can prefer `availableDecisions` when present to render the exact set of choices the server wants to expose, while still falling back to the older heuristics if it is omitted.
 3. Client response — for example `{ "decision": "accept" }`, `{ "decision": "acceptForSession" }`, `{ "decision": { "acceptWithExecpolicyAmendment": { "execpolicy_amendment": [...] } } }`, `{ "decision": { "applyNetworkPolicyAmendment": { "network_policy_amendment": { "host": "example.com", "action": "allow" } } } }`, `{ "decision": "decline" }`, or `{ "decision": "cancel" }`.
 4. `serverRequest/resolved` — `{ threadId, requestId }` confirms the pending request has been resolved or cleared, including lifecycle cleanup on turn start/complete/interrupt.
 5. `item/completed` — final `commandExecution` item with `status: "completed" | "failed" | "declined"` and execution output. Render this as the authoritative result.
+
+`kind` distinguishes command approvals from writes to an existing terminal. Requests from older servers without `kind` retain `command` semantics; `approvalId` alone does not distinguish stdin writes from execve interception.
 
 ### File change approvals
 
@@ -1880,6 +1929,7 @@ $skill-creator Add a new skill for triaging flaky CI and include step-by-step us
 ```
 
 Use `skills/list` to fetch the available skills (optionally scoped by `cwds`, with `forceReload`).
+Each skill includes a nullable `pluginId` matching its owning plugin's `id` in `plugin/list`, when known. Clients can use it to group plugin-owned skills without inferring ownership from names or paths. Older servers may omit this field.
 `skills/list` might reuse a cached skills result per `cwd`; setting `forceReload` to `true` refreshes the result from disk.
 The server also emits `skills/changed` notifications when watched local skill files change. Treat this as an invalidation signal and re-run `skills/list` with your current params when needed.
 Use `skills/extraRoots/set` to replace additional standalone skill roots for the current app-server process. These roots use the same layout as other standalone skill roots: each root contains skill directories, and each skill directory contains `SKILL.md`. Missing roots are accepted and load no skills until they exist. This setting is lost when app-server exits.
@@ -1897,6 +1947,7 @@ Use `skills/extraRoots/set` to replace additional standalone skill roots for the
               "name": "skill-creator",
               "description": "Create or update a Codex skill",
               "enabled": true,
+              "pluginId": null,
               "interface": {
                 "displayName": "Skill Creator",
                 "shortDescription": "Create or update a Codex skill",
@@ -2236,17 +2287,19 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 
 - **API key (`apiKey`)**: Caller supplies an OpenAI API key via `account/login/start` with `type: "apiKey"`. The API key is saved and used for API requests.
 - **ChatGPT managed (`chatgpt`)** (recommended): Codex owns the ChatGPT OAuth flow and refresh tokens. Start via `account/login/start` with `type: "chatgpt"` for the browser flow or `type: "chatgptDeviceCode"` for device code; Codex persists tokens to disk and refreshes them automatically.
-- **Codex managed Amazon Bedrock auth (`amazonBedrock`, experimental)**: Caller supplies an Amazon Bedrock API key and region via `account/login/start` with `type: "amazonBedrock"`. The client must enable the `experimentalApi` initialization capability for Codex-managed Amazon Bedrock login. Codex replaces the current primary auth with the Bedrock credential and writes `model_provider = "amazon-bedrock"` to the user config.
+- **Codex managed Amazon Bedrock auth (experimental)**: Caller supplies an Amazon Bedrock API key using `type: "amazonBedrock"` or AWS access keys using `type: "amazonBedrockAccessKeys"` via `account/login/start`. The client must enable the `experimentalApi` initialization capability. Codex replaces the current primary auth with the Bedrock credential and writes `model_provider = "amazon-bedrock"` to the user config.
 - **Personal access token (`personalAccessToken`)**: Codex uses a ChatGPT-backed personal access token loaded outside the app-server login RPCs, such as with `codex login --with-access-token` or `CODEX_ACCESS_TOKEN`.
 
 ### API Overview
 
 - `account/read` — fetch current account info; optionally refresh tokens.
-- `account/login/start` — begin login (`apiKey`, `chatgpt`, `chatgptDeviceCode`, `amazonBedrock`).
+- `account/login/start` — begin login (`apiKey`, `chatgpt`, `chatgptDeviceCode`, `amazonBedrock`, `amazonBedrockAccessKeys`).
+- `account/bedrock/discover` — experimental; list available AWS profiles and identify AWS access keys or Amazon Bedrock API keys visible in the app-server environment.
+- `account/bedrock/setup` — experimental; validate a selected AWS profile or existing environment credentials, then persist the Amazon Bedrock provider configuration.
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated` on success.
-- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `bedrockApiKey`, `chatgpt`, `personalAccessToken`, or `null`) and includes the current ChatGPT `planType` when available.
+- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `bedrockApiKey`, `bedrockAccessKeys`, `chatgpt`, `personalAccessToken`, or `null`) and includes the current ChatGPT `planType` when available.
 - `account/rateLimits/read` — fetch ChatGPT rate limits, an optional effective monthly credit limit, whether spend control has been reached, and the earned rate-limit resets currently available, including expiry details when provided by the backend. Rate-limit updates arrive via `account/rateLimits/updated` (notify); reset-credit data is snapshot-only.
 - `account/rateLimitResetCredit/consume` — consume one earned reset using a caller-provided idempotency key, optionally selecting a reset-credit ID returned by `account/rateLimits/read`.
 - `account/usage/read` — fetch ChatGPT account token-activity summary and daily buckets, or pass a valid thread UUID as `threadId` to read estimated credits, optional cost, and usage breakdowns for one thread using the app-server's active account. The optional `threadUsage` response field is absent on older servers and `null` when the billing route is unavailable.
@@ -2256,6 +2309,7 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/sendAddCreditsNudgeEmail` — ask ChatGPT to email the workspace owner about depleted credits or a reached usage limit.
 - `mcpServer/oauthLogin/completed` (notify) — emitted after a `mcpServer/oauth/login` flow finishes for a server; payload includes `{ name, threadId, success, error? }`.
 - `mcpServer/startupStatus/updated` (notify) — emitted when a configured MCP server's startup status changes; payload includes `{ threadId, name, status, error, failureReason }`, where `threadId` is the owning thread when startup is thread-scoped and `null` when it is app-scoped, and `status` is `starting`, `ready`, `failed`, or `cancelled`. `failureReason` is `reauthenticationRequired` when stored OAuth credentials have expired and cannot be refreshed, so clients can prompt the user to reconnect the named server.
+- `mcpServer/event/stream/notification` (experimental, notify) — forwards `{ subscriptionId, notification: { method, params } }` to the connection that owns the subscription.
 
 ### 1) Check auth state
 
@@ -2277,7 +2331,7 @@ Field notes:
 - `refreshToken` (bool): set `true` to force a token refresh.
 - `email` is `null` when the ChatGPT account does not have an email address.
 - `requiresOpenaiAuth` reflects the active provider; when `false`, Codex can run without OpenAI credentials.
-- Amazon Bedrock reports `usesCodexManagedCredentials: true` when it uses a Bedrock API key managed by Codex. It reports `false` for external credential paths, including the AWS credential chain and configured command auth. This identifies whether Codex-managed credentials are selected; it does not validate that the credential source can resolve credentials.
+- Amazon Bedrock reports `usesCodexManagedCredentials: true` when it uses a Bedrock API key or AWS access keys managed by Codex. It reports `false` for external credential paths, including the AWS credential chain and configured command auth. This identifies whether Codex-managed credentials are selected; it does not validate that the credential source can resolve credentials.
 
 ### 2) Log in with an API key
 
@@ -2320,7 +2374,7 @@ Field notes:
    `onboardingEntrypoint` is optional and is only emitted when the OAuth callback carries a
    recognized onboarding hint.
 
-### 3) Log in with an Amazon Bedrock API key
+### 3) Log in with Amazon Bedrock credentials
 
 This experimental flow requires the client to initialize with `experimentalApi: true`.
 
@@ -2342,7 +2396,77 @@ This experimental flow requires the client to initialize with `experimentalApi: 
    { "method": "account/updated", "params": { "authMode": "bedrockApiKey", "planType": null } }
    ```
 
-Codex stores the key and region as the primary Codex auth, replacing any previously stored login, and writes `model_provider = "amazon-bedrock"` to the active user config. Existing loaded sessions keep their current provider selection, so clients should restart the app-server before sending more model requests. This limitation will be addressed in a follow-up.
+To log in with AWS access keys instead:
+
+```json
+{
+  "method": "account/login/start",
+  "id": 30,
+  "params": {
+    "type": "amazonBedrockAccessKeys",
+    "accessKeyId": "...",
+    "secretAccessKey": "...",
+    "sessionToken": "...",
+    "region": "us-west-2"
+  }
+}
+{ "id": 30, "result": { "type": "amazonBedrock" } }
+{ "method": "account/login/completed", "params": { "loginId": null, "success": true, "error": null } }
+{ "method": "account/updated", "params": { "authMode": "bedrockAccessKeys", "planType": null } }
+```
+
+The session token is optional. Both flows store credentials in the configured auth backend
+(`auth.json` or keyring), replace any previously stored login, and select
+`model_provider = "amazon-bedrock"`; access-key login also writes the selected AWS region to the
+active user config. Neither flow changes `$CODEX_HOME/.env`. Existing loaded sessions keep their
+current provider selection, so clients should restart the app-server before sending more model
+requests. This limitation will be addressed in a follow-up.
+
+### Discover and configure AWS-managed Amazon Bedrock credentials
+
+These experimental methods require the client to initialize with `experimentalApi: true`.
+
+Discover AWS profiles and credentials already visible to the app-server process:
+
+```json
+{ "method": "account/bedrock/discover", "id": 31, "params": {} }
+{
+  "id": 31,
+  "result": {
+    "profiles": [{ "name": "engineering", "region": "us-west-2" }],
+    "environmentCredentials": [
+      { "type": "accessKeys", "region": "us-west-2" },
+      { "type": "bedrockApiKey", "region": "us-west-2" }
+    ]
+  }
+}
+```
+
+Discovery returns credential metadata only; it never includes access keys, secret access keys,
+session tokens, or Bedrock API keys. A profile or environment credential's `region` is `null`
+when no profile region or explicit `AWS_REGION` is available from that source.
+
+Set up a named AWS profile:
+
+```json
+{
+  "method": "account/bedrock/setup",
+  "id": 32,
+  "params": { "type": "profile", "profile": "engineering", "region": "us-west-2" }
+}
+{ "id": 32, "result": {} }
+```
+
+To select credentials already visible in the environment, use
+`{ "type": "environment", "region": "us-west-2" }`. The provider
+resolves available environment credentials through its normal authentication chain. Selecting
+profile or environment credentials leaves existing keys in `$CODEX_HOME/.env` unchanged.
+
+Successful setup writes `model_provider = "amazon-bedrock"` and the selected AWS region to the
+active user config, and additionally writes the selected profile for profile-based setup. Clients
+should restart the app-server before sending more model requests. Logging out while an Amazon
+Bedrock provider is selected clears the user-configured provider, profile, and region, removes
+any Codex-managed credentials, and leaves AWS-managed credentials and `$CODEX_HOME/.env` unchanged.
 
 ### 4) Log in with ChatGPT (device code flow)
 
@@ -2373,7 +2497,12 @@ Codex stores the key and region as the primary Codex auth, replacing any previou
 { "method": "account/updated", "params": { "authMode": null, "planType": null } }
 ```
 
-When using a Codex-managed Bedrock key, logout removes the key and clears `model_provider` if it is still set to `"amazon-bedrock"`. When using AWS-managed credentials, manage them through AWS or switch providers before logging out.
+When `model_provider` is `"amazon-bedrock"` or `"amazon-bedrock-runtime"`, logout clears that
+provider selection and its configured AWS profile and region, regardless of whether the
+credentials are Codex-managed or AWS-managed. If the selected model is Bedrock-specific, logout
+also clears `model`; `model_reasoning_effort` and other generic settings are preserved.
+Codex-managed credentials are removed; AWS profiles, environment credentials, and
+`$CODEX_HOME/.env` are left untouched.
 
 ### 7) Rate limits (ChatGPT)
 

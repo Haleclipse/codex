@@ -52,7 +52,7 @@ impl Handler {
             session
                 .services
                 .agent_control
-                .ensure_v2_agent_loaded(resume_config, receiver_thread_id)
+                .ensure_v2_agent_loaded(resume_config, receiver_thread_id, /*parent*/ None)
                 .await
                 .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
         }
@@ -145,7 +145,7 @@ pub(crate) struct SendInputResult {
 }
 
 impl ToolOutput for SendInputResult {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         tool_output_json_text(self, "send_input")
     }
 

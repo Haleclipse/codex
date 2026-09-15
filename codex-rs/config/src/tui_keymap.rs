@@ -123,12 +123,18 @@ pub struct TuiGlobalKeymap {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct TuiChatKeymap {
+    /// Toggle the microphone in an active voice conversation.
+    pub toggle_voice_mute: Option<KeybindingsSpec>,
     /// Interrupt the active turn.
     pub interrupt_turn: Option<KeybindingsSpec>,
     /// Decrease the active reasoning effort.
     pub decrease_reasoning_effort: Option<KeybindingsSpec>,
     /// Increase the active reasoning effort.
     pub increase_reasoning_effort: Option<KeybindingsSpec>,
+    /// Switch to the previous available permission mode.
+    pub previous_permission_mode: Option<KeybindingsSpec>,
+    /// Switch to the next available permission mode.
+    pub next_permission_mode: Option<KeybindingsSpec>,
     /// Edit the most recently queued message.
     pub edit_queued_message: Option<KeybindingsSpec>,
 }
@@ -233,6 +239,8 @@ pub struct TuiVimNormalKeymap {
     pub delete_char: Option<KeybindingsSpec>,
     /// Replace the character under the cursor (`r`).
     pub replace_char: Option<KeybindingsSpec>,
+    /// Repeat the last complete edit (`.`).
+    pub repeat_last_change: Option<KeybindingsSpec>,
     /// Delete character under cursor and enter insert mode (`s`).
     pub substitute_char: Option<KeybindingsSpec>,
     /// Delete from cursor to end of line (`D`).

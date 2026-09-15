@@ -158,6 +158,10 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
         }
         ThreadItem::CollabAgentToolCall { tool, .. } => {
             let action = match tool {
+                CollabAgentTool::SendMessage
+                | CollabAgentTool::FollowupTask
+                | CollabAgentTool::InterruptAgent
+                | CollabAgentTool::ListAgents => return None,
                 CollabAgentTool::SpawnAgent => "Spawned an agent",
                 CollabAgentTool::SendInput => "Sent input to an agent",
                 CollabAgentTool::ResumeAgent => "Resumed an agent",
@@ -173,6 +177,7 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
                 SubAgentActivityKind::Started => "Started",
                 SubAgentActivityKind::Interacted => "Contacted",
                 SubAgentActivityKind::Interrupted => "Interrupted",
+                SubAgentActivityKind::Completed => "Completed",
             };
             return bounded_summary(&format!("{action} {agent_path}"));
         }

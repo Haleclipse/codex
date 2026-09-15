@@ -3,6 +3,8 @@ use super::*;
 use super::tests::build_world_state_from_turn_context;
 use super::tests::make_session_and_context;
 use super::tests::raw_history_items;
+use crate::context::CompactionSummary;
+use crate::context::ContextualUserFragment;
 use codex_history::CompactedItem;
 use codex_history::InitialHistory;
 use codex_history::ResponseItemEnvelope;
@@ -17,6 +19,7 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::WorldStateItem;
 use codex_protocol::security_risk::SecurityRiskScore;
+use core_test_support::responses::strip_metadata_from_items;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -169,7 +172,9 @@ async fn record_initial_history_ignores_security_risk_scores() {
         .await;
 
     assert_eq!(
-        raw_history_items(&session.state.lock().await.clone_history()),
+        strip_metadata_from_items(&raw_history_items(
+            &session.state.lock().await.clone_history()
+        )),
         vec![user_item]
     );
 }
@@ -1268,7 +1273,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
         reconstructed.history,
         annotated(vec![
             user_message("before compact"),
-            user_message("legacy summary"),
+            ContextualUserFragment::into(CompactionSummary::new("legacy summary")),
         ])
     );
     assert!(reconstructed.reference_context_item.is_none());

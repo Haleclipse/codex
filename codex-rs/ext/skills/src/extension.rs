@@ -236,7 +236,9 @@ where
             }
             rendered
                 .fragment
-                .map(|fragment| PromptFragment::developer_capability(fragment.render()))
+                .map(|fragment| {
+                    PromptFragment::developer_capability(fragment.render(), fragment.content_kind())
+                })
                 .into_iter()
                 .collect()
         })

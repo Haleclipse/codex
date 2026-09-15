@@ -83,6 +83,10 @@ pub struct InitializeParams {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
     pub session_id: String,
+    /// Executor metadata at initialization, with the same shape as `environment/info`.
+    // TODO: Make this required once all supported exec-server versions return environmentInfo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_info: Option<EnvironmentInfo>,
 }
 
 /// Information about an execution/filesystem environment.
@@ -97,7 +101,7 @@ pub struct EnvironmentInfo {
     /// On Windows, a command's `TEMP` or `TMP` overrides take precedence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporary_directories: Option<Vec<PathUri>>,
-    /// Executor-native temporary directory for private, child-visible sidecars.
+    /// Executor-native temporary directory for child-visible sidecars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_dir: Option<PathUri>,
     /// Optional executor features that clients must gate before sending newer request fields.
@@ -118,9 +122,15 @@ pub struct EnvironmentCapabilities {
     /// Whether this executor supports the `environmentConfig/read` request.
     #[serde(default)]
     pub environment_config_read: bool,
+    /// Whether HTTP headers can resolve values from the executor environment.
+    #[serde(default)]
+    pub http_header_env_vars: bool,
     /// Whether filesystem streams can use the requested platform sandbox.
     #[serde(default)]
     pub sandboxed_file_streaming: bool,
+    /// Whether shell state can be cached and restored entirely inside the executor.
+    #[serde(default)]
+    pub shell_snapshot_v2: bool,
 }
 
 /// Status returned by an initialized exec-server connection.
@@ -182,7 +192,9 @@ impl EnvironmentInfo {
                 network_proxy_launch: true,
                 capability_discovery_sandbox: true,
                 environment_config_read: true,
+                http_header_env_vars: true,
                 sandboxed_file_streaming: true,
+                shell_snapshot_v2: cfg!(unix),
             },
         }
     }
@@ -219,6 +231,9 @@ pub struct ExecParams {
     pub cwd: PathUri,
     #[serde(default)]
     pub env_policy: Option<ExecEnvPolicy>,
+    /// Optional request to restore executor-owned, attachment-scoped shell state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_snapshot: Option<ShellSnapshotRequest>,
     pub env: HashMap<String, String>,
     pub tty: bool,
     /// Keep non-tty stdin writable through `process/write`.
@@ -252,6 +267,16 @@ pub struct ExecEnvPolicy {
     pub exclude: Vec<String>,
     pub r#set: HashMap<String, String>,
     pub include_only: Vec<String>,
+}
+
+/// Identifies shell state owned by one attachment within an executor session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellSnapshotRequest {
+    /// Attachment identity; executor sessions independently scope every cache.
+    pub scope_id: String,
+    /// Executor-native shell used to capture and restore the snapshot.
+    pub shell: ShellInfo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,9 +458,6 @@ pub struct FsCreateDirectoryParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
-    /// Atomically restrict a newly created, non-recursive directory to its owner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub private: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -663,8 +685,11 @@ impl ExecutorCapabilityDiscoverySnapshot {
 pub struct HttpHeader {
     /// Header name as it appears on the HTTP wire.
     pub name: String,
-    /// Header value after UTF-8 conversion.
+    /// Literal header value, or prefix for an executor-local environment value.
     pub value: String,
+    /// Environment variable resolved by the process that sends the HTTP request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_env_var: Option<String>,
 }
 
 /// Redirect behavior for an executor-side HTTP request.
@@ -852,6 +877,7 @@ mod tests {
             argv: vec!["true".to_string()],
             cwd,
             env_policy: None,
+            shell_snapshot: None,
             env: HashMap::new(),
             tty: false,
             pipe_stdin: false,
@@ -945,7 +971,9 @@ mod tests {
                 network_proxy_launch: true,
                 capability_discovery_sandbox: true,
                 environment_config_read: false,
+                http_header_env_vars: false,
                 sandboxed_file_streaming: false,
+                shell_snapshot_v2: false,
             }
         );
     }
@@ -960,7 +988,9 @@ mod tests {
                 "networkProxyLaunch": false,
                 "capabilityDiscoverySandbox": false,
                 "environmentConfigRead": false,
+                "httpHeaderEnvVars": false,
                 "sandboxedFileStreaming": false,
+                "shellSnapshotV2": false,
             },
         });
         let info: EnvironmentInfo = serde_json::from_value(expected.clone())

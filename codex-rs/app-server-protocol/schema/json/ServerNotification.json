@@ -573,6 +573,13 @@
             "bedrockApiKey"
           ],
           "type": "string"
+        },
+        {
+          "description": "Amazon Bedrock AWS access keys managed by Codex.",
+          "enum": [
+            "bedrockAccessKeys"
+          ],
+          "type": "string"
         }
       ]
     },
@@ -776,7 +783,11 @@
         "sendInput",
         "resumeAgent",
         "wait",
-        "closeAgent"
+        "closeAgent",
+        "sendMessage",
+        "followupTask",
+        "interruptAgent",
+        "listAgents"
       ],
       "type": "string"
     },
@@ -784,7 +795,8 @@
       "enum": [
         "inProgress",
         "completed",
-        "failed"
+        "failed",
+        "interrupted"
       ],
       "type": "string"
     },
@@ -1873,6 +1885,39 @@
           "type": "object"
         },
         {
+          "description": "A child approval for input to an existing command execution item.",
+          "properties": {
+            "approvalId": {
+              "type": "string"
+            },
+            "cwd": {
+              "$ref": "#/definitions/LegacyAppPathString"
+            },
+            "processId": {
+              "type": "string"
+            },
+            "stdin": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "writeStdin"
+              ],
+              "title": "WriteStdinGuardianApprovalReviewActionType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "approvalId",
+            "cwd",
+            "processId",
+            "stdin",
+            "type"
+          ],
+          "title": "WriteStdinGuardianApprovalReviewAction",
+          "type": "object"
+        },
+        {
           "properties": {
             "cwd": {
               "$ref": "#/definitions/AbsolutePathBuf"
@@ -2091,7 +2136,8 @@
         "userPromptSubmit",
         "subagentStart",
         "subagentStop",
-        "stop"
+        "stop",
+        "interrupt"
       ],
       "type": "string"
     },
@@ -2377,7 +2423,7 @@
           "type": "integer"
         },
         "targetItemId": {
-          "description": "Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review (only possible when using the shell_zsh_fork feature) - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
+          "description": "Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review (only possible when using the shell_zsh_fork feature) - stdin reviews, which refer to the existing parent command item and have a separate approval ID in the action payload - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
           "type": [
             "string",
             "null"
@@ -2421,7 +2467,7 @@
           "type": "integer"
         },
         "targetItemId": {
-          "description": "Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review (only possible when using the shell_zsh_fork feature) - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
+          "description": "Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review (only possible when using the shell_zsh_fork feature) - stdin reviews, which refer to the existing parent command item and have a separate approval ID in the action payload - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
           "type": [
             "string",
             "null"
@@ -2471,6 +2517,34 @@
     },
     "LegacyAppPathString": {
       "type": "string"
+    },
+    "McpServerEventNotification": {
+      "properties": {
+        "method": {
+          "type": "string"
+        },
+        "params": true
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "type": "object"
+    },
+    "McpServerEventStreamNotification": {
+      "properties": {
+        "notification": {
+          "$ref": "#/definitions/McpServerEventNotification"
+        },
+        "subscriptionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notification",
+        "subscriptionId"
+      ],
+      "type": "object"
     },
     "McpServerOauthLoginCompletedNotification": {
       "properties": {
@@ -3644,7 +3718,8 @@
       "enum": [
         "started",
         "interacted",
-        "interrupted"
+        "interrupted",
+        "completed"
       ],
       "type": "string"
     },
@@ -5024,6 +5099,65 @@
       ],
       "type": "object"
     },
+    "ThreadRealtimeBemItemPresentation": {
+      "description": "EXPERIMENTAL - how an existing agent item appears in a realtime conversation.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "wholeItem"
+              ],
+              "title": "WholeItemThreadRealtimeBemItemPresentationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "WholeItemThreadRealtimeBemItemPresentation",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "inlineMarkdown"
+              ],
+              "title": "InlineMarkdownThreadRealtimeBemItemPresentationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "InlineMarkdownThreadRealtimeBemItemPresentation",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "inlineVisualization"
+              ],
+              "title": "InlineVisualizationThreadRealtimeBemItemPresentationType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "index",
+            "type"
+          ],
+          "title": "InlineVisualizationThreadRealtimeBemItemPresentation",
+          "type": "object"
+        }
+      ]
+    },
     "ThreadRealtimeClosedNotification": {
       "description": "EXPERIMENTAL - emitted when thread realtime transport closes.",
       "properties": {
@@ -5058,6 +5192,112 @@
       ],
       "type": "object"
     },
+    "ThreadRealtimeItem": {
+      "description": "EXPERIMENTAL - a thread-scoped realtime item in the canonical timeline.",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "realtimeSessionStarted"
+              ],
+              "title": "RealtimeSessionStartedThreadRealtimeItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "RealtimeSessionStartedThreadRealtimeItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "role": {
+              "$ref": "#/definitions/ThreadRealtimeTranscriptRole"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "transcriptSegment"
+              ],
+              "title": "TranscriptSegmentThreadRealtimeItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "text",
+            "type"
+          ],
+          "title": "TranscriptSegmentThreadRealtimeItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "item_id": {
+              "type": "string"
+            },
+            "presentation": {
+              "$ref": "#/definitions/ThreadRealtimeBemItemPresentation"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "bemItemPromoted"
+              ],
+              "title": "BemItemPromotedThreadRealtimeItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "item_id",
+            "presentation",
+            "turn_id",
+            "type"
+          ],
+          "title": "BemItemPromotedThreadRealtimeItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "outcome": {
+              "$ref": "#/definitions/ThreadRealtimeSessionOutcome"
+            },
+            "type": {
+              "enum": [
+                "realtimeSessionClosed"
+              ],
+              "title": "RealtimeSessionClosedThreadRealtimeItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "type"
+          ],
+          "title": "RealtimeSessionClosedThreadRealtimeItem",
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "realtimeSessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "realtimeSessionId"
+      ],
+      "type": "object"
+    },
     "ThreadRealtimeItemAddedNotification": {
       "description": "EXPERIMENTAL - raw non-audio thread realtime item emitted by the backend.",
       "properties": {
@@ -5068,6 +5308,58 @@
       },
       "required": [
         "item",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadRealtimeItemCompletedNotification": {
+      "description": "EXPERIMENTAL - a realtime timeline item published after canonical commit.",
+      "properties": {
+        "item": {
+          "$ref": "#/definitions/ThreadRealtimeItem"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "item",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadRealtimeItemStartedNotification": {
+      "description": "EXPERIMENTAL - a realtime timeline item started before its content streams.",
+      "properties": {
+        "item": {
+          "$ref": "#/definitions/ThreadRealtimeItem"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "item",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadRealtimeItemTranscriptDeltaNotification": {
+      "description": "EXPERIMENTAL - text appended to an active realtime transcript item.",
+      "properties": {
+        "delta": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "delta",
+        "itemId",
         "threadId"
       ],
       "type": "object"
@@ -5103,6 +5395,13 @@
         "threadId"
       ],
       "type": "object"
+    },
+    "ThreadRealtimeSessionOutcome": {
+      "enum": [
+        "ended",
+        "failed"
+      ],
+      "type": "string"
     },
     "ThreadRealtimeStartedNotification": {
       "description": "EXPERIMENTAL - emitted when thread realtime startup is accepted.",
@@ -5167,6 +5466,13 @@
         "threadId"
       ],
       "type": "object"
+    },
+    "ThreadRealtimeTranscriptRole": {
+      "enum": [
+        "user",
+        "assistant"
+      ],
+      "type": "string"
     },
     "ThreadRevertedNotification": {
       "properties": {
@@ -6991,6 +7297,26 @@
       "properties": {
         "method": {
           "enum": [
+            "mcpServer/event/stream/notification"
+          ],
+          "title": "McpServer/event/stream/notificationNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/McpServerEventStreamNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "McpServer/event/stream/notificationNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
             "account/updated"
           ],
           "title": "Account/updatedNotificationMethod",
@@ -7446,6 +7772,66 @@
         "params"
       ],
       "title": "Thread/realtime/itemAddedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "thread/realtime/item/started"
+          ],
+          "title": "Thread/realtime/item/startedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadRealtimeItemStartedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/realtime/item/startedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "thread/realtime/item/transcript/delta"
+          ],
+          "title": "Thread/realtime/item/transcript/deltaNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadRealtimeItemTranscriptDeltaNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/realtime/item/transcript/deltaNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "thread/realtime/item/completed"
+          ],
+          "title": "Thread/realtime/item/completedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadRealtimeItemCompletedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/realtime/item/completedNotification",
       "type": "object"
     },
     {

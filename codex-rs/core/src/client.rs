@@ -78,7 +78,6 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -115,6 +114,8 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::context::BaseInstructionsFragment;
+use crate::context::ContextualUserFragment;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
@@ -207,6 +208,7 @@ struct ModelClientState {
     session_source: SessionSource,
     originator: String,
     model_verbosity: Option<VerbosityConfig>,
+    content_item_kinds_enabled: bool,
     enable_request_compression: bool,
     include_timing_metrics: bool,
     beta_features_header: Option<String>,
@@ -435,6 +437,7 @@ impl ModelClient {
         session_source: SessionSource,
         originator: String,
         model_verbosity: Option<VerbosityConfig>,
+        content_item_kinds_enabled: bool,
         enable_request_compression: bool,
         include_timing_metrics: bool,
         beta_features_header: Option<String>,
@@ -458,6 +461,7 @@ impl ModelClient {
                 session_source,
                 originator,
                 model_verbosity,
+                content_item_kinds_enabled,
                 enable_request_compression,
                 include_timing_metrics,
                 beta_features_header,
@@ -483,9 +487,17 @@ impl ModelClient {
     }
 
     fn prompt_cache_key(&self, responses_metadata: &CodexResponsesMetadata) -> String {
-        self.prompt_cache_key_override
-            .clone()
-            .unwrap_or_else(|| responses_metadata.session_id.clone())
+        if let Some(prompt_cache_key) = &self.prompt_cache_key_override {
+            return prompt_cache_key.clone();
+        }
+
+        if let SessionSource::Internal(source) = &self.state.session_source
+            && let Some(parent_thread_id) = responses_metadata.parent_thread_id
+        {
+            return format!("{source}:{parent_thread_id}");
+        }
+
+        responses_metadata.session_id.clone()
     }
 
     /// Creates a fresh turn-scoped streaming session.
@@ -686,6 +698,20 @@ impl ModelClient {
         })
     }
 
+    pub(crate) async fn realtime_sideband_headers(
+        &self,
+        mut extra_headers: ApiHeaderMap,
+    ) -> Result<ApiHeaderMap> {
+        let client_setup = self.current_client_setup().await?;
+        if let Some(header_value) = self.generate_attestation_header_for().await {
+            extra_headers.insert(X_OAI_ATTESTATION_HEADER, header_value);
+        }
+        extra_headers.extend(sideband_websocket_auth_headers(
+            client_setup.api_auth.as_ref(),
+        ));
+        Ok(extra_headers)
+    }
+
     /// Builds memory summaries for each provided normalized raw memory.
     ///
     /// This is a unary call (no streaming) to `/v1/memories/trace_summarize`.
@@ -853,18 +879,6 @@ impl ModelClient {
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
         let is_openai = self.state.provider.info().is_openai();
-        if !is_openai {
-            for item in &mut input {
-                item.clear_internal_chat_message_metadata_passthrough();
-                if let ResponseItem::FunctionCall {
-                    encrypted_function_args,
-                    ..
-                } = item
-                {
-                    *encrypted_function_args = None;
-                }
-            }
-        }
         let (instructions, tools) = if model_info.use_responses_lite {
             let tools = if self.state.provider.capabilities().namespace_tools {
                 create_tools_json_for_responses_lite(&prompt.tools)?
@@ -877,15 +891,9 @@ impl ModelClient {
                 tools,
             }];
             if !prompt.base_instructions.text.is_empty() {
-                prefix.push(ResponseItem::Message {
-                    id: None,
-                    role: "developer".to_string(),
-                    content: vec![ContentItem::InputText {
-                        text: prompt.base_instructions.text.clone(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                });
+                prefix.push(ContextualUserFragment::into(BaseInstructionsFragment(
+                    prompt.base_instructions.text.clone(),
+                )));
             }
             input.splice(0..0, prefix);
             (String::new(), None)
@@ -895,6 +903,18 @@ impl ModelClient {
                 Some(create_tools_raw_json_for_responses_api(&prompt.tools)?.into()),
             )
         };
+        if !is_openai {
+            for item in &mut input {
+                item.clear_internal_chat_message_metadata_passthrough();
+                if let ResponseItem::FunctionCall {
+                    encrypted_function_args,
+                    ..
+                } = item
+                {
+                    *encrypted_function_args = None;
+                }
+            }
+        }
         let reasoning = Self::build_reasoning(model_info, effort, summary);
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled
             && is_openai
@@ -945,6 +965,9 @@ impl ModelClient {
         for item in input {
             if item.id().is_some_and(|id| !id.is_prefixed()) {
                 item.set_id(/*new_id*/ None);
+            }
+            if !self.state.content_item_kinds_enabled {
+                item.clear_content_item_kinds();
             }
         }
     }
@@ -2202,7 +2225,9 @@ impl AuthRequestTelemetryContext {
         let auth_telemetry = auth_header_telemetry(api_auth);
         Self {
             auth_mode: auth_mode.map(|mode| match mode {
-                AuthMode::ApiKey | AuthMode::BedrockApiKey => "ApiKey",
+                AuthMode::ApiKey | AuthMode::BedrockApiKey | AuthMode::BedrockAccessKeys => {
+                    "ApiKey"
+                }
                 AuthMode::Chatgpt
                 | AuthMode::ChatgptAuthTokens
                 | AuthMode::Headers

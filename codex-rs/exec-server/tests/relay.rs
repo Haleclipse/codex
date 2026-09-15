@@ -277,9 +277,11 @@ async fn pending_noise_environment_connects_and_reconnects_after_ready_report() 
         second_reconnected_websocket,
         Arc::new(Mutex::new(Vec::new())),
     ));
-    let recovered_info = timeout(TEST_TIMEOUT, environment.info())
-        .await
-        .context("pending Noise environment should reconnect")??;
+    assert_eq!(
+        next_connection_state(&mut connection_state).await?,
+        EnvironmentConnectionState::Connected
+    );
+    let recovered_info = environment.info().await?;
 
     assert_eq!(recovered_info, initial_info);
     assert_eq!(
@@ -287,10 +289,6 @@ async fn pending_noise_environment_connects_and_reconnects_after_ready_report() 
         selected_capability_roots
     );
     assert_eq!(provider.calls(), 2);
-    assert_eq!(
-        next_connection_state(&mut connection_state).await?,
-        EnvironmentConnectionState::Connected
-    );
     registry.verify().await;
 
     second_relay.abort();
@@ -329,6 +327,7 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
         process_id: ProcessId::from("proc-1"),
         argv: vec!["true".to_string()],
         cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+        shell_snapshot: None,
         env_policy: None,
         env: HashMap::new(),
         tty: false,

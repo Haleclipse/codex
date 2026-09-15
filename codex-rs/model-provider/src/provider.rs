@@ -46,9 +46,7 @@ pub(crate) fn enforce_managed_residency(provider: &mut Provider) {
 pub enum RemoteCompactionSupport {
     /// The provider does not support remote compaction.
     Unsupported,
-    /// The provider supports only the dedicated `/v1/responses/compact` endpoint.
-    V1,
-    /// The provider supports both the dedicated endpoint and `compaction_trigger` items.
+    /// The provider supports `compaction_trigger` items over the Responses endpoint.
     V2,
 }
 
@@ -73,7 +71,7 @@ impl Default for ProviderCapabilities {
             image_generation: true,
             web_search: true,
             external_web_access: true,
-            remote_compaction: RemoteCompactionSupport::V2,
+            remote_compaction: RemoteCompactionSupport::Unsupported,
         }
     }
 }
@@ -404,7 +402,7 @@ impl ModelProvider for ConfiguredModelProvider {
                 })
                 .map(|auth| match &auth {
                     CodexAuth::ApiKey(_) => Ok(ProviderAccount::ApiKey),
-                    CodexAuth::BedrockApiKey(_) => {
+                    CodexAuth::BedrockApiKey(_) | CodexAuth::BedrockAccessKeys(_) => {
                         Err(ProviderAccountError::UnsupportedBedrockApiKeyAuth)
                     }
                     CodexAuth::Chatgpt(_)
@@ -521,6 +519,7 @@ mod tests {
     use codex_protocol::openai_models::ModelInfo;
     use codex_protocol::openai_models::ModelsResponse;
     use codex_protocol::protocol::SessionSource;
+    use codex_utils_redacted_string::RedactedString;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use wiremock::Mock;
@@ -629,13 +628,19 @@ mod tests {
     }
 
     #[test]
-    fn configured_provider_uses_default_capabilities() {
+    fn openai_provider_enables_remote_compaction() {
         let provider = create_model_provider(
             ModelProviderInfo::create_openai_provider(/*base_url*/ None),
             /*auth_manager*/ None,
         );
 
-        assert_eq!(provider.capabilities(), ProviderCapabilities::default());
+        assert_eq!(
+            provider.capabilities(),
+            ProviderCapabilities {
+                remote_compaction: RemoteCompactionSupport::V2,
+                ..ProviderCapabilities::default()
+            }
+        );
     }
 
     #[test]
@@ -817,7 +822,7 @@ mod tests {
                         "--skip",
                         counter.to_str().expect("counter path should be UTF-8"),
                     ]
-                    .map(str::to_string),
+                    .map(RedactedString::from),
                 ),
                 timeout_ms: NonZeroU64::new(10_000).expect("timeout should be non-zero"),
             }),
@@ -1165,7 +1170,7 @@ mod tests {
             .await;
 
         let mut provider_info = provider_for(server.uri());
-        provider_info.experimental_bearer_token = Some("provider-token".to_string());
+        provider_info.experimental_bearer_token = Some("provider-token".into());
         let provider = create_model_provider(
             provider_info,
             Some(AuthManager::from_auth_for_testing(

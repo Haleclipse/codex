@@ -198,8 +198,8 @@ impl ChatWidget {
             #[cfg(test)]
             pet_image_support_override: None,
             thread_id: None,
-            dismissed_plan_mode_nudge_scopes: HashSet::new(),
             thread_name: None,
+            pending_automatic_thread_names: HashSet::new(),
             thread_rename_block_message: None,
             active_side_conversation: false,
             blocks_direct_input: false,
@@ -211,6 +211,7 @@ impl ChatWidget {
             input_queue: InputQueueState::default(),
             safety_buffering_prompt: None,
             chat_keymap,
+            permission_shortcut_pending: false,
             queued_message_edit_hint_binding,
             show_welcome_banner: is_first_run,
             startup_tooltip_override,

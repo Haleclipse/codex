@@ -296,6 +296,21 @@ impl ResponsesRequest {
             .clone()
     }
 
+    /// Returns whether an input item's content annotations exactly match the given sequence.
+    pub fn has_content_kinds(&self, kinds: &[&str]) -> bool {
+        self.input().into_iter().any(|item| {
+            item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                .as_array()
+                .is_some_and(|actual| {
+                    actual.len() == kinds.len()
+                        && actual
+                            .iter()
+                            .zip(kinds)
+                            .all(|(actual, expected)| actual.as_str() == Some(*expected))
+                })
+        })
+    }
+
     pub fn inputs_of_type(&self, ty: &str) -> Vec<Value> {
         self.input()
             .iter()
@@ -1001,21 +1016,21 @@ pub fn ev_apply_patch_custom_tool_call(call_id: &str, patch: &str) -> Value {
     })
 }
 
-pub fn ev_shell_command_call(call_id: &str, command: &str) -> Value {
-    let args = serde_json::json!({ "command": command });
-    ev_shell_command_call_with_args(call_id, &args)
+pub fn ev_exec_command_call(call_id: &str, command: &str) -> Value {
+    let args = serde_json::json!({ "cmd": command });
+    ev_exec_command_call_with_args(call_id, &args)
 }
 
-pub fn ev_shell_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
-    let arguments = serde_json::to_string(args).expect("serialize shell command arguments");
-    ev_function_call(call_id, "shell_command", &arguments)
+pub fn ev_exec_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
+    let arguments = serde_json::to_string(args).expect("serialize exec command arguments");
+    ev_function_call(call_id, "exec_command", &arguments)
 }
 
-pub fn ev_apply_patch_shell_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {
-    let args = serde_json::json!({ "command": format!("apply_patch <<'EOF'\n{patch}\nEOF\n") });
+pub fn ev_apply_patch_exec_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {
+    let args = serde_json::json!({ "cmd": format!("apply_patch <<'EOF'\n{patch}\nEOF\n") });
     let arguments = serde_json::to_string(&args).expect("serialize apply_patch arguments");
 
-    ev_function_call(call_id, "shell_command", &arguments)
+    ev_function_call(call_id, "exec_command", &arguments)
 }
 
 pub fn sse_failed(id: &str, code: &str, message: &str) -> String {

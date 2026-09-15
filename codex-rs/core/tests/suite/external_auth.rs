@@ -3,11 +3,13 @@ use codex_login::CodexAuth;
 use codex_login::ExternalAuth;
 use codex_login::ExternalAuthFuture;
 use codex_login::ExternalAuthRefreshContext;
+use codex_login::auth::BedrockAccessKeysAuth;
 use codex_model_provider_info::AwsAuthRefreshConfig;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
+use codex_utils_redacted_string::RedactedString;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -160,7 +162,7 @@ async fn custom_provider_uses_explicit_bearer_without_ambient_account() -> anyho
     );
     let mut provider =
         create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
-    provider.experimental_bearer_token = Some("provider-token".to_string());
+    provider.experimental_bearer_token = Some("provider-token".into());
     let mut builder = test_codex()
         .with_auth(CodexAuth::Headers(AuthHeaders::new(headers)))
         .with_config(move |config| {
@@ -177,6 +179,51 @@ async fn custom_provider_uses_explicit_bearer_without_ambient_account() -> anyho
         Some("Bearer provider-token")
     );
     assert_eq!(request.header("chatgpt-account-id"), None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn amazon_bedrock_managed_access_keys_sign_requests() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let mut provider =
+        ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
+            profile: None,
+            region: Some("us-east-1".to_string()),
+            auth_refresh: None,
+        }));
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+
+    let mut builder = test_codex()
+        .with_model("openai.gpt-5.5")
+        .with_auth(CodexAuth::BedrockAccessKeys(BedrockAccessKeysAuth {
+            access_key_id: "managed-access-key-id".to_string(),
+            secret_access_key: "managed-secret-access-key".to_string(),
+            session_token: Some("managed-session-token".to_string()),
+        }))
+        .with_config(move |config| {
+            config.model_provider_id = provider.name.clone();
+            config.model_provider = provider;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    test.submit_turn("hello").await?;
+
+    let request = response_mock.single_request();
+    let authorization = request
+        .header("authorization")
+        .expect("managed AWS credentials should produce SigV4 authorization");
+    assert!(authorization.starts_with("AWS4-HMAC-SHA256 "));
+    assert!(authorization.contains("Credential=managed-access-key-id/"));
+    assert_eq!(
+        request.header("x-amz-security-token").as_deref(),
+        Some("managed-session-token")
+    );
     Ok(())
 }
 
@@ -253,7 +300,9 @@ async fn amazon_bedrock_aws_auth_refresh_resigns() -> anyhow::Result<()> {
             region: Some("us-east-1".to_string()),
             auth_refresh: Some(AwsAuthRefreshConfig {
                 command: "aws".to_string(),
-                args: Vec::from(["--exact", TEST_NAME, "--skip", HELPER_ARG].map(str::to_string)),
+                args: Vec::from(
+                    ["--exact", TEST_NAME, "--skip", HELPER_ARG].map(RedactedString::from),
+                ),
                 timeout_ms: NonZeroU64::new(30_000).expect("timeout should be non-zero"),
             }),
         }));

@@ -56,6 +56,7 @@ use crate::plan_tool::UpdatePlanArgs;
 use crate::request_permissions::RequestPermissionsEvent;
 use crate::request_permissions::RequestPermissionsResponse;
 use crate::request_user_input::RequestUserInputResponse;
+use crate::turn_input::SuspendTurnOutcome;
 use crate::turn_input::TurnInputMode;
 use crate::turn_input::TurnInputRequest;
 use crate::turn_input::TurnInputSubmission;
@@ -251,6 +252,7 @@ pub struct ConversationStartParams {
 pub enum ConversationStartTransport {
     Websocket,
     Webrtc { sdp: String },
+    ExistingCall { call_id: String },
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -580,6 +582,11 @@ pub enum Op {
         reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
     },
 
+    /// Stop the active root turn without recording a terminal turn event.
+    SuspendTurnAndShutdown {
+        reply: oneshot::Sender<CodexResult<SuspendTurnOutcome>>,
+    },
+
     /// Apply persistent thread-settings overrides without starting a turn.
     ///
     /// This uses the same submission queue as turn starts so app-server can
@@ -874,6 +881,7 @@ impl Op {
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
             Self::TurnInput { .. } => "turn_input",
             Self::RecoverTurn { .. } => "recover_turn",
+            Self::SuspendTurnAndShutdown { .. } => "suspend_turn_and_shutdown",
             Self::ThreadSettings { .. } => "thread_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
             Self::ExecApproval { .. } => "exec_approval",
@@ -1511,6 +1519,7 @@ pub enum HookEventName {
     SubagentStart,
     SubagentStop,
     Stop,
+    Interrupt,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2596,6 +2605,7 @@ pub enum SessionSource {
 pub enum ThreadSource {
     User,
     Subagent,
+    GuardianReview,
     Feature(String),
     MemoryConsolidation,
 }
@@ -2605,6 +2615,7 @@ impl ThreadSource {
         match self {
             ThreadSource::User => "user",
             ThreadSource::Subagent => "subagent",
+            ThreadSource::GuardianReview => "guardian_review",
             ThreadSource::Feature(feature) => feature,
             ThreadSource::MemoryConsolidation => "memory_consolidation",
         }
@@ -2638,6 +2649,7 @@ impl FromStr for ThreadSource {
         match value {
             "user" => Ok(ThreadSource::User),
             "subagent" => Ok(ThreadSource::Subagent),
+            "guardian_review" => Ok(ThreadSource::GuardianReview),
             "memory_consolidation" => Ok(ThreadSource::MemoryConsolidation),
             other => Ok(ThreadSource::Feature(other.to_string())),
         }
@@ -2649,6 +2661,7 @@ impl FromStr for ThreadSource {
 #[ts(rename_all = "snake_case")]
 pub enum InternalSessionSource {
     MemoryConsolidation,
+    Guardian,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
@@ -2821,6 +2834,7 @@ impl fmt::Display for InternalSessionSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InternalSessionSource::MemoryConsolidation => f.write_str("memory_consolidation"),
+            InternalSessionSource::Guardian => f.write_str("guardian"),
         }
     }
 }
@@ -4104,6 +4118,7 @@ pub enum SubAgentActivityKind {
     Started,
     Interacted,
     Interrupted,
+    Completed,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]

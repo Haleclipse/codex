@@ -1,7 +1,9 @@
+use crate::config::NetworkProxySpec;
 use crate::guardian::GuardianNetworkAccessTrigger;
 use crate::guardian::GuardianReviewContext;
 use crate::network_policy_decision::denied_network_policy_message;
 use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::approvals::ApprovalAction;
 use crate::tools::approvals::ApprovalContext;
@@ -9,6 +11,7 @@ use crate::tools::events::truncate_rejection_message;
 use crate::tools::sandboxing::ToolError;
 use codex_network_proxy::BlockedRequest;
 use codex_network_proxy::BlockedRequestObserver;
+use codex_network_proxy::EnvironmentNetworkPolicy;
 use codex_network_proxy::NetworkDecision;
 use codex_network_proxy::NetworkPolicyDecider;
 use codex_network_proxy::NetworkPolicyRequest;
@@ -45,20 +48,16 @@ use uuid::Uuid;
 const ABANDONED_NETWORK_APPROVAL_MESSAGE: &str =
     "network approval was cancelled before a decision was returned";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NetworkApprovalMode {
-    Immediate,
-    Deferred,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct NetworkApprovalSpec {
     pub network: Option<NetworkProxy>,
-    pub mode: NetworkApprovalMode,
     pub trigger: GuardianNetworkAccessTrigger,
+    /// Preserve the typed identity independently of Guardian's display-name payload.
+    pub tool_name: ToolName,
     pub command: String,
     pub environment_id: String,
     pub permission_profile: PermissionProfile,
+    pub network_policy: Option<EnvironmentNetworkPolicy>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,16 +96,11 @@ impl DeferredNetworkApproval {
 #[derive(Debug)]
 pub(crate) struct ActiveNetworkApproval {
     registration_id: Option<String>,
-    mode: NetworkApprovalMode,
     cancellation_token: CancellationToken,
     execution_proxy: NetworkProxy,
 }
 
 impl ActiveNetworkApproval {
-    pub(crate) fn mode(&self) -> NetworkApprovalMode {
-        self.mode
-    }
-
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancellation_token.clone()
     }
@@ -118,21 +112,15 @@ impl ActiveNetworkApproval {
     pub(crate) fn into_deferred(self) -> Option<DeferredNetworkApproval> {
         let ActiveNetworkApproval {
             registration_id,
-            mode,
             cancellation_token,
             execution_proxy,
         } = self;
-        match (mode, registration_id) {
-            (NetworkApprovalMode::Deferred, Some(registration_id)) => {
-                Some(DeferredNetworkApproval {
-                    registration_id,
-                    cancellation_token,
-                    finish_outcome: Arc::new(OnceCell::new()),
-                    _execution_proxy: Some(execution_proxy),
-                })
-            }
-            _ => None,
-        }
+        registration_id.map(|registration_id| DeferredNetworkApproval {
+            registration_id,
+            cancellation_token,
+            finish_outcome: Arc::new(OnceCell::new()),
+            _execution_proxy: Some(execution_proxy),
+        })
     }
 }
 
@@ -247,6 +235,7 @@ struct ActiveNetworkApprovalCall {
     registration_id: String,
     turn_id: String,
     trigger: GuardianNetworkAccessTrigger,
+    tool_name: ToolName,
     command: String,
     environment_id: String,
     permission_profile: PermissionProfile,
@@ -576,18 +565,6 @@ impl NetworkApprovalService {
         self.remove_call(registration_id).await
     }
 
-    async fn finish_call(
-        &self,
-        registration_id: &str,
-        cancellation_token: &CancellationToken,
-    ) -> Result<(), ToolError> {
-        let outcome = self
-            .finish_call_outcome(registration_id)
-            .await
-            .or_else(|| abandoned_network_approval_outcome(cancellation_token));
-        network_approval_outcome_to_result(outcome)
-    }
-
     pub(crate) async fn record_blocked_request(&self, blocked: BlockedRequest) {
         let Some(message) = denied_network_policy_message(&blocked) else {
             return;
@@ -760,8 +737,8 @@ impl NetworkApprovalService {
             |call| call.trigger.call_id.clone(),
         );
         let telemetry_tool_name = owner_call.as_ref().map_or_else(
-            || "network_access".to_string(),
-            |call| call.trigger.tool_name.clone(),
+            || ToolName::plain("network_access"),
+            |call| call.tool_name.clone(),
         );
         let action = ApprovalAction::NetworkAccess {
             id: guardian_approval_id,
@@ -779,8 +756,9 @@ impl NetworkApprovalService {
         };
         let approval_context = ApprovalContext {
             review_context: GuardianReviewContext::from(&turn_context),
+            cancellation_token: None,
             call_id: approval_call_id,
-            tool_name: ToolName::plain(telemetry_tool_name.clone()),
+            tool_name: telemetry_tool_name.clone(),
             strict_auto_review,
             approval_reason: Some(prompt_reason),
             retry_reason: Some(policy_denial_message.clone()),
@@ -1048,33 +1026,105 @@ pub(crate) fn build_network_policy_decider(
 }
 
 pub(crate) async fn begin_network_approval(
-    session: &Session,
-    turn_id: &str,
+    session: &Arc<Session>,
+    turn: &TurnContext,
     managed_network_active: bool,
     spec: Option<NetworkApprovalSpec>,
 ) -> Result<Option<ActiveNetworkApproval>, ToolError> {
     let NetworkApprovalSpec {
         network,
-        mode,
         trigger,
+        tool_name,
         command,
         environment_id,
         permission_profile,
+        network_policy,
     } = match spec {
         Some(spec) => spec,
         None => return Ok(None),
-    };
-    let Some(network) = network else {
-        return Ok(None);
     };
     if !managed_network_active {
         return Ok(None);
     }
 
+    let controller = turn.config.permissions.network.as_ref();
+    let owner_spec = network_policy
+        .as_ref()
+        .map(|policy| {
+            // Resolve owner policy once, where the command's actual enforcing proxy is built.
+            NetworkProxySpec::for_environment(
+                controller,
+                policy,
+                &permission_profile,
+                session.services.exec_policy.current().as_ref(),
+            )
+        })
+        .transpose()
+        .map_err(|error| {
+            ToolError::Rejected(format!(
+                "failed to resolve environment network policy: {error}"
+            ))
+        })?;
+    let network = if let Some(owner_spec) = owner_spec.as_ref() {
+        if controller.is_some() {
+            network
+                .or_else(|| {
+                    session
+                        .services
+                        .network_proxy
+                        .load_full()
+                        .map(|controller| controller.proxy())
+                })
+                .ok_or_else(|| {
+                    ToolError::Rejected(
+                        "environment network policy requires its configured controller proxy"
+                            .to_string(),
+                    )
+                })?
+        } else {
+            // This carrier never listens: the executor starts the real per-command proxy.
+            let state = owner_spec
+                .build_state_with_audit_metadata(
+                    session.services.network_proxy_audit_metadata.clone(),
+                )
+                .map_err(|error| {
+                    ToolError::Rejected(format!(
+                        "failed to build environment network policy: {error}"
+                    ))
+                })?;
+            NetworkProxy::builder()
+                .state(Arc::new(state))
+                .managed_by_codex(/*managed_by_codex*/ false)
+                .build()
+                .await
+                .map_err(|error| {
+                    ToolError::Rejected(format!(
+                        "failed to build execution-scoped network proxy: {error}"
+                    ))
+                })?
+        }
+    } else if let Some(network) = network {
+        network
+    } else {
+        return Ok(None);
+    };
+    let environment_policy = owner_spec.map(|spec| spec.environment_policy());
+    let fallback_policy_decider = environment_policy.as_ref().map(|_| {
+        build_network_policy_decider(
+            Arc::clone(&session.services.network_approval),
+            Arc::new(RwLock::new(Arc::downgrade(session))),
+        )
+    });
     let registration_id = Uuid::new_v4().to_string();
     let attribution_token = Uuid::new_v4().to_string();
     let execution_proxy = network
-        .for_execution(&environment_id, &registration_id, attribution_token)
+        .for_execution(
+            &environment_id,
+            &registration_id,
+            attribution_token,
+            environment_policy,
+            fallback_policy_decider,
+        )
         .map_err(|err| {
             ToolError::Codex(codex_protocol::error::CodexErr::Io(io::Error::other(
                 format!("failed to create execution-scoped network proxy: {err}"),
@@ -1086,8 +1136,9 @@ pub(crate) async fn begin_network_approval(
         .network_approval
         .register_call(ActiveNetworkApprovalCall {
             registration_id: registration_id.clone(),
-            turn_id: turn_id.to_string(),
+            turn_id: turn.sub_id.clone(),
             trigger,
+            tool_name,
             command,
             environment_id,
             permission_profile,
@@ -1097,25 +1148,9 @@ pub(crate) async fn begin_network_approval(
 
     Ok(Some(ActiveNetworkApproval {
         registration_id: Some(registration_id),
-        mode,
         cancellation_token,
         execution_proxy,
     }))
-}
-
-pub(crate) async fn finish_immediate_network_approval(
-    session: &Session,
-    active: ActiveNetworkApproval,
-) -> Result<(), ToolError> {
-    let Some(registration_id) = active.registration_id.as_deref() else {
-        return Ok(());
-    };
-
-    session
-        .services
-        .network_approval
-        .finish_call(registration_id, &active.cancellation_token)
-        .await
 }
 
 pub(crate) async fn finish_deferred_network_approval(

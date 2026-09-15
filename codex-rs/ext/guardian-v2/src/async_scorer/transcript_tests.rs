@@ -1,11 +1,15 @@
 use codex_extension_api::ResponseItem;
+use codex_protocol::AgentPath;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::TruncationPolicy;
+use core_test_support::responses::user_message_item;
 use pretty_assertions::assert_eq;
 
 use super::MANUAL_APPROVAL_DEVELOPER_PREFIX;
@@ -16,6 +20,16 @@ use super::MAX_TOOL_TRANSCRIPT_TOKENS;
 use super::TranscriptConfig;
 use super::TranscriptSource;
 use super::truncate_entry;
+
+fn assistant_message(text: impl Into<String>, phase: MessagePhase) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText { text: text.into() }],
+        phase: Some(phase),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
 
 #[test]
 fn transcript_keeps_conversation_and_configured_sources() {
@@ -40,7 +54,9 @@ fn transcript_keeps_conversation_and_configured_sources() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("Workspace inspected.".to_string()),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -64,7 +80,7 @@ fn transcript_keeps_conversation_and_configured_sources() {
         },
     ];
 
-    let transcript = TranscriptConfig::default().build(&items);
+    let transcript = TranscriptConfig::default().build(&items).entries;
     assert_eq!(
         transcript,
         vec![
@@ -79,7 +95,7 @@ fn transcript_keeps_conversation_and_configured_sources() {
         ..TranscriptConfig::default()
     };
 
-    let transcript = output_and_reasoning.build(&items);
+    let transcript = output_and_reasoning.build(&items).entries;
     assert_eq!(
         transcript,
         vec![
@@ -94,7 +110,7 @@ fn transcript_keeps_conversation_and_configured_sources() {
         ..TranscriptConfig::default()
     };
 
-    let transcript = calls_only.build(&items);
+    let transcript = calls_only.build(&items).entries;
     assert_eq!(
         transcript,
         vec![
@@ -133,7 +149,7 @@ fn transcript_truncates_oversized_entries_without_splitting_characters() {
         },
     ];
 
-    let transcript = TranscriptConfig::default().build(&items);
+    let transcript = TranscriptConfig::default().build(&items).entries;
 
     assert_eq!(transcript.len(), 2);
     let user_entry = &transcript[0];
@@ -172,7 +188,7 @@ fn transcript_preserves_first_and_latest_user_messages_and_recent_history() {
         internal_chat_message_metadata_passthrough: None,
     });
 
-    let transcript = TranscriptConfig::default().build(&items);
+    let transcript = TranscriptConfig::default().build(&items).entries;
 
     assert!(transcript[0].starts_with("[1] user: user turn 0:"));
     assert!(
@@ -204,6 +220,277 @@ fn transcript_preserves_first_and_latest_user_messages_and_recent_history() {
 }
 
 #[test]
+fn transcript_preserves_user_restrictions_before_final_assistant_messages() {
+    let first_user_entry = "[1] user: Find a flight to New York.\n";
+    let restriction_entry = "[2] user: Never book anything above $300.\n";
+    let latest_user_entry = "[4] user: Yes.\n";
+    let message_budget = [first_user_entry, restriction_entry, latest_user_entry]
+        .iter()
+        .map(|entry| TruncationPolicy::Bytes(entry.len()).token_budget())
+        .sum();
+    let items = vec![
+        user_message_item("Find a flight to New York."),
+        user_message_item("Never book anything above $300."),
+        assistant_message(
+            "I found a $450 flight. Should I book it?",
+            MessagePhase::FinalAnswer,
+        ),
+        user_message_item("Yes."),
+    ];
+
+    let transcript = TranscriptConfig {
+        max_message_transcript_tokens: message_budget,
+        ..TranscriptConfig::default()
+    }
+    .build(&items)
+    .entries;
+
+    assert_eq!(
+        transcript,
+        vec![first_user_entry, restriction_entry, latest_user_entry]
+    );
+}
+
+#[test]
+fn transcript_preserves_recent_tool_evidence_when_protected_messages_fill_entry_limit() {
+    let mut items = vec![user_message_item("Inspect the workspace.")];
+    items.extend((0..4).map(|index| {
+        assistant_message(format!("final answer {index}"), MessagePhase::FinalAnswer)
+    }));
+    items.push(ResponseItem::FunctionCall {
+        id: None,
+        name: "exec_command".to_string(),
+        namespace: None,
+        arguments: "recent evidence".to_string(),
+        encrypted_function_args: None,
+        call_id: "call-1".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+
+    let transcript = TranscriptConfig {
+        max_recent_non_user_entries: 4,
+        ..TranscriptConfig::default()
+    }
+    .build(&items);
+
+    assert_eq!(
+        transcript.entries,
+        vec![
+            "[1] user: Inspect the workspace.\n",
+            "[4] assistant: final answer 2\n",
+            "[5] assistant: final answer 3\n",
+            "[6] tool exec_command call: recent evidence\n",
+        ]
+    );
+    assert_eq!(
+        transcript
+            .truncations
+            .iter()
+            .map(|observation| (observation.component, observation.retained_bytes))
+            .collect::<Vec<_>>(),
+        vec![("transcript_message", 0); 2]
+    );
+}
+
+#[test]
+fn transcript_reserves_five_recent_tool_entries_from_protected_messages() {
+    let mut items = vec![user_message_item("Inspect the workspace.")];
+    items.extend((0..39).map(|index| {
+        assistant_message(format!("final answer {index}"), MessagePhase::FinalAnswer)
+    }));
+    for index in 0..3 {
+        let call_id = format!("call-{index}");
+        items.push(ResponseItem::FunctionCall {
+            id: None,
+            name: "exec_command".to_string(),
+            namespace: None,
+            arguments: format!("click {index}"),
+            encrypted_function_args: None,
+            call_id: call_id.clone(),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        items.push(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_text(format!("page state {index}")),
+            internal_chat_message_metadata_passthrough: None,
+        });
+    }
+    items.extend((0..20).map(|index| {
+        assistant_message(
+            format!("new final answer {index}"),
+            MessagePhase::FinalAnswer,
+        )
+    }));
+
+    let transcript = TranscriptConfig::default().build(&items).entries;
+    let tool_entries = transcript
+        .iter()
+        .filter(|entry| entry.contains("tool exec_command "))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        tool_entries,
+        vec![
+            "[42] tool exec_command result: page state 0\n",
+            "[43] tool exec_command call: click 1\n",
+            "[44] tool exec_command result: page state 1\n",
+            "[45] tool exec_command call: click 2\n",
+            "[46] tool exec_command result: page state 2\n",
+        ]
+    );
+}
+
+#[test]
+fn rejected_commentary_does_not_evict_retained_message_evidence() {
+    let protected_entry =
+        "[1] assistant: Previously approved a limited action after confirming authorization.\n";
+    let retained_entry = "[2] assistant: ok\n";
+    let message_budget = [protected_entry, retained_entry]
+        .iter()
+        .map(|entry| TruncationPolicy::Bytes(entry.len()).token_budget())
+        .sum();
+    let items = vec![
+        assistant_message(
+            "Previously approved a limited action after confirming authorization.",
+            MessagePhase::FinalAnswer,
+        ),
+        assistant_message("ok", MessagePhase::Commentary),
+        assistant_message(
+            "Additional commentary cannot fit.",
+            MessagePhase::Commentary,
+        ),
+    ];
+
+    let transcript = TranscriptConfig {
+        max_message_transcript_tokens: message_budget,
+        ..TranscriptConfig::default()
+    }
+    .build(&items)
+    .entries;
+
+    assert_eq!(transcript, vec![protected_entry, retained_entry]);
+}
+
+#[test]
+fn transcript_evicts_protected_messages_in_cacheable_chunks() {
+    let user_entry = "[1] user: Inspect the workspace.\n";
+    let assistant_entry = "[2] assistant: final answer 0\n";
+    let message_budget = TruncationPolicy::Bytes(user_entry.len()).token_budget()
+        + 4 * TruncationPolicy::Bytes(assistant_entry.len()).token_budget();
+    let configurations = [
+        TranscriptConfig {
+            max_recent_non_user_entries: 4,
+            ..TranscriptConfig::default()
+        },
+        TranscriptConfig {
+            max_message_transcript_tokens: message_budget,
+            ..TranscriptConfig::default()
+        },
+    ];
+
+    for config in configurations {
+        let build_transcript = |message_count| {
+            let mut items = vec![user_message_item("Inspect the workspace.")];
+            items.extend((0..message_count).map(|index| {
+                assistant_message(format!("final answer {index}"), MessagePhase::FinalAnswer)
+            }));
+            config.build(&items).entries
+        };
+
+        assert_eq!(
+            build_transcript(5),
+            vec![
+                user_entry,
+                "[4] assistant: final answer 2\n",
+                "[5] assistant: final answer 3\n",
+                "[6] assistant: final answer 4\n",
+            ]
+        );
+        assert_eq!(
+            build_transcript(6),
+            vec![
+                user_entry,
+                "[4] assistant: final answer 2\n",
+                "[5] assistant: final answer 3\n",
+                "[6] assistant: final answer 4\n",
+                "[7] assistant: final answer 5\n",
+            ]
+        );
+        assert_eq!(
+            build_transcript(7),
+            vec![
+                user_entry,
+                "[6] assistant: final answer 4\n",
+                "[7] assistant: final answer 5\n",
+                "[8] assistant: final answer 6\n",
+            ]
+        );
+    }
+}
+
+#[test]
+fn transcript_does_not_protect_legacy_inter_agent_instructions() {
+    let communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root()
+            .join("worker")
+            .expect("worker path should be valid"),
+        Vec::new(),
+        "Review the pending action.".to_string(),
+        /*trigger_turn*/ true,
+    );
+    let items = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: serde_json::to_string(&communication)
+                    .expect("legacy inter-agent communication should serialize"),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "I found a $450 flight. Should I book it?".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "exec_command".to_string(),
+            namespace: None,
+            arguments: "booking details".to_string(),
+            encrypted_function_args: None,
+            call_id: "call-1".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+
+    let transcript = TranscriptConfig {
+        max_recent_non_user_entries: 2,
+        ..TranscriptConfig::default()
+    }
+    .build(&items)
+    .entries;
+
+    assert_eq!(
+        transcript,
+        vec![
+            "[2] assistant: I found a $450 flight. Should I book it?\n",
+            "[3] tool exec_command call: booking details\n",
+        ]
+    );
+}
+
+#[test]
 fn transcript_reserves_separate_budget_for_recent_tool_evidence() {
     let mut items = (0..8)
         .map(|index| ResponseItem::Message {
@@ -226,7 +513,7 @@ fn transcript_reserves_separate_budget_for_recent_tool_evidence() {
         internal_chat_message_metadata_passthrough: None,
     }));
 
-    let transcript = TranscriptConfig::default().build(&items);
+    let transcript = TranscriptConfig::default().build(&items).entries;
 
     assert!(transcript[0].contains("user turn 0:"));
     assert!(
@@ -275,7 +562,7 @@ fn transcript_reserves_separate_budget_for_recent_tool_evidence() {
         call_id: "call-12".to_string(),
         internal_chat_message_metadata_passthrough: None,
     });
-    let next_transcript = TranscriptConfig::default().build(&items);
+    let next_transcript = TranscriptConfig::default().build(&items).entries;
     let next_first_retained_tool = next_transcript
         .iter()
         .find(|entry| entry.contains("tool exec_command call:"))
@@ -327,7 +614,8 @@ fn transcript_preserves_newest_manual_approval_when_message_budget_overflows() {
         max_message_transcript_tokens: message_budget,
         ..TranscriptConfig::default()
     }
-    .build(&items);
+    .build(&items)
+    .entries;
 
     assert_eq!(transcript, vec![approval_entry]);
 }
@@ -375,7 +663,8 @@ fn rejected_message_does_not_evict_retained_tool_entries() {
         max_message_transcript_tokens: TruncationPolicy::Bytes(user_entry.len()).token_budget(),
         ..TranscriptConfig::default()
     }
-    .build(&items);
+    .build(&items)
+    .entries;
 
     assert_eq!(transcript, expected);
 }
@@ -407,7 +696,7 @@ fn transcript_evicts_non_user_entries_in_cacheable_chunks() {
                 internal_chat_message_metadata_passthrough: None,
             }),
         );
-        config.build(&items)
+        config.build(&items).entries
     };
 
     let first_overflow = build_transcript(5);
@@ -459,13 +748,15 @@ fn transcript_truncates_tool_results_using_standard_budget() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_owned(),
+            call_id: Some("call-1".to_owned()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text(output),
             internal_chat_message_metadata_passthrough: None,
         },
     ];
 
-    let transcript = TranscriptConfig::default().build(&items);
+    let transcript = TranscriptConfig::default().build(&items).entries;
     let result = transcript
         .iter()
         .find(|entry| entry.contains(" result: "))
@@ -478,6 +769,36 @@ fn transcript_truncates_tool_results_using_standard_budget() {
     assert!(
         result.len()
             <= TruncationPolicy::Tokens(MAX_TOOL_ENTRY_TOKENS).byte_budget() + prefix.len() + 1
+    );
+}
+
+#[test]
+fn transcript_preserves_named_unpaired_tool_source() {
+    let mut items = vec![ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: None,
+        name: Some("notifications".to_owned()),
+        namespace: Some("slack".to_owned()),
+        output: FunctionCallOutputPayload::from_text("new message".to_owned()),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+
+    assert_eq!(
+        TranscriptConfig::default().build(&items).entries,
+        vec!["[1] tool slack.notifications result: new message\n"]
+    );
+
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut items[0] {
+        *output = FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,image".to_owned(),
+                detail: None,
+            },
+        ]);
+    }
+    assert_eq!(
+        TranscriptConfig::default().build(&items).entries,
+        vec!["[1] tool slack.notifications result: [non-text output]\n"]
     );
 }
 
@@ -508,7 +829,8 @@ fn configured_reasoning_counts_against_message_budget() {
         sources: vec![TranscriptSource::Reasoning],
         ..TranscriptConfig::default()
     }
-    .build(&items);
+    .build(&items)
+    .entries;
 
     assert!(transcript[0].contains("user turn 0:"));
     assert!(
@@ -564,7 +886,7 @@ fn transcript_keeps_only_manual_approval_developer_messages() {
         },
     ];
 
-    let transcript = TranscriptConfig::default().build(&items);
+    let transcript = TranscriptConfig::default().build(&items).entries;
     assert_eq!(
         transcript,
         vec![format!("[1] developer: {approval_text}\n")]
@@ -596,7 +918,9 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "Screenshot captured.".to_string(),
@@ -636,7 +960,7 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
         },
     ];
 
-    let transcript = TranscriptConfig::default().build(&items);
+    let transcript = TranscriptConfig::default().build(&items).entries;
     assert_eq!(
         transcript,
         vec![
@@ -692,7 +1016,7 @@ fn transcript_omits_encrypted_messages_arguments_and_tool_outputs() {
         },
     ];
 
-    let transcript = TranscriptConfig::default().build(&items);
+    let transcript = TranscriptConfig::default().build(&items).entries;
     assert_eq!(
         transcript,
         vec![

@@ -3,6 +3,7 @@ use std::io;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_protocol::config_types::WindowsSandboxLevel;
 
 use crate::CapabilityRootsDiscoverParams;
 use crate::CapabilityRootsDiscoverResponse;
@@ -74,6 +75,42 @@ impl FileSystemHandler {
         &self,
         params: CapabilityRootsDiscoverParams,
     ) -> Result<CapabilityRootsDiscoverResponse, JSONRPCErrorError> {
+        let sandbox = params
+            .roots
+            .first()
+            .and_then(|root| root.sandbox.as_ref())
+            .filter(|sandbox| {
+                sandbox.should_run_in_sandbox()
+                    && (!cfg!(target_os = "windows")
+                        || sandbox.windows_sandbox_level != WindowsSandboxLevel::Disabled)
+                    && params
+                        .roots
+                        .iter()
+                        .all(|root| root.sandbox.as_ref() == Some(*sandbox))
+            })
+            .cloned();
+
+        if let Some(sandbox) = sandbox {
+            let mut batched_params = params.clone();
+            for root in &mut batched_params.roots {
+                root.sandbox = None;
+            }
+            let result = match self.file_system.sandboxed() {
+                Ok(file_system) => {
+                    file_system
+                        .discover_capability_roots(batched_params, &sandbox)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    tracing::warn!(%error, "batched capability discovery failed; retrying roots separately");
+                }
+            }
+        }
+
         crate::discover_capability_roots(&self.file_system, params)
             .await
             .map_err(|error| invalid_request(error.to_string()))
@@ -169,32 +206,6 @@ impl FileSystemHandler {
         &self,
         params: FsCreateDirectoryParams,
     ) -> Result<FsCreateDirectoryResponse, JSONRPCErrorError> {
-        if params.private.unwrap_or(false) {
-            if params.follow_symlinks == Some(false) {
-                return Err(invalid_request(
-                    "private directories do not support followSymlinks=false".to_string(),
-                ));
-            }
-            if params.recursive.unwrap_or(false) || params.sandbox.is_some() {
-                return Err(invalid_request(
-                    "private directories must be non-recursive and unsandboxed".to_string(),
-                ));
-            }
-            #[cfg(unix)]
-            {
-                let path = params.path.to_abs_path().map_err(map_fs_error)?;
-                let mut builder = tokio::fs::DirBuilder::new();
-                builder.mode(0o700);
-                builder.create(path.as_path()).await.map_err(map_fs_error)?;
-                return Ok(FsCreateDirectoryResponse {});
-            }
-            #[cfg(not(unix))]
-            {
-                return Err(invalid_request(
-                    "owner-private directories are unsupported on this platform".to_string(),
-                ));
-            }
-        }
         let recursive = params.recursive.unwrap_or(true);
         self.file_system
             .create_directory(
@@ -344,9 +355,6 @@ fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     use codex_protocol::protocol::NetworkAccess;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_utils_path_uri::PathUri;
@@ -356,95 +364,6 @@ mod tests {
     use crate::FileSystemSandboxContext;
     use crate::protocol::FsReadFileParams;
     use crate::protocol::FsWriteFileParams;
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn private_directories_are_created_with_owner_only_permissions() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let runtime_paths = ExecServerRuntimePaths::new(
-            std::env::current_exe().expect("current exe"),
-            /*codex_linux_sandbox_exe*/ None,
-        )
-        .expect("runtime paths");
-        let handler = FileSystemHandler::new(runtime_paths);
-        let directory = temp_dir.path().join("private-metrics");
-        handler
-            .create_directory(FsCreateDirectoryParams {
-                path: PathUri::from_host_native_path(&directory).expect("directory URI"),
-                follow_symlinks: None,
-                recursive: Some(false),
-                sandbox: None,
-                private: Some(true),
-            })
-            .await
-            .expect("create private directory");
-
-        assert_eq!(
-            std::fs::metadata(directory)
-                .expect("directory metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn private_directories_reject_no_follow_before_resolving_the_path() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let runtime_paths = ExecServerRuntimePaths::new(
-            std::env::current_exe().expect("current exe"),
-            /*codex_linux_sandbox_exe*/ None,
-        )
-        .expect("runtime paths");
-        let handler = FileSystemHandler::new(runtime_paths);
-        let target = temp_dir.path().join("target");
-        std::fs::create_dir(&target).expect("create target");
-        let alias = temp_dir.path().join("alias");
-        std::os::unix::fs::symlink(&target, &alias).expect("create alias");
-        let directory = alias.join("private-metrics");
-
-        let error = handler
-            .create_directory(FsCreateDirectoryParams {
-                path: PathUri::from_host_native_path(&directory).expect("directory URI"),
-                follow_symlinks: Some(false),
-                recursive: Some(false),
-                sandbox: None,
-                private: Some(true),
-            })
-            .await
-            .expect_err("strict private directory request must fail closed");
-
-        assert!(error.message.contains("followSymlinks=false"));
-        assert!(!target.join("private-metrics").exists());
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn private_directories_are_rejected_when_owner_only_permissions_are_unsupported() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let runtime_paths = ExecServerRuntimePaths::new(
-            std::env::current_exe().expect("current exe"),
-            /*codex_linux_sandbox_exe*/ None,
-        )
-        .expect("runtime paths");
-        let handler = FileSystemHandler::new(runtime_paths);
-        let directory = temp_dir.path().join("private-metrics");
-        let error = handler
-            .create_directory(FsCreateDirectoryParams {
-                path: PathUri::from_host_native_path(&directory).expect("directory URI"),
-                follow_symlinks: None,
-                recursive: Some(false),
-                sandbox: None,
-                private: Some(true),
-            })
-            .await
-            .expect_err("private directories must fail closed");
-
-        assert!(error.message.contains("owner-private directories"));
-        assert!(!directory.exists());
-    }
 
     #[tokio::test]
     async fn no_platform_sandbox_policies_do_not_require_configured_sandbox_helper() {

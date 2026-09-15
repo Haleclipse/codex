@@ -162,12 +162,7 @@ impl PendingAppServerRequests {
                 );
                 None
             }
-            ServerRequest::DynamicToolCall { request_id, .. } => {
-                Some(UnsupportedAppServerRequest {
-                    request_id: request_id.clone(),
-                    message: "Dynamic tool calls are not available in TUI yet.".to_string(),
-                })
-            }
+            ServerRequest::DynamicToolCall { .. } => None,
             ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
             ServerRequest::AttestationGenerate { request_id, .. } => {
                 Some(UnsupportedAppServerRequest {
@@ -483,6 +478,7 @@ mod tests {
         let request = ServerRequest::CommandExecutionRequestApproval {
             request_id: AppServerRequestId::Integer(41),
             params: CommandExecutionRequestApprovalParams {
+                kind: Default::default(),
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 item_id: "call-1".to_string(),
@@ -837,32 +833,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dynamic_tool_calls_as_unsupported() {
-        let mut pending = PendingAppServerRequests::default();
-        let request = ServerRequest::DynamicToolCall {
-            request_id: AppServerRequestId::Integer(99),
-            params: codex_app_server_protocol::DynamicToolCallParams {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                call_id: "tool-1".to_string(),
-                namespace: None,
-                tool: "tool".to_string(),
-                arguments: json!({}),
-            },
-        };
-        assert!(!pending.contains_server_request(&request));
-        let unsupported = pending
-            .note_server_request(&request)
-            .expect("dynamic tool calls should be rejected");
-
-        assert_eq!(unsupported.request_id, AppServerRequestId::Integer(99));
-        assert_eq!(
-            unsupported.message,
-            "Dynamic tool calls are not available in TUI yet."
-        );
-    }
-
-    #[test]
     fn does_not_mark_chatgpt_auth_refresh_as_unsupported() {
         let mut pending = PendingAppServerRequests::default();
 
@@ -919,6 +889,7 @@ mod tests {
             pending.note_server_request(&ServerRequest::CommandExecutionRequestApproval {
                 request_id: AppServerRequestId::Integer(41),
                 params: CommandExecutionRequestApprovalParams {
+                    kind: Default::default(),
                     thread_id: thread_id.to_ascii_uppercase(),
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),

@@ -2,7 +2,8 @@ use super::persisted_resume_settings::PersistedResumeSettings;
 use super::persisted_resume_settings::latest_persisted_resume_settings;
 use super::thread_enrichment::enrich_loaded_threads;
 use super::thread_fork_goal::inherit_thread_goal_snapshot;
-use super::turn_processor::can_accept_direct_input;
+use super::thread_input::can_accept_direct_input;
+use super::thread_input::ensure_direct_input_allowed;
 use super::*;
 use crate::error_code::method_not_found;
 use codex_app_server_protocol::SelectedCapabilityRoot;
@@ -869,6 +870,35 @@ impl ThreadRequestProcessor {
             .map(|response| Some(response.into()))
     }
 
+    pub(crate) async fn thread_timeline_list(
+        &self,
+        params: ThreadTimelineListParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let thread_id = ThreadId::from_string(&params.thread_id)
+            .map_err(|error| invalid_request(format!("invalid thread id: {error}")))?;
+        let page = self
+            .thread_store
+            .list_timeline(StoreListTimelineParams {
+                thread_id,
+                cursor: params.cursor,
+                page_size: params
+                    .limit
+                    .map(|limit| limit as usize)
+                    .unwrap_or(THREAD_ITEMS_DEFAULT_LIMIT)
+                    .clamp(1, THREAD_ITEMS_MAX_LIMIT),
+            })
+            .await
+            .map_err(paginated_history_list_error)?;
+        Ok(Some(
+            ThreadTimelineListResponse {
+                data: page.items,
+                next_cursor: page.next_cursor,
+                active_realtime_session_at_page_start: page.active_realtime_session_at_page_start,
+            }
+            .into(),
+        ))
+    }
+
     pub(crate) async fn thread_shell_command(
         &self,
         request_id: &ConnectionRequestId,
@@ -914,6 +944,7 @@ impl ThreadRequestProcessor {
 
         Ok((thread_id, thread))
     }
+
     pub(super) async fn acquire_thread_list_state_permit(
         &self,
     ) -> Result<SemaphorePermit<'_>, JSONRPCErrorError> {
@@ -1644,8 +1675,10 @@ impl ThreadRequestProcessor {
         }
 
         archive_thread_ids[1..].reverse();
-        for &thread_id_to_archive in &archive_thread_ids {
-            self.prepare_thread_for_archive(thread_id_to_archive).await;
+        // Collaboration may resume an archived descendant without unarchiving it.
+        self.prepare_thread_for_archive(thread_id).await;
+        for &descendant_thread_id in subtree_thread_ids.iter().skip(1).rev() {
+            self.prepare_thread_for_archive(descendant_thread_id).await;
         }
 
         let archived_thread_ids = self
@@ -2011,6 +2044,7 @@ impl ThreadRequestProcessor {
             before_turn_id,
         } = params;
         let (thread_id, thread) = self.load_thread(&thread_id).await?;
+        ensure_direct_input_allowed(thread.as_ref()).await?;
         let config_snapshot = thread.config_snapshot().await;
         if !matches!(config_snapshot.history_mode, ThreadHistoryMode::Paginated) {
             return Err(invalid_request(
@@ -2229,6 +2263,7 @@ impl ThreadRequestProcessor {
         }
 
         let (thread_id, thread) = self.load_thread(&thread_id).await?;
+        ensure_direct_input_allowed(thread.as_ref()).await?;
         if matches!(
             thread.config_snapshot().await.history_mode,
             ThreadHistoryMode::Paginated
@@ -2282,6 +2317,7 @@ impl ThreadRequestProcessor {
         let ThreadCompactStartParams { thread_id } = params;
 
         let (_, thread) = self.load_thread(&thread_id).await?;
+        ensure_direct_input_allowed(thread.as_ref()).await?;
         self.submit_core_op(request_id, thread.as_ref(), Op::Compact)
             .await
             .map_err(|err| internal_error(format!("failed to start compaction: {err}")))?;
@@ -2362,6 +2398,10 @@ impl ThreadRequestProcessor {
         if command.is_empty() {
             return Err(invalid_request("command must not be empty"));
         }
+
+        let (_, thread) = self.load_thread(&thread_id).await?;
+        ensure_direct_input_allowed(thread.as_ref()).await?;
+
         // `thread/shellCommand` is app-server's local-host shell escape hatch,
         // not the normal turn-selected shell tool path.
         if self
@@ -2373,7 +2413,6 @@ impl ThreadRequestProcessor {
             return Err(internal_error("local environment is not configured"));
         }
 
-        let (_, thread) = self.load_thread(&thread_id).await?;
         self.submit_core_op(
             request_id,
             thread.as_ref(),
@@ -2393,6 +2432,7 @@ impl ThreadRequestProcessor {
         let event = serde_json::from_value(event)
             .map_err(|err| invalid_request(format!("invalid Guardian denial event: {err}")))?;
         let (_, thread) = self.load_thread(&thread_id).await?;
+        ensure_direct_input_allowed(thread.as_ref()).await?;
 
         self.submit_core_op(
             request_id,
@@ -3527,6 +3567,7 @@ impl ThreadRequestProcessor {
                 &params,
                 app_server_client_name.clone(),
                 app_server_client_version.clone(),
+                /*cold_resume_history*/ None,
             )
             .await
         {
@@ -3595,6 +3636,51 @@ impl ThreadRequestProcessor {
             matches!(thread.history_mode, ThreadHistoryMode::Paginated).then_some(thread.thread_id)
         });
         let paginated_resume = paginated_thread_id.is_some();
+
+        // Parent-owned V2 children must resume through their owner, not caller configuration.
+        if let InitialHistory::Resumed(resumed_history) = &thread_history
+            && let Some((source, _)) = thread_history.get_resumed_session_sources()
+            && !can_accept_direct_input(thread_history.get_multi_agent_version(), &source)
+        {
+            let child_thread_id = resumed_history.conversation_id;
+            self.thread_manager
+                .ensure_multi_agent_v2_child_loaded(child_thread_id)
+                .await
+                .map_err(|err| {
+                    tracing::warn!(
+                        thread_id = %child_thread_id,
+                        error = %err,
+                        "failed to resume a multi-agent v2 child through its parent"
+                    );
+                    invalid_request(
+                        "cannot resume an unloaded multi-agent v2 sub-agent through its parent; resume the parent first, or use thread/read to inspect it",
+                    )
+                })?;
+
+            let cold_resume_history = paginated_resume.then(|| thread_history.get_rollout_items());
+            // Attach to the resolved child with only the caller's history-paging preferences.
+            let attach_params = ThreadResumeParams {
+                thread_id: child_thread_id.to_string(),
+                exclude_turns,
+                initial_turns_page,
+                ..Default::default()
+            };
+            return match self
+                .resume_running_thread(
+                    &request_id,
+                    &attach_params,
+                    app_server_client_name,
+                    app_server_client_version,
+                    cold_resume_history,
+                )
+                .await?
+            {
+                RunningThreadResumeResult::Handled => Ok(()),
+                RunningThreadResumeResult::NotRunning(_) => Err(invalid_request(
+                    "cannot resume an unloaded multi-agent v2 sub-agent through its parent; resume the parent first, or use thread/read to inspect it",
+                )),
+            };
+        }
 
         let history_cwd = thread_history.session_cwd();
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
@@ -3943,6 +4029,7 @@ impl ThreadRequestProcessor {
         params: &ThreadResumeParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
+        cold_resume_history: Option<&[RolloutItem]>,
     ) -> Result<RunningThreadResumeResult, JSONRPCErrorError> {
         let running_thread = if params.history.is_some() {
             if let Ok(existing_thread_id) = ThreadId::from_string(&params.thread_id)
@@ -4018,7 +4105,14 @@ impl ThreadRequestProcessor {
                 let is_running =
                     matches!(existing_thread.agent_status().await, AgentStatus::Running);
 
-                if !has_subscribers && matches!(loaded_status, ThreadStatus::Idle) && !is_running {
+                // Parent-owned V2 children must not be rebuilt from public resume overrides.
+                if can_accept_direct_input(
+                    existing_thread.multi_agent_version(),
+                    &config_snapshot.session_source,
+                ) && !has_subscribers
+                    && matches!(loaded_status, ThreadStatus::Idle)
+                    && !is_running
+                {
                     // A loaded idle thread is only a cache entry. Shut it down
                     // before removing it so cold resume cannot duplicate a
                     // thread that timed out during shutdown.
@@ -4143,6 +4237,19 @@ impl ThreadRequestProcessor {
             } else {
                 None
             };
+            let cold_resume_token_usage_turn_id = cold_resume_history
+                .map(|history| {
+                    let turns = paginated_turns
+                        .as_deref()
+                        .filter(|turns| !turns.is_empty())
+                        .unwrap_or_else(|| {
+                            paginated_initial_turns_page
+                                .as_ref()
+                                .map_or(&[][..], |page| page.data.as_slice())
+                        });
+                    restored_token_usage_turn_id(history, turns)
+                })
+                .filter(|turn_id| !turn_id.is_empty());
             let paginated_initial_turns_page_with_active_slot = if paginated_resume {
                 match params.initial_turns_page.as_ref() {
                     Some(params)
@@ -4170,6 +4277,7 @@ impl ThreadRequestProcessor {
                 Box::new(crate::thread_state::PendingThreadResumeRequest {
                     request_id: request_id.clone(),
                     history_items,
+                    cold_resume_token_usage_turn_id,
                     config_snapshot,
                     instruction_sources,
                     thread_summary,

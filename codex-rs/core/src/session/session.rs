@@ -6,6 +6,8 @@ use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::hook_mcp_executor::CoreHookMcpExecutor;
+use crate::responses_metadata::CodexResponsesMetadata;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::state::ActiveTurn;
 use codex_extension_api::ExtensionDataInit;
@@ -95,7 +97,11 @@ pub(crate) struct SessionConfiguration {
     pub(super) permission_profile_state: PermissionProfileState,
     pub(super) allow_login_shell: bool,
     pub(super) shell_environment_policy: ShellEnvironmentPolicy,
+    // TODO(anp): Reconcile these legacy thread defaults with TurnEnvironment::sandbox_context;
+    // internal sandbox decisions should use the selected environment's configuration.
     pub(super) windows_sandbox_level: WindowsSandboxLevel,
+    pub(super) windows_sandbox_private_desktop: bool,
+    pub(super) use_legacy_landlock: bool,
 
     /// Legacy thread cwd used when a turn does not select an environment.
     pub(super) legacy_fallback_cwd: AbsolutePathBuf,
@@ -142,6 +148,9 @@ impl SessionConfiguration {
             allow_login_shell: self.allow_login_shell,
             permission_profile: self.permission_profile_state.snapshot(),
             shell_environment_policy: self.shell_environment_policy.clone(),
+            windows_sandbox_level: self.windows_sandbox_level,
+            windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
+            use_legacy_landlock: self.use_legacy_landlock,
             exec_policy: None,
             mcp_policy: None,
             network_policy: None,
@@ -291,6 +300,9 @@ impl SessionConfiguration {
             service_tier: Some(self.service_tier.clone()),
             collaboration_mode: Some(self.collaboration_mode.clone()),
             personality: self.personality,
+            // TODO(anp): Include the runtime Windows sandbox override in restored settings.
+            // This omission predates TurnEnvironment::sandbox_context; rebuilding FromThread
+            // environments falls back to Config instead of retaining that override.
             ..Default::default()
         }
     }
@@ -361,14 +373,6 @@ impl SessionConfiguration {
         let current_file_system_sandbox_policy =
             self.file_system_sandbox_policy(current_environments);
         let current_network_sandbox_policy = self.network_sandbox_policy();
-        let legacy_file_system_projection =
-            FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
-                &current_sandbox_policy,
-                self.cwd(),
-                &current_file_system_sandbox_policy,
-            );
-        let file_system_policy_matches_legacy = current_file_system_sandbox_policy
-            .is_semantically_equivalent_to(&legacy_file_system_projection, self.cwd());
         let file_system_policy_has_rebindable_project_root_write =
             current_file_system_sandbox_policy
                 .entries
@@ -503,8 +507,15 @@ impl SessionConfiguration {
                     ),
                 )?;
         } else if cwd_changed
-            && file_system_policy_matches_legacy
             && file_system_policy_has_rebindable_project_root_write
+            && current_file_system_sandbox_policy.is_semantically_equivalent_to(
+                &FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
+                    &current_sandbox_policy,
+                    self.cwd(),
+                    &current_file_system_sandbox_policy,
+                ),
+                self.cwd(),
+            )
         {
             // Preserve richer split policies across cwd-only updates; only
             // rederive when the session is already using a structurally
@@ -639,6 +650,22 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
+    pub(crate) async fn responses_metadata(
+        &self,
+        turn_context: &TurnContext,
+        request_kind: CodexResponsesRequestKind,
+    ) -> CodexResponsesMetadata {
+        let (window_id, context_window_id) = self.current_window().await;
+        CodexResponsesMetadata {
+            context_window_id: Some(context_window_id),
+            ..turn_context.turn_metadata_state.to_responses_metadata(
+                self.installation_id.clone(),
+                window_id,
+                request_kind,
+            )
+        }
+    }
+
     #[instrument(name = "session_init", level = "info", skip_all)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
@@ -715,7 +742,7 @@ impl Session {
             ThreadHistoryMode::Paginated
         ) && matches!(
             session_configuration.thread_source.as_ref(),
-            Some(ThreadSource::Subagent)
+            Some(ThreadSource::Subagent | ThreadSource::GuardianReview)
         );
         if let InitialHistory::Forked(items) = &mut initial_history {
             Self::assign_missing_rollout_response_item_ids(items);
@@ -1067,7 +1094,8 @@ impl Session {
                 terminal_type.clone(),
                 session_configuration.session_source.clone(),
             )
-            .with_auth_env(auth_env_telemetry.to_otel_metadata());
+            .with_auth_env(auth_env_telemetry.to_otel_metadata())
+            .with_tool_result_log_config(config.otel.tool_result);
             if let Some(service_name) = session_configuration.metrics_service_name.as_deref() {
                 session_telemetry = session_telemetry.with_metrics_service_name(service_name);
             }
@@ -1146,7 +1174,21 @@ impl Session {
             } else {
                 shell::default_user_shell()
             };
-            let shell_snapshot = if config.features.enabled(Feature::ShellSnapshot) {
+            let use_executor_shell_snapshots = config.features.enabled(Feature::ShellSnapshotV2)
+                && config.features.enabled(Feature::ShellTool)
+                && config.features.enabled(Feature::UnifiedExec)
+                && matches!(
+                    codex_tools::UnifiedExecShellMode::for_session(
+                        config.features.get(),
+                        crate::tools::tool_user_shell_type(&default_shell),
+                        config.zsh_path.as_ref(),
+                        config.main_execve_wrapper_exe.as_ref(),
+                    ),
+                    codex_tools::UnifiedExecShellMode::Direct
+                );
+            let shell_snapshot = if config.features.enabled(Feature::ShellSnapshot)
+                && !use_executor_shell_snapshots
+            {
                 ShellSnapshot::new(
                     config.codex_home.clone(),
                     thread_id,
@@ -1187,11 +1229,7 @@ impl Session {
                         otel.name = "session_init.thread_name_lookup",
                     ));
             let (agents_md_result, plugin_skill_errors, thread_name) = tokio::join!(
-                agents_md_manager.refresh(
-                    config.as_ref(),
-                    &resolved_environments,
-                    session_configuration.windows_sandbox_level,
-                ),
+                agents_md_manager.refresh(config.as_ref(), &resolved_environments),
                 plugin_skill_warmup,
                 thread_name_lookup,
             );
@@ -1242,7 +1280,12 @@ impl Session {
                         )
                     });
             let (network_proxy, session_network_proxy) =
-                if let Some(spec) = config.permissions.network.as_ref() {
+                if let Some(spec) = config
+                    .permissions
+                    .network
+                    .as_ref()
+                    .filter(|spec| spec.enabled())
+                {
                     let current_exec_policy = exec_policy.current();
                     let (network_proxy, session_network_proxy) = Self::start_managed_network_proxy(
                         spec,
@@ -1313,6 +1356,7 @@ impl Session {
                     | RolloutItem::InterAgentCommunicationMetadata { .. }
                     | RolloutItem::TurnContext(_)
                     | RolloutItem::WorldState(_)
+                    | RolloutItem::RealtimeItem(_)
                     | RolloutItem::SecurityRiskScore(_) => {}
                 }
             }
@@ -1400,6 +1444,7 @@ impl Session {
                     session_configuration.session_source.clone(),
                     session_configuration.originator.clone(),
                     config.model_verbosity,
+                    config.features.enabled(Feature::ContentItemKinds),
                     config.features.enabled(Feature::EnableRequestCompression),
                     config.features.enabled(Feature::RuntimeMetrics),
                     Self::build_model_client_beta_features_header(config.as_ref()),

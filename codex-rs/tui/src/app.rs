@@ -223,6 +223,7 @@ mod history_ui;
 mod input;
 mod loaded_threads;
 mod pending_interactive_replay;
+mod permission_shortcuts;
 mod pets;
 mod platform_actions;
 mod plugin_mentions;
@@ -239,6 +240,7 @@ mod thread_goal_actions;
 mod thread_routing;
 mod thread_session_state;
 mod thread_settings;
+mod thread_title;
 mod transcript_export;
 mod working_directory;
 
@@ -594,6 +596,7 @@ pub(crate) struct App {
     windows_sandbox: WindowsSandboxState,
 
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
+    temporary_structured_requests: HashMap<ThreadId, mpsc::UnboundedSender<ServerNotification>>,
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
     agent_navigation: AgentNavigationState,
     agents_overview: agents_overview::AgentsOverviewState,
@@ -606,6 +609,9 @@ pub(crate) struct App {
     primary_session_configured: Option<ThreadSessionState>,
     pending_primary_events: VecDeque<ThreadBufferedEvent>,
     pending_app_server_requests: PendingAppServerRequests,
+    dynamic_tool_status_updates:
+        tokio::sync::broadcast::Sender<codex_app_server_protocol::ThreadStatusChangedNotification>,
+    dynamic_tool_tasks: HashMap<codex_app_server_protocol::RequestId, (String, JoinHandle<()>)>,
     pending_startup_thread_start: bool,
     /// Keeps protected screens quarantined until initialized chat receives genuine user input.
     startup_protected_input_boundary: bool,

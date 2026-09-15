@@ -2570,11 +2570,19 @@
         }
       ]
     },
+    "CommandExecutionApprovalKind": {
+      "description": "Distinguishes a command approval from input sent to an existing terminal.",
+      "enum": [
+        "command",
+        "writeStdin"
+      ],
+      "type": "string"
+    },
     "CommandExecutionRequestApprovalParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "approvalId": {
-          "description": "Unique identifier for this specific approval callback.\n\nFor regular shell/unified_exec approvals, this is null.\n\nFor zsh-exec-bridge subcommand approvals, multiple callbacks can belong to one parent `itemId`, so `approvalId` is a distinct opaque callback id (a UUID) used to disambiguate routing.",
+          "description": "Unique identifier for this specific approval callback.\n\nFor regular shell/unified_exec approvals, this is null.\n\nFor zsh-exec-bridge subcommand approvals, multiple callbacks can belong to one parent `itemId`, so `approvalId` is a distinct opaque callback id (a UUID) used to disambiguate routing. Stdin approvals also use a distinct callback id; inspect `kind` to distinguish them.",
           "type": [
             "string",
             "null"
@@ -2618,6 +2626,15 @@
         },
         "itemId": {
           "type": "string"
+        },
+        "kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CommandExecutionApprovalKind"
+            }
+          ],
+          "default": "command",
+          "description": "Kind of action under review. Defaults to `command` for older servers."
         },
         "networkApprovalContext": {
           "anyOf": [
@@ -5206,6 +5223,26 @@
           "properties": {
             "method": {
               "enum": [
+                "mcpServer/event/stream/notification"
+              ],
+              "title": "McpServer/event/stream/notificationNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/McpServerEventStreamNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "McpServer/event/stream/notificationNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "account/updated"
               ],
               "title": "Account/updatedNotificationMethod",
@@ -5661,6 +5698,66 @@
             "params"
           ],
           "title": "Thread/realtime/itemAddedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/realtime/item/started"
+              ],
+              "title": "Thread/realtime/item/startedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadRealtimeItemStartedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/realtime/item/startedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/realtime/item/transcript/delta"
+              ],
+              "title": "Thread/realtime/item/transcript/deltaNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadRealtimeItemTranscriptDeltaNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/realtime/item/transcript/deltaNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/realtime/item/completed"
+              ],
+              "title": "Thread/realtime/item/completedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadRealtimeItemCompletedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/realtime/item/completedNotification",
           "type": "object"
         },
         {
@@ -6646,6 +6743,13 @@
       "AgentPath": {
         "type": "string"
       },
+      "AllowDenyRequirement": {
+        "enum": [
+          "allow",
+          "deny"
+        ],
+        "type": "string"
+      },
       "AnalyticsConfig": {
         "additionalProperties": true,
         "properties": {
@@ -7483,6 +7587,13 @@
               "bedrockApiKey"
             ],
             "type": "string"
+          },
+          {
+            "description": "Amazon Bedrock AWS access keys managed by Codex.",
+            "enum": [
+              "bedrockAccessKeys"
+            ],
+            "type": "string"
           }
         ]
       },
@@ -7535,11 +7646,195 @@
         },
         "type": "object"
       },
+      "BrowserUseAccessApprovalLifetime": {
+        "enum": [
+          "turn",
+          "thread"
+        ],
+        "type": "string"
+      },
+      "BrowserUseConfig": {
+        "properties": {
+          "allow_history_access": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "default_origin_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/BrowserUseOriginPolicyConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "origins": {
+            "additionalProperties": {
+              "$ref": "#/definitions/v2/BrowserUseOriginPolicyConfig"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "BrowserUseOriginPolicy": {
+        "properties": {
+          "access": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "accessApprovalLifetime": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/BrowserUseAccessApprovalLifetime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "autoReview": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "downloads": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fullCdpAccess": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "persistentApproval": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "uploads": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "BrowserUseOriginPolicyConfig": {
+        "properties": {
+          "access": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "downloads": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "full_cdp_access": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "uploads": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "BrowserUseRequirements": {
         "properties": {
+          "allowGlobalPersistentApproval": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "allowHistoryAccess": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "defaultOriginPolicy": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/BrowserUseOriginPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "disableAutoReview": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "origins": {
+            "additionalProperties": {
+              "$ref": "#/definitions/v2/BrowserUseOriginPolicy"
+            },
+            "type": [
+              "object",
               "null"
             ]
           }
@@ -7820,7 +8115,11 @@
           "sendInput",
           "resumeAgent",
           "wait",
-          "closeAgent"
+          "closeAgent",
+          "sendMessage",
+          "followupTask",
+          "interruptAgent",
+          "listAgents"
         ],
         "type": "string"
       },
@@ -7828,7 +8127,8 @@
         "enum": [
           "inProgress",
           "completed",
-          "failed"
+          "failed",
+          "interrupted"
         ],
         "type": "string"
       },
@@ -8345,11 +8645,206 @@
         ],
         "type": "object"
       },
+      "ComputerUseConfig": {
+        "properties": {
+          "default_app_access": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "macos": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ComputerUseMacosConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "windows": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ComputerUseWindowsConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ComputerUseMacosConfig": {
+        "properties": {
+          "bundle_ids": {
+            "additionalProperties": {
+              "$ref": "#/definitions/v2/AllowDenyRequirement"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ComputerUseMacosRequirements": {
+        "properties": {
+          "bundleIds": {
+            "additionalProperties": {
+              "$ref": "#/definitions/v2/AllowDenyRequirement"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ComputerUseRequirements": {
         "properties": {
           "allowLockedComputerUse": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "allowPersistentApproval": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "defaultAppAccess": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AllowDenyRequirement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "macos": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ComputerUseMacosRequirements"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "windows": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ComputerUseWindowsRequirements"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ComputerUseWindowsConfig": {
+        "properties": {
+          "aumids": {
+            "additionalProperties": {
+              "$ref": "#/definitions/v2/AllowDenyRequirement"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "exes": {
+            "items": {
+              "$ref": "#/definitions/v2/ComputerUseWindowsExeConfig"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ComputerUseWindowsExeConfig": {
+        "properties": {
+          "access": {
+            "$ref": "#/definitions/v2/AllowDenyRequirement"
+          },
+          "binary_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_name": {
+            "type": "string"
+          },
+          "publisher_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "access",
+          "product_name",
+          "publisher_name"
+        ],
+        "type": "object"
+      },
+      "ComputerUseWindowsExeRequirement": {
+        "properties": {
+          "access": {
+            "$ref": "#/definitions/v2/AllowDenyRequirement"
+          },
+          "binaryName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "productName": {
+            "type": "string"
+          },
+          "publisherName": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "access",
+          "productName",
+          "publisherName"
+        ],
+        "type": "object"
+      },
+      "ComputerUseWindowsRequirements": {
+        "properties": {
+          "aumids": {
+            "additionalProperties": {
+              "$ref": "#/definitions/v2/AllowDenyRequirement"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "exes": {
+            "items": {
+              "$ref": "#/definitions/v2/ComputerUseWindowsExeRequirement"
+            },
+            "type": [
+              "array",
               "null"
             ]
           }
@@ -8390,10 +8885,30 @@
             ],
             "description": "[UNSTABLE] Optional default for where approval requests are routed for review."
           },
+          "browser_use": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/BrowserUseConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "compact_prompt": {
             "type": [
               "string",
               "null"
+            ]
+          },
+          "computer_use": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ComputerUseConfig"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "desktop": {
@@ -8908,7 +9423,19 @@
       },
       "ConfigRequirements": {
         "properties": {
+          "additionalDeveloperInstructions": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "allowAppshots": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "allowBrowserAndComputerUse": {
             "type": [
               "boolean",
               "null"
@@ -9058,6 +9585,16 @@
             "anyOf": [
               {
                 "$ref": "#/definitions/v2/FeedbackRequirements"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "inAppBrowser": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/InAppBrowserRequirements"
               },
               {
                 "type": "null"
@@ -11711,6 +12248,39 @@
             "type": "object"
           },
           {
+            "description": "A child approval for input to an existing command execution item.",
+            "properties": {
+              "approvalId": {
+                "type": "string"
+              },
+              "cwd": {
+                "$ref": "#/definitions/v2/LegacyAppPathString"
+              },
+              "processId": {
+                "type": "string"
+              },
+              "stdin": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "writeStdin"
+                ],
+                "title": "WriteStdinGuardianApprovalReviewActionType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "approvalId",
+              "cwd",
+              "processId",
+              "stdin",
+              "type"
+            ],
+            "title": "WriteStdinGuardianApprovalReviewAction",
+            "type": "object"
+          },
+          {
             "properties": {
               "cwd": {
                 "$ref": "#/definitions/v2/AbsolutePathBuf"
@@ -11948,7 +12518,8 @@
           "userPromptSubmit",
           "subagentStart",
           "subagentStop",
-          "stop"
+          "stop",
+          "interrupt"
         ],
         "type": "string"
       },
@@ -12419,6 +12990,17 @@
           }
         ]
       },
+      "InAppBrowserRequirements": {
+        "properties": {
+          "allowExternalBrowserSettingsImport": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "InputModality": {
         "description": "Canonical user-input modality tags advertised by a model.",
         "oneOf": [
@@ -12541,7 +13123,7 @@
             "type": "integer"
           },
           "targetItemId": {
-            "description": "Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review (only possible when using the shell_zsh_fork feature) - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
+            "description": "Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review (only possible when using the shell_zsh_fork feature) - stdin reviews, which refer to the existing parent command item and have a separate approval ID in the action payload - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
             "type": [
               "string",
               "null"
@@ -12587,7 +13169,7 @@
             "type": "integer"
           },
           "targetItemId": {
-            "description": "Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review (only possible when using the shell_zsh_fork feature) - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
+            "description": "Identifier for the reviewed item or tool call when one exists.\n\nIn most cases, one review maps to one target item. The exceptions are - execve reviews, where a single command may contain multiple execve calls to review (only possible when using the shell_zsh_fork feature) - stdin reviews, which refer to the existing parent command item and have a separate approval ID in the action payload - network policy reviews, where there is no target item\n\nA network call is triggered by a CommandExecution item, so having a target_item_id set to the CommandExecution item would be misleading because the review is about the network call, not the command execution. Therefore, target_item_id is set to None for network policy reviews.",
             "type": [
               "string",
               "null"
@@ -12898,6 +13480,41 @@
             ],
             "title": "AmazonBedrockv2::LoginAccountParams",
             "type": "object"
+          },
+          {
+            "description": "[UNSTABLE] Managed Amazon Bedrock AWS access key login is experimental.",
+            "properties": {
+              "accessKeyId": {
+                "type": "string"
+              },
+              "region": {
+                "type": "string"
+              },
+              "secretAccessKey": {
+                "type": "string"
+              },
+              "sessionToken": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "amazonBedrockAccessKeys"
+                ],
+                "title": "AmazonBedrockAccessKeysv2::LoginAccountParamsType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "accessKeyId",
+              "region",
+              "secretAccessKey",
+              "type"
+            ],
+            "title": "AmazonBedrockAccessKeysv2::LoginAccountParams",
+            "type": "object"
           }
         ],
         "title": "LoginAccountParams"
@@ -13025,6 +13642,13 @@
       },
       "ManagedHooksRequirements": {
         "properties": {
+          "Interrupt": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
+            },
+            "type": "array"
+          },
           "PermissionRequest": {
             "items": {
               "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
@@ -13357,6 +13981,48 @@
         "title": "McpResourceReadResponse",
         "type": "object"
       },
+      "McpServerConnectionStatus": {
+        "enum": [
+          "notStarted",
+          "starting",
+          "connected",
+          "authenticationRequired",
+          "failed",
+          "cancelled",
+          "disabled"
+        ],
+        "type": "string"
+      },
+      "McpServerEventNotification": {
+        "properties": {
+          "method": {
+            "type": "string"
+          },
+          "params": true
+        },
+        "required": [
+          "method",
+          "params"
+        ],
+        "type": "object"
+      },
+      "McpServerEventStreamNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "notification": {
+            "$ref": "#/definitions/v2/McpServerEventNotification"
+          },
+          "subscriptionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "notification",
+          "subscriptionId"
+        ],
+        "title": "McpServerEventStreamNotification",
+        "type": "object"
+      },
       "McpServerInfo": {
         "description": "Presentation metadata advertised by an initialized MCP server.",
         "properties": {
@@ -13550,6 +14216,17 @@
               "$ref": "#/definitions/v2/Resource"
             },
             "type": "array"
+          },
+          "runtimeStatus": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/McpServerConnectionStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Current thread-runtime connection state; null when unavailable or the configuration changed."
           },
           "serverInfo": {
             "anyOf": [
@@ -17295,7 +17972,10 @@
           {
             "properties": {
               "call_id": {
-                "type": "string"
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "id": {
                 "type": [
@@ -17313,6 +17993,18 @@
                   }
                 ]
               },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "namespace": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "output": {
                 "$ref": "#/definitions/v2/FunctionCallOutputBody"
               },
@@ -17325,7 +18017,6 @@
               }
             },
             "required": [
-              "call_id",
               "output",
               "type"
             ],
@@ -18527,6 +19218,13 @@
           "path": {
             "$ref": "#/definitions/v2/AbsolutePathBuf"
           },
+          "pluginId": {
+            "description": "Owning plugin ID, matching `PluginSummary.id`, when known.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "scope": {
             "$ref": "#/definitions/v2/SkillScope"
           },
@@ -18840,7 +19538,8 @@
         "enum": [
           "started",
           "interacted",
-          "interrupted"
+          "interrupted",
+          "completed"
         ],
         "type": "string"
       },
@@ -20942,6 +21641,65 @@
         ],
         "type": "object"
       },
+      "ThreadRealtimeBemItemPresentation": {
+        "description": "EXPERIMENTAL - how an existing agent item appears in a realtime conversation.",
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "wholeItem"
+                ],
+                "title": "WholeItemThreadRealtimeBemItemPresentationType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "WholeItemThreadRealtimeBemItemPresentation",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "inlineMarkdown"
+                ],
+                "title": "InlineMarkdownThreadRealtimeBemItemPresentationType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "InlineMarkdownThreadRealtimeBemItemPresentation",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "index": {
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "inlineVisualization"
+                ],
+                "title": "InlineVisualizationThreadRealtimeBemItemPresentationType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "index",
+              "type"
+            ],
+            "title": "InlineVisualizationThreadRealtimeBemItemPresentation",
+            "type": "object"
+          }
+        ]
+      },
       "ThreadRealtimeClosedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - emitted when thread realtime transport closes.",
@@ -20996,6 +21754,112 @@
         ],
         "type": "object"
       },
+      "ThreadRealtimeItem": {
+        "description": "EXPERIMENTAL - a thread-scoped realtime item in the canonical timeline.",
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "realtimeSessionStarted"
+                ],
+                "title": "RealtimeSessionStartedThreadRealtimeItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "RealtimeSessionStartedThreadRealtimeItem",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "role": {
+                "$ref": "#/definitions/v2/ThreadRealtimeTranscriptRole"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "transcriptSegment"
+                ],
+                "title": "TranscriptSegmentThreadRealtimeItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "role",
+              "text",
+              "type"
+            ],
+            "title": "TranscriptSegmentThreadRealtimeItem",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "item_id": {
+                "type": "string"
+              },
+              "presentation": {
+                "$ref": "#/definitions/v2/ThreadRealtimeBemItemPresentation"
+              },
+              "turn_id": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "bemItemPromoted"
+                ],
+                "title": "BemItemPromotedThreadRealtimeItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "item_id",
+              "presentation",
+              "turn_id",
+              "type"
+            ],
+            "title": "BemItemPromotedThreadRealtimeItem",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "outcome": {
+                "$ref": "#/definitions/v2/ThreadRealtimeSessionOutcome"
+              },
+              "type": {
+                "enum": [
+                  "realtimeSessionClosed"
+                ],
+                "title": "RealtimeSessionClosedThreadRealtimeItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "outcome",
+              "type"
+            ],
+            "title": "RealtimeSessionClosedThreadRealtimeItem",
+            "type": "object"
+          }
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "realtimeSessionId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "realtimeSessionId"
+        ],
+        "type": "object"
+      },
       "ThreadRealtimeItemAddedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "EXPERIMENTAL - raw non-audio thread realtime item emitted by the backend.",
@@ -21010,6 +21874,64 @@
           "threadId"
         ],
         "title": "ThreadRealtimeItemAddedNotification",
+        "type": "object"
+      },
+      "ThreadRealtimeItemCompletedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "EXPERIMENTAL - a realtime timeline item published after canonical commit.",
+        "properties": {
+          "item": {
+            "$ref": "#/definitions/v2/ThreadRealtimeItem"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "item",
+          "threadId"
+        ],
+        "title": "ThreadRealtimeItemCompletedNotification",
+        "type": "object"
+      },
+      "ThreadRealtimeItemStartedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "EXPERIMENTAL - a realtime timeline item started before its content streams.",
+        "properties": {
+          "item": {
+            "$ref": "#/definitions/v2/ThreadRealtimeItem"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "item",
+          "threadId"
+        ],
+        "title": "ThreadRealtimeItemStartedNotification",
+        "type": "object"
+      },
+      "ThreadRealtimeItemTranscriptDeltaNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "EXPERIMENTAL - text appended to an active realtime transcript item.",
+        "properties": {
+          "delta": {
+            "type": "string"
+          },
+          "itemId": {
+            "type": "string"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "delta",
+          "itemId",
+          "threadId"
+        ],
+        "title": "ThreadRealtimeItemTranscriptDeltaNotification",
         "type": "object"
       },
       "ThreadRealtimeOutputAudioDeltaNotification": {
@@ -21047,6 +21969,13 @@
         ],
         "title": "ThreadRealtimeSdpNotification",
         "type": "object"
+      },
+      "ThreadRealtimeSessionOutcome": {
+        "enum": [
+          "ended",
+          "failed"
+        ],
+        "type": "string"
       },
       "ThreadRealtimeStartTransport": {
         "description": "EXPERIMENTAL - transport used by thread realtime.",
@@ -21086,6 +22015,27 @@
               "type"
             ],
             "title": "WebrtcThreadRealtimeStartTransport",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "callId": {
+                "description": "Identifier of a realtime call already created and negotiated by the client.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "existingCall"
+                ],
+                "title": "ExistingCallThreadRealtimeStartTransportType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "callId",
+              "type"
+            ],
+            "title": "ExistingCallThreadRealtimeStartTransport",
             "type": "object"
           }
         ]
@@ -21159,6 +22109,13 @@
         ],
         "title": "ThreadRealtimeTranscriptDoneNotification",
         "type": "object"
+      },
+      "ThreadRealtimeTranscriptRole": {
+        "enum": [
+          "user",
+          "assistant"
+        ],
+        "type": "string"
       },
       "ThreadResumeInitialTurnsPageParams": {
         "properties": {
@@ -22154,6 +23111,161 @@
         ],
         "title": "ThreadStatusChangedNotification",
         "type": "object"
+      },
+      "ThreadTimelineEntry": {
+        "description": "EXPERIMENTAL - one item or turn boundary in canonical rollout order.",
+        "oneOf": [
+          {
+            "properties": {
+              "item": {
+                "$ref": "#/definitions/v2/ThreadItem"
+              },
+              "position": {
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "turnId": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "item"
+                ],
+                "title": "ItemThreadTimelineEntryType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "item",
+              "position",
+              "turnId",
+              "type"
+            ],
+            "title": "ItemThreadTimelineEntry",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "item": {
+                "$ref": "#/definitions/v2/ThreadRealtimeItem"
+              },
+              "position": {
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "realtime"
+                ],
+                "title": "RealtimeThreadTimelineEntryType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "item",
+              "position",
+              "type"
+            ],
+            "title": "RealtimeThreadTimelineEntry",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "position": {
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "started_at": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "turn_id": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "turnStarted"
+                ],
+                "title": "TurnStartedThreadTimelineEntryType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "position",
+              "turn_id",
+              "type"
+            ],
+            "title": "TurnStartedThreadTimelineEntry",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "completed_at": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "duration_ms": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "error": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/TurnError"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "position": {
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "started_at": {
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "status": {
+                "$ref": "#/definitions/v2/TurnStatus"
+              },
+              "turn_id": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "turnCompleted"
+                ],
+                "title": "TurnCompletedThreadTimelineEntryType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "position",
+              "status",
+              "turn_id",
+              "type"
+            ],
+            "title": "TurnCompletedThreadTimelineEntry",
+            "type": "object"
+          }
+        ]
       },
       "ThreadTokenUsage": {
         "properties": {

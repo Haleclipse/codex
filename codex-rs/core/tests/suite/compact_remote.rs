@@ -1,3 +1,4 @@
+use super::compact::allow_echo_commands;
 use core_test_support::test_codex::local_selections;
 use std::fs;
 use std::path::Path;
@@ -6,6 +7,7 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_core::X_CODEX_ROUTING_HINT_HEADER;
@@ -456,7 +458,7 @@ fn assert_compact_request_omits_harness_metadata(request: &responses::ResponsesR
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn amazon_bedrock_uses_remote_compaction_endpoint() -> Result<()> {
+async fn amazon_bedrock_manual_compaction_uses_v2_responses_endpoint() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_auto_env_builder(amazon_bedrock_test_codex()).await?;
@@ -469,15 +471,20 @@ async fn amazon_bedrock_uses_remote_compaction_endpoint() -> Result<()> {
                 responses::ev_completed("response-1"),
             ]),
             sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "BEDROCK_REMOTE_COMPACTED_SUMMARY",
+                    }
+                }),
+                responses::ev_completed("response-compact"),
+            ]),
+            sse(vec![
                 responses::ev_assistant_message("message-2", "after compaction"),
                 responses::ev_completed("response-2"),
             ]),
         ],
-    )
-    .await;
-    let compact_mock = responses::mount_compact_user_history_with_summary_once(
-        harness.server(),
-        "BEDROCK_REMOTE_COMPACTED_SUMMARY",
     )
     .await;
 
@@ -486,8 +493,14 @@ async fn amazon_bedrock_uses_remote_compaction_endpoint() -> Result<()> {
     wait_for_turn_complete(&harness.test().codex).await;
     harness.test().submit_turn("after compact").await?;
 
-    let compact_request = compact_mock.single_request();
-    assert_eq!(compact_request.path(), "/v1/responses/compact");
+    let response_requests = response_mock.requests();
+    assert_eq!(response_requests.len(), 3);
+    assert!(
+        response_requests
+            .iter()
+            .all(|request| request.path() == "/v1/responses")
+    );
+    let compact_request = &response_requests[1];
     assert_eq!(
         compact_request.header("authorization").as_deref(),
         Some("Bearer bedrock-test-api-key")
@@ -502,15 +515,11 @@ async fn amazon_bedrock_uses_remote_compaction_endpoint() -> Result<()> {
         compact_request.body_json()["model"],
         AMAZON_BEDROCK_GPT_5_5_MODEL_ID
     );
-
-    let response_requests = response_mock.requests();
-    assert_eq!(response_requests.len(), 2);
-    assert!(
-        response_requests
-            .iter()
-            .all(|request| request.inputs_of_type("compaction_trigger").is_empty())
+    assert_eq!(
+        compact_request.inputs_of_type("compaction_trigger").len(),
+        1
     );
-    assert!(response_requests[1].input().iter().any(|item| {
+    assert!(response_requests[2].input().iter().any(|item| {
         item["type"] == "compaction"
             && item["encrypted_content"] == "BEDROCK_REMOTE_COMPACTED_SUMMARY"
     }));
@@ -679,7 +688,7 @@ async fn remote_compact_v2_retains_only_client_developer_messages_when_enabled(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn amazon_bedrock_automatic_compaction_uses_v1_endpoint_when_v2_is_enabled() -> Result<()> {
+async fn amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_auto_env_builder(amazon_bedrock_test_codex().with_config(
@@ -696,15 +705,20 @@ async fn amazon_bedrock_automatic_compaction_uses_v1_endpoint_when_v2_is_enabled
                 responses::ev_completed_with_tokens("response-1", /*total_tokens*/ 500),
             ]),
             sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "BEDROCK_AUTOMATIC_REMOTE_COMPACTED_SUMMARY",
+                    }
+                }),
+                responses::ev_completed("response-compact"),
+            ]),
+            sse(vec![
                 responses::ev_assistant_message("message-2", "after automatic compaction"),
                 responses::ev_completed("response-2"),
             ]),
         ],
-    )
-    .await;
-    let compact_mock = responses::mount_compact_user_history_with_summary_once(
-        harness.server(),
-        "BEDROCK_AUTOMATIC_REMOTE_COMPACTED_SUMMARY",
     )
     .await;
 
@@ -717,21 +731,33 @@ async fn amazon_bedrock_automatic_compaction_uses_v1_endpoint_when_v2_is_enabled
         .submit_turn("after automatic compact")
         .await?;
 
-    let compact_request = compact_mock.single_request();
-    assert_eq!(compact_request.path(), "/v1/responses/compact");
+    let response_requests = response_mock.requests();
+    assert_eq!(response_requests.len(), 3);
+    assert!(
+        response_requests
+            .iter()
+            .all(|request| request.path() == "/v1/responses")
+    );
+    let compact_request = &response_requests[1];
     assert_eq!(
         compact_request.header("authorization").as_deref(),
         Some("Bearer bedrock-test-api-key")
     );
-
-    let response_requests = response_mock.requests();
-    assert_eq!(response_requests.len(), 2);
-    assert!(
-        response_requests
-            .iter()
-            .all(|request| request.inputs_of_type("compaction_trigger").is_empty())
+    assert_eq!(
+        compact_request
+            .header("x-amzn-mantle-client-agent")
+            .as_deref(),
+        Some("codex")
     );
-    assert!(response_requests[1].input().iter().any(|item| {
+    assert_eq!(
+        compact_request.body_json()["model"],
+        AMAZON_BEDROCK_GPT_5_5_MODEL_ID
+    );
+    assert_eq!(
+        compact_request.inputs_of_type("compaction_trigger").len(),
+        1
+    );
+    assert!(response_requests[2].input().iter().any(|item| {
         item["type"] == "compaction"
             && item["encrypted_content"] == "BEDROCK_AUTOMATIC_REMOTE_COMPACTED_SUMMARY"
     }));
@@ -839,6 +865,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         compact_metadata["window_id"].as_str(),
         compact_request.header("x-codex-window-id").as_deref()
     );
+    assert!(compact_metadata["context_window_id"].as_str().is_some());
     assert_eq!(
         compact_metadata["compaction"],
         json!({
@@ -865,6 +892,10 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     assert_ne!(
         first_response_metadata["turn_id"], compact_metadata["turn_id"],
         "manual compaction should use its own turn id"
+    );
+    assert_eq!(
+        first_response_metadata["context_window_id"], compact_metadata["context_window_id"],
+        "remote compaction should retain the active model-visible context window"
     );
     assert_eq!(
         compact_body["tools"],
@@ -924,6 +955,10 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     assert_ne!(
         follow_up_metadata["window_id"], compact_metadata["window_id"],
         "the following user turn should use the new compacted context window"
+    );
+    assert_ne!(
+        follow_up_metadata["context_window_id"], compact_metadata["context_window_id"],
+        "the following user turn should expose the new model-visible context window"
     );
     let follow_up_body = follow_up_request.body_json().to_string();
     assert!(
@@ -1040,7 +1075,9 @@ async fn assert_remote_manual_compact_request_parity(
     scenario: &str,
 ) -> Result<()> {
     let uses_codex_backend = auth.uses_codex_backend();
-    let mut builder = test_codex().with_auth(auth);
+    let mut builder = test_codex()
+        .with_auth(auth)
+        .with_pre_build_hook(allow_echo_commands);
     if let Some(service_tier) = configured_service_tier {
         builder = builder.with_config(move |config| {
             config.service_tier = Some(service_tier.request_value().to_string());
@@ -1077,8 +1114,8 @@ async fn assert_remote_manual_compact_request_parity(
                 responses::ev_completed("turn-three-final-response"),
             ]),
             responses::sse(vec![
-                responses::ev_shell_command_call(
-                    "turn-four-shell-command",
+                responses::ev_exec_command_call(
+                    "turn-four-exec-command",
                     "echo TURN_FOUR_LOCAL_SHELL",
                 ),
                 responses::ev_completed("turn-four-local-shell-response"),
@@ -1858,6 +1895,12 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
 
     for compact_request in &response_requests[1..=3] {
         assert_eq!("/v1/responses", compact_request.path());
+        let compact_metadata: Value = serde_json::from_str(
+            &compact_request
+                .header("x-codex-turn-metadata")
+                .expect("v2 compact request should include turn metadata"),
+        )?;
+        assert!(compact_metadata["context_window_id"].as_str().is_some());
         assert!(
             compact_request
                 .body_json()
@@ -2168,7 +2211,9 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_builder(
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_pre_build_hook(allow_echo_commands),
     )
     .await?;
     let codex = harness.test().codex.clone();
@@ -2178,7 +2223,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     let initial_request = mount_sse_once(
         harness.server(),
         sse(vec![
-            responses::ev_shell_command_call("m1", "echo 'hi'"),
+            responses::ev_exec_command_call("m1", "echo 'hi'"),
             responses::ev_completed_with_tokens("resp-1", /*total_tokens*/ 100000000), // over token limit
         ]),
     )
@@ -2314,7 +2359,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
         harness.server(),
         vec![
             sse(vec![
-                responses::ev_shell_command_call(retained_call_id, retained_command),
+                responses::ev_exec_command_call(retained_call_id, retained_command),
                 responses::ev_completed("retained-call-response"),
             ]),
             sse(vec![
@@ -2322,7 +2367,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
                 responses::ev_completed("retained-final-response"),
             ]),
             sse(vec![
-                responses::ev_shell_command_call(trimmed_call_id, trimmed_command),
+                responses::ev_exec_command_call(trimmed_call_id, trimmed_command),
                 responses::ev_completed("trimmed-call-response"),
             ]),
         ],
@@ -2429,7 +2474,7 @@ async fn remote_compact_rewrites_multiple_trailing_function_call_outputs() -> Re
         harness.server(),
         vec![
             sse(vec![
-                responses::ev_shell_command_call(retained_call_id, retained_command),
+                responses::ev_exec_command_call(retained_call_id, retained_command),
                 responses::ev_completed("retained-call-response"),
             ]),
             sse(vec![
@@ -2437,8 +2482,8 @@ async fn remote_compact_rewrites_multiple_trailing_function_call_outputs() -> Re
                 responses::ev_completed("retained-final-response"),
             ]),
             sse(vec![
-                responses::ev_shell_command_call(first_trimmed_call_id, first_trimmed_command),
-                responses::ev_shell_command_call(second_trimmed_call_id, second_trimmed_command),
+                responses::ev_exec_command_call(first_trimmed_call_id, first_trimmed_command),
+                responses::ev_exec_command_call(second_trimmed_call_id, second_trimmed_command),
                 responses::ev_completed("parallel-call-response"),
             ]),
         ],
@@ -2534,7 +2579,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
         harness.server(),
         vec![
             sse(vec![
-                responses::ev_shell_command_call(retained_call_id, retained_command),
+                responses::ev_exec_command_call(retained_call_id, retained_command),
                 responses::ev_completed_with_tokens(
                     "retained-call-response",
                     /*total_tokens*/ 100,
@@ -2545,7 +2590,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
                 responses::ev_completed("retained-final-response"),
             ]),
             sse(vec![
-                responses::ev_shell_command_call(trimmed_call_id, trimmed_command),
+                responses::ev_exec_command_call(trimmed_call_id, trimmed_command),
                 responses::ev_completed_with_tokens(
                     "trimmed-call-response",
                     /*total_tokens*/ 100,
@@ -2858,7 +2903,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
         baseline_harness.server(),
         vec![
             sse(vec![
-                responses::ev_shell_command_call(baseline_retained_call_id, retained_command),
+                responses::ev_exec_command_call(baseline_retained_call_id, retained_command),
                 responses::ev_completed("baseline-retained-call-response"),
             ]),
             sse(vec![
@@ -2866,7 +2911,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
                 responses::ev_completed("baseline-retained-final-response"),
             ]),
             sse(vec![
-                responses::ev_shell_command_call(baseline_trailing_call_id, trailing_command),
+                responses::ev_exec_command_call(baseline_trailing_call_id, trailing_command),
                 responses::ev_completed("baseline-trailing-call-response"),
             ]),
             sse(vec![responses::ev_completed(
@@ -2954,7 +2999,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
         override_harness.server(),
         vec![
             sse(vec![
-                responses::ev_shell_command_call(override_retained_call_id, retained_command),
+                responses::ev_exec_command_call(override_retained_call_id, retained_command),
                 responses::ev_completed("override-retained-call-response"),
             ]),
             sse(vec![
@@ -2962,7 +3007,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
                 responses::ev_completed("override-retained-final-response"),
             ]),
             sse(vec![
-                responses::ev_shell_command_call(override_trailing_call_id, trailing_command),
+                responses::ev_exec_command_call(override_trailing_call_id, trailing_command),
                 responses::ev_completed("override-trailing-call-response"),
             ]),
             sse(vec![responses::ev_completed(
@@ -3298,9 +3343,14 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
 
     let server = wiremock::MockServer::start().await;
     let stale_developer_message = "STALE_DEVELOPER_INSTRUCTIONS_SHOULD_BE_REMOVED";
+    let managed_requirements = CloudConfigBundleFixture::loader_with_enterprise_requirement(
+        r#"additional_developer_instructions = "MANAGED_DEVELOPER_INSTRUCTIONS""#,
+    );
+    let managed_message = "<managed_developer_instructions>\nMANAGED_DEVELOPER_INSTRUCTIONS\n</managed_developer_instructions>";
 
-    let mut start_builder =
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let mut start_builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_cloud_config_bundle(managed_requirements.clone());
     let initial = start_builder.build(&server).await?;
     let home = initial.home.clone();
     let rollout_path = initial
@@ -3377,8 +3427,9 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     })
     .await;
 
-    let mut resume_builder =
-        test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let mut resume_builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_cloud_config_bundle(managed_requirements);
     let resumed = resume_builder.resume(&server, home, rollout_path).await?;
 
     resumed
@@ -3393,6 +3444,17 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
     assert_eq!(compact_mock.requests().len(), 1);
     let requests = responses_mock.requests();
     assert_eq!(requests.len(), 3, "expected three model requests");
+    for request in &requests {
+        assert_eq!(
+            request
+                .message_input_texts("developer")
+                .into_iter()
+                .filter(|message| message.contains("<managed_developer_instructions>"))
+                .collect::<Vec<_>>(),
+            vec![managed_message.to_string()],
+            "Each model request should contain exactly one managed developer-instructions block, including after compaction and resume."
+        );
+    }
 
     let after_compact_request = &requests[1];
     let after_resume_request = &requests[2];
@@ -4684,6 +4746,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_pre_build_hook(allow_echo_commands)
             .with_config(|config| {
                 config.model_auto_compact_token_limit = Some(200);
             }),
@@ -4702,7 +4765,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
     let second_turn_request_mock = responses::mount_sse_once(
         harness.server(),
         responses::sse(vec![
-            responses::ev_shell_command_call("call-remote-multi-summary", "echo multi-summary"),
+            responses::ev_exec_command_call("call-remote-multi-summary", "echo multi-summary"),
             responses::ev_completed_with_tokens("r1", /*total_tokens*/ 1_000),
         ]),
     )

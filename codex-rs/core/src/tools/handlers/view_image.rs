@@ -151,8 +151,7 @@ impl ViewImageHandler {
             ))
         })?;
         let model_visible_path = path_uri.inferred_native_path_string();
-        let sandbox = turn
-            .file_system_sandbox_context(/*additional_permissions*/ None, turn_environment);
+        let sandbox = turn_environment.sandbox_context(/*additional_permissions*/ None);
         let fs = turn_environment.environment.get_filesystem();
 
         let metadata = fs
@@ -223,7 +222,7 @@ pub struct ViewImageOutput {
 }
 
 impl ToolOutput for ViewImageOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         format!("<image data URL omitted: {} bytes>", self.image_url.len())
     }
 
@@ -323,7 +322,7 @@ mod tests {
             unified_image_budget: false,
         };
 
-        assert_eq!(output.log_preview(), "<image data URL omitted: 25 bytes>");
+        assert_eq!(output.log_output(), "<image data URL omitted: 25 bytes>");
     }
 
     #[test]

@@ -58,7 +58,7 @@ use crate::git_action_directives::parse_assistant_markdown;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::PermissionProfileSnapshot;
 use crate::mention_codec::LinkedMention;
-use crate::mention_codec::encode_history_mentions;
+use crate::mention_codec::encode_history_mentions_at_elements;
 use crate::model_catalog::ModelCatalog;
 use crate::multi_agents;
 use crate::multi_agents::AgentMetadata;
@@ -171,7 +171,6 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
-use ratatui::text::Text;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
@@ -389,6 +388,7 @@ mod model_popups;
 mod notifications;
 use self::notifications::Notification;
 mod permission_popups;
+mod permission_shortcuts;
 mod permissions_menu;
 pub(crate) use self::permissions_menu::auto_review_available;
 pub(crate) use self::permissions_menu::cyber_model_approval_reviewer;
@@ -666,12 +666,8 @@ pub(crate) struct ChatWidget {
     #[cfg(test)]
     pet_image_support_override: Option<crate::pets::PetImageSupport>,
     thread_id: Option<ThreadId>,
-    /// Nudge dismissals that should survive draft edits within the current thread scope.
-    ///
-    /// The nudge is only a discovery aid, so once a user dismisses it or enters Plan mode we keep it
-    /// hidden for that thread instead of resurfacing it on every matching draft.
-    dismissed_plan_mode_nudge_scopes: HashSet<PlanModeNudgeScope>,
     thread_name: Option<String>,
+    pending_automatic_thread_names: HashSet<String>,
     thread_rename_block_message: Option<String>,
     active_side_conversation: bool,
     blocks_direct_input: bool,
@@ -696,6 +692,7 @@ pub(crate) struct ChatWidget {
     safety_buffering_prompt: Option<UserMessage>,
     /// Main chat-surface bindings resolved from `tui.keymap.chat`.
     chat_keymap: ChatKeymap,
+    permission_shortcut_pending: bool,
     /// Keybinding to show for popping the most-recently queued message back
     /// into the composer. This may differ from the first configured binding
     /// when the default set includes a terminal-specific fallback.
@@ -837,29 +834,10 @@ enum SessionConfiguredDisplay {
     SideConversation,
 }
 
-/// Scope used to keep Plan-mode nudge dismissal local to one conversation context.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum PlanModeNudgeScope {
-    /// Drafts entered before the server has assigned a thread id.
-    NewThread,
-    /// Drafts associated with one configured thread.
-    Thread(ThreadId),
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum TurnAbortReason {
     Interrupted,
     BudgetLimited,
-}
-
-/// Returns whether `text` contains the standalone word `plan`.
-///
-/// This intentionally mirrors the App suggestion heuristic instead of trying to infer broader
-/// planning intent from substrings such as `planning`. Slash and shell drafts still match here so
-/// callers can keep lexical matching separate from presentation policy.
-fn contains_plan_keyword(text: &str) -> bool {
-    text.split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .any(|word| word.eq_ignore_ascii_case("plan"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -990,13 +968,6 @@ impl ChatWidget {
     fn restore_retry_status_header_if_present(&mut self) {
         if let Some(header) = self.status_state.take_retry_status_header() {
             self.set_status_header(header);
-        }
-    }
-
-    /// Record or update the raw markdown for the current agent turn.
-    fn record_agent_markdown(&mut self, message: &str) {
-        if !message.is_empty() {
-            self.transcript.record_agent_markdown(message.to_string());
         }
     }
 
@@ -1233,7 +1204,6 @@ impl ChatWidget {
         if let Some(pet) = self.ambient_pet.as_ref() {
             pet.schedule_next_frame();
         }
-        self.refresh_plan_mode_nudge();
         self.refresh_goal_status_indicator_for_time_tick();
         if self.terminal_title_shows_action_required() != self.last_terminal_title_requires_action {
             self.refresh_terminal_title();

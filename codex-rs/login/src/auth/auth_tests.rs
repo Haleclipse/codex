@@ -370,6 +370,7 @@ async fn stored_agent_identity_jwt_keeps_auth_json_unchanged() -> anyhow::Result
             agent_identity: Some(AgentIdentityStorage::Jwt(agent_identity.clone())),
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         },
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::Direct,
@@ -449,6 +450,7 @@ async fn login_with_access_token_writes_only_personal_access_token() {
             agent_identity: None,
             personal_access_token: Some("at-login-test".to_string()),
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         }
     );
     assert_eq!(auth.resolved_mode(), AuthMode::PersonalAccessToken);
@@ -1068,6 +1070,7 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
             agent_identity: None,
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         },
         auth_dot_json
     );
@@ -1116,6 +1119,7 @@ fn logout_removes_auth_file() -> Result<(), std::io::Error> {
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        bedrock_access_keys: None,
     };
     super::save_auth(
         dir.path(),
@@ -1274,6 +1278,44 @@ async fn external_bearer_only_auth_manager_returns_none_when_command_fails() {
     let manager = AuthManager::external_bearer_only(script.auth_config());
 
     assert_eq!(manager.auth().await, None);
+}
+
+#[tokio::test]
+async fn unauthorized_recovery_retries_provider_command_after_initial_failure() {
+    let script = ProviderAuthScript::new(&["provider-token"]).unwrap();
+    std::fs::write(script.tempdir.path().join("fail-once"), "").unwrap();
+    let manager = AuthManager::external_bearer_only(script.auth_config());
+    let mut recovery = manager.unauthorized_recovery();
+
+    assert_eq!(manager.auth().await, None);
+    assert_eq!(manager.auth_cached(), None);
+    assert!(recovery.has_next());
+    assert_eq!(recovery.unavailable_reason(), "ready");
+
+    let result = recovery
+        .next()
+        .await
+        .expect("external refresh should succeed");
+
+    assert_eq!(result.auth_state_changed(), Some(true));
+    assert_eq!(
+        manager.auth_cached(),
+        Some(CodexAuth::from_api_key("provider-token"))
+    );
+    assert!(!recovery.has_next());
+    assert_eq!(recovery.unavailable_reason(), "recovery_exhausted");
+    recovery.next().await.expect_err("recovery is bounded");
+}
+
+#[test]
+fn unauthorized_recovery_without_an_external_provider_still_requires_refreshable_auth() {
+    for auth in [None, Some(CodexAuth::from_api_key("static-token"))] {
+        let manager = AuthManager::from_optional_auth_for_testing(auth);
+        let recovery = manager.unauthorized_recovery();
+
+        assert!(!recovery.has_next());
+        assert_eq!(recovery.unavailable_reason(), "not_chatgpt_auth");
+    }
 }
 
 #[tokio::test]
@@ -1615,6 +1657,10 @@ impl ProviderAuthScript {
             std::fs::write(
                 &script_path,
                 r#"#!/bin/sh
+if [ -f fail-once ]; then
+    rm fail-once
+    exit 1
+fi
 first_line=$(sed -n '1p' tokens.txt)
 printf '%s\n' "$first_line"
 tail -n +2 tokens.txt > tokens.next
@@ -1637,6 +1683,10 @@ mv tokens.next tokens.txt
                 &script_path,
                 r#"@echo off
 setlocal EnableExtensions DisableDelayedExpansion
+if exist fail-once (
+    del fail-once
+    exit /b 1
+)
 set "first_line="
 <tokens.txt set /p "first_line="
 if not defined first_line exit /b 1
@@ -2331,6 +2381,7 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
                 agent_identity: Some(stored_agent_identity),
                 personal_access_token: None,
                 bedrock_api_key: None,
+                bedrock_access_keys: None,
             },
             AuthCredentialsStoreMode::File,
             AuthKeyringBackendKind::Direct,
@@ -2572,6 +2623,7 @@ async fn enforce_login_restrictions_logs_out_for_agent_identity_workspace_mismat
             agent_identity: Some(AgentIdentityStorage::Jwt(agent_identity)),
             personal_access_token: None,
             bedrock_api_key: None,
+            bedrock_access_keys: None,
         },
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),

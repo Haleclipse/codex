@@ -109,6 +109,17 @@ fn next_add_to_history_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEv
     }
 }
 
+fn next_copy_selection(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> (String, String) {
+    let selection = match rx.try_recv() {
+        Ok(AppEvent::CopySelection { text, label }) => (text.to_string(), label),
+        other => panic!("expected selected clipboard content, got {other:?}"),
+    };
+    assert_matches!(rx.try_recv(), Ok(AppEvent::SettingsSelectionClosed));
+    selection
+}
+
 #[tokio::test]
 async fn service_tier_commands_lowercase_catalog_names() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
@@ -1204,6 +1215,78 @@ async fn slash_rename_prefills_existing_thread_name() {
 }
 
 #[tokio::test]
+async fn slash_rename_requests_and_prefills_an_editable_title_suggestion() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.thread_name = Some("Current project title".to_string());
+
+    chat.dispatch_command(SlashCommand::Rename);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("slash_rename_suggestion_loading", popup);
+
+    let request_id = match rx.try_recv() {
+        Ok(AppEvent::SuggestThreadName {
+            thread_id: requested_thread_id,
+            request_id,
+        }) => {
+            assert_eq!(requested_thread_id, thread_id);
+            request_id
+        }
+        other => panic!("expected title suggestion request, got {other:?}"),
+    };
+
+    chat.apply_thread_name_suggestion(thread_id, request_id, Some("Fix login timeout"));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("slash_rename_suggestion_prefilled", popup);
+    assert_eq!(chat.thread_name.as_deref(), Some("Current project title"));
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::CodexOp(Op::SetThreadName { name })) if name == "Fix login timeout"
+    );
+}
+
+#[tokio::test]
+async fn slash_rename_preserves_manual_edits_when_suggestion_arrives() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+
+    chat.dispatch_command(SlashCommand::Rename);
+
+    let request_id = match rx.try_recv() {
+        Ok(AppEvent::SuggestThreadName {
+            thread_id: requested_thread_id,
+            request_id,
+        }) => {
+            assert_eq!(requested_thread_id, thread_id);
+            request_id
+        }
+        other => panic!("expected title suggestion request, got {other:?}"),
+    };
+
+    chat.handle_paste("My own title".to_string());
+    chat.apply_thread_name_suggestion(thread_id, request_id, Some("Generated title"));
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("My own title"));
+    assert!(!popup.contains("Generated title"));
+    assert!(!popup.contains("Generating a title suggestion"));
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::CodexOp(Op::SetThreadName { name })) if name == "My own title"
+    );
+}
+
+#[tokio::test]
 async fn slash_rename_without_existing_thread_name_starts_empty() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -1717,8 +1800,9 @@ async fn slash_copy_state_tracks_turn_complete_final_reply() {
 
 #[tokio::test]
 async fn slash_copy_state_tracks_plan_item_completion() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let plan_text = "## Plan\n\n1. Build it\n2. Test it".to_string();
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    complete_turn_with_message(&mut chat, "previous", Some("```rust\nstale();\n```"));
+    let plan_text = "## Plan\n\n1. Build it\n2. Test it\n\n```sh\r\njust test  \r\n```".to_string();
 
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -1738,6 +1822,334 @@ async fn slash_copy_state_tracks_plan_item_completion() {
     assert_matches!(
         chat.pending_notification,
         Some(Notification::AgentTurnComplete { ref response }) if response == &plan_text
+    );
+
+    let _ = drain_insert_history(&mut rx);
+    chat.dispatch_command(SlashCommand::Copy);
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("Whole response"), "picker: {popup}");
+    assert!(popup.contains("sh code"), "picker: {popup}");
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        (plan_text, "Whole response".to_string())
+    );
+    chat.dispatch_command(SlashCommand::Copy);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        ("just test  \r\n".to_string(), "sh code".to_string())
+    );
+    chat.transcript.plan_delta_buffer = "  ```sh\n  echo hi  \n  ```\n".to_string();
+    chat.on_plan_item_completed(String::new());
+    assert_eq!(
+        chat.last_agent_markdown_text(),
+        Some("```sh\n  echo hi  \n  ```")
+    );
+    let _ = drain_insert_history(&mut rx);
+    chat.dispatch_command(SlashCommand::Copy);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        ("echo hi  \n".to_string(), "sh code".to_string())
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_picker_preserves_completed_source_whitespace_and_hides_directives() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let source = concat!(
+        "Intro ::git-push{cwd=\"/repo\"}\r\n\r\n",
+        "```powershell\r\nWrite-Output value  \r\nWrite-Output done\t\r\n```\r\n\r\n",
+        "> Keep **formatting**  \r\n> > Nested quote\r\n> hidden ::git-stage{cwd=\"/repo\"}\r\n\r\n",
+        "> ::git-stage{cwd=\"/repo\"}\r\n"
+    );
+    complete_turn_with_message(&mut chat, "turn-1", Some(source));
+    while rx.try_recv().is_ok() {}
+
+    for (key, expected, label) in [
+        (
+            '1',
+            "Intro\n\n```powershell\nWrite-Output value\nWrite-Output done\n```\n\n> Keep **formatting**\n> > Nested quote\n> hidden\n\n>",
+            "Whole response",
+        ),
+        (
+            '2',
+            "Write-Output value  \r\nWrite-Output done\t\r\n",
+            "powershell code",
+        ),
+        (
+            '3',
+            "Keep **formatting**  \r\n> Nested quote\r\nhidden \r\n",
+            "Blockquote",
+        ),
+    ] {
+        chat.dispatch_command(SlashCommand::Copy);
+        assert_eq!(
+            render_bottom_popup(&chat, /*width*/ 100)
+                .matches("Blockquote")
+                .count(),
+            1
+        );
+        chat.handle_key_event(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        assert_eq!(
+            next_copy_selection(&mut rx),
+            (expected.to_string(), label.to_string())
+        );
+    }
+
+    chat.transcript.reset_copy_history();
+    assert_eq!(
+        (
+            chat.transcript.last_agent_markdown.as_deref(),
+            chat.transcript.last_agent_source.as_deref()
+        ),
+        (None, None)
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_picker_defers_queued_input_until_selection_or_cancellation_settles() {
+    for queued in ["/new", "/clear", "follow-up prompt"] {
+        for close_key in [KeyCode::Enter, KeyCode::Esc] {
+            let (mut chat, mut rx, mut op_rx) =
+                make_chatwidget_manual(/*model_override*/ None).await;
+            chat.thread_id = Some(ThreadId::new());
+            complete_turn_with_message(&mut chat, "previous", Some("Previous response"));
+            handle_turn_started(&mut chat, "active");
+            queue_composer_text_with_tab(&mut chat, queued);
+            chat.dispatch_command(SlashCommand::Copy);
+
+            complete_turn_with_message(&mut chat, "active", Some("New response"));
+            assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
+            assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Previous response"));
+            assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(
+                    event,
+                    AppEvent::NewSession { .. } | AppEvent::ClearUi { .. }
+                ));
+            }
+
+            chat.handle_key_event(KeyEvent::new(close_key, KeyModifiers::NONE));
+            if close_key == KeyCode::Enter {
+                assert_eq!(
+                    next_copy_selection(&mut rx),
+                    (
+                        "Previous response".to_string(),
+                        "Whole response".to_string()
+                    )
+                );
+            } else {
+                assert_matches!(rx.try_recv(), Ok(AppEvent::SettingsSelectionClosed));
+            }
+            assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
+            chat.set_queue_autosend_suppressed(/*suppressed*/ false);
+            chat.maybe_send_next_queued_input();
+            assert!(chat.input_queue.queued_user_messages.is_empty());
+            match queued {
+                "/new" => assert!(
+                    std::iter::from_fn(|| rx.try_recv().ok())
+                        .any(|event| matches!(event, AppEvent::NewSession { .. }))
+                ),
+                "/clear" => assert!(
+                    std::iter::from_fn(|| rx.try_recv().ok())
+                        .any(|event| matches!(event, AppEvent::ClearUi { .. }))
+                ),
+                _ => {
+                    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { items, .. } if items == vec![UserInput::Text { text: queued.to_string(), text_elements: Vec::new() }])
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn slash_copy_picker_previews_whole_response_code_blocks_and_blockquotes() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.transcript.last_agent_markdown = Some(
+        "Overview\n\n```python\nprint('first')\nprint('second')\n```\n\n> Important quote\n\n```sh\necho done\n```"
+            .to_string(),
+    );
+
+    chat.dispatch_command(SlashCommand::Copy);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    for expected in [
+        "1. Whole response",
+        "Overview",
+        "2. python code",
+        "print('first')",
+        "3. Blockquote",
+        "Important quote",
+        "4. sh code",
+        "echo done",
+    ] {
+        assert!(popup.contains(expected), "expected {expected:?} in {popup}");
+    }
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn slash_copy_picker_waits_for_submission_after_typing_or_autocomplete() {
+    for select_from_autocomplete in [false, true] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.transcript.last_agent_markdown = Some("Ready to copy".to_string());
+        chat.bottom_pane
+            .set_composer_text("/cop".to_string(), Vec::new(), Vec::new());
+
+        let key = if select_from_autocomplete {
+            KeyCode::Tab
+        } else {
+            KeyCode::Char('y')
+        };
+        chat.handle_key_event(KeyEvent::new(key, KeyModifiers::NONE));
+        if !select_from_autocomplete {
+            std::thread::sleep(crate::bottom_pane::ChatComposer::recommended_paste_flush_delay());
+            chat.handle_paste_burst_tick(FrameRequester::test_dummy());
+        }
+
+        assert_eq!(chat.bottom_pane.composer_text().trim(), "/copy");
+        assert!(
+            !render_bottom_popup(&chat, /*width*/ 80).contains("Whole response"),
+            "preparing /copy must not open the picker"
+        );
+        assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+
+        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let popup = render_bottom_popup(&chat, /*width*/ 80);
+        assert!(popup.contains("Whole response"), "picker: {popup}");
+        assert!(chat.bottom_pane.composer_text().is_empty());
+        assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+}
+
+#[tokio::test]
+async fn slash_copy_picker_waits_for_submission_after_paste() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.transcript.last_agent_markdown = Some("Ready to copy".to_string());
+
+    chat.handle_paste("/copy".to_string());
+
+    assert_eq!(chat.bottom_pane.composer_text(), "/copy");
+    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Whole response"));
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Whole response"));
+    assert!(chat.bottom_pane.composer_text().is_empty());
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn slash_copy_picker_numeric_shortcuts_copy_whole_response_and_exact_code() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let markdown = "Intro\n\n```rust\nfn main() {\n    run();\n}\n```";
+    chat.transcript.last_agent_markdown = Some(markdown.to_string());
+
+    chat.dispatch_command(SlashCommand::Copy);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        (markdown.to_string(), "Whole response".to_string())
+    );
+
+    chat.dispatch_command(SlashCommand::Copy);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        (
+            "fn main() {\n    run();\n}\n".to_string(),
+            "rust code".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_picker_preserves_nested_blockquote_markdown_and_code() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.transcript.last_agent_markdown =
+        Some("> **outer**\n> > _nested_\n> ```sh\n> nested()\n> ```\n".to_string());
+
+    chat.dispatch_command(SlashCommand::Copy);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        (
+            "**outer**\n> _nested_\n```sh\nnested()\n```\n".to_string(),
+            "Blockquote".to_string()
+        )
+    );
+
+    chat.dispatch_command(SlashCommand::Copy);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        ("nested()\n".to_string(), "sh code".to_string())
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_picker_supports_arrow_navigation_enter_and_scrolling() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.transcript.last_agent_markdown = Some(
+        (1..=11)
+            .map(|index| format!("```sh\nexample_{index}()\n```\n"))
+            .collect(),
+    );
+
+    chat.dispatch_command(SlashCommand::Copy);
+    for _ in 0..11 {
+        chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+    assert!(
+        render_bottom_popup(&chat, /*width*/ 80).contains("example_11()"),
+        "later rows must remain reachable through scrolling"
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        ("example_10()\n".to_string(), "sh code".to_string())
+    );
+}
+
+#[tokio::test]
+async fn slash_copy_picker_escape_dismisses_without_copying() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.transcript.last_agent_markdown = Some("Nothing copied".to_string());
+
+    chat.dispatch_command(SlashCommand::Copy);
+    assert!(!chat.bottom_pane.no_modal_or_popup_active());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(chat.bottom_pane.no_modal_or_popup_active());
+    assert_matches!(rx.try_recv(), Ok(AppEvent::SettingsSelectionClosed));
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn slash_copy_picker_remains_available_from_parent_owned_threads() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.transcript.last_agent_markdown = Some("Safe local copy".to_string());
+    chat.set_parent_owned_thread();
+    chat.bottom_pane
+        .set_composer_text("/cop".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Whole response"));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Whole response"));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+
+    assert_eq!(
+        next_copy_selection(&mut rx),
+        ("Safe local copy".to_string(), "Whole response".to_string())
+    );
+    assert!(
+        op_rx.try_recv().is_err(),
+        "copy must not submit an agent turn"
     );
 }
 
@@ -1996,6 +2408,22 @@ async fn slash_copy_stores_clipboard_lease_and_preserves_it_on_failure() {
         rendered.contains("Copy failed: blocked"),
         "expected failure message, got {rendered:?}"
     );
+
+    chat.copy_selection_with("print('ok')\n", "python code", |content| {
+        assert_eq!(content, "print('ok')\n");
+        Ok(Some(crate::clipboard_copy::ClipboardLease::test()))
+    });
+    assert!(chat.clipboard_lease.is_some());
+    let rendered = lines_to_single_string(&drain_insert_history(&mut rx)[0]);
+    assert!(rendered.contains("Copied python code to clipboard"));
+
+    chat.copy_selection_with("print('blocked')\n", "python code", |content| {
+        assert_eq!(content, "print('blocked')\n");
+        Err("blocked selection".to_string())
+    });
+    assert!(chat.clipboard_lease.is_some());
+    let rendered = lines_to_single_string(&drain_insert_history(&mut rx)[0]);
+    assert!(rendered.contains("Copy failed: blocked selection"));
 }
 
 #[tokio::test]

@@ -6,8 +6,10 @@
 
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
+use crate::app_event::ThreadTitleDestination;
 use crate::chatwidget::ThreadInputStateRestoreMode;
 use crate::session_resume::read_session_model;
+use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::WarningNotification;
@@ -780,9 +782,9 @@ impl App {
                 Ok(true)
             }
             AppCommand::SetThreadName { name } => {
-                app_server
-                    .thread_set_name(thread_id, name.to_string())
-                    .await?;
+                let name = name.to_string();
+                app_server.thread_set_name(thread_id, name.clone()).await?;
+                self.chat_widget.expect_manual_thread_name(thread_id, name);
                 Ok(true)
             }
             AppCommand::Review { target } => {
@@ -988,9 +990,32 @@ impl App {
             self.apply_thread_settings_to_cached_session(thread_id, &notification.thread_settings)
                 .await;
         }
-        let inferred_session = self
-            .infer_session_for_thread_notification(thread_id, &notification)
-            .await;
+        let inferred_session = if let ServerNotification::ThreadStarted(started) = &notification
+            && self.primary_session_configured.is_some()
+        {
+            self.upsert_agent_picker_thread(
+                thread_id,
+                started.thread.agent_nickname.clone(),
+                started.thread.agent_role.clone(),
+                /*is_closed*/ false,
+            );
+
+            // Lifecycle responses already contain authoritative session state. Their rollout may
+            // not exist until the first turn, so inferring it again can wait through reader retries.
+            let already_has_session = match self.thread_event_channels.get(&thread_id) {
+                Some(channel) => channel.store.lock().await.session.is_some(),
+                None => false,
+            };
+
+            if already_has_session {
+                None
+            } else {
+                self.infer_session_for_started_thread(thread_id, started)
+                    .await
+            }
+        } else {
+            None
+        };
         let is_turn_started = matches!(notification, ServerNotification::TurnStarted(_));
         let notification_status_change = SideParentStatusChange::for_notification(&notification);
         let (sender, store) = {
@@ -1104,14 +1129,11 @@ impl App {
         }
     }
 
-    pub(super) async fn infer_session_for_thread_notification(
-        &mut self,
+    async fn infer_session_for_started_thread(
+        &self,
         thread_id: ThreadId,
-        notification: &ServerNotification,
+        notification: &ThreadStartedNotification,
     ) -> Option<ThreadSessionState> {
-        let ServerNotification::ThreadStarted(notification) = notification else {
-            return None;
-        };
         let mut session = self.primary_session_configured.clone()?;
         session.thread_id = thread_id;
         session.thread_name = notification.thread.name.clone();
@@ -1128,12 +1150,6 @@ impl App {
         }
         session.message_history = None;
         session.rollout_path = rollout_path;
-        self.upsert_agent_picker_thread(
-            thread_id,
-            notification.thread.agent_nickname.clone(),
-            notification.thread.agent_role.clone(),
-            /*is_closed*/ false,
-        );
         Some(session)
     }
 
@@ -1433,6 +1449,16 @@ impl App {
     /// historical id now" and converted into closed picker entries instead of deleting them, so
     /// the stable traversal order remains intact for review and keyboard navigation.
     pub(super) async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        let frame_deadline = Instant::now() + tui::TARGET_FRAME_INTERVAL;
+        self.drain_active_thread_events_until(tui, frame_deadline)
+            .await
+    }
+
+    pub(super) async fn drain_active_thread_events_until(
+        &mut self,
+        tui: &mut tui::Tui,
+        frame_deadline: Instant,
+    ) -> Result<()> {
         let Some(mut rx) = self.active_thread_rx.take() else {
             return Ok(());
         };
@@ -1449,6 +1475,9 @@ impl App {
                     disconnected = true;
                     break;
                 }
+            }
+            if Instant::now() >= frame_deadline {
+                break;
             }
         }
 
@@ -1768,9 +1797,61 @@ impl App {
             // thread, so unrelated shutdowns cannot consume this marker.
             self.pending_shutdown_exit_thread_id = None;
         }
+        let automatic_title_user_message = if self.chat_widget.thread_name().is_none()
+            && let ThreadBufferedEvent::Notification(notification) = &event
+            && let ServerNotification::ItemCompleted(notification) = notification.as_ref()
+            && let ThreadItem::UserMessage { content, .. } = &notification.item
+        {
+            Some(
+                content
+                    .iter()
+                    .filter_map(|item| match item {
+                        codex_app_server_protocol::UserInput::Text { text, .. } => {
+                            Some(crate::ide_context::extract_prompt_request_with_offset(text).0)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        } else {
+            None
+        };
         let had_active_view = self.chat_widget.has_active_view();
         self.handle_thread_event_now_recovering_file_changes(event)
             .await;
+        if let Some(user_message) = automatic_title_user_message {
+            let expected_title = user_message
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(super::thread_title::THREAD_TITLE_MAX_CHARS)
+                .collect::<String>();
+
+            if !expected_title.is_empty()
+                && let Some(thread_id) = self.active_thread_id
+            {
+                match app_server
+                    .thread_set_name(thread_id, expected_title.clone())
+                    .await
+                {
+                    Ok(()) => {
+                        self.chat_widget
+                            .expect_automatic_thread_name(expected_title.clone());
+                        self.generate_thread_title(
+                            app_server,
+                            thread_id,
+                            ThreadTitleDestination::Automatic { expected_title },
+                            super::thread_title::thread_title_prompt(&user_message),
+                        );
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "failed to set provisional thread title");
+                    }
+                }
+            }
+        }
         if !had_active_view
             && self.chat_widget.has_active_view()
             && self.startup_protected_input_boundary

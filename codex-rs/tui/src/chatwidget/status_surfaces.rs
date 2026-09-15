@@ -14,6 +14,7 @@ use crate::status::format_estimated_usd_micros;
 use crate::status::format_tokens_compact;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::ConfigLayerSource;
+use codex_config::os_host_name;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::PermissionProfile;
@@ -695,6 +696,7 @@ impl ChatWidget {
                 ))
             }
             StatusLineItem::ProjectRoot => self.status_line_project_root_name(),
+            StatusLineItem::Hostname => os_host_name(),
             StatusLineItem::GitBranch => self.status_line_branch.clone(),
             StatusLineItem::PullRequestNumber => self
                 .status_line_git_summary
@@ -771,13 +773,23 @@ impl ChatWidget {
                 .and_then(|usage| usage.estimated_usage_usd_micros)
                 .and_then(format_estimated_usd_micros),
             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
-            StatusLineItem::FastMode => Some(
-                if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
-                    "Fast on".to_string()
-                } else {
-                    "Fast off".to_string()
-                },
-            ),
+            StatusLineItem::FastMode => self
+                .model_catalog
+                .try_list_models()
+                .ok()
+                .and_then(|models| {
+                    models
+                        .into_iter()
+                        .find(|preset| preset.model == self.current_model())
+                })
+                .is_none_or(|preset| preset.supports_fast_mode())
+                .then(|| {
+                    if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
+                        "Fast on".to_string()
+                    } else {
+                        "Fast off".to_string()
+                    }
+                }),
             StatusLineItem::RawOutput => self.raw_output_mode().then(|| "raw output".to_string()),
             StatusLineItem::ThreadTitle => self.thread_name.as_ref().map_or_else(
                 || self.thread_id.map(|id| id.to_string()),
@@ -813,6 +825,7 @@ impl ChatWidget {
             StatusSurfacePreviewItem::Status => return Some(self.run_state_status_text()),
             StatusSurfacePreviewItem::TaskProgress => return self.terminal_title_task_progress(),
             StatusSurfacePreviewItem::CurrentDir => StatusLineItem::CurrentDir,
+            StatusSurfacePreviewItem::Hostname => StatusLineItem::Hostname,
             StatusSurfacePreviewItem::ThreadTitle => StatusLineItem::ThreadTitle,
             StatusSurfacePreviewItem::GitBranch => StatusLineItem::GitBranch,
             StatusSurfacePreviewItem::PullRequestNumber => StatusLineItem::PullRequestNumber,

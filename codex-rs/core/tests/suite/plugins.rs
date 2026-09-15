@@ -388,7 +388,7 @@ async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
     let command = shlex::try_join(["/bin/sh", script_path.to_string_lossy().as_ref()])?;
     let call_id = "remote-plugin-command";
     let arguments = serde_json::to_string(&serde_json::json!({
-        "command": command,
+        "cmd": command,
         "login": false,
     }))?;
     mount_sse_sequence(
@@ -396,7 +396,7 @@ async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_function_call(call_id, "shell_command", &arguments),
+                ev_function_call(call_id, "exec_command", &arguments),
                 ev_completed("resp-1"),
             ]),
             sse(vec![
@@ -685,11 +685,13 @@ async fn legacy_plugin_skill_prompt_remains_complete() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() -> Result<()> {
+async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths_and_codex_env_overlay()
+-> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let search_call_id = "search-agent-echo";
     let tool_call_id = "call-agent-echo";
+    let overlay_call_id = "call-agent-overlay-env";
     let mock = mount_sse_sequence(
         &server,
         vec![
@@ -710,8 +712,18 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
             ]),
             sse(vec![
                 ev_response_created("resp-3"),
-                ev_assistant_message("msg-1", "done"),
+                ev_function_call_with_namespace(
+                    overlay_call_id,
+                    "mcp__agent",
+                    "echo",
+                    r#"{"message":"ping","env_var":"INSTA_WORKSPACE_ROOT"}"#,
+                ),
                 ev_completed("resp-3"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-4"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-4"),
             ]),
         ],
     )
@@ -744,6 +756,11 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
         plugin_root.join("mcp.json"),
         serde_json::to_vec_pretty(&mcp_config)?,
     )?;
+    std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+    std::fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"acme.tools","mcpServers":{"agent":{"command":"ignored","env_vars":["INSTA_WORKSPACE_ROOT"]}}}"#,
+    )?;
     let mut builder = test_codex().with_home(Arc::clone(&codex_home));
     let test_codex = builder.build_with_remote_and_local_env(&server).await?;
     wait_for_mcp_server(&test_codex.codex, "agent").await?;
@@ -770,6 +787,10 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
         matches!(event, EventMsg::McpToolCallEnd(_))
     })
     .await;
+    let overlay_end = wait_for_event(&test_codex.codex, |event| {
+        matches!(event, EventMsg::McpToolCallEnd(_))
+    })
+    .await;
     wait_for_event(&test_codex.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
@@ -787,10 +808,30 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
             .and_then(serde_json::Value::as_str),
         Some(expected_env.as_str())
     );
+    let EventMsg::McpToolCallEnd(overlay_end) = overlay_end else {
+        unreachable!("wait_for_event matched an MCP tool end")
+    };
+    let overlay_result = overlay_end
+        .result
+        .as_ref()
+        .expect("Agent Plugin overlay MCP tool result");
+    assert_eq!(
+        overlay_result
+            .structured_content
+            .as_ref()
+            .and_then(|content| content.get("env"))
+            .and_then(serde_json::Value::as_str),
+        Some(std::env::var("INSTA_WORKSPACE_ROOT")?.as_str())
+    );
     let requests = mock.requests();
     let search_output = requests[1].tool_search_output(search_call_id);
     assert!(namespace_child_tool(&search_output, "mcp__agent", "echo").is_some());
     assert!(requests[2].function_call_output(tool_call_id).is_object());
+    assert!(
+        requests[3]
+            .function_call_output(overlay_call_id)
+            .is_object()
+    );
     Ok(())
 }
 
@@ -1450,7 +1491,7 @@ async fn implicit_plugin_skill_invocation_tracks_remote_plugin_id(
         }
     };
     let command_args = serde_json::json!({
-        "command": command,
+        "cmd": command,
         "login": false,
     })
     .to_string();
@@ -1459,7 +1500,7 @@ async fn implicit_plugin_skill_invocation_tracks_remote_plugin_id(
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_function_call("call-1", "shell_command", &command_args),
+                ev_function_call("call-1", "exec_command", &command_args),
                 ev_completed("resp-1"),
             ]),
             sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),

@@ -8,6 +8,7 @@ use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
+use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
@@ -32,6 +33,8 @@ use crate::request_processors::FsRequestProcessor;
 use crate::request_processors::GitRequestProcessor;
 use crate::request_processors::InitializeRequestProcessor;
 use crate::request_processors::MarketplaceRequestProcessor;
+use crate::request_processors::McpEventStreamReady;
+use crate::request_processors::McpEventStreams;
 use crate::request_processors::McpRequestProcessor;
 use crate::request_processors::PluginRequestProcessor;
 use crate::request_processors::ProcessExecRequestProcessor;
@@ -163,6 +166,7 @@ pub(crate) struct MessageProcessor {
 #[derive(Debug)]
 pub(crate) struct ConnectionSessionState {
     pub(crate) rpc_gate: Arc<ConnectionRpcGate>,
+    pub(crate) mcp_event_streams: McpEventStreams,
     initialized: OnceLock<InitializedConnectionSessionState>,
 }
 
@@ -186,6 +190,7 @@ impl ConnectionSessionState {
     pub(crate) fn new() -> Self {
         Self {
             rpc_gate: Arc::new(ConnectionRpcGate::new()),
+            mcp_event_streams: McpEventStreams::default(),
             initialized: OnceLock::new(),
         }
     }
@@ -447,6 +452,7 @@ impl MessageProcessor {
         let mcp_processor = McpRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
+            thread_state_manager.clone(),
             outgoing.clone(),
             config_manager.clone(),
         );
@@ -784,6 +790,8 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         session_state: &ConnectionSessionState,
     ) {
+        session_state.rpc_gate.close().await;
+        session_state.mcp_event_streams.clear().await;
         if timeout(
             CONNECTION_RPC_DRAIN_TIMEOUT,
             session_state.rpc_gate.shutdown(),
@@ -821,7 +829,6 @@ impl MessageProcessor {
 
     /// Handle an error object received from the peer.
     pub(crate) async fn process_error(&self, err: JSONRPCError) {
-        tracing::error!("<- error: {:?}", err);
         self.outgoing.notify_client_error(err.id, err.error).await;
     }
 
@@ -893,10 +900,16 @@ impl MessageProcessor {
             &codex_request,
         );
 
+        let event_stream_ready = match &codex_request {
+            ClientRequest::McpServerEventStreamStart { params, .. } => Some(
+                session
+                    .mcp_event_streams
+                    .start(connection_id, params.clone(), self.mcp_processor.clone())
+                    .await?,
+            ),
+            _ => None,
+        };
         let serialization_scope = codex_request.serialization_scope();
-        let app_server_client_name = session.app_server_client_name().map(str::to_string);
-        let client_version = session.client_version().map(str::to_string);
-        let client_mcp_extensions = session.client_mcp_extensions();
         let error_request_id = connection_request_id.clone();
         let rpc_gate = Arc::clone(&session.rpc_gate);
         let processor = Arc::clone(self);
@@ -910,9 +923,8 @@ impl MessageProcessor {
                         connection_request_id,
                         codex_request,
                         request_context,
-                        app_server_client_name,
-                        client_version,
-                        client_mcp_extensions,
+                        session,
+                        event_stream_ready,
                     )
                     .await;
                 if let Err(error) = result {
@@ -940,16 +952,17 @@ impl MessageProcessor {
         connection_request_id: ConnectionRequestId,
         codex_request: ClientRequest,
         request_context: RequestContext,
-        app_server_client_name: Option<String>,
-        client_version: Option<String>,
-        client_mcp_extensions: ClientMcpExtensions,
+        session: Arc<ConnectionSessionState>,
+        event_stream_ready: Option<McpEventStreamReady>,
     ) -> Result<(), JSONRPCErrorError> {
         let connection_id = connection_request_id.connection_id;
+        let app_server_client_name = session.app_server_client_name().map(str::to_string);
+        let client_version = session.client_version().map(str::to_string);
+        let client_mcp_extensions = session.client_mcp_extensions();
         let request_id = ConnectionRequestId {
             connection_id,
             request_id: codex_request.id().clone(),
         };
-
         let result: Result<Option<ClientResponsePayload>, JSONRPCErrorError> = match codex_request {
             ClientRequest::Initialize { .. } => {
                 panic!("Initialize should be handled before initialized request dispatch");
@@ -1113,9 +1126,15 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::ThreadUnsubscribe { params, .. } => {
-                self.thread_processor
+                let thread_id = params.thread_id.clone();
+                let response = self
+                    .thread_processor
                     .thread_unsubscribe(&request_id, params)
-                    .await
+                    .await?;
+                if let Ok(thread_id) = ThreadId::from_string(&thread_id) {
+                    session.mcp_event_streams.stop_thread(thread_id).await;
+                }
+                Ok(response)
             }
             ClientRequest::ThreadResume { params, .. } => {
                 self.thread_processor
@@ -1429,7 +1448,9 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::ThreadInjectItems { params, .. } => {
-                self.turn_processor.thread_inject_items(params).await
+                self.turn_processor
+                    .thread_inject_items(&request_id, params)
+                    .await
             }
             ClientRequest::TurnSteer { params, .. } => {
                 self.turn_processor.turn_steer(&request_id, params).await
@@ -1464,6 +1485,9 @@ impl MessageProcessor {
                     .thread_realtime_stop(&request_id, params)
                     .await
             }
+            ClientRequest::ThreadTimelineList { params, .. } => {
+                self.thread_processor.thread_timeline_list(params).await
+            }
             ClientRequest::ThreadRealtimeListVoices { params: _, .. } => {
                 self.turn_processor.thread_realtime_list_voices().await
             }
@@ -1486,6 +1510,27 @@ impl MessageProcessor {
                     .mcp_resource_read(&request_id, params)
                     .await
             }
+            ClientRequest::McpServerEventStreamStart { params, .. } => {
+                let ready = event_stream_ready.ok_or_else(|| {
+                    internal_error("MCP event subscription was not reserved before startup")
+                })?;
+                session
+                    .mcp_event_streams
+                    .wait_for_activation(&params.subscription_id, ready)
+                    .await?;
+                Ok(Some(
+                    codex_app_server_protocol::McpServerEventStreamStartResponse {}.into(),
+                ))
+            }
+            ClientRequest::McpServerEventStreamStop { params, .. } => {
+                session
+                    .mcp_event_streams
+                    .stop(&params.subscription_id)
+                    .await;
+                Ok(Some(
+                    codex_app_server_protocol::McpServerEventStreamStopResponse {}.into(),
+                ))
+            }
             ClientRequest::McpServerToolCall { params, .. } => {
                 self.mcp_processor
                     .mcp_server_tool_call(&request_id, params)
@@ -1501,9 +1546,12 @@ impl MessageProcessor {
                     .login_account(request_id.clone(), params)
                     .await
             }
-            ClientRequest::BedrockDiscover { .. } | ClientRequest::BedrockSetup { .. } => Err(
-                crate::error_code::method_not_found("Amazon Bedrock setup is not implemented"),
-            ),
+            ClientRequest::BedrockDiscover { params, .. } => {
+                self.account_processor.bedrock_discover(params).await
+            }
+            ClientRequest::BedrockSetup { params, .. } => {
+                self.account_processor.bedrock_setup(params).await
+            }
             ClientRequest::LogoutAccount { .. } => {
                 self.account_processor
                     .logout_account(request_id.clone())

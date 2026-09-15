@@ -228,7 +228,7 @@ async fn responses_websocket_omits_routing_hint_for_provider_with_own_credential
 
     let mut provider = websocket_provider(&server);
     provider.name = ModelProviderInfo::create_openai_provider(/*base_url*/ None).name;
-    provider.experimental_bearer_token = Some("provider-specific-token".to_string());
+    provider.experimental_bearer_token = Some("provider-specific-token".into());
     let harness = websocket_harness_with_provider_options_and_auth(
         provider,
         /*runtime_metrics_enabled*/ false,
@@ -2514,6 +2514,7 @@ async fn websocket_harness_with_provider_options_and_auth(
         SessionSource::Exec,
         "test_originator".to_string(),
         config.model_verbosity,
+        config.features.enabled(Feature::ContentItemKinds),
         /*enable_request_compression*/ false,
         runtime_metrics_enabled,
         /*beta_features_header*/ None,

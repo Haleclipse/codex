@@ -142,7 +142,10 @@ async fn tool_start_receives_conversation_history() -> Result<()> {
     let second_history = &histories[1].items;
     assert!(second_history.iter().any(|item| matches!(
         item,
-        ResponseItem::FunctionCallOutput { call_id, .. } if call_id == first_call_id
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            ..
+        } if call_id == first_call_id
     )));
     assert!(second_history.iter().any(|item| matches!(
         item,
@@ -250,9 +253,9 @@ async fn tool_start_is_not_called_when_pre_tool_hook_prevents_execution() -> Res
             }),
         ),
         (
-            "shell_command",
+            "exec_command",
             "^Bash$",
-            json!({ "command": "echo original" }),
+            json!({ "cmd": "echo original" }),
             json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",

@@ -6,6 +6,9 @@
 //! Higher-level aggregation and resource/tool APIs live in
 //! [`crate::connection_manager`].
 
+#[path = "rmcp_client/status.rs"]
+mod status;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -23,6 +26,7 @@ use crate::codex_apps::normalize_codex_apps_callable_namespace;
 use crate::codex_apps::normalize_codex_apps_tool_title;
 use crate::codex_apps::prepare_openai_file_params_for_model;
 use crate::elicitation::ElicitationRequestManager;
+use crate::executor_environment_http_client::ExecutorEnvironmentHttpClient;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::openai_docs_source_attribution::maybe_with_openai_docs_source_attribution;
@@ -59,6 +63,7 @@ use codex_rmcp_client::LocalStdioServerLauncher;
 use codex_rmcp_client::McpProtocolMode;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::StdioServerLauncher;
+use codex_rmcp_client::StreamableHttpBearerToken;
 use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::ToolWithConnectorId;
 use codex_rmcp_client::is_authentication_required_error;
@@ -148,6 +153,7 @@ pub(crate) type ManagedClientFuture =
 #[derive(Default)]
 struct CodexAppsStartupReconnectState {
     current_client: Option<ManagedClient>,
+    last_error: Option<StartupOutcomeError>,
     reconnect_in_flight: bool,
     consecutive_failures: u32,
     retry_not_before: Option<TokioInstant>,
@@ -228,11 +234,13 @@ impl CodexAppsStartupReconnect {
                 match result {
                     Ok(client) => {
                         state.current_client = Some(client);
+                        state.last_error = None;
                         state.consecutive_failures = 0;
                         state.retry_not_before = None;
                         true
                     }
                     Err(error) => {
+                        state.last_error = Some(error.clone());
                         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
                         let retry_after = codex_apps_reconnect_backoff(state.consecutive_failures);
                         state.retry_not_before = Some(TokioInstant::now() + retry_after);
@@ -589,9 +597,9 @@ impl StartupOutcomeError {
         match self {
             Self::Cancelled => false,
             Self::Failed {
+                error,
                 is_authentication_required,
-                ..
-            } => *is_authentication_required,
+            } => *is_authentication_required || error.contains("Auth required"),
         }
     }
 }
@@ -1137,11 +1145,39 @@ async fn make_rmcp_client(
                 .http_client_for_server(server.config(), resolved_environment.as_ref())
                 .map_err(|error| StartupOutcomeError::from(anyhow!(error)))?;
             let http_client = maybe_with_openai_docs_source_attribution(&url, http_client);
-            let resolved_bearer_token =
-                match resolve_bearer_token(server_name, bearer_token_env_var.as_deref()) {
-                    Ok(token) => token,
-                    Err(error) => return Err(error.into()),
+            let executor_resolves_bearer_token = if !is_local_environment
+                && bearer_token_env_var.is_some()
+            {
+                let Some(environment) = resolved_environment.as_ref() else {
+                    return Err(StartupOutcomeError::from(anyhow!(
+                        "non-local HTTP MCP server `{server_name}` did not resolve an execution environment"
+                    )));
                 };
+                environment
+                    .info()
+                    .await
+                    .map_err(|error| StartupOutcomeError::from(anyhow!(error)))?
+                    .capabilities
+                    .http_header_env_vars
+            } else {
+                false
+            };
+            let (http_client, resolved_bearer_token) = if executor_resolves_bearer_token
+                && let Some(env_var) = bearer_token_env_var.as_ref()
+            {
+                (
+                    Arc::new(ExecutorEnvironmentHttpClient {
+                        bearer_token_env_var: env_var.clone(),
+                        http_client,
+                    }) as Arc<dyn codex_exec_server::HttpClient>,
+                    Some(StreamableHttpBearerToken::ProvidedByHttpClient),
+                )
+            } else {
+                let token = resolve_bearer_token(server_name, bearer_token_env_var.as_deref())
+                    .map_err(StartupOutcomeError::from)?
+                    .map(StreamableHttpBearerToken::Resolved);
+                (http_client, token)
+            };
             let redirect_mode = if server.is_agent_plugin() {
                 StreamableHttpRedirectMode::AgentPluginV1
             } else {

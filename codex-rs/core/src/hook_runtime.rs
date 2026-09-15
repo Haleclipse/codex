@@ -5,6 +5,8 @@ use std::time::Duration;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::HookRunFact;
 use codex_analytics::build_track_events_context;
+use codex_core_plugins::executor_plugin_hook_sources;
+use codex_hooks::InterruptRequest;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
 use codex_hooks::PermissionRequestRequest;
@@ -38,6 +40,7 @@ use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookStartedEvent;
+use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::WarningEvent;
@@ -52,9 +55,11 @@ use crate::context::HookAdditionalContext;
 use crate::event_mapping::parse_turn_item;
 use crate::session::TurnInput;
 use crate::session::session::Session;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::sandboxing::PermissionRequestPayload;
+use crate::turn_metadata::McpTurnMetadataContext;
 
 pub(crate) struct HookRuntimeOutcome {
     pub should_stop: bool,
@@ -305,10 +310,11 @@ pub(crate) async fn run_post_tool_use_hooks(
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn run_turn_stop_hooks(
     sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
+    step_context: &Arc<StepContext>,
     stop_hook_active: bool,
     last_assistant_message: Option<String>,
 ) -> StopOutcome {
+    let turn_context = &step_context.turn;
     // Resolve the stop hook kind from the session source before building the
     // request. Root turns run Stop; thread-spawned child turns run SubagentStop.
     let (target, transcript_path) = match &turn_context.session_source {
@@ -351,8 +357,24 @@ pub(crate) async fn run_turn_stop_hooks(
         // Internal/synthetic subagents do not expose user-configured lifecycle
         // hooks, so there is no Stop or SubagentStop request to dispatch.
         SessionSource::SubAgent(_) => return StopOutcome::default(),
+        SessionSource::Internal(InternalSessionSource::MemoryConsolidation) => (
+            StopHookTarget::MemoryConsolidation,
+            sess.hook_transcript_path().await,
+        ),
         _ => (StopHookTarget::Stop, sess.hook_transcript_path().await),
     };
+    let request_metadata = turn_context
+        .turn_metadata_state
+        .current_meta_value_for_mcp_request(McpTurnMetadataContext {
+            model: step_context.model_info.slug.as_str(),
+            reasoning_effort: step_context.reasoning_effort.clone(),
+        })
+        .map(|turn_metadata| {
+            serde_json::Map::from_iter([(
+                crate::X_CODEX_TURN_METADATA_HEADER.to_string(),
+                turn_metadata,
+            )])
+        });
     let request = codex_hooks::StopRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -361,11 +383,17 @@ pub(crate) async fn run_turn_stop_hooks(
         transcript_path,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
+        request_metadata,
         stop_hook_active,
         last_assistant_message,
         target,
     };
-    let hooks = sess.hooks();
+    let executor_hook_sources = step_context
+        .executor_capability_discovery
+        .as_deref()
+        .map(executor_plugin_hook_sources)
+        .unwrap_or_default();
+    let hooks = sess.hooks().with_executor_hooks(executor_hook_sources);
     emit_hook_started_events(sess, turn_context, hooks.preview_stop(&request)).await;
 
     let mut outcome = hooks.run_stop(request).await;
@@ -403,6 +431,35 @@ pub(crate) async fn run_session_end_hooks(sess: &Arc<Session>) {
 
     let outcome = hooks.run_session_end(request).await;
     emit_hook_completed_events(sess, &turn_context, outcome.hook_events).await;
+}
+
+pub(crate) async fn run_turn_interrupt_hooks(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) {
+    if matches!(&turn_context.session_source, SessionSource::SubAgent(_)) {
+        return;
+    }
+
+    let hooks = sess.hooks();
+    let preview_runs = hooks.preview_interrupt();
+    if preview_runs.is_empty() {
+        return;
+    }
+
+    let request = InterruptRequest {
+        session_id: sess.session_id().into(),
+        turn_id: turn_context.sub_id.clone(),
+        #[allow(deprecated)]
+        cwd: turn_context.cwd.clone(),
+        transcript_path: sess.hook_transcript_path().await,
+        model: turn_context.model_info.slug.clone(),
+        permission_mode: hook_permission_mode(turn_context),
+    };
+    if let Err(err) = sess.flush_rollout().await {
+        tracing::warn!("failed to flush transcript before Interrupt hook: {err}");
+    }
+    emit_hook_started_events(sess, turn_context, preview_runs).await;
+
+    let outcome = hooks.run_interrupt(request).await;
+    emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
 }
 
 pub(crate) async fn run_pre_compact_hooks(
@@ -819,6 +876,7 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
         HookEventName::SubagentStart => "SubagentStart",
         HookEventName::SubagentStop => "SubagentStop",
         HookEventName::Stop => "Stop",
+        HookEventName::Interrupt => "Interrupt",
     };
     let hook_source = match run.source {
         HookSource::System => "system",
