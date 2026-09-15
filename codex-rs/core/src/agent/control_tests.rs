@@ -1249,6 +1249,7 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
                     }
                     .into(),
                 ]),
+                mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
@@ -1378,6 +1379,10 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                     content: vec![
                         ContentItem::InputText {
                             text: "Developer context before.\nParent developer instructions.\nDeveloper context after."
+                                .to_string(),
+                        },
+                        ContentItem::InputText {
+                            text: "<multi_agent_mode>Proactive multi-agent delegation is active.</multi_agent_mode>"
                                 .to_string(),
                         },
                         ContentItem::InputText {
@@ -1650,6 +1655,10 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
                         .to_string(),
                 },
                 ContentItem::InputText {
+                    text: "<multi_agent_mode>Proactive multi-agent delegation is active.</multi_agent_mode>"
+                        .to_string(),
+                },
+                ContentItem::InputText {
                     text: "Preserved compacted developer context.".to_string(),
                 },
             ],
@@ -1665,6 +1674,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
                 replacement_history: Some(
                     replacement_history.into_iter().map(Into::into).collect(),
                 ),
+                mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
@@ -1739,6 +1749,13 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     assert!(
         !history_contains_text(history.raw_items(), "Parent root guidance."),
         "forked child history should strip stale parent hints from compacted replacement history"
+    );
+    assert!(
+        !history_contains_text(
+            history.raw_items(),
+            "Proactive multi-agent delegation is active."
+        ),
+        "forked child history should strip stale policy fragments from compound compacted messages"
     );
     assert!(
         !history_contains_text(history.raw_items(), "Parent developer instructions."),
@@ -1839,6 +1856,7 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
                 replacement_history: Some(
                     replacement_history.into_iter().map(Into::into).collect(),
                 ),
+                mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
@@ -1968,6 +1986,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
             RolloutItem::Compacted(CompactedItem {
                 message: "legacy compacted summary".to_string(),
                 replacement_history: None,
+                mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,

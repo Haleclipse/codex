@@ -1,10 +1,12 @@
 use super::*;
+use crate::PluginGitMode;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
 use pretty_assertions::assert_eq;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -36,7 +38,6 @@ last_revision = "abc123"
             source: "https://github.com/example/good.git".to_string(),
             ref_name: Some("main".to_string()),
             sparse_paths: vec!["plugins".to_string()],
-            last_revision: Some("abc123".to_string()),
         })
     );
 }
@@ -85,6 +86,138 @@ source = {good_url:?}
                 .expect("installed marketplace root")
         ]
     );
+    assert_eq!(
+        std::fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE)).unwrap(),
+        config
+    );
+}
+
+#[test]
+fn automatic_marketplace_git_ignores_inherited_repository_configuration() {
+    const CHILD_HOME: &str = "CODEX_MARKETPLACE_GIT_ISOLATION_CHILD_HOME";
+    const CHILD_SOURCE: &str = "CODEX_MARKETPLACE_GIT_ISOLATION_CHILD_SOURCE";
+
+    if let Some(codex_home) = std::env::var_os(CHILD_HOME) {
+        let codex_home = PathBuf::from(codex_home);
+        let source = std::env::var(CHILD_SOURCE).expect("read configured marketplace source");
+        let config =
+            format!("[marketplaces.trusted]\nsource_type = \"git\"\nsource = {source:?}\n");
+        std::fs::write(codex_home.join(CONFIG_TOML_FILE), &config).expect("write config");
+        let stack = config_layer_stack(&codex_home, &config);
+        let outcome = upgrade_configured_git_marketplaces_with_mode(
+            &codex_home,
+            &stack,
+            /*marketplace_name*/ None,
+            PluginGitMode::Automatic,
+        );
+        assert_eq!(
+            outcome,
+            ConfiguredMarketplaceUpgradeOutcome {
+                selected_marketplaces: vec!["trusted".to_string()],
+                upgraded_roots: vec![
+                    AbsolutePathBuf::try_from(
+                        marketplace_install_root(&codex_home).join("trusted")
+                    )
+                    .expect("installed marketplace root"),
+                ],
+                errors: Vec::new(),
+            }
+        );
+        for (url, mode) in [
+            ("global:marketplace", PluginGitMode::Automatic),
+            ("manual:marketplace", PluginGitMode::Manual),
+        ] {
+            let materialized = crate::loader::materialize_marketplace_plugin_source_with_mode(
+                &codex_home,
+                &crate::marketplace::MarketplacePluginSource::Git {
+                    url: url.to_string(),
+                    path: None,
+                    ref_name: matches!(mode, PluginGitMode::Manual)
+                        .then(|| "manual-filter".to_string()),
+                    sha: None,
+                },
+                mode,
+            )
+            .expect("materialize automatic or manually installed Git plugin");
+            if matches!(mode, PluginGitMode::Manual) {
+                assert!(
+                    std::fs::read_to_string(materialized.path.as_path().join("manual.txt"))
+                        .expect("read manually filtered checkout")
+                        .starts_with("git version ")
+                );
+            }
+        }
+        return;
+    }
+
+    let root = TempDir::new().expect("create temporary directory");
+    let project = root.path().join("project");
+    let codex_home = project.join("codex-home");
+    let remote = root.path().join("remote");
+    std::fs::create_dir_all(&codex_home).expect("create Codex home");
+    std::fs::create_dir_all(&remote).expect("create remote marketplace");
+    init_marketplace_repo(&remote, "trusted");
+    run_git(&remote, &["switch", "--create", "manual-filter"]);
+    std::fs::write(
+        remote.join(".gitattributes"),
+        "manual.txt filter=codex-required\n",
+    )
+    .expect("write required manual checkout filter");
+    std::fs::write(remote.join("manual.txt"), "manual checkout")
+        .expect("write manual checkout fixture");
+    run_git(&remote, &["add", "."]);
+    run_git(
+        &remote,
+        &["commit", "-m", "add required manual checkout filter"],
+    );
+    run_git(&remote, &["switch", "-"]);
+    run_git(&project, &["init", "--quiet"]);
+
+    let source = url::Url::from_directory_path(&remote)
+        .expect("remote marketplace URL")
+        .to_string();
+    let untrusted = url::Url::from_directory_path(root.path().join("missing"))
+        .expect("malicious replacement URL")
+        .to_string();
+    let rewrite_key = format!("url.{untrusted}.insteadOf");
+    run_git(&project, &["config", &rewrite_key, &source]);
+    std::fs::write(
+        root.path().join("global.conf"),
+        "[url \"../remote\"]\n\tinsteadOf = global:marketplace\n[protocol \"file\"]\n\tallow = always\n",
+    )
+    .expect("write global Git configuration");
+    std::fs::write(
+        root.path().join("system.conf"),
+        "[protocol \"file\"]\n\tallow = never\n",
+    )
+    .expect("write system Git configuration");
+    let output = Command::new(std::env::current_exe().expect("locate test binary"))
+        .args([
+            "--exact",
+            "marketplace_upgrade::tests::automatic_marketplace_git_ignores_inherited_repository_configuration",
+            "--nocapture",
+        ])
+        .current_dir(&project)
+        .env(CHILD_HOME, &codex_home)
+        .env(CHILD_SOURCE, &source)
+        .env("GIT_CONFIG_GLOBAL", "../global.conf")
+        .env("GIT_CONFIG_SYSTEM", "../system.conf")
+        .env("GIT_DIR", project.join(".git"))
+        .env("GIT_CONFIG_COUNT", "3")
+        .env("GIT_CONFIG_KEY_0", &rewrite_key)
+        .env("GIT_CONFIG_VALUE_0", &source)
+        .env("GIT_CONFIG_KEY_1", "url.../remote.insteadOf")
+        .env("GIT_CONFIG_VALUE_1", "manual:marketplace")
+        .env("GIT_CONFIG_KEY_2", "filter.codex-required.smudge")
+        .env("GIT_CONFIG_VALUE_2", "git version")
+        .output()
+        .expect("run marketplace Git isolation regression");
+    assert!(
+        output.status.success(),
+        "marketplace Git isolation failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -111,7 +244,6 @@ ref = "missing-ref"
         source: raw_source,
         ref_name: Some("missing-ref".to_string()),
         sparse_paths: Vec::new(),
-        last_revision: None,
     };
     let normalized_source = MarketplaceSource::Git {
         url: normalized_url,
@@ -124,6 +256,7 @@ ref = "missing-ref"
         &install_root,
         &marketplace,
         Some(&normalized_source),
+        PluginGitMode::Manual,
     )
     .expect("upgrade should use the validated source")
     .expect("marketplace should be upgraded");
@@ -154,7 +287,6 @@ fn up_to_date_fast_path_validates_marketplace_name() {
         source: missing_source.clone(),
         ref_name: Some(REVISION.to_string()),
         sparse_paths: Vec::new(),
-        last_revision: Some(REVISION.to_string()),
     };
     super::activation::write_installed_marketplace_metadata(&destination, &marketplace, REVISION)
         .expect("write installed marketplace metadata");
@@ -168,10 +300,84 @@ fn up_to_date_fast_path_validates_marketplace_name() {
         &install_root,
         &marketplace,
         Some(&normalized_source),
+        PluginGitMode::Manual,
     )
     .expect_err("mismatched marketplace name must not use the up-to-date fast path");
 
     assert!(err.contains("git clone marketplace source failed"));
+}
+
+#[test]
+fn stale_activation_restores_newer_concurrently_installed_marketplace() {
+    const INITIAL_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const STALE_REVISION: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const NEWER_REVISION: &str = "cccccccccccccccccccccccccccccccccccccccc";
+
+    let codex_home = TempDir::new().expect("create Codex home");
+    let install_root = marketplace_install_root(codex_home.path());
+    let destination = install_root.join("good");
+    std::fs::create_dir_all(&destination).expect("create installed marketplace root");
+    let marketplace = ConfiguredGitMarketplace {
+        name: "good".to_string(),
+        source: "https://github.com/example/good.git".to_string(),
+        ref_name: Some("main".to_string()),
+        sparse_paths: Vec::new(),
+    };
+    super::activation::write_installed_marketplace_metadata(
+        &destination,
+        &marketplace,
+        INITIAL_REVISION,
+    )
+    .expect("write initial installed marketplace metadata");
+    let previous_snapshot =
+        super::activation::read_installed_marketplace_snapshot(&destination, &marketplace.name);
+
+    std::fs::write(destination.join("marker.txt"), "newer snapshot")
+        .expect("write newer installed marketplace snapshot");
+    super::activation::write_installed_marketplace_metadata(
+        &destination,
+        &marketplace,
+        NEWER_REVISION,
+    )
+    .expect("write newer installed marketplace metadata");
+
+    let staged_dir = tempfile::Builder::new()
+        .prefix("marketplace-upgrade-")
+        .tempdir_in(&install_root)
+        .expect("create stale upgrade staging directory");
+    std::fs::write(staged_dir.path().join("marker.txt"), "stale snapshot")
+        .expect("write stale staged marketplace snapshot");
+    super::activation::write_installed_marketplace_metadata(
+        staged_dir.path(),
+        &marketplace,
+        STALE_REVISION,
+    )
+    .expect("write stale staged marketplace metadata");
+
+    let err = super::activation::activate_marketplace_root(
+        &destination,
+        staged_dir,
+        &previous_snapshot,
+        || Ok(()),
+    )
+    .expect_err("stale upgrade must not replace a newer installed snapshot");
+
+    assert_eq!(
+        err,
+        "installed marketplace `good` changed while auto-upgrade was in flight"
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join("marker.txt"))
+            .expect("read restored marketplace snapshot"),
+        "newer snapshot"
+    );
+    let restored_snapshot =
+        super::activation::read_installed_marketplace_snapshot(&destination, &marketplace.name);
+    assert!(super::activation::installed_marketplace_metadata_matches(
+        &restored_snapshot,
+        &marketplace,
+        NEWER_REVISION
+    ));
 }
 
 fn config_layer_stack(codex_home: &Path, config: &str) -> ConfigLayerStack {

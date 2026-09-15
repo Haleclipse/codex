@@ -15,6 +15,7 @@ pub use resource_client::McpResourceClient;
 pub use resource_client::McpResourceClientCacheKey;
 pub use resource_client::McpResourcePage;
 pub use resource_client::McpResourceReadResult;
+pub use rmcp::model::ReadResourceRequestParams;
 pub use rmcp_client::MCP_SANDBOX_STATE_META_CAPABILITY;
 pub use runtime::McpRuntime;
 pub use runtime::McpRuntimeContext;
@@ -31,6 +32,7 @@ pub type CodexAppsToolsCache = codex_connectors::ConnectorRuntimeManager<ToolInf
 pub type CodexAppsToolsCacheKey = codex_connectors::ConnectorRuntimeContextKey;
 
 pub use catalog::McpCatalogBuilder;
+pub use catalog::McpEnvironmentAuthority;
 pub use catalog::McpPluginAttribution;
 pub use catalog::McpServerConflict;
 pub use catalog::McpServerConflictAction;
@@ -102,6 +104,7 @@ mod openai_docs_source_attribution;
 mod pagination;
 mod plugin_config;
 mod resource_client;
+mod resource_origin;
 pub(crate) mod rmcp_client;
 pub(crate) mod runtime;
 pub(crate) mod server;

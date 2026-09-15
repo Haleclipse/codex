@@ -121,6 +121,7 @@ async fn run_cmd_result_with_permission_profile(
         cmd,
         cwd,
         permission_profile,
+        create_env_from_core_vars(),
         timeout_ms,
         use_legacy_landlock,
     )
@@ -154,6 +155,7 @@ async fn run_cmd_result_with_cwd_and_writable_roots(
         cmd,
         cwd,
         permission_profile,
+        create_env_from_core_vars(),
         timeout_ms,
         use_legacy_landlock,
     )
@@ -164,6 +166,7 @@ async fn run_cmd_result_with_permission_profile_for_cwd(
     cmd: &[&str],
     cwd: AbsolutePathBuf,
     permission_profile: PermissionProfile,
+    env: HashMap<String, String>,
     timeout_ms: u64,
     use_legacy_landlock: bool,
 ) -> Result<codex_protocol::exec_output::ExecToolCallOutput> {
@@ -173,7 +176,7 @@ async fn run_cmd_result_with_permission_profile_for_cwd(
         cwd,
         expiration: timeout_ms.into(),
         capture_policy: ExecCapturePolicy::ShellTool,
-        env: create_env_from_core_vars(),
+        env,
         network: None,
         network_environment_id: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
@@ -415,6 +418,80 @@ async fn test_no_new_privs_is_enabled() {
         .find(|line| line.starts_with("NoNewPrivs:"))
         .unwrap_or("");
     assert_eq!(line.trim(), "NoNewPrivs:\t1");
+}
+
+#[tokio::test]
+async fn sandboxed_command_has_no_effective_or_permitted_capabilities() {
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        return;
+    }
+
+    let output = run_cmd_output(
+        &[
+            "bash",
+            "-lc",
+            "awk '$1 == \"CapPrm:\" || $1 == \"CapEff:\" { print $1, $2 }' /proc/self/status",
+        ],
+        &[],
+        LONG_TIMEOUT_MS,
+    )
+    .await;
+
+    assert_eq!(
+        output.stdout.text,
+        "CapPrm: 0000000000000000\nCapEff: 0000000000000000\n"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_inner_stage_rejects_retained_capabilities() {
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        return;
+    }
+
+    let user_namespace_probe = match std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user", "--", "/bin/true"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping capability test: unshare is unavailable");
+            return;
+        }
+        Err(err) => panic!("failed to probe unprivileged user namespaces: {err}"),
+    };
+    if !user_namespace_probe.status.success() {
+        eprintln!("skipping capability test: unprivileged user namespaces are unavailable");
+        return;
+    }
+
+    let permission_profile = serde_json::to_string(&PermissionProfile::read_only())
+        .expect("read-only permission profile should serialize");
+    let output = std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user", "--"])
+        .arg(codex_linux_sandbox_exe())
+        .args(["--sandbox-policy-cwd", "/", "--permission-profile"])
+        .arg(permission_profile)
+        .args([
+            "--apply-seccomp-then-exec",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf command-ran",
+        ])
+        .output()
+        .expect("capability-bearing sandbox helper should execute");
+
+    assert!(!output.status.success());
+    assert_eq!(output.stdout, Vec::<u8>::new());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Linux sandbox retained effective or permitted capabilities"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -676,6 +753,12 @@ async fn sandbox_keeps_parent_repo_discovery_while_blocking_child_metadata() {
     let tmpdir = tempfile::tempdir().expect("tempdir");
     let repo = tmpdir.path().join("repo");
     let subdir = repo.join("sub");
+    let real_tmp = tmpdir.path().join("real-tmp");
+    let redirected_tmp = tmpdir.path().join("redirected-tmp");
+    let tmp_alias = tmpdir.path().join("tmp-alias");
+    std::fs::create_dir(&real_tmp).expect("create real temp directory");
+    std::fs::create_dir(&redirected_tmp).expect("create redirected temp directory");
+    std::os::unix::fs::symlink(&real_tmp, &tmp_alias).expect("create temp directory alias");
     std::fs::create_dir_all(&subdir).expect("create nested workspace");
     assert!(
         std::process::Command::new("git")
@@ -689,9 +772,22 @@ async fn sandbox_keeps_parent_repo_discovery_while_blocking_child_metadata() {
     );
 
     let repo = repo.to_string_lossy();
+    let redirected_tmp = redirected_tmp.to_string_lossy();
     let script = format!(
         r#"set -e
 test "$(git rev-parse --show-toplevel)" = '{repo}'
+touch "$TMPDIR/writable-sibling"
+registry="${{TMPDIR:-/tmp}}/codex-bwrap-synthetic-mount-targets-$(id -u)"
+if touch "$registry/forged-marker" 2>/dev/null; then
+  exit 22
+fi
+redirected_registry='{redirected_tmp}'/codex-bwrap-synthetic-mount-targets-$(id -u)
+for marker_dir in "$registry"/*; do
+  [ -d "$marker_dir" ] || continue
+  mkdir -p "$redirected_registry/${{marker_dir##*/}}"
+  touch "$redirected_registry/${{marker_dir##*/}}/1"
+done
+ln -sfn '{redirected_tmp}' "$TMPDIR"
 git status --short > status.before
 if grep -E '(^|[[:space:]])\.(git|codex|agents)(/|$)' status.before; then
   cat status.before
@@ -700,13 +796,22 @@ fi
 "#,
     );
 
-    let output = run_cmd_result_with_cwd_and_writable_roots(
+    let cwd = AbsolutePathBuf::try_from(subdir.as_path()).expect("cwd should be absolute");
+    let permission_profile = PermissionProfile::workspace_write_with(
+        std::slice::from_ref(&cwd),
+        NetworkSandboxPolicy::Enabled,
+        /*exclude_tmpdir_env_var*/ false,
+        /*exclude_slash_tmp*/ false,
+    );
+    let mut env = create_env_from_core_vars();
+    env.insert("TMPDIR".to_string(), tmp_alias.display().to_string());
+    let output = run_cmd_result_with_permission_profile_for_cwd(
         &["bash", "-lc", &script],
-        &subdir,
-        std::slice::from_ref(&subdir),
+        cwd,
+        permission_profile,
+        env,
         LONG_TIMEOUT_MS,
         /*use_legacy_landlock*/ false,
-        /*network_access*/ true,
     )
     .await
     .expect("sandboxed command should execute");
@@ -716,6 +821,7 @@ fi
         "stdout:\n{}\nstderr:\n{}",
         output.stdout.text, output.stderr.text
     );
+    assert!(!subdir.join(".git").exists());
 
     let git_init_output = expect_denied(
         run_cmd_result_with_cwd_and_writable_roots(
@@ -805,21 +911,26 @@ async fn sandbox_blocks_explicit_split_policy_carveouts_under_bwrap() {
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(sandbox_helper_dir.as_path())
-                    .expect("absolute helper dir"),
+                    .expect("absolute helper dir")
+                    .into(),
             },
             access: FileSystemAccessMode::Read,
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(tmpdir.path()).expect("absolute tempdir"),
+                path: AbsolutePathBuf::try_from(tmpdir.path())
+                    .expect("absolute tempdir")
+                    .into(),
             },
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(blocked.as_path()).expect("absolute blocked dir"),
+                path: AbsolutePathBuf::try_from(blocked.as_path())
+                    .expect("absolute blocked dir")
+                    .into(),
             },
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
@@ -877,28 +988,35 @@ async fn sandbox_reenables_writable_subpaths_under_unreadable_parents() {
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
                 path: AbsolutePathBuf::try_from(sandbox_helper_dir.as_path())
-                    .expect("absolute helper dir"),
+                    .expect("absolute helper dir")
+                    .into(),
             },
             access: FileSystemAccessMode::Read,
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(tmpdir.path()).expect("absolute tempdir"),
+                path: AbsolutePathBuf::try_from(tmpdir.path())
+                    .expect("absolute tempdir")
+                    .into(),
             },
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(blocked.as_path()).expect("absolute blocked dir"),
+                path: AbsolutePathBuf::try_from(blocked.as_path())
+                    .expect("absolute blocked dir")
+                    .into(),
             },
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(allowed.as_path()).expect("absolute allowed dir"),
+                path: AbsolutePathBuf::try_from(allowed.as_path())
+                    .expect("absolute allowed dir")
+                    .into(),
             },
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
@@ -952,7 +1070,9 @@ async fn sandbox_blocks_root_read_carveouts_under_bwrap() {
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::try_from(blocked.as_path()).expect("absolute blocked dir"),
+                path: AbsolutePathBuf::try_from(blocked.as_path())
+                    .expect("absolute blocked dir")
+                    .into(),
             },
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,

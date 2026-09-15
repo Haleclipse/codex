@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -75,15 +76,23 @@ impl McpBinding {
         self.plugins_available
     }
 
-    /// Returns the frozen catalog captured for this binding.
+    /// Returns the frozen model-visible catalog captured for this binding.
     pub fn tools(&self) -> &[ToolInfo] {
         &self.tools
     }
 
-    /// Binds a call to the exact client and metadata advertised by this binding.
+    /// Returns permitted tool metadata, including app-only tools.
+    pub fn tool_info(&self, server: &str, tool: &str) -> Option<&ToolInfo> {
+        self.calls
+            .get(&(server.to_string(), tool.to_string()))
+            .map(PreparedMcpCall::tool_info)
+    }
+
+    /// Binds a model-visible call to the exact client and metadata in this binding.
     pub fn prepare_call(&self, server: &str, tool: &str) -> Option<PreparedMcpCall> {
         self.calls
             .get(&(server.to_string(), tool.to_string()))
+            .filter(|call| crate::tool_is_model_visible(call.tool_info()))
             .cloned()
     }
 
@@ -252,22 +261,34 @@ impl PreparedMcpCall {
         &self,
         arguments: Option<JsonValue>,
         meta: Option<JsonValue>,
+        timeout: Option<Duration>,
     ) -> Result<CallToolResult> {
-        self.call_with_preparation(|| async move { Ok((arguments, meta)) })
+        self.call_with_preparation(timeout, || async move { Ok((arguments, meta)) })
             .await
     }
 
     /// Runs irreversible call preparation and execution under the authority of
     /// this call's exact catalog revision and the extensions owned by the Codex session.
+    /// A caller-supplied timeout can further restrict the server's configured timeout.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "catalog replacement must remain serialized with call preparation and execution"
     )]
-    pub async fn call_with_preparation<F, Fut>(&self, prepare: F) -> Result<CallToolResult>
+    pub async fn call_with_preparation<F, Fut>(
+        &self,
+        requested_timeout: Option<Duration>,
+        prepare: F,
+    ) -> Result<CallToolResult>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(Option<JsonValue>, Option<JsonValue>)>>,
     {
+        let effective_timeout = match (self.client.tool_timeout, requested_timeout) {
+            (Some(server_timeout), Some(requested_timeout)) => {
+                Some(server_timeout.min(requested_timeout))
+            }
+            (server_timeout, requested_timeout) => server_timeout.or(requested_timeout),
+        };
         let tool_name = self.tool_info.tool.name.to_string();
         let current_revision = self.catalog_revision_source.read().await;
         if *current_revision != self.catalog_revision {
@@ -280,7 +301,7 @@ impl PreparedMcpCall {
         let result = self
             .client
             .client
-            .call_tool(tool_name.clone(), arguments, meta, self.client.tool_timeout)
+            .call_tool(tool_name.clone(), arguments, meta, effective_timeout)
             .await
             .with_context(|| format!("tool call failed for `{}/{tool_name}`", self.server_name))?;
         drop(current_revision);

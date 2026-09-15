@@ -231,6 +231,7 @@ async fn record_initial_history_resumed_bare_turn_context_does_not_hydrate_previ
         approvals_reviewer: None,
         sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
@@ -278,6 +279,7 @@ async fn record_initial_history_resumed_hydrates_previous_turn_settings_from_lif
         approvals_reviewer: None,
         sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
@@ -1007,6 +1009,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1067,6 +1070,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1136,6 +1140,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: Some(2),
             first_window_id: Some(compacted_first_window_id.to_string()),
             previous_window_id: Some(compacted_previous_window_id.to_string()),
@@ -1171,6 +1176,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(Vec::new()),
+                mcp_resource_origins: None,
                 window_number: Some(1),
                 first_window_id: None,
                 previous_window_id: None,
@@ -1218,6 +1224,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1245,6 +1252,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1280,6 +1288,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1341,6 +1350,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         approvals_reviewer: None,
         sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
@@ -1381,6 +1391,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1430,6 +1441,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             approvals_reviewer: None,
             sandbox_policy: turn_context.sandbox_policy(),
             permission_profile: None,
+            active_permission_profile: None,
             network: None,
             file_system_sandbox_policy: None,
             model: previous_model.to_string(),
@@ -1462,6 +1474,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         approvals_reviewer: None,
         sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
@@ -1543,6 +1556,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1592,6 +1606,7 @@ async fn record_initial_history_resumed_unmatched_abort_preserves_active_turn_fo
         approvals_reviewer: None,
         sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: current_model.to_string(),
@@ -1719,6 +1734,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         approvals_reviewer: None,
         sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
@@ -1791,6 +1807,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1889,6 +1906,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         approvals_reviewer: None,
         sandbox_policy: turn_context.sandbox_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: previous_model.to_string(),
@@ -1962,6 +1980,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,

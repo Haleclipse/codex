@@ -8,6 +8,7 @@ use codex_app_server_protocol::ApprovalsReviewer;
 use codex_app_server_protocol::AppsConfig;
 use codex_app_server_protocol::AppsDefaultConfig;
 use codex_app_server_protocol::AskForApproval;
+use codex_app_server_protocol::CliAuthCredentialsStoreMode;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigEdit;
 use codex_app_server_protocol::ConfigLayerSource;
@@ -45,6 +46,104 @@ fn write_config(codex_home: &TempDir, contents: &str) -> Result<()> {
         codex_home.path().join("config.toml"),
         contents,
     )?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_auth_settings_are_exposed_enforced_and_read_only() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(
+        &codex_home,
+        r#"cli_auth_credentials_store = "file"
+chatgpt_base_url = "https://user.example/backend-api/"
+"#,
+    )?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        r#"cli_auth_credentials_store = "ephemeral"
+chatgpt_base_url = "https://managed.example/backend-api/"
+"#,
+    )?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let requirements_id = app_server.send_config_requirements_read_request().await?;
+    let requirements: ConfigRequirementsReadResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_response(requirements_id),
+    )
+    .await??;
+    let requirements = requirements.requirements.expect("managed requirements");
+    assert_eq!(
+        (
+            requirements.cli_auth_credentials_store,
+            requirements.chatgpt_base_url.as_deref(),
+        ),
+        (
+            Some(CliAuthCredentialsStoreMode::Ephemeral),
+            Some("https://managed.example/backend-api/"),
+        ),
+    );
+
+    let config_id = app_server
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let config: ConfigReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(config_id)).await??;
+    assert_eq!(
+        (
+            config.config.additional.get("cli_auth_credentials_store"),
+            config.config.additional.get("chatgpt_base_url"),
+        ),
+        (
+            Some(&json!("ephemeral")),
+            Some(&json!("https://managed.example/backend-api/")),
+        ),
+    );
+
+    for (field, value) in [
+        ("cli_auth_credentials_store", json!("file")),
+        (
+            "chatgpt_base_url",
+            json!("https://user.example/backend-api/"),
+        ),
+    ] {
+        let write_id = app_server
+            .send_config_value_write_request(ConfigValueWriteParams {
+                file_path: None,
+                key_path: field.to_string(),
+                value,
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await?;
+        let error: JSONRPCError = timeout(
+            DEFAULT_READ_TIMEOUT,
+            app_server.read_stream_until_error_message(RequestId::Integer(write_id)),
+        )
+        .await??;
+        assert_eq!(
+            error
+                .error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("config_write_error_code"))
+                .and_then(serde_json::Value::as_str),
+            Some("configRequirementReadonly"),
+        );
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(codex_home.path().join("config.toml"))?,
+        "cli_auth_credentials_store = \"file\"\nchatgpt_base_url = \"https://user.example/backend-api/\"\n",
+    );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -228,6 +327,40 @@ service_tier = "fast"
         Some(ReasoningEffort::Medium)
     );
     assert_eq!(defaults.service_tier.as_deref(), Some("fast"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_read_disables_guardian_v2_when_managed_config_requires_guardian_v1() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(&codex_home, "[features]\nguardianv2 = true\n")?;
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        "allowed_approvals_reviewers = [\"auto_review\"]\n",
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let ConfigReadResponse { config, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert_eq!(
+        config
+            .additional
+            .get("features")
+            .and_then(|features| features.get("guardianv2")),
+        Some(&json!(false))
+    );
+
     Ok(())
 }
 
@@ -720,6 +853,80 @@ model_reasoning_effort = "high"
         }
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_read_respects_managed_project_root_markers() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(&codex_home, "model_context_window = 16384\n")?;
+    let workspace = TempDir::new()?;
+    let ancestor_config = workspace.path().join(".codex");
+    let child = workspace.path().join("child");
+    let child_config = child.join(".codex");
+    for dir in [
+        workspace.path().join(".git"),
+        ancestor_config.clone(),
+        child_config.clone(),
+    ] {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(workspace.path().join(".git/HEAD"), "ref: refs/heads/main\n")?;
+    std::fs::write(
+        ancestor_config.join("config.toml"),
+        "model_context_window = 32768\n",
+    )?;
+    std::fs::write(
+        child_config.join("config.toml"),
+        "model_reasoning_effort = \"high\"\n",
+    )?;
+    set_project_trust_level(codex_home.path(), workspace.path(), TrustLevel::Trusted)?;
+    let managed_path = codex_home.path().join("managed_config.toml");
+    std::fs::write(&managed_path, "project_root_markers = []\n")?;
+    let managed_path = managed_path.to_string_lossy().into_owned();
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("CODEX_APP_SERVER_MANAGED_CONFIG_PATH", Some(&managed_path))])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let request_id = app_server
+        .send_config_read_request(ConfigReadParams {
+            include_layers: true,
+            cwd: Some(child.to_string_lossy().into_owned()),
+        })
+        .await?;
+    let ConfigReadResponse { config, layers, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(request_id)).await??;
+
+    assert_eq!(
+        (
+            config.additional.get("project_root_markers"),
+            config.model_context_window,
+            config.model_reasoning_effort,
+        ),
+        (Some(&json!([])), Some(16384), Some(ReasoningEffort::High))
+    );
+    let project_layers = layers
+        .expect("layers present")
+        .into_iter()
+        .filter_map(|layer| {
+            if let ConfigLayerSource::Project { dot_codex_folder } = layer.name {
+                Some((dot_codex_folder, layer.config, layer.disabled_reason))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        project_layers,
+        vec![(
+            AbsolutePathBuf::try_from(child_config)?,
+            json!({"model_reasoning_effort": "high"}),
+            None,
+        )]
+    );
     Ok(())
 }
 

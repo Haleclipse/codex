@@ -261,19 +261,24 @@ impl FeedbackRequestProcessor {
         }
 
         let session_source = self.thread_manager.session_source();
+        let http_client_factory = self.config.http_client_factory();
+        let runtime_handle = tokio::runtime::Handle::current();
 
         let upload_result = tokio::task::spawn_blocking(move || {
             let tags = (!upload_tags.is_empty()).then_some(&upload_tags);
-            snapshot.upload_feedback(FeedbackUploadOptions {
-                classification: &classification,
-                reason: reason.as_deref(),
-                tags,
-                include_logs,
-                extra_attachments: &extra_attachments,
-                extra_attachment_paths: &attachment_paths,
-                session_source: Some(session_source),
-                logs_override: sqlite_feedback_logs,
-            })
+            runtime_handle.block_on(snapshot.upload_feedback(
+                FeedbackUploadOptions {
+                    classification: &classification,
+                    reason: reason.as_deref(),
+                    tags,
+                    include_logs,
+                    extra_attachments: &extra_attachments,
+                    extra_attachment_paths: &attachment_paths,
+                    session_source: Some(session_source),
+                    logs_override: sqlite_feedback_logs,
+                },
+                &http_client_factory,
+            ))
         })
         .await;
 
@@ -286,7 +291,8 @@ impl FeedbackRequestProcessor {
             }
         };
 
-        upload_result.map_err(|err| internal_error(format!("failed to upload feedback: {err}")))?;
+        upload_result
+            .map_err(|err| internal_error(format!("failed to upload feedback: {err:#}")))?;
         Ok(FeedbackUploadResponse { thread_id })
     }
 
@@ -472,6 +478,7 @@ mod tests {
     use codex_rollout::RolloutLine;
     use core_test_support::responses::start_mock_server;
     use core_test_support::test_codex::test_codex;
+    use http::HeaderMap;
     use pretty_assertions::assert_eq;
 
     #[tokio::test]
@@ -703,6 +710,7 @@ mod tests {
                     approvals_reviewer: None,
                     sandbox_policy: codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
                     permission_profile: None,
+                    active_permission_profile: None,
                     network: None,
                     file_system_sandbox_policy: None,
                     model: (*model).to_string(),
@@ -783,9 +791,7 @@ mod tests {
     #[test]
     fn tool_cache_feedback_attachments_include_directory_cache_without_account_id() {
         let codex_home = tempfile::tempdir().expect("create tempdir");
-        let auth = CodexAuth::Headers(codex_login::AuthHeaders::new(
-            reqwest::header::HeaderMap::new(),
-        ));
+        let auth = CodexAuth::Headers(codex_login::AuthHeaders::new(HeaderMap::new()));
         let directory_cache_context = ConnectorDirectoryCacheContext::new(
             codex_home.path().to_path_buf(),
             ConnectorDirectoryCacheKey::new(

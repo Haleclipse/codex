@@ -257,13 +257,24 @@ fn commands_for_intercepted_exec_policy_parses_plain_shell_wrappers() {
     );
 
     assert_eq!(
-        candidate_commands.commands,
+        candidate_commands,
         vec![
             vec!["git".to_string(), "status".to_string()],
             vec!["pwd".to_string()],
         ]
     );
-    assert!(!candidate_commands.used_complex_parsing);
+}
+
+#[test]
+fn commands_for_intercepted_exec_policy_preserves_unparsed_shell_wrappers() {
+    let program = AbsolutePathBuf::try_from(host_absolute_path(&["bin", "bash"])).unwrap();
+    for script in ["", "  \n\t", "cat <<'EOF'\nhello\nEOF"] {
+        let argv = ["not-bash".into(), "-lc".into(), script.into()];
+        assert_eq!(
+            commands_for_intercepted_exec_policy(&program, &argv),
+            vec![join_program_and_argv(&program, &argv)]
+        );
+    }
 }
 
 #[test]
@@ -300,14 +311,18 @@ fn shell_request_escalation_execution_is_explicit() {
     let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::from_absolute_path("/tmp/original/output").unwrap(),
+                path: AbsolutePathBuf::from_absolute_path("/tmp/original/output")
+                    .unwrap()
+                    .into(),
             },
             access: FileSystemAccessMode::Write,
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: AbsolutePathBuf::from_absolute_path("/tmp/secret").unwrap(),
+                path: AbsolutePathBuf::from_absolute_path("/tmp/secret")
+                    .unwrap()
+                    .into(),
             },
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,

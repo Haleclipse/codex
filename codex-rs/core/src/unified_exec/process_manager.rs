@@ -1217,10 +1217,8 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
     ) -> Result<(UnifiedExecAttempt, Option<DeferredNetworkApproval>), UnifiedExecError> {
         let turn = &context.step_context.turn;
-        let local_policy_env = create_env(
-            &turn.config.permissions.shell_environment_policy,
-            /*thread_id*/ None,
-        );
+        let shell_environment_policy = request.turn_environment.shell_environment_policy();
+        let local_policy_env = create_env(shell_environment_policy, /*thread_id*/ None);
         let mut env = local_policy_env.clone();
         env.insert(
             CODEX_THREAD_ID_ENV_VAR.to_string(),
@@ -1232,38 +1230,42 @@ impl UnifiedExecProcessManager {
         inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
         let mut env = apply_unified_exec_env(env);
         strip_output_env(&mut env);
-        let mut explicit_env_overrides = turn
-            .config
-            .permissions
-            .shell_environment_policy
-            .r#set
-            .clone();
+        let mut explicit_env_overrides = shell_environment_policy.r#set.clone();
         strip_output_env(&mut explicit_env_overrides);
         let exec_server_env_config = ExecServerEnvConfig {
-            policy: exec_env_policy_from_shell_policy(
-                &turn.config.permissions.shell_environment_policy,
-            ),
+            policy: exec_env_policy_from_shell_policy(shell_environment_policy),
             local_policy_env,
         };
         let mut orchestrator = ToolOrchestrator::new();
         let mut runtime = UnifiedExecRuntime::new(self, request.shell_mode.clone());
+        let session_shell = context.session.user_shell();
+        let configured_shell = request
+            .turn_environment
+            .shell
+            .as_ref()
+            .unwrap_or(session_shell.as_ref());
         let exec_approval_requirement = context
             .session
             .services
             .exec_policy
-            .create_exec_approval_requirement_for_command(ExecApprovalRequest {
-                command: &request.command,
-                approval_policy: turn.approval_policy(),
-                permission_profile: request.turn_environment.permission_profile().clone(),
-                windows_sandbox_level: turn.windows_sandbox_level,
-                sandbox_permissions: if request.additional_permissions_preapproved {
-                    crate::sandboxing::SandboxPermissions::UseDefault
-                } else {
-                    request.sandbox_permissions
+            .create_exec_approval_requirement_for_shell(
+                ExecApprovalRequest {
+                    command: &request.command,
+                    approval_policy: turn.approval_policy(),
+                    permission_profile: request.turn_environment.permission_profile().clone(),
+                    environment_policy: request.turn_environment.config().exec_policy.as_ref(),
+                    windows_sandbox_level: turn.windows_sandbox_level,
+                    sandbox_permissions: if request.additional_permissions_preapproved {
+                        crate::sandboxing::SandboxPermissions::UseDefault
+                    } else {
+                        request.sandbox_permissions
+                    },
+                    prefix_rule: request.prefix_rule.clone(),
+                    allow_prefix_rules: context.step_context.turn.allow_prefix_rules(),
                 },
-                prefix_rule: request.prefix_rule.clone(),
-                allow_prefix_rules: context.step_context.turn.allow_prefix_rules(),
-            })
+                configured_shell,
+                &request.shell_mode,
+            )
             .await;
         let req = UnifiedExecToolRequest {
             command: request.command.clone(),
@@ -1342,7 +1344,7 @@ impl UnifiedExecProcessManager {
             let mut wait_for_output = None;
             {
                 let mut guard = output_buffer.lock().await;
-                drained_output = guard.drain();
+                drained_output = std::mem::take(&mut *guard);
                 has_drained_output =
                     drained_output.retained_bytes() > 0 || drained_output.omitted_bytes() > 0;
                 if !has_drained_output {

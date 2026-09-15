@@ -1219,10 +1219,7 @@ fn validate_auth_restrictions(
     let Some(expected_workspaces) = expected_workspaces else {
         return Ok(());
     };
-    if matches!(
-        auth,
-        CodexAuth::ApiKey(_) | CodexAuth::Headers(_) | CodexAuth::BedrockApiKey(_)
-    ) {
+    if matches!(auth, CodexAuth::ApiKey(_) | CodexAuth::BedrockApiKey(_)) {
         return Ok(());
     }
 
@@ -1317,12 +1314,12 @@ async fn enforce_login_restrictions_with_agent_identity_authapi_base_url(
 
     if let Some(expected_account_ids) = config.forced_chatgpt_workspace_id.as_deref() {
         let chatgpt_account_id = match &auth {
-            CodexAuth::ApiKey(_) | CodexAuth::Headers(_) | CodexAuth::BedrockApiKey(_) => {
+            CodexAuth::ApiKey(_) | CodexAuth::BedrockApiKey(_) => {
                 return Ok(());
             }
-            CodexAuth::AgentIdentity(_) | CodexAuth::PersonalAccessToken(_) => {
-                auth.get_account_id()
-            }
+            CodexAuth::Headers(_)
+            | CodexAuth::AgentIdentity(_)
+            | CodexAuth::PersonalAccessToken(_) => auth.get_account_id(),
             CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_) => {
                 let token_data = match auth.get_token_data() {
                     Ok(data) => data,
@@ -1583,8 +1580,19 @@ async fn request_chatgpt_token_refresh(
     } else {
         let body = response.text().await.unwrap_or_default();
         tracing::error!("Failed to refresh token: {status}: {body}");
-        let failed = classify_refresh_token_failure(&body);
-        if status == StatusCode::UNAUTHORIZED || failed.reason != RefreshTokenFailedReason::Other {
+        let code = extract_refresh_token_error_code(&body);
+        // RFC 6749 reports an unusable refresh token as invalid_grant without preserving
+        // the legacy expired/reused/revoked subtype. Keep it terminal with the generic reason.
+        let is_invalid_grant_bad_request = status == StatusCode::BAD_REQUEST
+            && code
+                .as_deref()
+                .is_some_and(|code| code.eq_ignore_ascii_case("invalid_grant"));
+        let failed =
+            classify_refresh_token_failure(code.as_deref(), &body, is_invalid_grant_bad_request);
+        if status == StatusCode::UNAUTHORIZED
+            || failed.reason != RefreshTokenFailedReason::Other
+            || is_invalid_grant_bad_request
+        {
             Err(RefreshTokenError::Permanent(failed))
         } else {
             let message = try_parse_error_message(&body);
@@ -1595,10 +1603,12 @@ async fn request_chatgpt_token_refresh(
     }
 }
 
-fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError {
-    let code = extract_refresh_token_error_code(body);
-
-    let normalized_code = code.as_deref().map(str::to_ascii_lowercase);
+fn classify_refresh_token_failure(
+    code: Option<&str>,
+    body: &str,
+    is_invalid_grant_bad_request: bool,
+) -> RefreshTokenFailedError {
+    let normalized_code = code.map(str::to_ascii_lowercase);
     let reason = match normalized_code.as_deref() {
         Some("refresh_token_expired") => RefreshTokenFailedReason::Expired,
         Some("refresh_token_reused") => RefreshTokenFailedReason::Exhausted,
@@ -1606,7 +1616,7 @@ fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError {
         _ => RefreshTokenFailedReason::Other,
     };
 
-    if reason == RefreshTokenFailedReason::Other {
+    if reason == RefreshTokenFailedReason::Other && !is_invalid_grant_bad_request {
         tracing::warn!(
             backend_code = normalized_code.as_deref(),
             backend_body = body,
@@ -2145,8 +2155,13 @@ impl AuthManager {
 
     /// Create an AuthManager with a specific CodexAuth, for testing only.
     pub fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self> {
+        Self::from_optional_auth_for_testing(Some(auth))
+    }
+
+    /// Create an AuthManager with an optional CodexAuth, for testing only.
+    pub(crate) fn from_optional_auth_for_testing(auth: Option<CodexAuth>) -> Arc<Self> {
         let cached = CachedAuth {
-            auth: Some(auth),
+            auth,
             permanent_refresh_failure: None,
         };
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);

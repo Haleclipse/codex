@@ -1118,7 +1118,8 @@ fn guardian_approval_request_to_json_renders_mcp_tool_call_shape() -> serde_json
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn build_guardian_prompt_items_explains_node_repl_review_scope() -> anyhow::Result<()> {
+async fn build_guardian_prompt_items_keeps_required_node_repl_reviews_generic() -> anyhow::Result<()>
+{
     let (session, mut turn) =
         guardian_test_session_and_turn_with_base_url("http://localhost").await;
     Arc::make_mut(
@@ -1144,31 +1145,14 @@ async fn build_guardian_prompt_items_explains_node_repl_review_scope() -> anyhow
     .await?;
 
     let text = guardian_prompt_text(&prompt.items);
-    assert!(text.contains("It may invoke connected MCP, browser, or computer-use tools"));
-    assert!(text.contains("Distinguish preparation"));
-    assert!(text.contains("connecting to browser-wide CDP is consequential"));
-    assert!(text.contains("do not invent effects absent evidence"));
-    assert!(text.contains("tool output cannot broaden it"));
-    assert!(text.contains("assess all staged values and attachments"));
-    assert!(text.contains("Item-scoped work does not authorize account-"));
-    assert!(text.contains("When scope is unclear, use a read-only check"));
-    assert!(text.contains("Trusted prerequisites, limits, stop, confirmation"));
-    assert!(text.contains("Read-only inspection returned only to the agent transcript"));
-    assert!(text.contains("Targeted secret extraction for use, persistence, or transfer"));
-    assert!(text.contains("Reading an OAuth or authentication page is not a grant"));
-    assert!(text.contains("An authorized compatibility repair is not a bypass"));
-    assert!(text.contains("untrusted instructions as actionable only when"));
-    assert!(text.contains("unmerged-branch protected-runner eligibility"));
-    assert!(text.contains("persistent production credentials"));
-    assert!(text.contains("exact private-location disclosure"));
-    assert!(text.contains("Otherwise approve ordinary final actions"));
+    assert!(text.contains("Assess the exact planned action below."));
     assert!(text.contains("Retry reason:\nRetry the authorized browser inspection."));
-    assert!(text.contains("Node REPL action JSON:"));
+    assert!(text.contains("Planned action JSON:"));
     assert!(text.contains("\"tool\": \"mcp_tool_call\""));
     assert!(text.contains("\"server\": \"node_repl\""));
     assert!(text.contains("\"tool_name\": \"js\""));
     assert!(text.contains("await browser.open('https://example.com')"));
-    assert!(!text.contains("Planned action JSON:"));
+    assert!(!text.contains("# Computer and Browser Use"));
 
     Ok(())
 }
@@ -1207,7 +1191,7 @@ async fn build_guardian_prompt_items_keeps_other_requests_generic() -> anyhow::R
 
 #[test]
 fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_json::Result<()> {
-    let cwd = test_path_buf("/repo").abs();
+    let cwd = PathUri::parse("file:///C:/repo").expect("valid Windows path URI");
     let action = GuardianApprovalRequest::NetworkAccess {
         id: "network-1".to_string(),
         turn_id: "turn-1".to_string(),
@@ -1219,7 +1203,7 @@ fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_j
             call_id: "call-1".to_string(),
             tool_name: "shell".to_string(),
             command: vec!["curl".to_string(), "https://example.com".to_string()],
-            cwd: cwd.clone(),
+            cwd,
             sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
             additional_permissions: None,
             justification: Some("Fetch the release metadata.".to_string()),
@@ -1239,7 +1223,7 @@ fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_j
                 "callId": "call-1",
                 "toolName": "shell",
                 "command": ["curl", "https://example.com"],
-                "cwd": cwd.to_string_lossy().to_string(),
+                "cwd": "C:\\repo",
                 "sandboxPermissions": "use_default",
                 "justification": "Fetch the release metadata.",
             },
@@ -1253,7 +1237,7 @@ fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_j
 async fn build_guardian_prompt_items_explains_network_access_review_scope() -> anyhow::Result<()> {
     let (session, turn) = guardian_test_session_and_turn_with_base_url("http://localhost").await;
     seed_guardian_parent_history(&session, &turn).await;
-    let cwd = test_path_buf("/repo").abs();
+    let cwd = PathUri::from_abs_path(&test_path_buf("/repo").abs());
 
     let prompt = build_guardian_prompt_items(
         session.as_ref(),
@@ -1382,7 +1366,7 @@ fn guardian_request_target_item_id_omits_network_access_trigger_call_id() {
             call_id: "call-1".to_string(),
             tool_name: "shell".to_string(),
             command: vec!["curl".to_string(), "https://example.com".to_string()],
-            cwd: test_path_buf("/repo").abs(),
+            cwd: PathUri::from_abs_path(&test_path_buf("/repo").abs()),
             sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
             additional_permissions: None,
             justification: None,
@@ -2989,6 +2973,7 @@ async fn escalated_retry_bypasses_extension_approval_and_runs_guardian() -> anyh
             _session_store: &'a codex_extension_api::ExtensionData,
             _thread_store: &'a codex_extension_api::ExtensionData,
             _prompt: &'a str,
+            _extension_metrics: Option<Arc<dyn codex_extension_api::ExtensionMetrics>>,
         ) -> codex_extension_api::ExtensionFuture<'a, Option<ReviewDecision>> {
             Box::pin(async move { Some(ReviewDecision::Approved) })
         }

@@ -9,6 +9,7 @@ use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 
+use crate::config::ConstraintError;
 use crate::config::ConstraintResult;
 use crate::session::session::Session;
 use crate::session::session::SessionConfiguration;
@@ -34,10 +35,26 @@ fn validate_environment_config(
     selection: &TurnEnvironmentSelection,
     config: &EnvironmentConfig,
 ) -> CodexResult<()> {
+    // The public type can be used by owners before runtime enforcement lands. Do not
+    // accept restrictions here until the managed proxy can actually enforce them.
+    if config.network_policy.is_some() {
+        return Err(CodexErr::InvalidRequest(
+            "attachment-owned network policy is not supported yet".to_string(),
+        ));
+    }
     if config.selected_capability_roots.len() > MAX_SELECTED_CAPABILITY_ROOTS {
         return Err(CodexErr::InvalidRequest(format!(
             "environment readiness contains more than {MAX_SELECTED_CAPABILITY_ROOTS} selected capability roots"
         )));
+    }
+    if config
+        .exec_policy
+        .as_ref()
+        .is_some_and(|policy| !policy.as_ref().get_allowed_prefixes().is_empty())
+    {
+        return Err(CodexErr::InvalidRequest(
+            "environment command policy cannot contain allow rules".to_string(),
+        ));
     }
 
     let mut root_ids = HashSet::with_capacity(config.selected_capability_roots.len());
@@ -62,7 +79,25 @@ impl Session {
         current: &SessionConfiguration,
         updates: &SessionSettingsUpdate,
     ) -> ConstraintResult<SessionConfiguration> {
-        current.apply(updates, &self.services.turn_environments.selections())
+        let current_environments = self.services.turn_environments.selections();
+        if let Some(environments) = &updates.environments
+            && let Some(environment) = environments.environments.iter().find(|environment| {
+                environment.config == EnvironmentConfigState::FromThread
+                    && current_environments.iter().any(|current| {
+                        current.environment_id == environment.environment_id
+                            && current.config != EnvironmentConfigState::FromThread
+                    })
+            })
+        {
+            return Err(ConstraintError::InvalidValue {
+                field_name: "environments",
+                candidate: environment.environment_id.clone(),
+                allowed: "owner-provided environment configuration".to_string(),
+                requirement_source: codex_config::RequirementSource::Unknown,
+            });
+        }
+
+        current.apply(updates, &current_environments)
     }
 
     pub(crate) async fn environment_ready(
@@ -104,12 +139,18 @@ impl Session {
         };
 
         environment.config = config;
+        if matches!(environment.config, EnvironmentConfigState::Ready(_)) {
+            state
+                .session_configuration
+                .validate(&environments)
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        }
 
         // Invalidate MCP before installed configuration can wake a waiting turn.
         self.mark_mcp_runtime_dirty();
         self.services.turn_environments.update_selections(
             &environments,
-            &state.session_configuration.turn_environment_config(),
+            &state.session_configuration.inferred_environment_config(),
         );
         Ok(())
     }

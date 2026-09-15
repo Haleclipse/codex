@@ -223,7 +223,27 @@ pub(crate) async fn run_turn(
     // Keep the exact model-visible state used by this turn and its inline compactions.
     let (world_state, display_roots) = tokio::join!(
         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
-        turn_diff_display_roots(first_step_context.as_ref()),
+        async {
+            if first_step_context
+                .turn
+                .config
+                .features
+                .enabled(Feature::CwdRelativeTurnDiffs)
+            {
+                first_step_context
+                    .environments
+                    .turn_environments()
+                    .map(|environment| {
+                        (
+                            environment.selection().environment_id,
+                            environment.cwd().clone(),
+                        )
+                    })
+                    .collect()
+            } else {
+                turn_diff_display_roots(first_step_context.as_ref()).await
+            }
+        },
     );
     let mut world_state = world_state?;
 
@@ -1736,6 +1756,23 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
             TurnItem::AgentMessage(item) => Some((agent_message_text(item), item.phase.clone())),
             _ => None,
         },
+        EventMsg::ExecApprovalRequest(_)
+        | EventMsg::RequestPermissions(_)
+        | EventMsg::ApplyPatchApprovalRequest(_)
+        | EventMsg::RequestUserInput(_)
+        | EventMsg::ElicitationRequest(_) => {
+            let message = if matches!(
+                msg,
+                EventMsg::RequestUserInput(_) | EventMsg::ElicitationRequest(_)
+            ) {
+                "I need your input. Please respond in the app."
+            } else {
+                "I need your approval to continue. Please review the request in the app."
+            };
+            serde_json::to_string(msg)
+                .ok()
+                .map(|request| (format!("{message}\n\n{request}"), None))
+        }
         EventMsg::Error(_)
         | EventMsg::Warning(_)
         | EventMsg::GuardianWarning(_)
@@ -1778,14 +1815,9 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::ImageGenerationBegin(_)
         | EventMsg::ImageGenerationEnd(_)
         | EventMsg::ViewImageToolCall(_)
-        | EventMsg::ExecApprovalRequest(_)
-        | EventMsg::RequestPermissions(_)
-        | EventMsg::RequestUserInput(_)
         | EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_)
         | EventMsg::GuardianAssessment(_)
-        | EventMsg::ElicitationRequest(_)
-        | EventMsg::ApplyPatchApprovalRequest(_)
         | EventMsg::DeprecationNotice(_)
         | EventMsg::StreamError(_)
         | EventMsg::TurnDiff(_)
@@ -2008,6 +2040,7 @@ async fn emit_agent_message_in_plan_mode(
                     content: Vec::new(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
                 })
             });
         sess.emit_turn_item_started(turn_context, &start_item).await;

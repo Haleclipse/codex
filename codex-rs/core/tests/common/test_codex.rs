@@ -58,7 +58,10 @@ use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::ThreadStore;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -121,6 +124,21 @@ pub fn local(cwd: AbsolutePathBuf) -> TurnEnvironmentSelection {
         workspace_roots: vec![PathUri::from_abs_path(&cwd)],
         config: EnvironmentConfigState::FromThread,
     }
+}
+
+/// Converts the host-shaped /C:/... cwd projection used by Wine tests back
+/// into the selected executor's Windows URI.
+pub fn executor_path_uri(path: impl AsRef<Path>) -> Result<PathUri> {
+    let path = path.as_ref();
+    if matches!(test_environment(), TestEnvironment::WineExec)
+        && let Some(path) = path.to_str()
+        && matches!(path.as_bytes(), [b'/', drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
+    {
+        return LegacyAppPathString::from_string(path[1..].to_string())
+            .to_path_uri(PathConvention::Windows)
+            .map_err(Into::into);
+    }
+    Ok(PathUri::from_host_native_path(path)?)
 }
 
 pub fn local_selections(cwd: AbsolutePathBuf) -> TurnEnvironmentSelections {
@@ -213,7 +231,10 @@ pub async fn test_env() -> Result<TestEnv> {
                 .get_filesystem()
                 .create_directory(
                     &cwd_uri,
-                    CreateDirectoryOptions { recursive: true },
+                    CreateDirectoryOptions {
+                        recursive: true,
+                        follow_symlinks: true,
+                    },
                     /*sandbox*/ None,
                 )
                 .await?;
@@ -643,7 +664,7 @@ impl TestCodexBuilder {
         cwd: Arc<TempDir>,
         home: Arc<TempDir>,
         resume_from: Option<PathBuf>,
-        test_env: TestEnv,
+        mut test_env: TestEnv,
         environment_manager: Arc<codex_exec_server::EnvironmentManager>,
     ) -> anyhow::Result<TestCodex> {
         let auth = self.auth.clone();
@@ -656,7 +677,10 @@ impl TestCodexBuilder {
                     config.codex_home.clone(),
                 ))
             });
-        let auth_manager = codex_core::test_support::auth_manager_from_auth(auth.clone());
+        let auth_manager = codex_core::test_support::auth_manager_from_auth_with_home(
+            auth.clone(),
+            config.codex_home.to_path_buf(),
+        );
         let models_manager = self
             .models_manager
             .clone()
@@ -671,7 +695,7 @@ impl TestCodexBuilder {
             Arc::clone(&self.extensions),
             user_instructions_provider,
             /*analytics_events_client*/ None,
-            thread_store,
+            Arc::clone(&thread_store),
             codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
             installation_id,
             /*attestation_provider*/ None,
@@ -703,7 +727,10 @@ impl TestCodexBuilder {
 
         let new_conversation = match (resume_from, user_shell_override) {
             (Some(path), Some(user_shell_override)) => {
-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
+                let auth_manager = codex_core::test_support::auth_manager_from_auth_with_home(
+                    auth,
+                    config.codex_home.to_path_buf(),
+                );
                 Box::pin(
                     codex_core::test_support::resume_thread_from_rollout_with_user_shell_override(
                         thread_manager.as_ref(),
@@ -717,7 +744,10 @@ impl TestCodexBuilder {
                 .await?
             }
             (Some(path), None) => {
-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
+                let auth_manager = codex_core::test_support::auth_manager_from_auth_with_home(
+                    auth,
+                    config.codex_home.to_path_buf(),
+                );
                 Box::pin(thread_manager.resume_thread_from_rollout(
                     config.clone(),
                     path,
@@ -739,9 +769,23 @@ impl TestCodexBuilder {
                 .await?
             }
             (None, None) => {
+                let environments = if test_env.selection().cwd.infer_path_convention()
+                    == Some(PathConvention::Windows)
+                    && PathUri::from_abs_path(&config.cwd) != test_env.selection().cwd
+                {
+                    let cwd = executor_path_uri(&config.cwd)?;
+                    let mut selection = test_env.selection().clone();
+                    selection.cwd = cwd.clone();
+                    selection.workspace_roots = vec![cwd];
+                    test_env.selection = selection.clone();
+                    Some(vec![selection])
+                } else {
+                    None
+                };
                 Box::pin(thread_manager.start_thread(StartThreadOptions {
                     history_mode: self.history_mode,
                     client_mcp_extensions: client_mcp_extensions(),
+                    environments,
                     ..StartThreadOptions::new(config.clone())
                 }))
                 .await?
@@ -755,6 +799,7 @@ impl TestCodexBuilder {
             codex: new_conversation.thread,
             session_configured: new_conversation.session_configured,
             thread_manager,
+            thread_store,
             _test_env: test_env,
         })
     }
@@ -845,6 +890,7 @@ pub struct TestCodex {
     pub session_configured: SessionConfiguredEvent,
     pub config: Config,
     pub thread_manager: Arc<ThreadManager>,
+    pub thread_store: Arc<dyn ThreadStore>,
     _test_env: TestEnv,
 }
 
@@ -859,6 +905,14 @@ impl TestCodex {
 
     pub fn workspace_path(&self, rel: impl AsRef<Path>) -> PathBuf {
         self.cwd_path().join(rel)
+    }
+
+    pub fn workspace_path_uri(&self, rel: impl AsRef<Path>) -> Result<PathUri> {
+        let rel = rel
+            .as_ref()
+            .to_str()
+            .context("test workspace path must be UTF-8")?;
+        Ok(self.executor_environment().selection().cwd.join(rel)?)
     }
 
     pub fn executor_environment(&self) -> &TestEnv {
@@ -1093,24 +1147,26 @@ impl TestCodexHarness {
         rel: impl AsRef<Path>,
         contents: impl AsRef<[u8]>,
     ) -> Result<()> {
-        let abs_path = self.path_abs(rel);
-        if let Some(parent) = abs_path.parent() {
-            let parent_uri = PathUri::from_host_native_path(&parent)?;
+        let path_uri = self.test.workspace_path_uri(rel)?;
+        if let Some(parent_uri) = path_uri.parent() {
             self.test
                 .fs()
                 .create_directory(
                     &parent_uri,
-                    CreateDirectoryOptions { recursive: true },
+                    CreateDirectoryOptions {
+                        recursive: true,
+                        follow_symlinks: true,
+                    },
                     /*sandbox*/ None,
                 )
                 .await?;
         }
-        let abs_path_uri = PathUri::from_host_native_path(&abs_path)?;
         self.test
             .fs()
             .write_file(
-                &abs_path_uri,
+                &path_uri,
                 contents.as_ref().to_vec(),
+                Default::default(),
                 /*sandbox*/ None,
             )
             .await?;
@@ -1118,23 +1174,24 @@ impl TestCodexHarness {
     }
 
     pub async fn read_file_text(&self, rel: impl AsRef<Path>) -> Result<String> {
-        let path = self.path_abs(rel);
-        let path_uri = PathUri::from_host_native_path(&path)?;
+        let path_uri = self.test.workspace_path_uri(rel)?;
         Ok(self
             .test
             .fs()
-            .read_file_text(&path_uri, /*sandbox*/ None)
+            .read_file_text(&path_uri, Default::default(), /*sandbox*/ None)
             .await?)
     }
 
     pub async fn create_dir_all(&self, rel: impl AsRef<Path>) -> Result<()> {
-        let path = self.path_abs(rel);
-        let path_uri = PathUri::from_host_native_path(&path)?;
+        let path_uri = self.test.workspace_path_uri(rel)?;
         self.test
             .fs()
             .create_directory(
                 &path_uri,
-                CreateDirectoryOptions { recursive: true },
+                CreateDirectoryOptions {
+                    recursive: true,
+                    follow_symlinks: true,
+                },
                 /*sandbox*/ None,
             )
             .await?;
@@ -1142,7 +1199,8 @@ impl TestCodexHarness {
     }
 
     pub async fn path_exists(&self, rel: impl AsRef<Path>) -> Result<bool> {
-        self.abs_path_exists(&self.path_abs(rel)).await
+        self.path_uri_exists(&self.test.workspace_path_uri(rel)?)
+            .await
     }
 
     pub async fn remove_abs_path(&self, path: &AbsolutePathBuf) -> Result<()> {
@@ -1154,6 +1212,7 @@ impl TestCodexHarness {
                 RemoveOptions {
                     recursive: false,
                     force: true,
+                    follow_symlinks: true,
                 },
                 /*sandbox*/ None,
             )
@@ -1163,10 +1222,14 @@ impl TestCodexHarness {
 
     pub async fn abs_path_exists(&self, path: &AbsolutePathBuf) -> Result<bool> {
         let path_uri = PathUri::from_abs_path(path);
+        self.path_uri_exists(&path_uri).await
+    }
+
+    async fn path_uri_exists(&self, path_uri: &PathUri) -> Result<bool> {
         match self
             .test
             .fs()
-            .get_metadata(&path_uri, /*sandbox*/ None)
+            .get_metadata(path_uri, Default::default(), /*sandbox*/ None)
             .await
         {
             Ok(_) => Ok(true),

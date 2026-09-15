@@ -36,9 +36,12 @@ pub fn normalize_additional_permissions(
                 }
                 let path = match entry.path {
                     FileSystemPath::Path { path } => FileSystemPath::Path {
-                        path: canonicalize_preserving_symlinks(path.as_path())
+                        path: path
+                            .to_abs_path()
                             .ok()
+                            .and_then(|path| canonicalize_preserving_symlinks(path.as_path()).ok())
                             .and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok())
+                            .map(Into::into)
                             .unwrap_or(path),
                     },
                     FileSystemPath::GlobPattern { pattern } => {
@@ -67,6 +70,21 @@ pub fn normalize_additional_permissions(
         network,
         file_system,
     })
+}
+
+/// Resolves cwd-dependent permission entries without filtering their authority.
+///
+/// Unlike intersection, this preserves narrower grants beneath denied paths.
+pub fn materialize_additional_permissions(
+    mut additional_permissions: AdditionalPermissionProfile,
+    cwd: &Path,
+) -> Result<AdditionalPermissionProfile, String> {
+    if let Some(file_system) = additional_permissions.file_system.as_mut() {
+        for entry in &mut file_system.entries {
+            *entry = materialize_cwd_dependent_entry(entry, cwd);
+        }
+    }
+    normalize_additional_permissions(additional_permissions)
 }
 
 pub fn merge_permission_profiles(
@@ -381,7 +399,7 @@ fn materialize_cwd_dependent_entry(
 
 fn resolve_permission_path(path: &FileSystemPath, cwd: &Path) -> Option<AbsolutePathBuf> {
     match path {
-        FileSystemPath::Path { path } => Some(path.clone()),
+        FileSystemPath::Path { path } => path.to_abs_path().ok(),
         FileSystemPath::GlobPattern { .. } => None,
         FileSystemPath::Special { value } => match value {
             FileSystemSpecialPath::Root => {

@@ -194,47 +194,6 @@ pub(crate) fn thread_settings_from_config_snapshot(
     }
 }
 
-pub(crate) fn thread_settings_from_core_snapshot(
-    snapshot: codex_protocol::protocol::ThreadSettingsSnapshot,
-) -> ThreadSettings {
-    let codex_protocol::protocol::ThreadSettingsSnapshot {
-        model,
-        model_provider_id,
-        service_tier,
-        approval_policy,
-        approvals_reviewer,
-        permission_profile,
-        active_permission_profile,
-        cwd,
-        reasoning_effort,
-        reasoning_summary,
-        personality,
-        collaboration_mode,
-    } = snapshot;
-    let sandbox_policy = codex_sandboxing::compatibility_sandbox_policy_for_permission_profile(
-        &permission_profile,
-        cwd.as_path(),
-    )
-    .into();
-    ThreadSettings {
-        sandbox_policy,
-        cwd,
-        approval_policy: approval_policy.into(),
-        approvals_reviewer: approvals_reviewer.into(),
-        active_permission_profile: thread_response_active_permission_profile(
-            active_permission_profile,
-        ),
-        model,
-        model_provider: model_provider_id,
-        service_tier,
-        effort: reasoning_effort,
-        summary: reasoning_summary,
-        collaboration_mode,
-        multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
-        personality,
-    }
-}
-
 #[cfg(test)]
 fn parse_datetime(timestamp: Option<&str>) -> Option<DateTime<Utc>> {
     timestamp.and_then(|ts| {
@@ -309,6 +268,7 @@ pub(crate) fn summary_to_thread(
         ephemeral: false,
         section: None,
         section_entered_at: None,
+        project_id: None,
         history_mode: ThreadHistoryMode::Legacy,
         model_provider,
         created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),

@@ -144,6 +144,7 @@ impl ChatWidget {
             self.request_pending_usage_output_insertion_after_stream_shutdown();
         }
         self.flush_unified_exec_wait_streak();
+        self.flush_completed_command_activity();
         if !from_replay {
             self.collect_runtime_metrics_delta();
             let runtime_metrics =
@@ -442,7 +443,9 @@ impl ChatWidget {
         message: String,
         codex_error_info: Option<AppServerCodexErrorInfo>,
     ) {
-        if codex_error_info
+        if codex_error_info == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation) {
+            self.on_misalignment_policy_violation();
+        } else if codex_error_info
             .as_ref()
             .is_some_and(|info| self.handle_app_server_steer_rejected_error(info))
         {

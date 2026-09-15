@@ -324,23 +324,24 @@ async fn write_stdin(
 
 #[test]
 fn push_chunk_preserves_prefix_and_suffix() {
-    let mut buffer = HeadTailBuffer::default();
+    let mut buffer: HeadTailBuffer = Default::default();
     buffer.push_chunk(vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
     buffer.push_chunk(vec![b'b']);
     buffer.push_chunk(vec![b'c']);
 
     assert_eq!(buffer.retained_bytes(), UNIFIED_EXEC_OUTPUT_MAX_BYTES);
-    let snapshot = buffer.snapshot_chunks();
+    let snapshot = buffer.to_bytes();
     let head_bytes = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 2;
     let tail_bytes = UNIFIED_EXEC_OUTPUT_MAX_BYTES - head_bytes;
-    let mut expected_tail = vec![b'a'; tail_bytes - 2];
-    expected_tail.extend_from_slice(b"bc");
-    assert_eq!(snapshot, vec![vec![b'a'; head_bytes], expected_tail]);
+    let expected = std::iter::repeat_n(b'a', head_bytes + tail_bytes - 2)
+        .chain(b"bc".iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(snapshot, expected);
 }
 
 #[test]
 fn head_tail_buffer_default_preserves_prefix_and_suffix() {
-    let mut buffer = HeadTailBuffer::default();
+    let mut buffer: HeadTailBuffer = Default::default();
     buffer.push_chunk(vec![b'a'; UNIFIED_EXEC_OUTPUT_MAX_BYTES]);
     buffer.push_chunk(b"bc".to_vec());
 

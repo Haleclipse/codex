@@ -1,9 +1,10 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
-use crate::agent::role::apply_role_to_config_for_multi_agent_v2;
+use crate::agent::role::apply_role_to_config;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
+use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::session::multi_agents::resolve_usage_hints;
 use codex_extension_api::ExtensionDataInit;
@@ -85,22 +86,27 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
     }
 }
 
-fn is_fork_excluded_developer_message(item: &ResponseItem, usage_hint_texts: &[String]) -> bool {
+fn retain_forked_developer_message(item: &mut ResponseItem, usage_hint_texts: &[String]) -> bool {
     let ResponseItem::Message { role, content, .. } = item else {
-        return false;
+        return true;
     };
     if role != "developer" {
-        return false;
+        return true;
     }
-    let [ContentItem::InputText { text }] = content.as_slice() else {
-        return false;
-    };
 
-    MultiAgentRoleInstructions::matches_text(text)
-        || CurrentTimeReminder::matches_text(text)
-        || usage_hint_texts
-            .iter()
-            .any(|usage_hint_text| usage_hint_text == text)
+    content.retain(|content_item| {
+        let ContentItem::InputText { text } = content_item else {
+            return true;
+        };
+
+        !(MultiAgentRoleInstructions::matches_text(text)
+            || MultiAgentModeInstructions::matches_text(text)
+            || CurrentTimeReminder::matches_text(text)
+            || usage_hint_texts
+                .iter()
+                .any(|usage_hint_text| usage_hint_text == text))
+    });
+    !content.is_empty()
 }
 
 async fn load_agent_model_context(
@@ -267,6 +273,7 @@ impl AgentControl {
         if self.state.agent_metadata_for_thread(thread_id).is_none() {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
+        let environment_selections = self.state.evicted_environments(thread_id);
 
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
@@ -310,7 +317,7 @@ impl AgentControl {
                 ),
             };
 
-            apply_role_to_config_for_multi_agent_v2(&mut config, Some(&role_name))
+            apply_role_to_config(&mut config, Some(&role_name))
                 .await
                 .map_err(CodexErr::InvalidRequest)?;
             config
@@ -365,18 +372,21 @@ impl AgentControl {
                 agent_control: self.clone(),
                 session_source,
                 parent_thread_id,
+                environment_selections,
                 inherited_environments,
                 inherited_exec_policy,
             })
             .await
         {
             Ok(reloaded_thread) => {
+                self.state.clear_evicted_environments(thread_id);
                 residency_slot.commit(reloaded_thread.thread_id);
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(())
             }
             Err(err) => {
                 if state.get_thread(thread_id).await.is_ok() {
+                    self.state.clear_evicted_environments(thread_id);
                     drop(residency_slot);
                     self.touch_loaded_v2_residency(&state, thread_id).await;
                     return Ok(());
@@ -720,7 +730,7 @@ impl AgentControl {
             if matches!(response_item, ResponseItem::AgentMessage { .. }) {
                 return false;
             }
-            if is_fork_excluded_developer_message(
+            if !retain_forked_developer_message(
                 response_item,
                 &multi_agent_v2_usage_hint_texts_to_filter,
             ) {
@@ -1009,6 +1019,7 @@ impl AgentControl {
                 agent_control: self.clone(),
                 session_source,
                 parent_thread_id,
+                environment_selections: None,
                 inherited_environments,
                 inherited_exec_policy,
             })

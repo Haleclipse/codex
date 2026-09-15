@@ -16,6 +16,8 @@ pub use declarations::PluginHookDeclaration;
 pub use declarations::plugin_hook_declarations;
 pub use engine::HookListEntry;
 pub use engine::HookListEntryHandler;
+pub use engine::dispatcher::hook_execution_mode_label;
+pub use engine::dispatcher::hook_handler_type_label;
 pub use events::common::SubagentHookContext;
 /// Hook event names as they appear in hooks JSON and config files.
 pub const HOOK_EVENT_NAMES: [&str; 11] = [
@@ -72,13 +74,11 @@ pub use events::stop::StopRequest;
 pub use events::user_prompt_submit::UserPromptSubmitOutcome;
 pub use events::user_prompt_submit::UserPromptSubmitRequest;
 pub use legacy_notify::legacy_notify_json;
-pub use legacy_notify::notify_hook;
 pub use mcp::HookMcpCall;
 pub use mcp::HookMcpExecutor;
 pub use registry::HookListOutcome;
 pub use registry::Hooks;
 pub use registry::HooksConfig;
-pub use registry::command_from_argv;
 pub use registry::list_hooks;
 pub use schema::write_schema_fixtures;
 pub use types::Hook;

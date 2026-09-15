@@ -37,6 +37,7 @@ fn agent_status_uses_bounded_buffered_activity() {
                 text: "Finished checking the focused TUI tests.".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
             thread_id: "thread-child".to_string(),
             turn_id: "turn-1".to_string(),
@@ -54,7 +55,7 @@ fn agent_status_uses_bounded_buffered_activity() {
         .join("\n");
 
     insta::assert_snapshot!(rendered, @r###"
-    /agent
+    /subagents
     Sub-agents running
 
       • `/root/reviewer`
@@ -102,7 +103,7 @@ fn agent_status_uses_reasoning_summaries_only() {
         .join("\n");
 
     insta::assert_snapshot!(rendered, @r###"
-    /agent
+    /subagents
     Sub-agents running
 
       • `/root/reviewer`

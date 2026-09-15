@@ -15,6 +15,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::ReasoningItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::mcp::McpResourceOrigin;
+use codex_protocol::mcp::McpResourceOriginCheckpoint;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
@@ -54,13 +56,17 @@ use super::thread_history;
 use super::write_migration_journal;
 use crate::ItemSortKey;
 use crate::ListItemsParams;
+use crate::ListThreadsParams;
 use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
+use crate::ThreadMetadataPatch;
+use crate::ThreadSortKey;
 use crate::ThreadStore;
 use crate::ThreadStoreError;
 use crate::TurnPage;
+use crate::UpdateThreadMetadataParams;
 use crate::local::test_support::test_config;
 
 const TIMESTAMP: &str = "2025-01-03T12:00:00Z";
@@ -150,6 +156,7 @@ fn agent_message(text: &str) -> RolloutItem {
         message: text.to_string(),
         phase: None,
         memory_citation: None,
+        delivery: None,
     }))
 }
 
@@ -220,6 +227,7 @@ fn compacted(replacement_history: Vec<ResponseItem>) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: "checkpoint".to_string(),
         replacement_history: Some(replacement_history.into_iter().map(Into::into).collect()),
+        mcp_resource_origins: None,
         window_number: Some(1),
         first_window_id: None,
         previous_window_id: None,
@@ -1019,6 +1027,33 @@ async fn migration_rolls_back_inter_agent_metadata_with_its_delivery() {
 async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
     let home = TempDir::new().expect("create Codex home");
     let thread_id = ThreadId::new();
+    let RolloutItem::Compacted(mut checkpoint) = compacted(vec![
+        input_response_message("user", "old question"),
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "old answer".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]) else {
+        unreachable!("compacted helper always creates a compaction checkpoint");
+    };
+    checkpoint.mcp_resource_origins = Some(McpResourceOriginCheckpoint {
+        origins: vec![McpResourceOrigin {
+            call_id: "widget-call".to_string(),
+            turn_id: Some("keep-before-compaction".to_string()),
+            tool: "_product_search".to_string(),
+            connector_id: "shopping".to_string(),
+            link_id: None,
+            uri: "ui://shopping/widget".to_string(),
+            ambiguous_account: false,
+        }],
+        turns: vec!["keep-before-compaction".to_string()],
+        current_turn_id: Some("keep-before-compaction".to_string()),
+    });
     let path = write_rollout(
         home.path(),
         thread_id,
@@ -1027,18 +1062,7 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
             started("keep-before-compaction"),
             user_message("old question"),
             completed("keep-before-compaction"),
-            compacted(vec![
-                input_response_message("user", "old question"),
-                ResponseItem::Message {
-                    id: None,
-                    role: "assistant".to_string(),
-                    content: vec![ContentItem::OutputText {
-                        text: "old answer".to_string(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                },
-            ]),
+            RolloutItem::Compacted(checkpoint),
             started("remove-after-compaction"),
             user_message("new question"),
             completed("remove-after-compaction"),
@@ -1067,14 +1091,15 @@ async fn migration_rolls_back_pre_compaction_turns_from_sqlite_history() {
         .await
         .expect("read rollback-through-compaction turns");
     assert_eq!(turns.turns.len(), 1);
-    let replacement_history = read_rollout(&path)
+    let checkpoint = read_rollout(&path)
         .into_iter()
         .find_map(|line| match line.item {
-            RolloutItem::Compacted(item) => item.replacement_history,
+            RolloutItem::Compacted(item) => Some(item),
             _ => None,
         })
         .expect("retained compaction");
-    assert!(replacement_history.is_empty());
+    assert_eq!(checkpoint.replacement_history, Some(Vec::new()));
+    assert_eq!(checkpoint.mcp_resource_origins, None);
 }
 
 #[tokio::test]
@@ -1363,6 +1388,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
             RolloutItem::Compacted(CompactedItem {
                 message: "superseded checkpoint".repeat(1024),
                 replacement_history: Some(Vec::new()),
+                mcp_resource_origins: None,
                 window_number: Some(1),
                 first_window_id: None,
                 previous_window_id: None,
@@ -1382,6 +1408,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                     }
                     .into(),
                 ]),
+                mcp_resource_origins: None,
                 window_number: Some(2),
                 first_window_id: None,
                 previous_window_id: None,
@@ -1398,6 +1425,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "test-model".to_string(),
@@ -1741,6 +1769,137 @@ async fn migration_migrates_archived_rollouts_without_unarchiving_them() {
         .expect("read archived projected turns");
     assert_eq!(turns.turns.len(), 1);
     assert_eq!(turns.turns[0].items.len(), 2);
+}
+
+#[tokio::test]
+async fn migration_preserves_legacy_displayed_thread_names() {
+    let home = TempDir::new().expect("create Codex home");
+    let title_thread_id = ThreadId::new();
+    write_rollout(
+        home.path(),
+        title_thread_id,
+        SessionSource::Cli,
+        vec![user_message("title question")],
+    );
+    let index_thread_id = ThreadId::new();
+    write_rollout(
+        home.path(),
+        index_thread_id,
+        SessionSource::Cli,
+        vec![user_message("index question")],
+    );
+    let store = indexed_store(home.path()).await;
+    store
+        .update_thread_metadata(UpdateThreadMetadataParams {
+            thread_id: title_thread_id,
+            patch: ThreadMetadataPatch {
+                name: Some(Some("renamed title".to_string())),
+                ..Default::default()
+            },
+            include_archived: false,
+        })
+        .await
+        .expect("rename legacy thread");
+    codex_rollout::append_thread_name(home.path(), title_thread_id, "stale index title")
+        .await
+        .expect("write stale legacy index name");
+    codex_rollout::append_thread_name(home.path(), index_thread_id, "indexed title")
+        .await
+        .expect("write legacy index name");
+
+    store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("migrate named rollouts");
+
+    let page = store
+        .list_threads(ListThreadsParams {
+            page_size: 10,
+            cursor: None,
+            sort_key: ThreadSortKey::CreatedAt,
+            sort_direction: SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            model_providers: None,
+            cwd_filters: None,
+            section: None,
+            project_id: None,
+            archived: false,
+            search_term: None,
+            relation_filter: None,
+            use_state_db_only: true,
+        })
+        .await
+        .expect("list migrated threads");
+    let title_thread = page
+        .items
+        .iter()
+        .find(|thread| thread.thread_id == title_thread_id)
+        .expect("renamed title thread");
+    let index_thread = page
+        .items
+        .iter()
+        .find(|thread| thread.thread_id == index_thread_id)
+        .expect("indexed title thread");
+
+    assert_eq!(title_thread.name.as_deref(), Some("renamed title"));
+    assert_eq!(index_thread.name.as_deref(), Some("indexed title"));
+}
+
+#[tokio::test]
+async fn migration_repairs_a_missing_paginated_name_when_rerun() {
+    let home = TempDir::new().expect("create Codex home");
+    let thread_id = ThreadId::new();
+    write_rollout(
+        home.path(),
+        thread_id,
+        SessionSource::Cli,
+        vec![user_message("question")],
+    );
+    let store = indexed_store(home.path()).await;
+    store
+        .update_thread_metadata(UpdateThreadMetadataParams {
+            thread_id,
+            patch: ThreadMetadataPatch {
+                name: Some(Some("renamed title".to_string())),
+                ..Default::default()
+            },
+            include_archived: false,
+        })
+        .await
+        .expect("rename legacy thread");
+    store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("migrate named rollout");
+    let state_db = store.state_db().await.expect("state runtime");
+    state_db
+        .update_thread_title(thread_id, "question")
+        .await
+        .expect("restore derived title");
+    state_db
+        .update_thread_name(thread_id, /*name*/ None)
+        .await
+        .expect("clear migrated name");
+
+    let report = store
+        .migrate_rollouts(apply_options())
+        .await
+        .expect("repair migrated name");
+
+    assert_eq!(
+        report.outcomes[0].status,
+        RolloutMigrationStatus::AlreadyPaginated
+    );
+    assert_eq!(
+        state_db
+            .get_thread(thread_id)
+            .await
+            .expect("read repaired metadata")
+            .expect("repaired thread")
+            .name
+            .as_deref(),
+        Some("renamed title")
+    );
 }
 
 #[cfg(unix)]

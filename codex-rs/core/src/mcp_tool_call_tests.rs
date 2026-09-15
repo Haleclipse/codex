@@ -88,9 +88,7 @@ fn approval_metadata(
 }
 
 fn approval_config(turn_context: &TurnContext) -> codex_mcp::McpConfig {
-    let mut config = (*mcp_config_for_test(&turn_context.config)).clone();
-    config.permission_profile = turn_context.permission_profile();
-    config
+    (*mcp_config_for_test(&turn_context.config)).clone()
 }
 
 fn mcp_turn_metadata_context(turn_context: &TurnContext) -> McpTurnMetadataContext<'_> {
@@ -1120,6 +1118,10 @@ async fn mcp_sandbox_cwd_uses_matching_server_environment_uri() -> anyhow::Resul
                         .permissions
                         .permission_profile_state()
                         .snapshot(),
+                    shell_environment_policy: Default::default(),
+                    exec_policy: None,
+                    mcp_policy: None,
+                    network_policy: None,
                     selected_capability_roots: Vec::new(),
                 }),
             },

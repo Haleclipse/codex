@@ -81,12 +81,7 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
 
     let fs = turn_environment.environment.get_filesystem();
 
-    let mut explicit_env_overrides = turn
-        .config
-        .permissions
-        .shell_environment_policy
-        .r#set
-        .clone();
+    let mut explicit_env_overrides = turn_environment.shell_environment_policy().r#set.clone();
     let mut env = exec_params.env.clone();
     strip_output_env(&mut env);
     strip_output_env(&mut explicit_env_overrides);
@@ -184,6 +179,7 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
             command: &exec_params.command,
             approval_policy: turn.approval_policy(),
             permission_profile: turn_environment.permission_profile().clone(),
+            environment_policy: turn_environment.config().exec_policy.as_ref(),
             windows_sandbox_level: turn.windows_sandbox_level,
             sandbox_permissions: if effective_additional_permissions.permissions_preapproved {
                 codex_protocol::models::SandboxPermissions::UseDefault

@@ -48,13 +48,12 @@ pub enum HistoryLineWrapPolicy {
 
 /// Selects the terminal escape strategy used when writing history above the viewport.
 ///
-/// Raw lines intentionally remain unbroken so terminal selection copies their source faithfully.
-/// Zellij does not constrain soft-wrapped continuation rows to Codex's scroll region, so its raw
-/// path appends history through the terminal and reserves blank rows for the next viewport draw.
+/// Full-screen insertion preserves terminal-native scrollback when partial scroll regions are
+/// unreliable and keeps terminal-managed soft wrapping intact for Zellij.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InsertHistoryMode {
     Standard,
-    ZellijRaw,
+    FullScreen,
 }
 
 /// Insert `lines` above the viewport using the terminal's backend writer
@@ -94,11 +93,13 @@ pub(crate) fn insert_history_lines_with_mode_and_wrap_policy<B>(
 where
     B: Backend<Error = io::Error> + Write,
 {
+    let screen_size = terminal.last_known_screen_size;
     insert_history_hyperlink_lines_with_mode_and_wrap_policy(
         terminal,
         &plain_hyperlink_lines(lines.iter().map(line_to_static).collect()),
         mode,
         wrap_policy,
+        screen_size,
     )
 }
 
@@ -107,12 +108,11 @@ pub(crate) fn insert_history_hyperlink_lines_with_mode_and_wrap_policy<B>(
     lines: &[HyperlinkLine],
     mode: InsertHistoryMode,
     wrap_policy: HistoryLineWrapPolicy,
+    screen_size: Size,
 ) -> io::Result<()>
 where
     B: Backend<Error = io::Error> + Write,
 {
-    let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
-
     let mut area = terminal.viewport_area;
     let mut should_update_area = false;
     let last_cursor_pos = terminal.last_known_cursor_pos;
@@ -132,7 +132,7 @@ where
     let (wrapped, wrapped_rows) = wrap_history_hyperlink_lines(lines, wrap_width, wrap_policy);
     let wrapped_lines = wrapped_rows as u16;
     match mode {
-        InsertHistoryMode::ZellijRaw => {
+        InsertHistoryMode::FullScreen => {
             // The existing viewport is immediately replaced in the same draw pass. Clear it
             // before terminal scrolling can move composer contents into scrollback.
             terminal.clear_after_position(area.as_position())?;
@@ -479,7 +479,7 @@ where
             bg = next_bg;
         }
 
-        queue!(writer, Print(span.content.clone()))?;
+        queue!(writer, Print(&span.content))?;
     }
 
     queue!(
@@ -832,11 +832,13 @@ mod tests {
             .map(|line| line.style(ratatui::style::Style::default().bg(Color::Blue)))
             .collect::<Vec<_>>();
 
+        let screen_size = term.last_known_screen_size;
         insert_history_hyperlink_lines_with_mode_and_wrap_policy(
             &mut term,
             &lines,
             InsertHistoryMode::Standard,
             HistoryLineWrapPolicy::PreWrap,
+            screen_size,
         )
         .expect("insert wrapped user message");
 
@@ -1030,7 +1032,7 @@ mod tests {
         insert_history_lines_with_mode_and_wrap_policy(
             &mut term,
             vec![line],
-            InsertHistoryMode::ZellijRaw,
+            InsertHistoryMode::FullScreen,
             HistoryLineWrapPolicy::Terminal,
         )
         .expect("insert Zellij raw history");
@@ -1066,7 +1068,7 @@ mod tests {
         insert_history_lines_with_mode_and_wrap_policy(
             &mut term,
             vec![line],
-            InsertHistoryMode::ZellijRaw,
+            InsertHistoryMode::FullScreen,
             HistoryLineWrapPolicy::Terminal,
         )
         .expect("replay Zellij raw history");

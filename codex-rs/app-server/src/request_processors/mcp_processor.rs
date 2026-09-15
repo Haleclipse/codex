@@ -1,6 +1,7 @@
 use super::*;
 use codex_core::McpManager;
 use codex_mcp::McpServerSource;
+use codex_mcp::ReadResourceRequestParams;
 
 const MCP_TOOL_THREAD_ID_META_KEY: &str = "threadId";
 
@@ -422,19 +423,49 @@ impl McpRequestProcessor {
         let outgoing = Arc::clone(&self.outgoing);
         let McpResourceReadParams {
             thread_id,
+            origin_call_id,
             server,
             uri,
+            connector_id,
         } = params;
+        let mut resource_params = ReadResourceRequestParams::new(uri);
+        if let Some(connector_id) = connector_id {
+            resource_params.meta = Some(
+                serde_json::Map::from_iter([(
+                    "x-codex-turn-metadata".to_string(),
+                    serde_json::json!({
+                        "mcp_request_meta": {
+                            "selected_connector_ids": [connector_id],
+                        },
+                    }),
+                )])
+                .into(),
+            );
+        }
 
         if let Some(thread_id) = thread_id {
             let (_, thread) = self.load_thread(&thread_id).await?;
             let request_id = request_id.clone();
 
             tokio::spawn(async move {
-                let result = thread.read_mcp_resource(&server, &uri).await;
-                Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
+                let origin_call_id =
+                    origin_call_id.filter(|_| server == codex_mcp::CODEX_APPS_MCP_SERVER_NAME);
+                let result = match origin_call_id.as_deref() {
+                    Some(call_id) => {
+                        thread
+                            .read_mcp_resource_for_call(call_id, &resource_params.uri)
+                            .await
+                    }
+                    None => thread.read_mcp_resource(&server, resource_params).await,
+                };
+                Self::send_mcp_resource_read_response(outgoing, request_id, result, origin_call_id)
+                    .await;
             });
             return Ok(());
+        }
+
+        if origin_call_id.is_some() {
+            return Err(invalid_request("originCallId requires threadId"));
         }
 
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
@@ -459,11 +490,14 @@ impl McpRequestProcessor {
                 codex_apps_tools_cache,
                 tool_catalog_cache,
                 &server,
-                &uri,
+                resource_params,
             )
             .await
             .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));
-            Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
+            Self::send_mcp_resource_read_response(
+                outgoing, request_id, result, /*origin_call_id*/ None,
+            )
+            .await;
         });
         Ok(())
     }
@@ -472,6 +506,7 @@ impl McpRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         request_id: ConnectionRequestId,
         result: anyhow::Result<serde_json::Value>,
+        origin_call_id: Option<String>,
     ) {
         let result = result
             .map_err(|error| internal_error(format!("{error:#}")))
@@ -481,6 +516,10 @@ impl McpRequestProcessor {
                         "failed to deserialize MCP resource read response: {error}"
                     ))
                 })
+            })
+            .map(|mut response| {
+                response.origin_call_id = origin_call_id;
+                response
             });
         outgoing.send_result(request_id, result).await;
     }

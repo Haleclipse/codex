@@ -182,9 +182,6 @@ impl AccountRequestProcessor {
 
     pub(crate) fn clear_external_auth(&self) {
         self.auth_manager.clear_external_auth();
-        self.thread_manager
-            .plugins_manager()
-            .set_auth_mode(self.auth_manager.get_api_auth_mode());
     }
 
     fn current_account_updated_notification(&self) -> AccountUpdatedNotification {
@@ -217,9 +214,6 @@ impl AccountRequestProcessor {
         thread_manager: &Arc<ThreadManager>,
         auth: Option<CodexAuth>,
     ) {
-        thread_manager
-            .plugins_manager()
-            .set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
         thread_manager
             .plugins_manager()
             .clear_recommended_plugins_cache();
@@ -1412,6 +1406,7 @@ mod tests {
     use super::*;
     use codex_backend_client::TokenUsageProfileDailyBucket;
     use codex_backend_client::TokenUsageProfileStats;
+    use http::StatusCode;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -1483,9 +1478,9 @@ mod tests {
     #[test]
     fn workspace_messages_feature_disabled_only_for_not_found() {
         let cases = [
-            (reqwest::StatusCode::NOT_FOUND, true),
-            (reqwest::StatusCode::UNAUTHORIZED, false),
-            (reqwest::StatusCode::FORBIDDEN, false),
+            (StatusCode::NOT_FOUND, true),
+            (StatusCode::UNAUTHORIZED, false),
+            (StatusCode::FORBIDDEN, false),
         ];
 
         for (status, expected) in cases {

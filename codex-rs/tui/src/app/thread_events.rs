@@ -49,6 +49,7 @@ pub(super) struct ThreadEventStore {
     pub(super) input_state: Option<ThreadInputState>,
     pub(super) capacity: usize,
     pub(super) active: bool,
+    pub(super) buffered_agent_message_delta_bytes: usize,
 }
 
 impl ThreadEventStore {
@@ -76,6 +77,7 @@ impl ThreadEventStore {
             input_state: None,
             capacity,
             active: false,
+            buffered_agent_message_delta_bytes: 0,
         }
     }
 
@@ -98,6 +100,7 @@ impl ThreadEventStore {
 
     pub(super) fn rebase_buffer_after_session_refresh(&mut self) {
         self.buffer.retain(Self::event_survives_session_refresh);
+        self.buffered_agent_message_delta_bytes = 0;
     }
 
     pub(super) fn set_turns(&mut self, turns: Vec<Turn>) {
@@ -160,31 +163,13 @@ impl ThreadEventStore {
             return;
         }
 
-        self.buffer
-            .push_back(ThreadBufferedEvent::Notification(Box::new(
-                notification.into_owned(),
-            )));
-        if self.buffer.len() > self.capacity
-            && let Some(removed) = self.buffer.pop_front()
-            && let ThreadBufferedEvent::Request(request) = &removed
-        {
-            self.pending_interactive_replay
-                .note_evicted_server_request(request.as_ref());
-        }
+        self.push_replay_notification(notification);
     }
 
     pub(super) fn push_request(&mut self, request: ServerRequest) {
         self.pending_interactive_replay
             .note_server_request(&request);
-        self.buffer
-            .push_back(ThreadBufferedEvent::Request(Box::new(request)));
-        if self.buffer.len() > self.capacity
-            && let Some(removed) = self.buffer.pop_front()
-            && let ThreadBufferedEvent::Request(request) = &removed
-        {
-            self.pending_interactive_replay
-                .note_evicted_server_request(request.as_ref());
-        }
+        self.push_buffered_event(ThreadBufferedEvent::Request(Box::new(request)));
     }
 
     pub(super) fn pending_replay_requests(&self) -> Vec<ServerRequest> {
@@ -211,35 +196,7 @@ impl ThreadEventStore {
         turn_id: &str,
         item_id: &str,
     ) -> Option<Vec<codex_app_server_protocol::FileUpdateChange>> {
-        self.buffer
-            .iter()
-            .rev()
-            .find_map(|event| match event {
-                ThreadBufferedEvent::Notification(notification) => match notification.as_ref() {
-                    ServerNotification::ItemStarted(notification)
-                        if turn_id_matches(turn_id, &notification.turn_id) =>
-                    {
-                        file_change_item_changes(&notification.item, item_id)
-                    }
-                    ServerNotification::ItemCompleted(notification)
-                        if turn_id_matches(turn_id, &notification.turn_id) =>
-                    {
-                        file_change_item_changes(&notification.item, item_id)
-                    }
-                    _ => None,
-                },
-                ThreadBufferedEvent::Request(_)
-                | ThreadBufferedEvent::HistoryEntryResponse(_)
-                | ThreadBufferedEvent::FeedbackSubmission(_) => None,
-            })
-            .or_else(|| {
-                self.turns
-                    .iter()
-                    .rev()
-                    .filter(|turn| turn_id_matches(turn_id, &turn.id))
-                    .flat_map(|turn| turn.items.iter().rev())
-                    .find_map(|item| file_change_item_changes(item, item_id))
-            })
+        file_change_changes(self.buffer.iter(), &self.turns, turn_id, item_id)
     }
 
     pub(super) fn snapshot(&self) -> ThreadEventSnapshot {
@@ -311,6 +268,38 @@ impl ThreadEventStore {
 
 fn turn_id_matches(request_turn_id: &str, candidate_turn_id: &str) -> bool {
     request_turn_id.is_empty() || request_turn_id == candidate_turn_id
+}
+
+pub(super) fn file_change_changes<'a>(
+    events: impl DoubleEndedIterator<Item = &'a ThreadBufferedEvent>,
+    turns: &'a [Turn],
+    turn_id: &str,
+    item_id: &str,
+) -> Option<Vec<codex_app_server_protocol::FileUpdateChange>> {
+    let event_items = events.rev().filter_map(|event| {
+        let ThreadBufferedEvent::Notification(notification) = event else {
+            return None;
+        };
+        let (candidate_turn_id, item) = match notification.as_ref() {
+            ServerNotification::ItemStarted(notification) => {
+                (&notification.turn_id, &notification.item)
+            }
+            ServerNotification::ItemCompleted(notification) => {
+                (&notification.turn_id, &notification.item)
+            }
+            _ => return None,
+        };
+        turn_id_matches(turn_id, candidate_turn_id).then_some(item)
+    });
+    event_items
+        .chain(
+            turns
+                .iter()
+                .rev()
+                .filter(|turn| turn_id_matches(turn_id, &turn.id))
+                .flat_map(|turn| turn.items.iter().rev()),
+        )
+        .find_map(|item| file_change_item_changes(item, item_id))
 }
 
 fn file_change_item_changes(

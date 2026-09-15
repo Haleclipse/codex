@@ -73,6 +73,7 @@ pub use session_archive_commands::DeleteConfirmation;
 pub use session_archive_commands::SessionArchiveAction;
 pub use session_archive_commands::SessionArchiveCommandOptions;
 pub use session_archive_commands::run_session_archive_command;
+pub use session_queue_commands::run_session_queue_command;
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -163,7 +164,6 @@ mod pager_overlay;
 // @cometix: statusline, translation, and overlay modules
 #[allow(dead_code, unused_imports, clippy::all)]
 mod cxline_overlay;
-mod permission_compat;
 pub(crate) mod public_widgets;
 mod render;
 mod resize_reflow_cap;
@@ -172,9 +172,10 @@ mod selection_list;
 mod service_tier_resolution;
 mod session_archive_commands;
 mod session_log;
+mod session_queue_commands;
 mod session_resume;
+mod session_start;
 mod session_state;
-mod shimmer;
 mod skills_helpers;
 mod slash_command;
 mod startup_draft;
@@ -205,6 +206,7 @@ mod translate_overlay;
 mod translation;
 mod tui;
 mod ui_consts;
+mod unarchive_prompt;
 pub(crate) mod update_action;
 pub use update_action::UpdateAction;
 #[cfg(not(debug_assertions))]
@@ -743,6 +745,7 @@ fn latest_session_lookup_params(
         source_kinds: Some(resume_source_kinds(include_non_interactive)),
         archived: Some(false),
         section_id: None,
+        project_id: None,
         parent_thread_id: None,
         ancestor_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().to_string())),
@@ -1083,10 +1086,36 @@ async fn run_ratatui_app(
             }
         }
     }
+    let remote_project_trust =
+        if uses_remote_workspace && let Some(remote_cwd) = remote_cwd_override.as_deref() {
+            match startup_draft
+                .run_until(
+                    &mut tui,
+                    config_update::read_remote_project_trust(
+                        app_server_session.request_handle(),
+                        remote_cwd,
+                    ),
+                )
+                .await
+            {
+                Ok(Ok(remote_project_trust)) => remote_project_trust,
+                Ok(Err(err)) => {
+                    shutdown_startup_session(Some(app_server_session), &mut terminal_restore_guard)
+                        .await;
+                    return Err(err);
+                }
+                Err(err) => {
+                    shutdown_startup_session(Some(app_server_session), &mut terminal_restore_guard)
+                        .await;
+                    return Err(err.into());
+                }
+            }
+        } else {
+            None
+        };
     let mut app_server = Some(app_server_session);
-
-    let should_show_trust_screen_flag =
-        !uses_remote_workspace && should_show_trust_screen(&initial_config);
+    let should_show_trust_screen_flag = remote_project_trust.is_some()
+        || (!uses_remote_workspace && should_show_trust_screen(&initial_config));
     #[cfg(target_os = "windows")]
     let mut trust_decision_was_made = false;
     let startup_model_provider = initial_config.model_provider_id.clone();
@@ -1128,6 +1157,7 @@ async fn run_ratatui_app(
             OnboardingScreenArgs {
                 show_login_screen,
                 show_trust_screen: should_show_trust_screen_flag,
+                remote_project_trust,
                 login_status,
                 app_server_request_handle: app_server
                     .as_ref()
@@ -1162,7 +1192,8 @@ async fn run_ratatui_app(
         }
         #[cfg(target_os = "windows")]
         {
-            trust_decision_was_made = onboarding_result.directory_trust_persisted;
+            trust_decision_was_made =
+                !uses_remote_workspace && onboarding_result.directory_trust_persisted;
         }
         let reloaded_config = startup_draft
             .run_until(&mut tui, async {
@@ -1179,8 +1210,8 @@ async fn run_ratatui_app(
 
                 // Reload config when persisted trust or auth changes alter the current process.
                 Ok::<_, std::io::Error>(
-                    if onboarding_result.directory_trust_persisted
-                        || (show_login_screen && !uses_remote_workspace)
+                    if !uses_remote_workspace
+                        && (onboarding_result.directory_trust_persisted || show_login_screen)
                     {
                         load_config_or_exit(
                             cli_kv_overrides.clone(),
@@ -1207,7 +1238,7 @@ async fn run_ratatui_app(
         initial_config
     };
     startup_draft.apply_config(&config);
-    if !(cli.resume_picker || cli.fork_picker)
+    if !(cli.resume_picker || cli.fork_picker || cli.agents_overview)
         && let Err(err) = startup_draft.show(&mut tui)
     {
         shutdown_startup_session(app_server.take(), &mut terminal_restore_guard).await;
@@ -1235,7 +1266,9 @@ async fn run_ratatui_app(
         };
 
     let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
-    let session_selection = if use_fork {
+    let session_selection = if cli.agents_overview {
+        resume_picker::SessionSelection::AgentsOverview
+    } else if use_fork {
         if let Some(id_str) = cli.fork_session_id.as_deref() {
             let Some(startup_app_server) = app_server.as_mut() else {
                 unreachable!("app server should be initialized for --fork <id>");

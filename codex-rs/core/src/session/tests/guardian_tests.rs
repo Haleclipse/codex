@@ -786,7 +786,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
     );
     let plugins_manager = Arc::new(plugins_manager_for_config(
         &config,
-        auth_manager.get_api_auth_mode(),
+        Arc::clone(&auth_manager),
     ));
     let skills_service = Arc::new(HostSkillsService::new(
         config.codex_home.clone(),
@@ -832,6 +832,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         environment_selections: Vec::new(),
         thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
         client_mcp_extensions: ClientMcpExtensions::default(),
+        reserved_thread_id: None,
         analytics_events_client: None,
         thread_store,
         attestation_provider: None,

@@ -237,6 +237,7 @@ impl ApprovalAction {
                 ..
             } => vec![ApprovalCacheKey::ExecCommand(UnifiedExecApprovalKey {
                 environment_id: environment_id.clone(),
+                executable: command.first().cloned(),
                 command: canonicalize_command_for_approval(command),
                 cwd: cwd.clone(),
                 tty: *tty,
@@ -703,7 +704,19 @@ impl Session {
                     .clone()
                     .or_else(|| ctx.approval_reason.clone())
                     .or_else(|| justification.clone());
-                with_cached_approval(&self.services, tool_name, action.cache_keys(), || async {
+                let policy_fingerprint = ctx
+                    .review_context
+                    .environments()
+                    .turn_environments()
+                    .find(|environment| environment.selection.environment_id == *environment_id)
+                    .and_then(|environment| environment.config().exec_policy.as_ref())
+                    .map(codex_execpolicy::RequirementsExecPolicy::fingerprint);
+                let cache_keys = action
+                    .cache_keys()
+                    .into_iter()
+                    .map(|key| (key, &policy_fingerprint))
+                    .collect();
+                with_cached_approval(&self.services, tool_name, cache_keys, || async {
                     self.request_command_approval(
                         ctx.review_context.turn(),
                         ctx.call_id.clone(),

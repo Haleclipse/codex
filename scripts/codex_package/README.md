@@ -4,6 +4,14 @@ This package contains the implementation behind `scripts/build_codex_package.py`
 The top-level script is the stable executable entry point; these modules keep the
 package-building logic split by responsibility.
 
+Run the builder through `just`:
+
+```bash
+just assemble-codex-package --help
+just assemble-codex-package --variant codex-app-server
+just assemble-codex-package --target x86_64-unknown-linux-gnu
+```
+
 The builder creates a canonical Codex package directory:
 
 ```text
@@ -31,8 +39,9 @@ artifacts; pass a GNU Linux target explicitly for native glibc local builds. If
 prints its path after the package is built.
 
 The `--variant` flag selects the package entrypoint. Supported variants are
-`codex` and `codex-app-server`. The `version` field in `codex-package.json` is
-read from `[workspace.package].version` in `codex-rs/Cargo.toml`.
+`codex` and `codex-app-server`. The `--package-version` flag sets the version in
+`codex-package.json`; it defaults to `[workspace.package].version` in
+`codex-rs/Cargo.toml`.
 
 ## Source-built artifacts
 

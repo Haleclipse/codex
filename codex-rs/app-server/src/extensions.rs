@@ -94,8 +94,12 @@ where
         git_attribution_base_url,
         http_client_factory,
     );
-    codex_guardian::install(&mut builder, guardian_agent_spawner);
-    codex_guardian_v2::install(&mut builder, auth_manager.clone(), thread_manager);
+    codex_guardian_v2::install(
+        &mut builder,
+        guardian_agent_spawner,
+        auth_manager.clone(),
+        thread_manager,
+    );
     codex_memories_extension::install(&mut builder, codex_otel::global());
     codex_mcp_extension::install(&mut builder);
     codex_mcp_extension::install_executor_plugins(&mut builder, environment_manager);
@@ -115,6 +119,7 @@ where
         codex_otel::global(),
         |config: &Config| codex_skills_extension::SkillsExtensionConfig {
             include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: config.bundled_skills_enabled(),
             orchestrator_skills_enabled: config.orchestrator_skills_enabled,
             shadow_selection_enabled: config

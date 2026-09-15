@@ -45,7 +45,6 @@ use codex_sandboxing::SandboxablePreference;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_sandboxing::record_filesystem_sandbox_violation;
 use codex_shell_command::bash::parse_shell_lc_plain_commands;
-use codex_shell_command::bash::parse_shell_lc_single_command_prefix;
 use codex_shell_escalation::EscalateServer;
 use codex_shell_escalation::EscalationDecision;
 use codex_shell_escalation::EscalationExecution;
@@ -183,7 +182,10 @@ pub(super) async fn try_run_zsh_fork(
         ctx.session
             .services
             .exec_policy
-            .current_for_prefix_rules(ctx.step_context.turn.allow_prefix_rules())
+            .current_for_environment(
+                req.turn_environment.config().exec_policy.as_ref(),
+                ctx.step_context.turn.allow_prefix_rules(),
+            )
             .as_ref()
             .clone(),
     ));
@@ -297,7 +299,10 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         ctx.session
             .services
             .exec_policy
-            .current_for_prefix_rules(ctx.step_context.turn.allow_prefix_rules())
+            .current_for_environment(
+                req.turn_environment.config().exec_policy.as_ref(),
+                ctx.step_context.turn.allow_prefix_rules(),
+            )
             .as_ref()
             .clone(),
     ));
@@ -380,7 +385,7 @@ struct CoreShellActionProvider {
 #[allow(clippy::large_enum_variant)]
 enum DecisionSource {
     PrefixRule,
-    /// Often, this is `is_safe_command()`.
+    /// Derived from the unmatched-command sandbox fallback.
     UnmatchedCommandFallback,
 }
 
@@ -675,10 +680,7 @@ fn evaluate_intercepted_exec_policy(
         sandbox_permissions,
         enable_shell_wrapper_parsing,
     } = context;
-    let CandidateCommands {
-        commands,
-        used_complex_parsing,
-    } = if enable_shell_wrapper_parsing {
+    let commands = if enable_shell_wrapper_parsing {
         // In this codepath, the first argument in `commands` could be a bare
         // name like `find` instead of an absolute path like `/usr/bin/find`.
         // It could also be a shell built-in like `echo`.
@@ -686,10 +688,7 @@ fn evaluate_intercepted_exec_policy(
     } else {
         // In this codepath, `commands` has a single entry where the program
         // is always an absolute path.
-        CandidateCommands {
-            commands: vec![join_program_and_argv(program, argv)],
-            used_complex_parsing: false,
-        }
+        vec![join_program_and_argv(program, argv)]
     };
 
     let fallback = |cmd: &[String]| {
@@ -700,7 +699,6 @@ fn evaluate_intercepted_exec_policy(
                 permission_profile: &permission_profile,
                 windows_sandbox_level,
                 sandbox_permissions,
-                used_complex_parsing,
                 command_origin: crate::exec_policy::ExecPolicyCommandOrigin::Generic,
             },
         )
@@ -724,39 +722,24 @@ struct InterceptedExecPolicyContext {
     enable_shell_wrapper_parsing: bool,
 }
 
-struct CandidateCommands {
-    commands: Vec<Vec<String>>,
-    used_complex_parsing: bool,
-}
-
 fn commands_for_intercepted_exec_policy(
     program: &AbsolutePathBuf,
     argv: &[String],
-) -> CandidateCommands {
+) -> Vec<Vec<String>> {
     if let [_, flag, script] = argv {
         let shell_command = [
             program.to_string_lossy().to_string(),
             flag.clone(),
             script.clone(),
         ];
-        if let Some(commands) = parse_shell_lc_plain_commands(&shell_command) {
-            return CandidateCommands {
-                commands,
-                used_complex_parsing: false,
-            };
-        }
-        if let Some(single_command) = parse_shell_lc_single_command_prefix(&shell_command) {
-            return CandidateCommands {
-                commands: vec![single_command],
-                used_complex_parsing: true,
-            };
+        if let Some(commands) = parse_shell_lc_plain_commands(&shell_command)
+            && !commands.is_empty()
+        {
+            return commands;
         }
     }
 
-    CandidateCommands {
-        commands: vec![join_program_and_argv(program, argv)],
-        used_complex_parsing: false,
-    }
+    vec![join_program_and_argv(program, argv)]
 }
 
 struct CoreShellCommandExecutor {

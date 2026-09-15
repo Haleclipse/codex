@@ -1,6 +1,7 @@
 //! App-server event stream handling for the TUI app.
 
 use super::App;
+use super::ThreadBufferedEvent;
 use super::app_server_event_targets::ServerNotificationThreadTarget;
 use super::app_server_event_targets::server_notification_thread_target;
 use super::app_server_event_targets::server_request_thread_id;
@@ -11,9 +12,15 @@ use crate::app_server_session::AppServerSession;
 use crate::app_server_session::status_account_display_from_auth_mode;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::AuthMode;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::RateLimitReachedType;
+use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
+use codex_protocol::protocol::SubAgentSource;
 
 impl App {
     pub(super) fn refresh_mcp_startup_expected_servers_from_config(&mut self) {
@@ -57,6 +64,7 @@ impl App {
                 );
                 self.refresh_mcp_startup_expected_servers_from_config();
                 self.chat_widget.finish_mcp_startup_after_lag();
+                self.refresh_agents_overview_threads(app_server_client);
             }
             AppServerEvent::ServerNotification(notification) => {
                 self.handle_server_notification_event(app_server_client, *notification)
@@ -79,11 +87,51 @@ impl App {
         app_server_client: &AppServerSession,
         notification: ServerNotification,
     ) {
+        if let ServerNotification::ThreadStarted(started) = &notification
+            && let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) = &started.thread.source
+            && self
+                .agents_overview
+                .dispatched_requests
+                .contains_key(parent_thread_id)
+            && let Ok(thread_id) = codex_protocol::ThreadId::from_string(&started.thread.id)
+        {
+            self.agents_overview
+                .dispatched_requests
+                .entry(thread_id)
+                .or_default();
+        }
+        if matches!(
+            &notification,
+            ServerNotification::ThreadStarted(_)
+                | ServerNotification::ThreadStatusChanged(_)
+                | ServerNotification::ThreadSettingsUpdated(_)
+                | ServerNotification::ThreadNameUpdated(_)
+                | ServerNotification::ThreadArchived(_)
+                | ServerNotification::ThreadDeleted(_)
+                | ServerNotification::ThreadClosed(_)
+        ) {
+            self.refresh_agents_overview_threads(app_server_client);
+        }
         match &notification {
             ServerNotification::ServerRequestResolved(notification) => {
+                let notification_thread_id =
+                    codex_protocol::ThreadId::from_string(&notification.thread_id).ok();
+                self.pending_primary_events.retain(|event| {
+                    !matches!(event, ThreadBufferedEvent::Request(request)
+                        if request.id() == &notification.request_id
+                            && server_request_thread_id(request) == notification_thread_id)
+                });
+                if let Some(thread_id) = notification_thread_id
+                    && let Some(requests) =
+                        self.agents_overview.dispatched_requests.get_mut(&thread_id)
+                {
+                    requests.retain(|request| request.id() != &notification.request_id);
+                }
                 if let Some(request) = self
                     .pending_app_server_requests
-                    .resolve_notification(&notification.request_id)
+                    .resolve_notification(&notification.thread_id, &notification.request_id)
                 {
                     self.chat_widget.dismiss_app_server_request(&request);
                     if self.startup_pending_protected_request {
@@ -179,6 +227,31 @@ impl App {
 
         match server_notification_thread_target(&notification) {
             ServerNotificationThreadTarget::Thread(thread_id) => {
+                if self.primary_thread_id.is_none() && !self.pending_startup_thread_start {
+                    return;
+                }
+                if self.primary_thread_id.is_some()
+                    && self.primary_thread_id != Some(thread_id)
+                    && !self.thread_event_channels.contains_key(&thread_id)
+                    && self.agent_navigation.get(&thread_id).is_none()
+                    && !self.side_threads.contains_key(&thread_id)
+                    && !matches!(&notification, ServerNotification::McpServerStatusUpdated(_))
+                    && !matches!(
+                        &notification,
+                        ServerNotification::ThreadStarted(started)
+                            if matches!(
+                                &started.thread.source,
+                                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                                    parent_thread_id,
+                                    ..
+                                }) if self.primary_thread_id == Some(*parent_thread_id)
+                                    || self.thread_event_channels.contains_key(parent_thread_id)
+                                    || self.agent_navigation.get(parent_thread_id).is_some()
+                            )
+                    )
+                {
+                    return;
+                }
                 let result = if self.primary_thread_id == Some(thread_id)
                     || self.primary_thread_id.is_none()
                 {
@@ -231,6 +304,88 @@ impl App {
                 tracing::warn!("{err}");
             }
             return;
+        }
+        if thread_id.is_some()
+            && self.primary_thread_id.is_none()
+            && self.pending_startup_thread_start
+        {
+            self.pending_primary_events
+                .push_back(ThreadBufferedEvent::Request(Box::new(request)));
+            return;
+        }
+        let unsupported_request = matches!(
+            &request,
+            ServerRequest::DynamicToolCall { .. }
+                | ServerRequest::AttestationGenerate { .. }
+                | ServerRequest::CurrentTimeRead { .. }
+                | ServerRequest::ApplyPatchApproval { .. }
+                | ServerRequest::ExecCommandApproval { .. }
+        );
+        if self
+            .pending_app_server_requests
+            .contains_server_request(&request)
+        {
+            return;
+        }
+        if let Some(thread_id) = thread_id
+            && self.primary_thread_id != Some(thread_id)
+            && !unsupported_request
+            && let Some(requests) = self.agents_overview.dispatched_requests.get_mut(&thread_id)
+        {
+            requests.push(request);
+            return;
+        }
+        if thread_id.is_some()
+            && self.primary_thread_id.is_none()
+            && !self.pending_startup_thread_start
+            && !unsupported_request
+        {
+            return;
+        }
+        if let Some(thread_id) = thread_id
+            && self.primary_thread_id.is_some()
+            && self.primary_thread_id != Some(thread_id)
+            && !self.thread_event_channels.contains_key(&thread_id)
+            && self.agent_navigation.get(&thread_id).is_none()
+            && !self.side_threads.contains_key(&thread_id)
+            && !unsupported_request
+        {
+            let thread = app_server_client
+                .request_handle()
+                .request_typed::<ThreadReadResponse>(ClientRequest::ThreadRead {
+                    request_id: RequestId::String(format!("subagent-approval-{thread_id}")),
+                    params: ThreadReadParams {
+                        thread_id: thread_id.to_string(),
+                        include_turns: false,
+                    },
+                })
+                .await;
+            let Ok(ThreadReadResponse { thread }) = thread else {
+                return;
+            };
+            let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) = thread.source
+            else {
+                return;
+            };
+            if self.primary_thread_id != Some(parent_thread_id)
+                && !self.thread_event_channels.contains_key(&parent_thread_id)
+                && self.agent_navigation.get(&parent_thread_id).is_none()
+            {
+                if self
+                    .agents_overview
+                    .dispatched_requests
+                    .contains_key(&parent_thread_id)
+                {
+                    self.agents_overview
+                        .dispatched_requests
+                        .entry(thread_id)
+                        .or_default()
+                        .push(request);
+                }
+                return;
+            }
         }
 
         if let Some(unsupported) = self

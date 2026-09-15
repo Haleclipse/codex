@@ -250,7 +250,6 @@ deny = [
         # upstream HTTP transport independently of Codex.
         "codex-responses-api-proxy",
         # Temporary migration exceptions.
-        "codex-app-server",
         "codex-otel",
         # @cometix: the reasoning-translation client calls third-party LLM providers
         # directly; migrate to codex-http-client when that abstraction is stable here.

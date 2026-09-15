@@ -2,12 +2,20 @@
 
 use anyhow::Result;
 use codex_config::test_support::CloudConfigBundleFixture;
+use codex_core::EnvironmentConfig;
 use codex_core::TurnInputRequest;
+use codex_core::config::Constrained;
+use codex_execpolicy::Decision;
+use codex_execpolicy::Policy;
+use codex_execpolicy::RequirementsExecPolicy;
 use codex_features::Feature;
+use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GranularApprovalConfig;
@@ -23,10 +31,12 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_target_windows;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::fs;
@@ -91,6 +101,91 @@ fn assert_no_matched_rules_invariant(output_item: &Value) {
         !output.contains("invariant failed: matched_rules must be non-empty"),
         "unexpected invariant panic surfaced in output: {output}"
     );
+}
+
+#[tokio::test]
+async fn git_status_requires_approval_under_unless_trusted() -> Result<()> {
+    skip_if_wine_exec!(Ok(()), "command approval requires host-native paths");
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::workspace_write())
+            .expect("set workspace-write permissions");
+        config.approvals_reviewer = ApprovalsReviewer::User;
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    let call_id = "git-status-approval";
+    let args = json!({"cmd": "git status", "yield_time_ms": 1_000});
+    let initial_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-git-status-1"),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+            ev_completed("resp-git-status-1"),
+        ]),
+    )
+    .await;
+    let results_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-git-status-1", "done"),
+            ev_completed("resp-git-status-2"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "check git status".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
+        )
+    })
+    .await;
+    let EventMsg::ExecApprovalRequest(approval) = event else {
+        let output = results_mock.function_call_output_text(call_id);
+        panic!(
+            "expected git status to request approval before turn completion; output: {output:?}"
+        );
+    };
+    assert_eq!(approval.call_id, call_id);
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: None,
+            decision: ReviewDecision::denied("git status was not approved"),
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert!(
+        initial_mock
+            .single_request()
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "check git status")
+    );
+    let output = results_mock
+        .single_request()
+        .function_call_output_text(call_id)
+        .expect("shell command output");
+    assert!(output.contains("git status was not approved"), "{output}");
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -278,6 +373,68 @@ async fn granular_complex_forced_rm_requests_approval_when_allowed() -> Result<(
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn deeply_nested_forced_rm_is_rejected_before_execution_when_approvals_are_disabled()
+-> Result<()> {
+    skip_if_target_windows!(Ok(()), "uses a POSIX shell command fixture");
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let test = builder.build_with_auto_env(&server).await?;
+    let sentinel = test.config.cwd.join("forced-rm-sentinel");
+    fs::write(&sentinel, "must not be deleted")?;
+    let call_id = "deeply-nested-forced-rm";
+    let args = json!({
+        "command": "env env env env env env env env env rm -rf forced-rm-sentinel",
+        "timeout_ms": 1_000,
+    });
+
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-deeply-nested-forced-rm-1"),
+            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_completed("resp-deeply-nested-forced-rm-1"),
+        ]),
+    )
+    .await;
+    let results_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-deeply-nested-forced-rm", "done"),
+            ev_completed("resp-deeply-nested-forced-rm-2"),
+        ]),
+    )
+    .await;
+
+    submit_user_turn(
+        &test,
+        "run the deeply nested forced rm",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+        /*collaboration_mode*/ None,
+    )
+    .await?;
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let output_item = results_mock.single_request().function_call_output(call_id);
+    let output = output_item
+        .get("output")
+        .and_then(Value::as_str)
+        .expect("function call output should include a string output payload");
+    assert!(
+        output.contains("rejected: blocked by policy"),
+        "unexpected output: {output}"
+    );
+    assert!(sentinel.exists(), "the rejected command must not execute");
 
     Ok(())
 }
@@ -520,6 +677,233 @@ prefix_rules = [
         output.contains("policy forbids commands starting with `echo`"),
         "unexpected output: {output}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn environment_command_restrictions_override_saved_prefix_approvals() -> Result<()> {
+    skip_if_target_windows!(
+        Ok(()),
+        "managed prefix fixture uses POSIX executable semantics"
+    );
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+        let policy_path = config.codex_home.join("rules").join("approved.rules");
+        fs::create_dir_all(policy_path.parent().expect("rules directory"))
+            .expect("create rules directory");
+        fs::write(
+            policy_path,
+            r#"prefix_rule(pattern=["echo"], decision="allow")"#,
+        )
+        .expect("write approved command prefix");
+    });
+    let server = start_mock_server().await;
+    let test = builder.build_with_auto_env(&server).await?;
+    let selection = test
+        .codex
+        .environment_selections()
+        .await
+        .into_iter()
+        .next()
+        .expect("thread should select its executor environment");
+    let mut invalid_policy = Policy::empty();
+    invalid_policy.add_prefix_rule(&["echo".to_string()], Decision::Allow)?;
+    let error = test
+        .codex
+        .environment_ready(
+            &selection,
+            EnvironmentConfig {
+                allow_login_shell: true,
+                permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
+                shell_environment_policy: Default::default(),
+                exec_policy: Some(RequirementsExecPolicy::new(invalid_policy)),
+                mcp_policy: None,
+                network_policy: None,
+                selected_capability_roots: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("environment policies must not introduce command allowances");
+    assert!(matches!(
+        error.details(),
+        CodexErrorDetails::InvalidRequest(message)
+            if message == "environment command policy cannot contain allow rules"
+    ));
+
+    let mut environment_policy = Policy::empty();
+    environment_policy.add_prefix_rule(&["echo".to_string()], Decision::Forbidden)?;
+    test.codex
+        .environment_ready(
+            &selection,
+            EnvironmentConfig {
+                allow_login_shell: true,
+                permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
+                shell_environment_policy: Default::default(),
+                exec_policy: Some(RequirementsExecPolicy::new(environment_policy)),
+                mcp_policy: None,
+                network_policy: None,
+                selected_capability_roots: Vec::new(),
+            },
+        )
+        .await?;
+
+    let call_id = "environment-managed-command";
+    let args = json!({
+        "cmd": "echo blocked",
+        "yield_time_ms": 1_000,
+    });
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-environment-managed-1"),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+            ev_completed("resp-environment-managed-1"),
+        ]),
+    )
+    .await;
+    let results_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-environment-managed", "done"),
+            ev_completed("resp-environment-managed-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn_with_approval_and_permission_profile(
+        "run shell command",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let output_item = results_mock.single_request().function_call_output(call_id);
+    let output = output_item
+        .get("output")
+        .and_then(Value::as_str)
+        .expect("function call output should include a string output payload");
+    assert!(
+        output.contains("policy forbids commands starting with `echo`"),
+        "unexpected output: {output}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn environment_command_policy_changes_invalidate_session_approvals() -> Result<()> {
+    skip_if_target_windows!(
+        Ok(()),
+        "managed prefix fixture uses POSIX executable semantics"
+    );
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::Disabled)
+            .expect("test config should allow unrestricted permissions");
+        config.approvals_reviewer = ApprovalsReviewer::User;
+        let policy_path = config.codex_home.join("rules").join("prompt.rules");
+        fs::create_dir_all(policy_path.parent().expect("rules directory"))
+            .expect("create rules directory");
+        fs::write(
+            policy_path,
+            r#"prefix_rule(pattern=["echo"], decision="prompt")"#,
+        )
+        .expect("write prompt command prefix");
+    });
+    let server = start_mock_server().await;
+    let test = builder.build_with_auto_env(&server).await?;
+    let selection = test
+        .codex
+        .environment_selections()
+        .await
+        .into_iter()
+        .next()
+        .expect("thread should select its executor environment");
+
+    for (attempt, decision) in [
+        ("before-owner-policy", ReviewDecision::ApprovedForSession),
+        ("after-owner-policy", ReviewDecision::Approved),
+    ] {
+        if attempt == "after-owner-policy" {
+            let mut policy = Policy::empty();
+            policy.add_prefix_rule(&["echo".to_string()], Decision::Prompt)?;
+            test.codex
+                .environment_ready(
+                    &selection,
+                    EnvironmentConfig {
+                        allow_login_shell: true,
+                        permission_profile: PermissionProfileSnapshot::legacy(
+                            PermissionProfile::Disabled,
+                        ),
+                        shell_environment_policy: Default::default(),
+                        exec_policy: Some(RequirementsExecPolicy::new(policy)),
+                        mcp_policy: None,
+                        network_policy: None,
+                        selected_capability_roots: Vec::new(),
+                    },
+                )
+                .await?;
+        }
+
+        let args = json!({ "cmd": "echo approval", "yield_time_ms": 1_000 });
+        mount_sse_once(
+            &server,
+            sse(vec![
+                ev_response_created(attempt),
+                ev_function_call(attempt, "exec_command", &serde_json::to_string(&args)?),
+                ev_completed(attempt),
+            ]),
+        )
+        .await;
+        mount_sse_once(
+            &server,
+            sse(vec![
+                ev_assistant_message(attempt, "done"),
+                ev_completed(attempt),
+            ]),
+        )
+        .await;
+
+        test.codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: attempt.into(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        let event = wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
+            )
+        })
+        .await;
+        let EventMsg::ExecApprovalRequest(approval) = event else {
+            panic!("expected a fresh command approval {attempt}");
+        };
+        test.codex
+            .submit(Op::ExecApproval {
+                id: approval.effective_approval_id(),
+                turn_id: None,
+                decision,
+            })
+            .await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+    }
 
     Ok(())
 }

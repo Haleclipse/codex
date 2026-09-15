@@ -24,6 +24,7 @@ use crate::tools::handlers::ReadMcpResourceHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
+use crate::tools::handlers::SendUserMessageAsyncHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
@@ -1059,6 +1060,16 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
             },
             ToolExposure::DirectModelOnly,
         );
+    }
+
+    if !turn_context.session_source.is_non_root_agent()
+        && turn_context
+            .model_info
+            .experimental_supported_tools
+            .iter()
+            .any(|tool| tool == "send_user_message_async")
+    {
+        registry.add_with_exposure(SendUserMessageAsyncHandler, ToolExposure::DirectModelOnly);
     }
 
     if environment_mode.has_environment() && features.enabled(Feature::RequestPermissionsTool) {

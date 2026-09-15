@@ -88,6 +88,7 @@ pub struct UnifiedExecRequest {
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct UnifiedExecApprovalKey {
     pub environment_id: String,
+    pub executable: Option<String>,
     pub command: Vec<String>,
     pub cwd: PathUri,
     pub tty: bool,
@@ -230,7 +231,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 call_id: ctx.call_id.clone(),
                 tool_name: flat_tool_name(&ctx.tool_name).into_owned(),
                 command: req.command.clone(),
-                cwd: req.cwd.to_abs_path().ok()?,
+                cwd: req.cwd.clone(),
                 sandbox_permissions: req.sandbox_permissions,
                 additional_permissions: req.additional_permissions.clone(),
                 justification: req.justification.clone(),
@@ -542,6 +543,10 @@ mod tests {
                     permission_profile: PermissionProfileSnapshot::legacy(
                         PermissionProfile::read_only(),
                     ),
+                    shell_environment_policy: Default::default(),
+                    exec_policy: None,
+                    mcp_policy: None,
+                    network_policy: None,
                     selected_capability_roots: Vec::new(),
                 }),
             },

@@ -45,15 +45,23 @@ async fn write_repo_skill(
     let skill_dir_uri = PathUri::from_host_native_path(&skill_dir)?;
     fs.create_directory(
         &skill_dir_uri,
-        CreateDirectoryOptions { recursive: true },
+        CreateDirectoryOptions {
+            recursive: true,
+            follow_symlinks: true,
+        },
         /*sandbox*/ None,
     )
     .await?;
     let contents = format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n");
     let path = skill_dir.join("SKILL.md");
     let path_uri = PathUri::from_host_native_path(&path)?;
-    fs.write_file(&path_uri, contents.into_bytes(), /*sandbox*/ None)
-        .await?;
+    fs.write_file(
+        &path_uri,
+        contents.into_bytes(),
+        Default::default(),
+        /*sandbox*/ None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -157,6 +165,7 @@ async fn user_turn_selects_symlinked_skill_by_advertised_discovery_path() -> Res
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
+        max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: false,
         orchestrator_skills_enabled: false,
         shadow_selection_enabled: false,

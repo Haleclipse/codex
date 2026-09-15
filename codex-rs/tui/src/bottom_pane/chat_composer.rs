@@ -77,6 +77,7 @@
 //!
 //! - Expands pending paste placeholders so element ranges align with the final text.
 //! - Trims whitespace and rebases text elements accordingly.
+//! - Treats a leading `!` revealed only by paste expansion as literal model input, not shell input.
 //! - Prunes local attached images so only placeholders that survive expansion are sent.
 //! - Preserves remote image URLs as separate attachments even when text is empty.
 //!
@@ -321,6 +322,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -382,7 +384,7 @@ fn parent_owned_command_is_allowed(command: SlashCommand, args: &str) -> bool {
                 | SlashCommand::App
                 | SlashCommand::Side
                 | SlashCommand::Btw
-                | SlashCommand::Agent
+                | SlashCommand::Agents
                 | SlashCommand::MultiAgents
                 | SlashCommand::Vim
                 | SlashCommand::Keymap
@@ -422,6 +424,8 @@ fn parent_owned_command_is_allowed(command: SlashCommand, args: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedInputAction {
     Plain,
+    /// Preserve model-input provenance when paste expansion reveals a leading shell sigil.
+    Literal,
     ParseSlash,
     RunShell,
 }
@@ -514,7 +518,7 @@ pub(crate) struct ChatComposer {
     toggle_shortcuts_keys: Vec<KeyBinding>,
     history_search_previous_keys: Vec<KeyBinding>,
     history_search_next_keys: Vec<KeyBinding>,
-    editor_keymap: EditorKeymap,
+    editor_keymap: Arc<EditorKeymap>,
     vim_normal_keymap: VimNormalKeymap,
     // @cometix: statusline/cxline fields
     #[allow(dead_code)]
@@ -731,6 +735,7 @@ impl ChatComposer {
             statusline_weekly_rate_limit_percent: None,
             statusline_weekly_resets_at: None,
         };
+        this.draft.textarea.set_keymap_bindings(&default_keymap);
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
         this
@@ -1364,8 +1369,7 @@ impl ChatComposer {
         enabled
     }
 
-    /// Return whether Vim editing is enabled for tests that assert mode transitions.
-    #[cfg(test)]
+    /// Return whether Vim editing is enabled.
     pub(crate) fn is_vim_enabled(&self) -> bool {
         self.draft.textarea.is_vim_enabled()
     }
@@ -1382,14 +1386,7 @@ impl ChatComposer {
     }
 
     fn vim_mode_indicator_span(&self) -> Option<Span<'static>> {
-        self.draft
-            .textarea
-            .vim_mode_label()
-            .map(|label| match label {
-                "Normal" => "Vim: Normal".magenta(),
-                "Insert" => "Vim: Insert".green(),
-                _ => unreachable!(),
-            })
+        self.draft.textarea.vim_mode_indicator_span()
     }
 
     fn mode_indicator_line(&self, show_cycle_hint: bool) -> Option<Line<'static>> {
@@ -3030,13 +3027,29 @@ impl ChatComposer {
         }
         self.draft.recent_submission_mention_bindings = original_mention_bindings.clone();
         if record_history && (!text.is_empty() || !self.attachments.is_empty()) {
+            let preserve_literal_paste = self.slash_commands_enabled()
+                && text.starts_with('!')
+                && !original_input.trim_start().starts_with('!');
+            let (history_text, history_text_elements) = if preserve_literal_paste {
+                let history_text = original_input.trim().to_string();
+                let history_text_elements = Self::trim_text_elements(
+                    &original_input,
+                    &history_text,
+                    original_text_elements,
+                );
+                (history_text, history_text_elements)
+            } else {
+                (text.clone(), text_elements.clone())
+            };
             self.history.record_local_submission(HistoryEntry {
-                text: text.clone(),
-                text_elements: text_elements.clone(),
+                text: history_text,
+                text_elements: history_text_elements,
                 local_image_paths: self.attachments.local_image_paths(),
                 remote_image_urls: self.attachments.remote_image_urls(),
                 mention_bindings: original_mention_bindings,
-                pending_pastes: if pending_paste_handling == PendingPasteHandling::Preserve {
+                pending_pastes: if pending_paste_handling == PendingPasteHandling::Preserve
+                    || preserve_literal_paste
+                {
                     original_pending_pastes.clone()
                 } else {
                     Vec::new()
@@ -3114,6 +3127,10 @@ impl ChatComposer {
             if let Some(pasted) = self.draft.paste_burst.flush_before_modified_input() {
                 self.handle_paste(pasted);
             }
+            let visible_shell_command = self.is_bang_shell_command();
+            let original_input = self.current_text();
+            let original_text_elements = self.current_text_elements();
+            let original_pending_pastes = self.draft.pending_pastes.clone();
             let raw_text = self.draft.textarea.text();
             let defer_slash_validation = self.slash_input().should_parse_on_dequeue(raw_text);
             let preserve_pending_pastes = defer_slash_validation
@@ -3138,7 +3155,20 @@ impl ChatComposer {
                     PendingPasteHandling::Expand
                 },
             ) {
-                let action = slash_input::queued_input_action(&text, defer_slash_validation);
+                let action = if text.starts_with('!') && !visible_shell_command {
+                    QueuedInputAction::Literal
+                } else {
+                    slash_input::queued_input_action(&text, defer_slash_validation)
+                };
+                let (text, text_elements, pending_pastes) = if action == QueuedInputAction::Literal
+                {
+                    let text = original_input.trim().to_string();
+                    let text_elements =
+                        Self::trim_text_elements(&original_input, &text, original_text_elements);
+                    (text, text_elements, original_pending_pastes)
+                } else {
+                    (text, text_elements, pending_pastes)
+                };
                 return (
                     InputResult::Queued {
                         text,
@@ -3175,13 +3205,19 @@ impl ChatComposer {
         if let Some((text, text_elements)) =
             self.prepare_submission_text(/*record_history*/ true)
         {
-            if should_queue {
+            if self.slash_commands_enabled()
+                && text.starts_with('!')
+                && !original_input.trim_start().starts_with('!')
+            {
+                let text = original_input.trim().to_string();
+                let text_elements =
+                    Self::trim_text_elements(&original_input, &text, original_text_elements);
                 (
                     InputResult::Queued {
                         text,
                         text_elements,
-                        action: QueuedInputAction::Plain,
-                        pending_pastes: Vec::new(),
+                        action: QueuedInputAction::Literal,
+                        pending_pastes: original_pending_pastes,
                     },
                     true,
                 )
@@ -5087,7 +5123,8 @@ mod tests {
     #[test]
     fn parent_owned_thread_allows_bare_navigation_commands() {
         for (command, expected) in [
-            ("/agent", SlashCommand::Agent),
+            ("/agents", SlashCommand::Agents),
+            ("/subagents", SlashCommand::MultiAgents),
             ("/side", SlashCommand::Side),
             ("/btw", SlashCommand::Btw),
             ("/diff ", SlashCommand::Diff),
@@ -5113,7 +5150,7 @@ mod tests {
             .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .0;
 
-        assert_eq!(result, InputResult::Command(SlashCommand::Agent));
+        assert_eq!(result, InputResult::Command(SlashCommand::Agents));
     }
 
     #[test]
@@ -11334,8 +11371,10 @@ mod tests {
         assert!(matches!(result, InputResult::Submitted { .. }));
 
         let mut keymap = RuntimeKeymap::defaults();
-        keymap.editor.move_up = vec![key_hint::plain(KeyCode::F(2))];
+        Arc::make_mut(&mut keymap.editor).move_up = vec![key_hint::plain(KeyCode::F(2))];
         composer.set_keymap_bindings(&keymap);
+        assert!(Arc::ptr_eq(&composer.editor_keymap, &keymap.editor));
+        assert_eq!(Arc::strong_count(&keymap.editor), 3);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert!(composer.draft.textarea.is_empty());
@@ -12293,8 +12332,16 @@ mod tests {
         );
 
         let count = LARGE_PASTE_CHAR_THRESHOLD; // 1000 in current config
-        let chars: Vec<char> = vec!['z'; count];
-        type_chars_humanlike(&mut composer, &chars);
+        let mut now = Instant::now();
+        let step = ChatComposer::recommended_paste_flush_delay();
+        for _ in 0..count {
+            let _ = composer.handle_input_basic_with_time(
+                KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+                now,
+            );
+            now += step;
+            let _ = composer.handle_paste_burst_flush(now);
+        }
 
         assert_eq!(composer.draft.textarea.text(), "z".repeat(count));
         assert!(composer.draft.pending_pastes.is_empty());

@@ -8,6 +8,7 @@ use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
 use crate::current_time::app_server_time_provider;
+use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
@@ -34,6 +35,7 @@ use crate::request_processors::MarketplaceRequestProcessor;
 use crate::request_processors::McpRequestProcessor;
 use crate::request_processors::PluginRequestProcessor;
 use crate::request_processors::ProcessExecRequestProcessor;
+use crate::request_processors::ProjectRequestProcessor;
 use crate::request_processors::RemoteControlRequestProcessor;
 use crate::request_processors::SearchRequestProcessor;
 use crate::request_processors::ThreadGoalRequestProcessor;
@@ -50,6 +52,7 @@ use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
+use crate::turn_cost_worker::TurnCostWorker;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ClientNotification;
@@ -64,7 +67,6 @@ use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
-use codex_chatgpt::workspace_settings;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
@@ -97,13 +99,40 @@ use crate::models_refresh_worker::ModelsRefreshWorker;
 const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 
 fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
+    reject_obsolete_request_fields(&request)?;
+
     ClientRequest::try_from(request)
         .map_err(|err| invalid_request(format!("Invalid request: {err}")))
+}
+
+fn reject_obsolete_request_fields(request: &JSONRPCRequest) -> Result<(), JSONRPCErrorError> {
+    reject_removed_permission_profile(request)?;
+    Ok(())
+}
+
+fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSONRPCErrorError> {
+    if matches!(
+        request.method.as_str(),
+        "thread/start" | "thread/resume" | "thread/fork" | "turn/start"
+    ) && request
+        .params
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|params| params.contains_key("permissionProfile"))
+    {
+        let method = request.method.as_str();
+        return Err(invalid_params(format!(
+            "`permissionProfile` is no longer supported for `{method}`; use `permissions` with a named profile id instead"
+        )));
+    }
+
+    Ok(())
 }
 
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     models_refresh_worker: ModelsRefreshWorker,
+    turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: AccountRequestProcessor,
     apps_processor: AppsRequestProcessor,
@@ -120,6 +149,7 @@ pub(crate) struct MessageProcessor {
     marketplace_processor: MarketplaceRequestProcessor,
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
+    project_processor: ProjectRequestProcessor,
     remote_control_processor: RemoteControlRequestProcessor,
     search_processor: SearchRequestProcessor,
     thread_goal_processor: ThreadGoalRequestProcessor,
@@ -330,6 +360,8 @@ impl MessageProcessor {
         let models_manager = thread_manager.get_models_manager();
         let models_refresh_worker =
             crate::models_refresh_worker::spawn(&models_manager, config.http_client_factory());
+        let turn_cost_worker =
+            TurnCostWorker::spawn(Arc::clone(&config), Arc::clone(&auth_manager));
         thread_manager
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
@@ -343,8 +375,6 @@ impl MessageProcessor {
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
-        let workspace_settings_cache =
-            Arc::new(workspace_settings::WorkspaceSettingsCache::default());
         let app_list_shutdown_token = CancellationToken::new();
         let request_serialization_queues = RequestSerializationQueues::default();
         let config_processor = ConfigRequestProcessor::new(
@@ -373,17 +403,14 @@ impl MessageProcessor {
             Arc::clone(&thread_manager),
             outgoing.clone(),
             config_manager.clone(),
-            Arc::clone(&workspace_settings_cache),
             app_list_shutdown_token,
         );
         let catalog_processor = CatalogRequestProcessor::new(
             outgoing.clone(),
             Arc::clone(&skills_watcher),
-            auth_manager.clone(),
             Arc::clone(&thread_manager),
             Arc::clone(&config),
             config_manager.clone(),
-            Arc::clone(&workspace_settings_cache),
         );
         let command_exec_processor = CommandExecRequestProcessor::new(
             arg0_paths.clone(),
@@ -429,7 +456,6 @@ impl MessageProcessor {
             outgoing.clone(),
             analytics_events_client.clone(),
             config_manager.clone(),
-            workspace_settings_cache,
             on_effective_plugins_changed,
         );
         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
@@ -448,6 +474,11 @@ impl MessageProcessor {
             outgoing.clone(),
             queue_service,
         );
+        let project_processor = ProjectRequestProcessor::new(
+            Arc::clone(&thread_store),
+            outgoing.clone(),
+            Arc::clone(&thread_list_state_permit),
+        );
         let thread_processor = ThreadRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
@@ -464,10 +495,11 @@ impl MessageProcessor {
             state_db.clone(),
             log_db,
             Arc::clone(&skills_watcher),
+            turn_cost_worker.as_ref().map(TurnCostWorker::handle),
             config_warnings,
         );
         let turn_processor = TurnRequestProcessor::new(
-            auth_manager.clone(),
+            auth_manager,
             Arc::clone(&thread_manager),
             outgoing.clone(),
             analytics_events_client.clone(),
@@ -479,6 +511,7 @@ impl MessageProcessor {
             thread_watch_manager,
             thread_list_state_permit,
             Arc::clone(&skills_watcher),
+            turn_cost_worker.as_ref().map(TurnCostWorker::handle),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
             // Keep plugin startup warmups aligned at app-server startup.
@@ -488,7 +521,6 @@ impl MessageProcessor {
                 .plugins_manager()
                 .maybe_start_plugin_startup_tasks_for_config(
                     &config.plugins_config_input(),
-                    auth_manager,
                     Some(on_effective_plugins_changed),
                 );
         }
@@ -519,6 +551,7 @@ impl MessageProcessor {
         Self {
             outgoing,
             models_refresh_worker,
+            turn_cost_worker,
             skills_watcher,
             account_processor,
             apps_processor,
@@ -535,6 +568,7 @@ impl MessageProcessor {
             marketplace_processor,
             mcp_processor,
             plugin_processor,
+            project_processor,
             remote_control_processor,
             search_processor,
             thread_goal_processor,
@@ -727,6 +761,9 @@ impl MessageProcessor {
 
     pub(crate) async fn drain_background_tasks(&self) {
         self.models_refresh_worker.shutdown();
+        if let Some(worker) = &self.turn_cost_worker {
+            worker.shutdown();
+        }
         self.thread_processor.drain_background_tasks().await;
     }
 
@@ -778,7 +815,6 @@ impl MessageProcessor {
 
     /// Handle a standalone JSON-RPC response originating from the peer.
     pub(crate) async fn process_response(&self, response: JSONRPCResponse) {
-        tracing::info!("<- response: {:?}", response);
         let JSONRPCResponse { id, result, .. } = response;
         self.outgoing.notify_client_response(id, result).await
     }
@@ -1241,6 +1277,27 @@ impl MessageProcessor {
             ClientRequest::ThreadList { params, .. } => {
                 self.thread_processor.thread_list(params).await
             }
+            ClientRequest::ProjectList { params, .. } => {
+                self.project_processor.project_list(params).await
+            }
+            ClientRequest::ProjectRead { params, .. } => {
+                self.project_processor.project_read(params).await
+            }
+            ClientRequest::ProjectCreate { params, .. } => {
+                self.project_processor.project_create(params).await
+            }
+            ClientRequest::ProjectImport { params, .. } => {
+                self.project_processor.project_import(params).await
+            }
+            ClientRequest::ProjectUpdate { params, .. } => {
+                self.project_processor.project_update(params).await
+            }
+            ClientRequest::ProjectMove { params, .. } => {
+                self.project_processor.project_move(params).await
+            }
+            ClientRequest::ProjectDelete { params, .. } => {
+                self.project_processor.project_delete(params).await
+            }
             ClientRequest::ThreadSearch { params, .. } => {
                 self.thread_processor.thread_search(params).await
             }
@@ -1444,6 +1501,9 @@ impl MessageProcessor {
                     .login_account(request_id.clone(), params)
                     .await
             }
+            ClientRequest::BedrockDiscover { .. } | ClientRequest::BedrockSetup { .. } => Err(
+                crate::error_code::method_not_found("Amazon Bedrock setup is not implemented"),
+            ),
             ClientRequest::LogoutAccount { .. } => {
                 self.account_processor
                     .logout_account(request_id.clone())

@@ -120,7 +120,7 @@ pub(crate) struct McpElicitationApprovalRequest {
 }
 
 impl ApprovalRequest {
-    fn thread_id(&self) -> ThreadId {
+    pub(super) fn thread_id(&self) -> ThreadId {
         match self {
             ApprovalRequest::Exec(request) => request.thread_id,
             ApprovalRequest::Permissions(request) => request.thread_id,
@@ -142,16 +142,16 @@ impl ApprovalRequest {
         match (self, request) {
             (
                 ApprovalRequest::Exec(request),
-                ResolvedAppServerRequest::ExecApproval { id: resolved_id },
-            ) => request.id == *resolved_id,
+                ResolvedAppServerRequest::ExecApproval { thread_id, id },
+            ) => request.thread_id.to_string() == *thread_id && request.id == *id,
             (
                 ApprovalRequest::Permissions(request),
-                ResolvedAppServerRequest::PermissionsApproval { id },
-            ) => request.call_id == *id,
+                ResolvedAppServerRequest::PermissionsApproval { thread_id, id },
+            ) => request.thread_id.to_string() == *thread_id && request.call_id == *id,
             (
                 ApprovalRequest::ApplyPatch(request),
-                ResolvedAppServerRequest::FileChangeApproval { id: resolved_id },
-            ) => request.id == *resolved_id,
+                ResolvedAppServerRequest::FileChangeApproval { thread_id, id },
+            ) => request.thread_id.to_string() == *thread_id && request.id == *id,
             (
                 ApprovalRequest::McpElicitation(request),
                 ResolvedAppServerRequest::McpElicitation {
@@ -742,30 +742,7 @@ fn build_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
             }
             Box::new(Paragraph::new(header).wrap(Wrap { trim: false }))
         }
-        ApprovalRequest::ApplyPatch(request) => {
-            let mut header: Vec<Box<dyn Renderable>> = Vec::new();
-            if let Some(thread_label) = &request.thread_label {
-                header.push(Box::new(Line::from(vec![
-                    "Thread: ".into(),
-                    thread_label.clone().bold(),
-                ])));
-            }
-            if let Some(reason) = &request.reason
-                && !reason.is_empty()
-            {
-                if !header.is_empty() {
-                    header.push(Box::new(Line::from("")));
-                }
-                header.push(Box::new(
-                    Paragraph::new(Line::from_iter([
-                        "Reason: ".into(),
-                        reason.clone().italic(),
-                    ]))
-                    .wrap(Wrap { trim: false }),
-                ));
-            }
-            Box::new(ColumnRenderable::with(header))
-        }
+        ApprovalRequest::ApplyPatch(request) => super::apply_patch_header::build_header(request),
         ApprovalRequest::McpElicitation(request) => {
             let mut lines = Vec::new();
             if let Some(thread_label) = &request.thread_label {
@@ -1124,6 +1101,8 @@ mod tests {
     use codex_protocol::models::FileSystemPermissions;
     use codex_protocol::models::NetworkPermissions;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_absolute_path::test_support::PathExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
@@ -1496,10 +1475,20 @@ mod tests {
     fn resolved_request_dismisses_overlay_without_emitting_abort() {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
-        let mut view = make_overlay(make_exec_request(), tx, Features::with_defaults());
+        let request = make_exec_request();
+        let thread_id = request.thread_id();
+        let mut view = make_overlay(request, tx, Features::with_defaults());
 
         assert!(
+            !view.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: ThreadId::new().to_string(),
+                id: "test".to_string(),
+            })
+        );
+        assert!(!view.is_complete());
+        assert!(
             view.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
+                thread_id: thread_id.to_string(),
                 id: "test".to_string(),
             })
         );
@@ -2128,12 +2117,30 @@ mod tests {
                 content: "one\ntwo\nthree\n".to_string(),
             },
         );
+        changes.insert(
+            PathBuf::from("old.txt"),
+            FileChange::Update {
+                unified_diff: String::new(),
+                move_path: Some(PathBuf::from("new.txt")),
+            },
+        );
+        #[cfg(windows)]
+        let (foreign_path, foreign_move_path) = ("/remote/old.txt", "/remote/new.txt");
+        #[cfg(not(windows))]
+        let (foreign_path, foreign_move_path) = (r"C:\workspace\old.txt", r"C:\workspace\new.txt");
+        changes.insert(
+            PathBuf::from(foreign_path),
+            FileChange::Update {
+                unified_diff: String::new(),
+                move_path: Some(PathBuf::from(foreign_move_path)),
+            },
+        );
         let request = ApprovalRequest::ApplyPatch(ApplyPatchApprovalRequest {
             thread_id: ThreadId::new(),
             thread_label: Some("Banach [worker]".to_string()),
             id: "test".to_string(),
             reason: None,
-            cwd: absolute_path("/tmp"),
+            cwd: test_path_buf("/tmp").abs(),
             changes,
         });
         let keymap = crate::keymap::RuntimeKeymap::defaults();
@@ -2146,8 +2153,34 @@ mod tests {
         );
         let rendered = render_overlay_lines(&view, /*width*/ 120);
         assert!(rendered.contains("Thread: Banach [worker]"));
+        assert!(rendered.contains("Description: Apply proposed file edits"));
+        for path in ["/tmp/bug1.txt", "/tmp/new.txt", "/tmp/old.txt"] {
+            assert!(rendered.contains(&format!("Destination: {}", test_path_buf(path).display())));
+        }
+        for path in [foreign_path, foreign_move_path] {
+            assert!(rendered.contains(&format!("Destination: {path}")));
+        }
         assert!(rendered.contains("o to open thread"));
         assert!(!rendered.contains("$ apply_patch"));
+    }
+
+    #[test]
+    fn apply_patch_prompt_without_changes_shows_unavailable_destination() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+        let request = ApprovalRequest::ApplyPatch(ApplyPatchApprovalRequest {
+            thread_id: ThreadId::new(),
+            thread_label: None,
+            id: "test".to_string(),
+            reason: None,
+            cwd: absolute_path("/tmp"),
+            changes: HashMap::new(),
+        });
+        let view = make_overlay(request, tx, Features::with_defaults());
+        assert_snapshot!(
+            "approval_overlay_patch_destination_unavailable",
+            normalize_snapshot_paths(render_overlay_lines(&view, /*width*/ 120))
+        );
     }
 
     #[test]

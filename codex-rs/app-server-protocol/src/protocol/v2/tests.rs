@@ -258,6 +258,7 @@ fn thread_resume_response_round_trips_initial_turns_page() {
                 appearance: None,
             }),
             section_entered_at: Some(1),
+            project_id: None,
             history_mode: Default::default(),
             model_provider: "openai".to_string(),
             created_at: 1,
@@ -314,10 +315,12 @@ fn thread_resume_response_round_trips_initial_turns_page() {
         .expect("serialized thread should be an object");
     legacy_thread_fields.remove("section");
     legacy_thread_fields.remove("sectionEnteredAt");
+    legacy_thread_fields.remove("projectId");
     let legacy_thread =
         serde_json::from_value::<Thread>(legacy_thread).expect("deserialize legacy thread");
     assert_eq!(legacy_thread.section, None);
     assert_eq!(legacy_thread.section_entered_at, None);
+    assert_eq!(legacy_thread.project_id, None);
 
     assert_eq!(
         value.get("initialTurnsPage"),
@@ -835,6 +838,52 @@ fn additional_file_system_permissions_preserves_canonical_entries() {
         CoreFileSystemPermissions::try_from(permissions)
             .expect("API paths should convert to native paths"),
         core_permissions
+    );
+
+    for path in [r"C:\workspace\read-only", r"\\server\share\read-only"] {
+        let path = LegacyAppPathString::from_string(path);
+        let core_permissions = CoreFileSystemPermissions::from_read_write_path_uris(
+            Some(vec![
+                PathUri::try_from(path.clone()).expect("valid foreign permission path"),
+            ]),
+            /*write*/ None,
+        );
+        let permissions = AdditionalFileSystemPermissions::from(core_permissions.clone());
+        assert_eq!(permissions.read, Some(vec![path]));
+        assert_eq!(permissions.entries.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            CoreFileSystemPermissions::try_from(permissions)
+                .expect("foreign API paths should round-trip"),
+            core_permissions
+        );
+    }
+    #[cfg(windows)]
+    for path in ["//server/share/read-only", r"/\server/share/read-only"] {
+        let path = LegacyAppPathString::from_string(path);
+        let core_permissions =
+            CoreFileSystemPermissions::try_from(AdditionalFileSystemPermissions {
+                read: Some(vec![path.clone()]),
+                write: None,
+                glob_scan_max_depth: None,
+                entries: None,
+            })
+            .expect("native slash UNC permission path");
+        let permissions = AdditionalFileSystemPermissions::from(core_permissions);
+        assert_eq!(
+            permissions.read,
+            Some(vec![LegacyAppPathString::from_string(
+                r"\\server\share\read-only"
+            )])
+        );
+    }
+    assert!(
+        CoreFileSystemPermissions::try_from(AdditionalFileSystemPermissions {
+            read: Some(vec![LegacyAppPathString::from_string(r"\\localhost\share")]),
+            write: None,
+            glob_scan_max_depth: None,
+            entries: None,
+        })
+        .is_ok()
     );
 }
 
@@ -1991,6 +2040,8 @@ fn config_approvals_reviewer_is_marked_experimental() {
 fn config_requirements_granular_allowed_approval_policy_is_marked_experimental() {
     let reason =
         crate::experimental_api::ExperimentalApi::experimental_reason(&ConfigRequirements {
+            cli_auth_credentials_store: None,
+            chatgpt_base_url: None,
             allowed_approval_policies: Some(vec![AskForApproval::Granular {
                 sandbox_approval: true,
                 rules: true,
@@ -2891,6 +2942,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         ],
         phase: None,
         memory_citation: None,
+        delivery: None,
     });
 
     assert_eq!(
@@ -2900,6 +2952,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             text: "Hello world".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
         }
     );
 
@@ -2918,6 +2971,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             }],
             rollout_ids: vec!["rollout-1".to_string()],
         }),
+        delivery: None,
     });
 
     assert_eq!(
@@ -2935,6 +2989,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
                 }],
                 thread_ids: vec!["rollout-1".to_string()],
             }),
+            delivery: None,
         }
     );
 

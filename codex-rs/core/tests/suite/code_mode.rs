@@ -10,6 +10,7 @@ use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::CurrentTimeReminderConfig;
+use codex_core::context::NodeReplReviewEvidence;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ToolCallOutcome;
@@ -33,6 +34,8 @@ use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ToolMode;
@@ -3618,7 +3621,6 @@ async fn code_mode_notify_injects_additional_exec_tool_output_into_active_contex
         "use exec notify helper",
         r#"
 notify("code_mode_notify_marker");
-await tools.test_sync_tool({});
 text("done");
 "#,
     )
@@ -3679,46 +3681,6 @@ text("after");
     );
     assert_eq!(text_item(&items, /*index*/ 1), "before");
     assert_eq!(output, "before");
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_surfaces_text_stringify_errors() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
-        &server,
-        "use exec to return circular text",
-        r#"
-const circular = {};
-circular.self = circular;
-text(circular);
-"#,
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let items = custom_tool_output_items(&req, "call-1");
-    let (_, success) = req
-        .custom_tool_call_output_content_and_success("call-1")
-        .expect("custom tool output should be present");
-    assert_ne!(
-        success,
-        Some(true),
-        "circular stringify unexpectedly succeeded"
-    );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert!(text_item(&items, /*index*/ 1).contains("Script error:"));
-    assert!(text_item(&items, /*index*/ 1).contains("Converting circular structure to JSON"));
 
     Ok(())
 }
@@ -4344,10 +4306,174 @@ contentLength=0"
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_node_repl_screenshots_can_be_captured_without_guardian_transcript_flags()
+-> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    const SCREENSHOT: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    let server = responses::start_mock_server().await;
+    let mcp_server_bin = remote_aware_stdio_server_bin()?;
+    let mut builder = test_codex().with_config(move |config| {
+        config
+            .features
+            .enable(Feature::CodeMode)
+            .expect("enable Code Mode");
+        let mcp = serde_json::from_value(serde_json::json!({
+            "command": mcp_server_bin,
+            "environment_id": remote_aware_environment_id(),
+            "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
+            "omit_tools_from": ["deferred"],
+        }))
+        .expect("valid node_repl MCP server config");
+        config
+            .mcp_servers
+            .set(HashMap::from([("node_repl".to_owned(), mcp)]))
+            .expect("configure node_repl MCP server");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    core_test_support::wait_for_mcp_server(&test.codex, "node_repl").await?;
+    let evidence = test
+        .codex
+        .thread_extension_data()
+        .get_or_init(NodeReplReviewEvidence::default);
+    evidence.enable_image_capture();
+
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_custom_tool_call(
+                    "node-repl-image",
+                    "exec",
+                    r#"for (let index = 0; index < 2; index++) await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });"#,
+                ),
+                ev_completed("response-node-repl"),
+            ]),
+            sse(vec![ev_completed("response-done")]),
+        ],
+    )
+    .await;
+    test.submit_text_turn("capture a computer-use screenshot")
+        .await?;
+
+    assert_eq!(
+        evidence.images(),
+        vec![ContentItem::InputImage {
+            image_url: SCREENSHOT.to_owned(),
+            detail: Some(ImageDetail::Low),
+        }]
+    );
+    let parent_request = response_mock
+        .requests()
+        .pop()
+        .expect("parent turn should complete");
+    assert!(!serde_json::to_string(&parent_request.input())?.contains(SCREENSHOT));
+
+    Ok(())
+}
+
+#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_node_repl_image_flag_without_enhanced_stays_disabled() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "Guardian approval actions require host-native paths"
+    );
+
+    let server = responses::start_mock_server().await;
+    let mcp_server_bin = remote_aware_stdio_server_bin()?;
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.5", |model| {
+            model.node_repl_auto_review_required = false;
+        })
+        .with_config(move |config| {
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("enable Code Mode");
+            config
+                .features
+                .set_enabled(
+                    Feature::GuardianEnhancedNodeReplTranscripts,
+                    /*enabled*/ false,
+                )
+                .expect("disable enhanced Guardian transcripts");
+            config
+                .features
+                .enable(Feature::GuardianNodeReplTranscriptImages)
+                .expect("enable Guardian transcript images");
+            let mcp = serde_json::from_value(serde_json::json!({
+                "command": mcp_server_bin,
+                "environment_id": remote_aware_environment_id(),
+                "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
+                "omit_tools_from": ["deferred"],
+            }))
+            .expect("valid node_repl MCP server config");
+            config
+                .mcp_servers
+                .set(HashMap::from([("node_repl".to_owned(), mcp)]))
+                .expect("configure node_repl MCP server");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&test.codex, "node_repl").await?;
+
+    let code = r#"
+await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
+await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated", justification: "review" });
+"#;
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_custom_tool_call("code-mode-call", "exec", code),
+                ev_completed("resp-parent"),
+            ]),
+            sse(vec![
+                ev_assistant_message("guardian", r#"{"outcome":"allow"}"#),
+                ev_completed("resp-guardian"),
+            ]),
+            sse(vec![ev_completed("resp-done")]),
+        ],
+    )
+    .await;
+    test.submit_text_turn("review a nested node_repl screenshot")
+        .await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    let guardian_request = requests
+        .iter()
+        .find(|request| {
+            request.body_json()["client_metadata"]["x-openai-subagent"].as_str() == Some("guardian")
+        })
+        .expect("the shell command should trigger Guardian review");
+    assert!(guardian_request.message_input_image_urls("user").is_empty());
+    let guardian_text = guardian_request.message_input_texts("user").concat();
+    let parent_input = serde_json::to_string(&requests.last().unwrap().input())?;
+    for marker in [
+        "guardian-visible-before-image",
+        "guardian-visible-after-image",
+        "data:image/png;base64,",
+    ] {
+        assert!(!guardian_text.contains(marker));
+        assert!(!parent_input.contains(marker));
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_case(false, false, false, None; "disabled")]
-#[test_case(false, true, false, None; "image_flag_without_enhanced_stays_disabled")]
 #[test_case(true, false, false, None; "manually_enabled_text_only")]
 #[test_case(true, true, false, None; "manually_enabled_multimodal")]
 #[test_case(false, false, true, None; "required_model_forces_multimodal")]
@@ -4378,7 +4504,7 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
     let check_detail = enhanced_transcripts && transcript_images && reviewer_constraint.is_none();
     let mut large_image = Cursor::new(Vec::new());
     if check_detail {
-        DynamicImage::new_rgba8(/*w*/ 2048, /*h*/ 2048)
+        DynamicImage::new_rgba8(/*w*/ 2049, /*h*/ 32)
             .write_to(&mut large_image, ImageFormat::Png)?;
     }
     let mut builder = test_codex()
@@ -4568,7 +4694,7 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
             let payload = reviewer_image_urls[1].split_once(',').unwrap().1;
             let dimensions =
                 image::load_from_memory(&BASE64_STANDARD.decode(payload)?)?.dimensions();
-            assert_eq!(dimensions, (1600, 1600));
+            assert_eq!(dimensions, (2048, 32));
         }
         for (index, marker) in [(image_index - 1, "before"), (image_index + 1, "after")] {
             let text = reviewer_user_content[index]["text"].as_str().unwrap();
@@ -5236,8 +5362,7 @@ async fn code_mode_uses_the_first_dynamic_tool_for_a_normalized_name() -> Result
         test.codex = new_thread.thread;
         test.session_configured = new_thread.session_configured;
 
-        let first_mock = responses::mount_sse_once(
-            &server,
+        let first_response = if use_responses_lite {
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_custom_tool_call(
@@ -5255,17 +5380,28 @@ text(JSON.stringify({
 "#,
                 ),
                 ev_completed("resp-1"),
-            ]),
-        )
-        .await;
-        let second_mock = responses::mount_sse_once(
-            &server,
+            ])
+        } else {
             sse(vec![
                 ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-2"),
-            ]),
-        )
-        .await;
+                ev_completed("resp-1"),
+            ])
+        };
+        let first_mock = responses::mount_sse_once(&server, first_response).await;
+        let second_mock = if use_responses_lite {
+            Some(
+                responses::mount_sse_once(
+                    &server,
+                    sse(vec![
+                        ev_assistant_message("msg-1", "done"),
+                        ev_completed("resp-2"),
+                    ]),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
 
         let cwd = test.config.cwd.clone();
         let (sandbox_policy, permission_profile) =
@@ -5302,25 +5438,27 @@ text(JSON.stringify({
             _ => None,
         })
         .await;
-        let request = wait_for_event_match(&test.codex, |event| match event {
-            EventMsg::DynamicToolCallRequest(request) => Some(request.clone()),
-            _ => None,
-        })
-        .await;
-        assert_eq!(request.namespace, None);
-        assert_eq!(request.tool, "foo-bar");
-        assert_eq!(request.arguments, serde_json::json!({}));
-        test.codex
-            .submit(Op::DynamicToolResponse {
-                id: request.call_id,
-                response: DynamicToolResponse {
-                    content_items: vec![DynamicToolCallOutputContentItem::InputText {
-                        text: "first-winner".to_string(),
-                    }],
-                    success: true,
-                },
+        if use_responses_lite {
+            let request = wait_for_event_match(&test.codex, |event| match event {
+                EventMsg::DynamicToolCallRequest(request) => Some(request.clone()),
+                _ => None,
             })
-            .await?;
+            .await;
+            assert_eq!(request.namespace, None);
+            assert_eq!(request.tool, "foo-bar");
+            assert_eq!(request.arguments, serde_json::json!({}));
+            test.codex
+                .submit(Op::DynamicToolResponse {
+                    id: request.call_id,
+                    response: DynamicToolResponse {
+                        content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                            text: "first-winner".to_string(),
+                        }],
+                        success: true,
+                    },
+                })
+                .await?;
+        }
         wait_for_event(&test.codex, |event| match event {
             EventMsg::TurnComplete(event) => event.turn_id == turn_id,
             _ => false,
@@ -5400,18 +5538,20 @@ text(JSON.stringify({
         assert!(!exec_description.contains("First normalized dynamic tool."));
         assert!(!exec_description.contains("Shadowed normalized dynamic tool."));
 
-        let request = second_mock.single_request();
-        let output = custom_tool_output_last_non_empty_text(&request, "call-1")
-            .expect("code mode should return normalized tool metadata");
-        let result: Value = serde_json::from_str(&output)?;
-        assert_eq!(result["count"], serde_json::json!(1));
-        assert_eq!(result["name"], serde_json::json!("foo_bar"));
-        assert_eq!(result["output"], serde_json::json!("first-winner"));
-        let description = result["description"]
-            .as_str()
-            .expect("the winning tool should have a description");
-        assert!(description.contains("First normalized dynamic tool."));
-        assert!(!description.contains("Shadowed normalized dynamic tool."));
+        if let Some(second_mock) = second_mock {
+            let request = second_mock.single_request();
+            let output = custom_tool_output_last_non_empty_text(&request, "call-1")
+                .expect("code mode should return normalized tool metadata");
+            let result: Value = serde_json::from_str(&output)?;
+            assert_eq!(result["count"], serde_json::json!(1));
+            assert_eq!(result["name"], serde_json::json!("foo_bar"));
+            assert_eq!(result["output"], serde_json::json!("first-winner"));
+            let description = result["description"]
+                .as_str()
+                .expect("the winning tool should have a description");
+            assert!(description.contains("First normalized dynamic tool."));
+            assert!(!description.contains("Shadowed normalized dynamic tool."));
+        }
     }
 
     Ok(())

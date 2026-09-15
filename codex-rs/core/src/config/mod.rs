@@ -31,6 +31,7 @@ use codex_config::config_toml::ThreadStoreToml;
 use codex_config::config_toml::validate_model_providers;
 use codex_config::loader::load_config_layers_state;
 use codex_config::loader::project_trust_key;
+use codex_config::permissions_toml::PermissionProfileToml;
 use codex_config::permissions_toml::PermissionsToml;
 use codex_config::sandbox_mode_requirement_for_permission_profile;
 use codex_config::types::ApprovalsReviewer;
@@ -57,6 +58,7 @@ use codex_core_plugins::PluginLoadOutcome;
 use codex_core_plugins::PluginsConfigInput;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
+use codex_exec_server::ReadFileOptions;
 use codex_features::CodeModeConfigToml;
 use codex_features::CurrentTimeReminderConfigToml;
 use codex_features::CurrentTimeReminderDeliveryMode;
@@ -130,6 +132,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -184,6 +187,11 @@ pub(crate) use resolved_permission_profile::PermissionProfileState;
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
+
+/// Signals that a public config selected the retired `untrusted` approval policy.
+#[derive(Debug, thiserror::Error)]
+#[error("approval_policy = \"untrusted\" is no longer supported; remove this setting")]
+pub struct UnsupportedUntrustedApprovalPolicyError;
 
 /// Compatibility-only config retained so legacy `ghost_snapshot` settings
 /// continue to load even though snapshots are no longer produced.
@@ -649,6 +657,9 @@ pub struct Config {
     /// Whether to inject the `<skills_instructions>` developer block.
     pub include_skill_instructions: bool,
 
+    /// Optional token budget override for the available-skills catalog.
+    pub skill_max_context_tokens: Option<NonZeroUsize>,
+
     /// Whether orchestrator-owned skills are exposed to the model.
     pub orchestrator_skills_enabled: bool,
 
@@ -950,10 +961,6 @@ pub struct Config {
     /// instructions inserted into developer messages when realtime becomes
     /// active.
     pub experimental_realtime_start_instructions: Option<String>,
-    /// Experimental / do not use. When set, app-server fetches thread-scoped
-    /// config from a remote service at this endpoint.
-    pub experimental_thread_config_endpoint: Option<String>,
-
     /// Experimental / do not use. Selects the thread persistence backend.
     pub experimental_thread_store: ThreadStoreConfig,
     /// When set, restricts ChatGPT login to one or more workspace identifiers.
@@ -2014,7 +2021,7 @@ fn filter_mcp_servers_by_requirements(
         let allowed = allowlist
             .value
             .get(name)
-            .is_some_and(|requirement| requirement.matches(server));
+            .is_some_and(|requirement| server.matches_requirement(requirement));
         if allowed {
             server.disabled_reason = None;
         } else {
@@ -2050,7 +2057,7 @@ fn filter_plugin_mcp_servers_by_requirements(
     for (name, server) in mcp_servers.iter_mut() {
         let allowed = plugin_mcp_requirements
             .and_then(|mcp_requirements| mcp_requirements.get(name))
-            .is_some_and(|requirement| requirement.matches(server));
+            .is_some_and(|requirement| server.matches_requirement(requirement));
         if allowed {
             server.disabled_reason = None;
         } else {
@@ -2388,6 +2395,7 @@ struct PermissionSelectionToml {
 struct EffectivePermissionSelection<'a> {
     profiles: Option<PermissionsToml>,
     selected_profile_id: Option<&'a str>,
+    persisted_profile_id_was_provided: bool,
     requirements_force_profile_selection: bool,
 }
 
@@ -2403,7 +2411,8 @@ impl EffectivePermissionSelection<'_> {
         default_permissions_override: Option<&str>,
         permission_config_syntax: Option<PermissionConfigSyntax>,
     ) -> bool {
-        self.requirements_force_profile_selection
+        self.persisted_profile_id_was_provided
+            || self.requirements_force_profile_selection
             || default_permissions_override.is_some()
             || matches!(
                 permission_config_syntax,
@@ -2506,6 +2515,10 @@ pub struct ConfigOverrides {
     pub sandbox_mode: Option<SandboxMode>,
     pub permission_profile: Option<PermissionProfile>,
     pub default_permissions: Option<String>,
+    /// Permission profile ID recovered from persisted thread state. Explicit
+    /// permission overrides take precedence, and stale profile IDs fall back
+    /// to the configured default.
+    pub persisted_permission_profile_id: Option<String>,
     pub model_provider: Option<String>,
     pub service_tier: Option<Option<String>>,
     pub codex_self_exe: Option<PathBuf>,
@@ -3112,6 +3125,8 @@ impl Config {
         let ConfigRequirements {
             allowed_login_methods: _,
             allowed_chatgpt_workspaces: _,
+            cli_auth_credentials_store,
+            chatgpt_base_url: _,
             sqlite_home: _,
             log_dir: _,
             model_catalog_json: _,
@@ -3151,6 +3166,7 @@ impl Config {
             sandbox_mode,
             permission_profile,
             default_permissions: default_permissions_override,
+            persisted_permission_profile_id,
             model_provider,
             service_tier: service_tier_override,
             codex_self_exe,
@@ -3295,9 +3311,23 @@ impl Config {
             sandbox_mode,
         );
         let requirements_toml = config_layer_stack.requirements_toml();
+        let windows_sandbox_level = match effective_windows_sandbox_mode {
+            Some(WindowsSandboxModeToml::Elevated) => WindowsSandboxLevel::Elevated,
+            Some(WindowsSandboxModeToml::Unelevated) => WindowsSandboxLevel::RestrictedToken,
+            None => WindowsSandboxLevel::Disabled,
+        };
+        let persisted_permission_profile_id = if sandbox_mode.is_some()
+            || permission_profile.is_some()
+            || default_permissions_override.is_some()
+        {
+            None
+        } else {
+            persisted_permission_profile_id.as_deref()
+        };
         let effective_permission_selection = resolve_effective_permission_selection(
             cfg.permissions.as_ref(),
             default_permissions_override.as_deref(),
+            persisted_permission_profile_id,
             cfg.default_permissions.as_deref(),
             requirements_toml,
             &mut startup_warnings,
@@ -3316,11 +3346,6 @@ impl Config {
             ));
         }
 
-        let windows_sandbox_level = match effective_windows_sandbox_mode {
-            Some(WindowsSandboxModeToml::Elevated) => WindowsSandboxLevel::Elevated,
-            Some(WindowsSandboxModeToml::Unelevated) => WindowsSandboxLevel::RestrictedToken,
-            None => WindowsSandboxLevel::Disabled,
-        };
         let memories_config: MemoriesConfig = cfg.memories.clone().unwrap_or_default().into();
         let memories_root = memory_root(&codex_home);
 
@@ -3328,7 +3353,9 @@ impl Config {
             default_permissions_override.as_deref(),
             permission_config_syntax,
         );
-        let explicit_permission_profile_mode = default_permissions_override.is_some()
+        let explicit_permission_profile_mode = effective_permission_selection
+            .persisted_profile_id_was_provided
+            || default_permissions_override.is_some()
             || matches!(
                 permission_config_syntax,
                 Some(PermissionConfigSyntax::Profiles)
@@ -3340,7 +3367,9 @@ impl Config {
         .into_iter()
         .filter(|profile| !is_builtin_permission_profile_name(&profile.id))
         .collect();
-        let using_implicit_builtin_profile = permission_config_syntax.is_none()
+        let using_implicit_builtin_profile = !effective_permission_selection
+            .persisted_profile_id_was_provided
+            && permission_config_syntax.is_none()
             && effective_permission_selection.selected_profile_id.is_none();
         let should_seed_legacy_workspace_roots = effective_permission_selection
             .selected_profile_id
@@ -3531,6 +3560,12 @@ impl Config {
                 );
             }
             configured_network_proxy_config.enabled = true;
+        }
+        if cfg.approval_policy == Some(AskForApproval::UnlessTrusted) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                UnsupportedUntrustedApprovalPolicyError,
+            ));
         }
         let approval_policy_was_explicit =
             approval_policy_override.is_some() || cfg.approval_policy.is_some();
@@ -3797,6 +3832,10 @@ impl Config {
             .as_ref()
             .and_then(|skills| skills.include_instructions)
             .unwrap_or(true);
+        let skill_max_context_tokens = cfg
+            .skills
+            .as_ref()
+            .and_then(|skills| skills.max_context_tokens);
         let include_environment_context = cfg.include_environment_context.unwrap_or(true);
         let guardian_policy_config =
             guardian_policy_config_from_requirements(config_layer_stack.requirements_toml())
@@ -4001,15 +4040,19 @@ impl Config {
             include_apps_instructions,
             include_collaboration_mode_instructions,
             include_skill_instructions,
+            skill_max_context_tokens,
             orchestrator_skills_enabled,
             orchestrator_mcp_enabled,
             include_environment_context,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
             // is important in code to differentiate the mode from the store implementation.
-            cli_auth_credentials_store_mode: resolve_cli_auth_credentials_store_mode(
-                cfg.cli_auth_credentials_store.unwrap_or_default(),
-                env!("CARGO_PKG_VERSION"),
-            ),
+            cli_auth_credentials_store_mode: match cli_auth_credentials_store {
+                Some(required) => required.value,
+                None => resolve_cli_auth_credentials_store_mode(
+                    cfg.cli_auth_credentials_store.unwrap_or_default(),
+                    env!("CARGO_PKG_VERSION"),
+                ),
+            },
             mcp_servers,
             non_prefixed_mcp_tool_servers,
             // The config.toml omits "_mode" because it's a config file. However, "_mode"
@@ -4112,7 +4155,6 @@ impl Config {
             experimental_realtime_ws_backend_prompt: cfg.experimental_realtime_ws_backend_prompt,
             experimental_realtime_ws_startup_context: cfg.experimental_realtime_ws_startup_context,
             experimental_realtime_start_instructions: cfg.experimental_realtime_start_instructions,
-            experimental_thread_config_endpoint: cfg.experimental_thread_config_endpoint,
             experimental_thread_store: thread_store_config(cfg.experimental_thread_store),
             forced_chatgpt_workspace_id,
             forced_login_method,
@@ -4218,7 +4260,7 @@ impl Config {
 
         let path_uri = PathUri::from_abs_path(path);
         let contents = fs
-            .read_file_text(&path_uri, /*sandbox*/ None)
+            .read_file_text(&path_uri, ReadFileOptions::default(), /*sandbox*/ None)
             .await
             .map_err(|e| {
                 std::io::Error::new(
@@ -4275,7 +4317,33 @@ impl Config {
             .is_some()
     }
 
-    pub(crate) fn network_proxy_spec_for_active_permission_profile(
+    /// Resolves a named permission profile from effective config and managed requirements.
+    pub fn resolve_permission_profile(
+        &self,
+        profile_name: &str,
+    ) -> std::io::Result<PermissionProfileToml> {
+        let cfg: ConfigToml = self
+            .config_layer_stack
+            .effective_config()
+            .try_into()
+            .map_err(|err| {
+                std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "failed to read effective config for selected permission profile: {err}"
+                    ),
+                )
+            })?;
+        let permissions = merge_managed_permission_profiles(
+            cfg.permissions.as_ref(),
+            self.config_layer_stack.requirements_toml(),
+        )?
+        .unwrap_or_default();
+
+        permissions::resolve_permission_profile(&permissions, profile_name)
+    }
+
+    pub fn network_proxy_spec_for_active_permission_profile(
         &self,
         active_permission_profile: &ActivePermissionProfile,
         permission_profile: &PermissionProfile,
@@ -4378,18 +4446,31 @@ fn merge_managed_permission_profiles(
 }
 
 fn resolve_effective_permission_selection<'a>(
-    configured_permissions: Option<&PermissionsToml>,
+    configured_profiles: Option<&PermissionsToml>,
     default_permissions_override: Option<&'a str>,
-    configured_default_permissions: Option<&'a str>,
+    persisted_profile_id: Option<&'a str>,
+    configured_default_profile_id: Option<&'a str>,
     requirements_toml: &'a ConfigRequirementsToml,
     startup_warnings: &mut Vec<String>,
 ) -> std::io::Result<EffectivePermissionSelection<'a>> {
-    let profiles = merge_managed_permission_profiles(configured_permissions, requirements_toml)?;
+    let profiles = merge_managed_permission_profiles(configured_profiles, requirements_toml)?;
     validate_user_permission_profile_names(profiles.as_ref())?;
     validate_required_permission_profile_catalog(requirements_toml, profiles.as_ref())?;
+    let valid_persisted_profile_id = persisted_profile_id.filter(|profile_id| {
+        is_builtin_permission_profile_name(profile_id)
+            || profiles.as_ref().is_some_and(|profiles| {
+                compile_permission_profile_selection(
+                    Some(profiles),
+                    profile_id,
+                    /*workspace_write*/ None,
+                    &mut Vec::new(),
+                )
+                .is_ok()
+            })
+    });
     let selected_profile_id = resolve_default_permissions(
-        default_permissions_override,
-        configured_default_permissions,
+        default_permissions_override.or(valid_persisted_profile_id),
+        configured_default_profile_id,
         requirements_toml,
         startup_warnings,
     )?;
@@ -4397,6 +4478,8 @@ fn resolve_effective_permission_selection<'a>(
     Ok(EffectivePermissionSelection {
         profiles,
         selected_profile_id,
+        persisted_profile_id_was_provided: default_permissions_override.is_none()
+            && valid_persisted_profile_id.is_some(),
         requirements_force_profile_selection: requirements_toml
             .allowed_permission_profiles
             .is_some(),

@@ -1,3 +1,4 @@
+use crate::PluginGitMode;
 use crate::app_mcp_routing::apply_app_mcp_routing_policy;
 use crate::app_mcp_routing::apps_route_available;
 use crate::is_openai_curated_marketplace_name;
@@ -56,7 +57,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
 use tracing::instrument;
 use tracing::warn;
@@ -496,6 +496,7 @@ pub(crate) fn refresh_non_curated_plugin_cache(
         codex_home,
         additional_roots,
         configured_plugin_keys,
+        PluginGitMode::Automatic,
     ))
 }
 
@@ -503,12 +504,14 @@ pub(crate) fn refresh_non_curated_plugin_cache_detailed(
     codex_home: &Path,
     additional_roots: &[AbsolutePathBuf],
     configured_plugin_keys: &[String],
+    git_mode: PluginGitMode,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
     refresh_non_curated_plugin_cache_with_mode(
         codex_home,
         additional_roots,
         configured_plugin_keys,
         NonCuratedCacheRefreshMode::IfVersionChanged,
+        git_mode,
     )
 }
 
@@ -522,6 +525,7 @@ pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall(
         codex_home,
         additional_roots,
         configured_plugin_keys,
+        PluginGitMode::Automatic,
     ))
 }
 
@@ -529,12 +533,14 @@ pub(crate) fn refresh_non_curated_plugin_cache_force_reinstall_detailed(
     codex_home: &Path,
     additional_roots: &[AbsolutePathBuf],
     configured_plugin_keys: &[String],
+    git_mode: PluginGitMode,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
     refresh_non_curated_plugin_cache_with_mode(
         codex_home,
         additional_roots,
         configured_plugin_keys,
         NonCuratedCacheRefreshMode::ForceReinstall,
+        git_mode,
     )
 }
 
@@ -543,6 +549,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
     additional_roots: &[AbsolutePathBuf],
     configured_plugin_keys: &[String],
     mode: NonCuratedCacheRefreshMode,
+    git_mode: PluginGitMode,
 ) -> Result<NonCuratedCacheRefreshOutcome, String> {
     let mut configured_non_curated_plugin_ids = configured_plugin_keys
         .iter()
@@ -644,9 +651,10 @@ fn refresh_non_curated_plugin_cache_with_mode(
         };
         let refresh_result = (|| -> Result<bool, String> {
             let materialized =
-                materialize_marketplace_plugin_source(codex_home, &source).map_err(|err| {
-                    format!("failed to materialize plugin source for {plugin_key}: {err}")
-                })?;
+                materialize_marketplace_plugin_source_with_mode(codex_home, &source, git_mode)
+                    .map_err(|err| {
+                        format!("failed to materialize plugin source for {plugin_key}: {err}")
+                    })?;
             let source_path = materialized.path;
             let plugin_version = match manifest_fallback_contents.as_deref() {
                 Some(manifest_contents) => plugin_version_for_source_with_fallback_manifest(
@@ -1397,6 +1405,73 @@ pub async fn load_configured_plugin_mcp_servers(
     load_plugin_mcp_servers_with_policy(plugin_root, auth_mode, plugin_policy).await
 }
 
+/// Resolves effective per-plugin MCP policies without validating opaque selected-root IDs.
+pub fn configured_plugin_mcp_server_policies(
+    config_layer_stack: &ConfigLayerStack,
+) -> HashMap<String, HashMap<String, PluginMcpServerConfig>> {
+    config_layer_stack
+        .effective_user_config()
+        .map(|config| configured_plugins_from_user_config_value(&config))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(plugin_id, plugin)| (plugin_id, plugin.mcp_servers))
+        .collect()
+}
+
+/// Applies user policy without widening the selected plugin's declared restrictions.
+pub fn apply_configured_plugin_mcp_server_policies(
+    policies: &HashMap<String, PluginMcpServerConfig>,
+    servers: &mut HashMap<String, McpServerConfig>,
+) {
+    for (name, server) in servers {
+        if let Some(policy) = policies.get(name) {
+            let declared_approval_mode = server.default_tools_approval_mode.unwrap_or_default();
+            server.enabled &= policy.enabled;
+
+            if let Some(approval_mode) = policy.default_tools_approval_mode {
+                server.default_tools_approval_mode =
+                    Some(declared_approval_mode.restrict_to(approval_mode));
+            }
+            if let Some(enabled_tools) = &policy.enabled_tools {
+                match &mut server.enabled_tools {
+                    Some(declared_tools) => {
+                        declared_tools.retain(|tool| enabled_tools.contains(tool));
+                    }
+                    None => server.enabled_tools = Some(enabled_tools.clone()),
+                }
+            }
+            if let Some(disabled_tools) = &policy.disabled_tools {
+                let declared_tools = server.disabled_tools.get_or_insert_default();
+                for tool in disabled_tools {
+                    if !declared_tools.contains(tool) {
+                        declared_tools.push(tool.clone());
+                    }
+                }
+            }
+            for (tool_name, tool_policy) in &policy.tools {
+                if tool_policy.approval_mode.is_some() {
+                    server.tools.entry(tool_name.clone()).or_default();
+                }
+            }
+            for (tool_name, tool_config) in &mut server.tools {
+                if let Some(approval_mode) = policy
+                    .tools
+                    .get(tool_name)
+                    .and_then(|tool_policy| tool_policy.approval_mode)
+                    .or(policy.default_tools_approval_mode)
+                {
+                    tool_config.approval_mode = Some(
+                        tool_config
+                            .approval_mode
+                            .unwrap_or(declared_approval_mode)
+                            .restrict_to(approval_mode),
+                    );
+                }
+            }
+        }
+    }
+}
+
 async fn load_plugin_mcp_servers_with_policy(
     plugin_root: &Path,
     auth_mode: Option<AuthMode>,
@@ -1640,6 +1715,15 @@ pub fn materialize_marketplace_plugin_source(
     codex_home: &Path,
     source: &MarketplacePluginSource,
 ) -> Result<MaterializedMarketplacePluginSource, String> {
+    materialize_marketplace_plugin_source_with_mode(codex_home, source, PluginGitMode::Manual)
+}
+
+/// Applies the initiating operation's Git trust policy throughout plugin materialization.
+pub(crate) fn materialize_marketplace_plugin_source_with_mode(
+    codex_home: &Path,
+    source: &MarketplacePluginSource,
+    mode: PluginGitMode,
+) -> Result<MaterializedMarketplacePluginSource, String> {
     match source {
         MarketplacePluginSource::Local { path } => Ok(MaterializedMarketplacePluginSource {
             path: path.clone(),
@@ -1668,11 +1752,13 @@ pub fn materialize_marketplace_plugin_source(
                     )
                 })?;
             clone_git_plugin_source(
+                codex_home,
                 url,
                 ref_name.as_deref(),
                 sha.as_deref(),
                 path.as_deref(),
                 tempdir.path(),
+                mode,
             )?;
             let path = if let Some(path) = path {
                 AbsolutePathBuf::try_from(tempdir.path().join(path)).map_err(|err| {
@@ -1708,12 +1794,18 @@ pub fn materialize_marketplace_plugin_source(
 }
 
 fn clone_git_plugin_source(
+    codex_home: &Path,
     url: &str,
     ref_name: Option<&str>,
     sha: Option<&str>,
     sparse_checkout_path: Option<&str>,
     destination: &Path,
+    mode: PluginGitMode,
 ) -> Result<(), String> {
+    let clone_cwd = match mode {
+        PluginGitMode::Automatic => Some(codex_home),
+        PluginGitMode::Manual => None,
+    };
     if let Some(sparse_checkout_path) = sparse_checkout_path {
         run_git(
             &[
@@ -1724,7 +1816,8 @@ fn clone_git_plugin_source(
                 url,
                 destination.to_string_lossy().as_ref(),
             ],
-            /*cwd*/ None,
+            clone_cwd,
+            mode,
         )?;
         run_git(
             &[
@@ -1735,42 +1828,56 @@ fn clone_git_plugin_source(
                 sparse_checkout_path,
             ],
             Some(destination),
+            mode,
         )?;
     } else {
         run_git(
             &["clone", url, destination.to_string_lossy().as_ref()],
-            /*cwd*/ None,
+            clone_cwd,
+            mode,
         )?;
     }
     if let Some(sha) = sha {
-        run_git(&["checkout", sha], Some(destination))?;
-        let checked_out_sha = run_git_output(&["rev-parse", "HEAD"], Some(destination))?;
+        run_git(&["checkout", sha], Some(destination), mode)?;
+        let checked_out_sha = run_git_output(&["rev-parse", "HEAD"], Some(destination), mode)?;
         if !checked_out_sha.eq_ignore_ascii_case(sha) {
             return Err(format!(
                 "checked out Git SHA {checked_out_sha} does not match requested SHA {sha}"
             ));
         }
     } else if let Some(ref_name) = ref_name {
-        run_git(&["checkout", ref_name], Some(destination))?;
+        run_git(&["checkout", ref_name], Some(destination), mode)?;
     } else if sparse_checkout_path.is_some() {
-        run_git(&["checkout"], Some(destination))?;
+        run_git(&["checkout"], Some(destination), mode)?;
     }
     Ok(())
 }
 
-fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
-    run_git_output(args, cwd).map(drop)
+fn run_git(args: &[&str], cwd: Option<&Path>, mode: PluginGitMode) -> Result<(), String> {
+    run_git_output(args, cwd, mode).map(drop)
 }
 
-fn run_git_output(args: &[&str], cwd: Option<&Path>) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command
-        .args(["-c", codex_git_utils::SAFE_BARE_REPOSITORY_CONFIG])
-        .args(args);
+fn run_git_output(
+    args: &[&str],
+    cwd: Option<&Path>,
+    mode: PluginGitMode,
+) -> Result<String, String> {
+    let mut command = mode.command(Path::new("git"));
+    command.args(args);
     command.env("GIT_TERMINAL_PROMPT", "0");
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
+    let _trusted_repository = if let Some(cwd) = cwd
+        && args.first() == Some(&"clone")
+    {
+        Some(crate::configure_trusted_git_repository(&mut command, cwd)?)
+    } else {
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+            if matches!(mode, PluginGitMode::Manual) {
+                command.env_remove("GIT_DIR");
+            }
+        }
+        None
+    };
 
     let output = command
         .output()

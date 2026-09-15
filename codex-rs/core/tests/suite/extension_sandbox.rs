@@ -117,7 +117,7 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
         .entries
         .push(FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: denied_path.clone(),
+                path: denied_path.clone().into(),
             },
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
@@ -149,7 +149,8 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn extension_tool_uses_granted_turn_permissions_without_local_persistence() -> Result<()> {
+async fn extension_tool_uses_granted_turn_permissions_without_host_local_persistence() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
@@ -201,7 +202,9 @@ async fn extension_tool_uses_granted_turn_permissions_without_local_persistence(
     std::fs::write(&image_path, TINY_PNG_BYTES)?;
     let requested_permissions = RequestPermissionProfile {
         file_system: Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![image_dir.path().canonicalize()?.try_into()?]),
+            Some(vec![AbsolutePathBuf::try_from(
+                image_dir.path().canonicalize()?,
+            )?]),
             Some(Vec::new()),
         )),
         ..RequestPermissionProfile::default()
@@ -302,13 +305,25 @@ async fn extension_tool_uses_granted_turn_permissions_without_local_persistence(
         .last_request()
         .context("missing request containing extension output")?;
     let output = request.function_call_output(image_call_id);
+    let expected_path = test
+        .config
+        .cwd
+        .join("generated_images")
+        .join("image-edit-granted.png");
     assert_eq!(
-        output["output"],
-        json!([{
+        output["output"][0],
+        json!({
             "type": "input_image",
             "image_url": TINY_PNG_DATA_URL,
-        }])
+        })
     );
+    assert_eq!(output["output"].as_array().map(Vec::len), Some(2));
+    assert!(
+        output["output"][1]["text"]
+            .as_str()
+            .is_some_and(|hint| hint.contains(&expected_path.display().to_string()))
+    );
+    assert_eq!(std::fs::read(expected_path.as_path())?, TINY_PNG_BYTES);
     assert!(!test.config.codex_home.join("generated_images").exists());
 
     Ok(())

@@ -81,6 +81,9 @@ use pretty_assertions::assert_eq;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+#[path = "skills_extension/shadow_task_context_tests.rs"]
+mod shadow_task_context_tests;
+
 static NEXT_CODEX_HOME_ID: AtomicUsize = AtomicUsize::new(0);
 const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. `file` locators are on the host filesystem, `executor package` locators are owned by their execution environment, `orchestrator package` locators are opaque package identifiers, and `custom resource` locators use their provider's access mechanism.";
 const DEMO_SKILL_CONTENTS: &str =
@@ -172,7 +175,6 @@ async fn installed_extension_uses_host_service_snapshot() -> TestResult {
         name: "demo".to_string(),
         description: "Demo skill.".to_string(),
         short_description: None,
-        model: None,
         interface: None,
         dependencies: None,
         policy: None,
@@ -254,7 +256,6 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
         name: "demo".to_string(),
         description: "Demo skill.".to_string(),
         short_description: None,
-        model: None,
         interface: None,
         dependencies: None,
         policy: None,
@@ -319,7 +320,6 @@ async fn host_world_state_records_catalog_metrics_on_publish_and_change() -> Tes
         name: "other".to_string(),
         description: "Other skill.".to_string(),
         short_description: None,
-        model: None,
         interface: None,
         dependencies: None,
         policy: None,
@@ -372,7 +372,6 @@ async fn persisted_host_snapshot_deduplicates_warning_after_reinitialization() -
         name: "demo".to_string(),
         description: "Demo skill.".to_string(),
         short_description: None,
-        model: None,
         interface: None,
         dependencies: None,
         policy: None,
@@ -948,7 +947,13 @@ async fn shadow_lru_selector_recovers_a_skill_invoked_on_an_earlier_turn() -> Te
                     .find(|attribute| attribute.key.as_str() == "method")?
                     .value
                     .as_str();
-                if method != "lru_v1" && method != "lru_plus_lexical_v1" {
+                if !matches!(
+                    method.as_ref(),
+                    "lru_v1"
+                        | "lru_plus_lexical_v1"
+                        | "lru_plus_character_routing_v1"
+                        | "lru_plus_lexical_character_routing_v1"
+                ) {
                     return None;
                 }
                 let hit = point
@@ -966,6 +971,16 @@ async fn shadow_lru_selector_recovers_a_skill_invoked_on_an_earlier_turn() -> Te
 
     assert_eq!(
         vec![
+            (
+                "lru_plus_character_routing_v1".to_string(),
+                "true".to_string(),
+                2,
+            ),
+            (
+                "lru_plus_lexical_character_routing_v1".to_string(),
+                "true".to_string(),
+                2,
+            ),
             ("lru_plus_lexical_v1".to_string(), "true".to_string(), 2),
             ("lru_v1".to_string(), "false".to_string(), 1),
             ("lru_v1".to_string(), "true".to_string(), 1),
@@ -2279,6 +2294,10 @@ impl RecordingMetrics {
 }
 
 impl ExtensionMetrics for RecordingMetrics {
+    fn counter(&self, name: &str, _inc: i64, _tags: &[(&str, &str)]) {
+        panic!("unexpected counter: {name}");
+    }
+
     fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) {
         self.samples
             .lock()
@@ -2393,6 +2412,7 @@ fn default_config() -> TestConfig {
 fn skills_extension_config(config: &TestConfig) -> SkillsExtensionConfig {
     SkillsExtensionConfig {
         include_instructions: config.include_instructions,
+        max_context_tokens: None,
         bundled_skills_enabled: config.bundled_skills_enabled,
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.shadow_selection_enabled,

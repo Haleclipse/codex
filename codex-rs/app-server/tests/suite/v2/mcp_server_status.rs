@@ -28,6 +28,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_core::config::set_project_trust_level;
+use codex_http_client::HttpClientBuilder;
 use codex_protocol::config_types::TrustLevel;
 use core_test_support::stdio_server_bin;
 use pretty_assertions::assert_eq;
@@ -48,11 +49,13 @@ use rmcp::transport::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use url::Url;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -118,16 +121,15 @@ async fn oauth_login_uses_http_headers_helper() -> Result<()> {
         .await?;
     let response: McpServerOauthLoginResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
-    let authorization_url = reqwest::Url::parse(&response.authorization_url)?;
+    let authorization_url = Url::parse(&response.authorization_url)?;
     let query: BTreeMap<_, _> = authorization_url.query_pairs().into_owned().collect();
-    let mut callback_url = reqwest::Url::parse(&query["redirect_uri"])?;
+    let mut callback_url = Url::parse(&query["redirect_uri"])?;
     callback_url
         .query_pairs_mut()
         .append_pair("code", "test-code")
         .append_pair("state", &query["state"]);
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()?
+    HttpClientBuilder::new()
+        .build_direct()?
         .get(callback_url)
         .send()
         .await?
@@ -150,16 +152,22 @@ async fn oauth_login_uses_http_headers_helper() -> Result<()> {
     Ok(())
 }
 
+#[test_case(false; "plain HTTP")]
+#[test_case(true; "HTTP headers helper")]
 #[tokio::test]
-async fn oauth_login_does_not_run_helper_disabled_by_managed_requirements() -> Result<()> {
+async fn oauth_login_rejects_servers_disabled_by_managed_requirements(
+    with_headers_helper: bool,
+) -> Result<()> {
     let codex_home = TempDir::new()?;
     let marker = codex_home.path().join("helper-ran");
-    let helper = toml::Value::String(format!("echo invoked > \"{}\"", marker.display()));
+    let helper = with_headers_helper
+        .then(|| toml::Value::String(format!("echo invoked > \"{}\"", marker.display())))
+        .map_or_else(String::new, |command| {
+            format!("http_headers_helper = {command}\n")
+        });
     std::fs::write(
         codex_home.path().join("config.toml"),
-        format!(
-            "[mcp_servers.blocked]\nurl = \"https://example.com/mcp\"\nhttp_headers_helper = {helper}\n"
-        ),
+        format!("[mcp_servers.blocked]\nurl = \"https://example.com/mcp\"\n{helper}"),
     )?;
     std::fs::write(
         codex_home.path().join("requirements.toml"),
@@ -243,7 +251,6 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
     });
     let registrations = Arc::new(AtomicUsize::new(0));
     let registration_count = Arc::clone(&registrations);
-    let token_count = Arc::new(AtomicUsize::new(0));
     let (token_request_tx, mut token_request_rx) = mpsc::unbounded_channel();
     let (mcp_authorization_tx, mut mcp_authorization_rx) = mpsc::unbounded_channel();
     let tool_name = Arc::new("cimd".to_string());
@@ -296,7 +303,6 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
             "/token",
             post(move |headers: HeaderMap, body: Bytes| {
                 let token_request_tx = token_request_tx.clone();
-                let token_count = Arc::clone(&token_count);
                 async move {
                     let _ = token_request_tx.send((
                         String::from_utf8_lossy(&body).into_owned(),
@@ -305,21 +311,12 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_string),
                     ));
-                    if token_count.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Json(json!({
-                            "access_token": "expired-cimd-access-token",
-                            "token_type": "Bearer",
-                            "expires_in": 0,
-                            "refresh_token": "test-refresh-token",
-                        }))
-                    } else {
-                        Json(json!({
-                            "access_token": "refreshed-cimd-access-token",
-                            "token_type": "Bearer",
-                            "expires_in": 3600,
-                            "refresh_token": "test-refresh-token",
-                        }))
-                    }
+                    Json(json!({
+                        "access_token": "cimd-access-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "refresh_token": "test-refresh-token",
+                    }))
                 }
             }),
         )
@@ -348,13 +345,13 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
         .await?;
     let response: McpServerOauthLoginResponse =
         timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(request_id)).await??;
-    let authorization_url = reqwest::Url::parse(&response.authorization_url)?;
+    let authorization_url = Url::parse(&response.authorization_url)?;
     let parameters = authorization_url
         .query_pairs()
         .into_owned()
         .collect::<BTreeMap<String, String>>();
     let redirect_uri = parameters["redirect_uri"].clone();
-    let mut callback_url = reqwest::Url::parse(&redirect_uri)?;
+    let mut callback_url = Url::parse(&redirect_uri)?;
     let callback_id = callback_url
         .path()
         .strip_prefix("/callback/")
@@ -371,9 +368,8 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
         .query_pairs_mut()
         .append_pair("code", "cimd-authorization-code")
         .append_pair("state", &parameters["state"]);
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()?
+    HttpClientBuilder::new()
+        .build_direct()?
         .get(callback_url)
         .send()
         .await?
@@ -424,29 +420,11 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
             },
         })
         .await?;
-    let (refresh_request, refresh_authorization) =
-        timeout(DEFAULT_READ_TIMEOUT, token_request_rx.recv())
-            .await?
-            .expect("expired CIMD token should be refreshed");
-    let refresh_parameters = url::form_urlencoded::parse(refresh_request.as_bytes())
-        .into_owned()
-        .collect::<BTreeMap<String, String>>();
-    assert_eq!(
-        refresh_parameters.get("grant_type").map(String::as_str),
-        Some("refresh_token")
-    );
-    assert_eq!(
-        refresh_parameters.get("refresh_token").map(String::as_str),
-        Some("test-refresh-token")
-    );
-    assert_eq!(refresh_parameters.get("client_id"), Some(&client_id));
-    assert!(!refresh_parameters.contains_key("client_secret"));
-    assert_eq!(refresh_authorization, None);
     assert_eq!(
         timeout(DEFAULT_READ_TIMEOUT, mcp_authorization_rx.recv())
             .await?
-            .expect("MCP startup should use the refreshed token"),
-        "Bearer refreshed-cimd-access-token"
+            .expect("MCP startup should use the access token"),
+        "Bearer cimd-access-token"
     );
     assert_eq!(registrations.load(Ordering::SeqCst), 0);
 

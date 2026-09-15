@@ -120,6 +120,7 @@ impl SessionTarget {
 #[derive(Debug, Clone)]
 pub enum SessionSelection {
     StartFresh,
+    AgentsOverview,
     Resume(SessionTarget),
     Fork(SessionTarget),
     Exit,
@@ -2056,6 +2057,7 @@ fn thread_list_params(
         source_kinds: Some(crate::resume_source_kinds(include_non_interactive)),
         archived: Some(status == SessionStatus::Archived),
         section_id: None,
+        project_id: None,
         parent_thread_id: None,
         ancestor_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().into_owned())),
@@ -5703,6 +5705,7 @@ session_picker_view = "dense"
             render_list(&mut frame, area, &state);
         }
         terminal.flush().expect("flush");
+        terminal.swap_buffers();
         assert!(terminal.backend().to_string().contains("↓ more"));
 
         state.density = SessionListDensity::Dense;
@@ -6322,6 +6325,7 @@ session_picker_view = "dense"
             ephemeral: false,
             section: None,
             section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             created_at: 1,
@@ -6363,6 +6367,7 @@ session_picker_view = "dense"
             ephemeral: false,
             section: None,
             section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             created_at: 1,
@@ -6396,6 +6401,7 @@ session_picker_view = "dense"
                         text: String::from("hello from assistant"),
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
                     },
                     ThreadItem::Plan {
                         id: String::from("plan-1"),
@@ -6442,6 +6448,7 @@ session_picker_view = "dense"
             ephemeral: false,
             section: None,
             section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             created_at: 1,
@@ -6514,6 +6521,7 @@ session_picker_view = "dense"
             ephemeral: false,
             section: None,
             section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             created_at: 1,

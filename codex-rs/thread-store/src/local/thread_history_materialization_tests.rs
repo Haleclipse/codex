@@ -169,6 +169,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
             search_term: None,
             relation_filter: None,
             section: None,
+            project_id: None,
             use_state_db_only: true,
         })
         .await
@@ -225,6 +226,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
                         }],
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
                     }),
                 ),
                 turn_completed("turn-1"),
@@ -317,6 +319,7 @@ async fn paginated_live_append_materializes_turn_items_and_state() {
                         }],
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
                     }),
                 ),
                 turn_completed("turn-1"),
@@ -1301,6 +1304,33 @@ async fn summary_items_use_final_answers_and_ignore_commentary() {
         })
         .await
         .expect("append items before turn lifecycle");
+
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    sqlx::query(
+        r#"
+INSERT OR REPLACE INTO thread_items (
+    thread_id,
+    turn_id,
+    item_id,
+    rollout_ordinal,
+    created_at_ms,
+    item_json
+)
+SELECT thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json
+FROM thread_items
+WHERE thread_id = ? AND turn_id = ?
+        "#,
+    )
+    .bind(thread_id.to_string())
+    .bind("turn-1")
+    .execute(&pool)
+    .await
+    .expect("older writers can append items without a stored item type");
+
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
@@ -2342,6 +2372,7 @@ fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
         }],
         phase: Some(phase),
         memory_citation: None,
+        delivery: None,
     })
 }
 

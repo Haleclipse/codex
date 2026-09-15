@@ -46,6 +46,7 @@ SELECT
     ) AS section_appearance,
     threads.section_position,
     threads.section_entered_at_ms,
+    threads.project_id,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -60,12 +61,31 @@ WHERE threads.id = ?
             .transpose()
     }
 
-    /// Permanently promote a thread to paginated history without changing metadata or recency.
-    pub async fn mark_thread_paginated(&self, thread_id: ThreadId) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET history_mode = 'paginated' WHERE id = ?")
-            .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
-            .await?;
+    /// Permanently promote a thread, preserving its canonical name or a legacy-visible fallback.
+    pub async fn mark_thread_paginated(
+        &self,
+        thread_id: ThreadId,
+        legacy_name: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        // Legacy threads display `title`, then fall back to the name index. Paginated threads
+        // display `name`; `title` remains derived metadata used for search. Preserve an existing
+        // `name`, otherwise carry over the legacy display name.
+        let result = sqlx::query(
+            r#"
+UPDATE threads
+SET
+    history_mode = 'paginated',
+    name = CASE
+        WHEN name IS NULL OR trim(name) = '' THEN ?
+        ELSE name
+    END
+WHERE id = ?
+            "#,
+        )
+        .bind(legacy_name)
+        .bind(thread_id.to_string())
+        .execute(self.pool.as_ref())
+        .await?;
         Ok(result.rows_affected() > 0)
     }
     pub async fn get_thread_memory_mode(&self, id: ThreadId) -> anyhow::Result<Option<String>> {
@@ -414,6 +434,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 model_providers,
                 cwd_filters: None,
                 section: None,
+                project_id: None,
                 anchor: None,
                 sort_key: crate::SortKey::UpdatedAt,
                 sort_direction: SortDirection::Desc,
@@ -539,6 +560,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 model_providers,
                 cwd_filters: None,
                 section: None,
+                project_id: None,
                 anchor,
                 sort_key,
                 sort_direction: SortDirection::Desc,
@@ -620,8 +642,9 @@ INSERT INTO threads (
     git_sha,
     git_branch,
     git_origin_url,
-    memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    memory_mode,
+    project_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -670,6 +693,7 @@ ON CONFLICT(id) DO NOTHING
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
         .bind("enabled")
+        .bind(metadata.project_id.as_deref())
         .execute(self.pool.as_ref())
         .await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
@@ -895,8 +919,9 @@ INSERT INTO threads (
     git_sha,
     git_branch,
     git_origin_url,
-    memory_mode
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    memory_mode,
+    project_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -978,6 +1003,7 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(metadata.git_branch.as_deref())
         .bind(metadata.git_origin_url.as_deref())
         .bind(creation_memory_mode.unwrap_or("enabled"))
+        .bind(metadata.project_id.as_deref())
         .execute(self.pool.as_ref())
         .await?;
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
@@ -1277,6 +1303,7 @@ SELECT
     ) AS section_appearance,
     threads.section_position,
     threads.section_entered_at_ms,
+    threads.project_id,
     threads.git_sha,
     threads.git_branch,
     threads.git_origin_url
@@ -1311,6 +1338,7 @@ pub struct ThreadFilterOptions<'a> {
     pub model_providers: Option<&'a [String]>,
     pub cwd_filters: Option<&'a [PathBuf]>,
     pub section: Option<Option<&'a str>>,
+    pub project_id: Option<Option<&'a str>>,
     pub anchor: Option<&'a crate::Anchor>,
     pub sort_key: SortKey,
     pub sort_direction: SortDirection,
@@ -1342,6 +1370,7 @@ fn push_thread_filters_with_preview<'a>(
         model_providers,
         cwd_filters,
         section,
+        project_id,
         anchor,
         sort_key,
         sort_direction,
@@ -1353,7 +1382,7 @@ fn push_thread_filters_with_preview<'a>(
     } else {
         builder.push(" AND threads.archived = 0");
     }
-    if !include_empty_preview {
+    if !include_empty_preview && !matches!(section, Some(Some(_))) {
         builder.push(" AND threads.preview <> ''");
     }
     match section {
@@ -1363,6 +1392,16 @@ fn push_thread_filters_with_preview<'a>(
         }
         Some(None) => {
             builder.push(" AND threads.thread_section_id IS NULL");
+        }
+        None => {}
+    }
+    match project_id {
+        Some(Some(project_id)) => {
+            builder.push(" AND threads.project_id = ");
+            builder.push_bind(project_id);
+        }
+        Some(None) => {
+            builder.push(" AND threads.project_id IS NULL");
         }
         None => {}
     }
@@ -1574,7 +1613,7 @@ mod tests {
 
         assert!(
             runtime
-                .mark_thread_paginated(thread_id)
+                .mark_thread_paginated(thread_id, /*legacy_name*/ None)
                 .await
                 .expect("mark paginated history")
         );
@@ -1635,6 +1674,10 @@ mod tests {
         ] {
             let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
             metadata.recency_at = DateTime::<Utc>::from_timestamp(recency_at, 0).unwrap();
+            if thread_id == oldest_pinned {
+                metadata.preview = Some(String::new());
+                metadata.first_user_message = None;
+            }
             metadata.section = section.map(|id| crate::ThreadSection {
                 id: id.to_string(),
                 name: crate::PINNED_THREAD_SECTION_NAME.to_string(),
@@ -1649,6 +1692,7 @@ mod tests {
             model_providers: None,
             cwd_filters: None,
             section,
+            project_id: None,
             anchor,
             sort_key: SortKey::RecencyAt,
             sort_direction: SortDirection::Desc,
@@ -1708,12 +1752,7 @@ mod tests {
                 .iter()
                 .map(|thread| thread.id)
                 .collect::<Vec<_>>(),
-            vec![
-                newest_unpinned,
-                newest_pinned,
-                oldest_pinned,
-                oldest_unpinned,
-            ]
+            vec![newest_unpinned, newest_pinned, oldest_unpinned,]
         );
 
         let mut builder = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
@@ -1766,6 +1805,10 @@ mod tests {
 
         for (thread_id, position) in [(first, 1_000_000), (tied, 1_000_000), (last, 2_000_000)] {
             let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            if thread_id == tied {
+                metadata.preview = Some(String::new());
+                metadata.first_user_message = None;
+            }
             metadata.section = Some(crate::ThreadSection {
                 id: CUSTOM_THREAD_SECTION_ID.to_string(),
                 name: "Custom section".to_string(),
@@ -1782,6 +1825,7 @@ mod tests {
             model_providers: None,
             cwd_filters: None,
             section: Some(Some(CUSTOM_THREAD_SECTION_ID)),
+            project_id: None,
             anchor,
             sort_key: SortKey::SectionPosition,
             sort_direction: SortDirection::Asc,
@@ -2029,6 +2073,7 @@ mod tests {
                     model_providers: Some(&model_providers),
                     cwd_filters: None,
                     section: None,
+                    project_id: None,
                     anchor: Some(&anchor),
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Asc,
@@ -2058,6 +2103,7 @@ mod tests {
                     model_providers: Some(&model_providers),
                     cwd_filters: None,
                     section: None,
+                    project_id: None,
                     anchor: page.next_anchor.as_ref(),
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Asc,
@@ -2115,6 +2161,7 @@ mod tests {
                     model_providers: None,
                     cwd_filters: Some(cwd_filters.as_slice()),
                     section: None,
+                    project_id: None,
                     anchor: None,
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Desc,
@@ -2148,6 +2195,7 @@ mod tests {
                     model_providers: None,
                     cwd_filters: Some(cwd_filters.as_slice()),
                     section: None,
+                    project_id: None,
                     anchor: first_page.next_anchor.as_ref(),
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Desc,
@@ -2174,6 +2222,7 @@ mod tests {
                     model_providers: None,
                     cwd_filters: Some(&[]),
                     section: None,
+                    project_id: None,
                     anchor: None,
                     sort_key: SortKey::UpdatedAt,
                     sort_direction: SortDirection::Desc,
@@ -2242,6 +2291,7 @@ mod tests {
                         model_providers: Some(&model_providers),
                         cwd_filters,
                         section: None,
+                        project_id: None,
                         anchor,
                         sort_key,
                         sort_direction: SortDirection::Desc,
@@ -2343,6 +2393,7 @@ mod tests {
                 model_providers: None,
                 cwd_filters: None,
                 section: None,
+                project_id: None,
                 anchor: None,
                 sort_key: SortKey::CreatedAt,
                 sort_direction: SortDirection::Desc,
@@ -2372,6 +2423,7 @@ mod tests {
             model_providers: None,
             cwd_filters: None,
             section: None,
+            project_id: None,
             anchor,
             sort_key: SortKey::CreatedAt,
             sort_direction: SortDirection::Desc,
@@ -3056,6 +3108,7 @@ mod tests {
                     model_providers: None,
                     cwd_filters: None,
                     section: None,
+                    project_id: None,
                     anchor: None,
                     sort_key: SortKey::RecencyAt,
                     sort_direction: SortDirection::Desc,
@@ -3089,6 +3142,7 @@ mod tests {
                     model_providers: None,
                     cwd_filters: None,
                     section: None,
+                    project_id: None,
                     anchor: first_page.next_anchor.as_ref(),
                     sort_key: SortKey::RecencyAt,
                     sort_direction: SortDirection::Desc,
@@ -3122,6 +3176,7 @@ mod tests {
                     model_providers: None,
                     cwd_filters: None,
                     section: None,
+                    project_id: None,
                     anchor: second_page.next_anchor.as_ref(),
                     sort_key: SortKey::RecencyAt,
                     sort_direction: SortDirection::Desc,

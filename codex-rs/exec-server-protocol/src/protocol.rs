@@ -361,6 +361,8 @@ pub struct TerminateResponse {
 #[serde(rename_all = "camelCase")]
 pub struct FsReadFileParams {
     pub path: PathUri,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -414,6 +416,8 @@ pub struct FsCloseResponse {}
 pub struct FsWriteFileParams {
     pub path: PathUri,
     pub data_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -426,6 +430,8 @@ pub struct FsWriteFileResponse {}
 pub struct FsCreateDirectoryParams {
     pub path: PathUri,
     pub recursive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
     /// Atomically restrict a newly created, non-recursive directory to its owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -440,6 +446,8 @@ pub struct FsCreateDirectoryResponse {}
 #[serde(rename_all = "camelCase")]
 pub struct FsGetMetadataParams {
     pub path: PathUri,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -504,6 +512,8 @@ pub struct FsRemoveParams {
     pub path: PathUri,
     pub recursive: Option<bool>,
     pub force: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -1058,15 +1068,14 @@ mod tests {
         let file_system = ManagedFileSystemPermissions::Restricted {
             entries: vec![
                 FileSystemSandboxEntry {
-                    path: FileSystemPath::Path {
-                        path: native_cwd.clone().try_into().expect("absolute cwd"),
-                    },
+                    path: FileSystemPath::Path { path: cwd.clone() },
                     access: FileSystemAccessMode::Read,
                     missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry::skip_missing_path(
                     FileSystemPath::Path {
-                        path: native_cwd.join(".git").try_into().expect("absolute path"),
+                        path: PathUri::from_host_native_path(native_cwd.join(".git"))
+                            .expect("absolute path"),
                     },
                     FileSystemAccessMode::Read,
                 ),
@@ -1136,9 +1145,7 @@ mod tests {
         let cwd = PathUri::from_host_native_path(&native_cwd).expect("cwd URI");
         let mut file_system_policy =
             FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: native_cwd.try_into().expect("absolute cwd"),
-                },
+                path: FileSystemPath::Path { path: cwd.clone() },
                 access: FileSystemAccessMode::Read,
                 missing_path_behavior: None,
             }]);

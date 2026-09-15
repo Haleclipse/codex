@@ -3,6 +3,7 @@ use crate::agent::control::SpawnAgentOptions;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
+use crate::mcp::McpEnvironmentScope;
 use crate::mcp::McpThreadIdentity;
 use crate::rollout::RolloutRecorder;
 use crate::session::session::SessionSettingsUpdate;
@@ -56,6 +57,62 @@ fn thread_id_generator_defaults_to_standard_ids() {
         agent_control.generate_thread_id(),
         agent_control.generate_thread_id()
     );
+}
+
+#[tokio::test]
+async fn reserved_thread_id_is_used_without_changing_normal_id_generation() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let generated_ids = [
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0001),
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0002),
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0003),
+    ];
+    let next_id = std::sync::atomic::AtomicUsize::new(0);
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    )
+    .with_thread_id_generator(move || generated_ids[next_id.fetch_add(1, Ordering::Relaxed)]);
+
+    let reserved_id = manager.reserve_thread_id();
+    let mut reserved_options = StartThreadOptions::new(config.clone());
+    reserved_options.reserved_thread_id = Some(reserved_id);
+    let reserved = manager
+        .start_thread(reserved_options)
+        .await
+        .expect("start reserved thread");
+    let mut resumed_options = StartThreadOptions::new(config.clone());
+    resumed_options.initial_history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: reserved.thread_id,
+        history: Arc::new(Vec::new()),
+        rollout_path: None,
+    });
+    let resumed_id = manager.reserve_thread_id();
+    resumed_options.reserved_thread_id = Some(resumed_id);
+    let resume_error = manager
+        .start_thread(resumed_options)
+        .await
+        .err()
+        .expect("reject reserved ID for resume");
+    let generated = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start generated thread");
+
+    assert_eq!(reserved.thread_id, generated_ids[0]);
+    assert!(matches!(
+        resume_error.details(),
+        codex_protocol::error::CodexErrorDetails::InvalidRequest(message)
+            if message == "reserved thread ID cannot be used when resuming a thread"
+    ));
+    assert_eq!(generated.thread_id, generated_ids[2]);
 }
 
 /// One custom ID factory supplies identifiers for roots, actual child agents, and forks.
@@ -975,6 +1032,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             McpThreadIdentity {
                 session_source: &SessionSource::Exec,
                 originator: &first_originator,
+                environments: McpEnvironmentScope::Live(&first_session.services.turn_environments),
             },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
@@ -992,6 +1050,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             McpThreadIdentity {
                 session_source: &second_session_source,
                 originator: &second_originator,
+                environments: McpEnvironmentScope::Live(&second_session.services.turn_environments),
             },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
@@ -2044,6 +2103,7 @@ fn completed_legacy_event_history_is_not_mid_turn() {
             message: "done".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
         })),
     ]);
 

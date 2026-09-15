@@ -49,17 +49,7 @@ impl PluginRequestProcessor {
         let plugin_sharing_enabled = config.features.enabled(Feature::PluginSharing);
 
         let auth = self.auth_manager.auth().await;
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
-        {
-            return Ok(empty_response());
-        }
-
         let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
-        self.thread_manager
-            .plugins_manager()
-            .set_auth_mode(auth_mode);
         let remote_plugin_enabled = config.features.enabled(Feature::RemotePlugin);
         let use_remote_global_catalog =
             remote_plugin_enabled && auth_mode.is_some_and(DomainAuthMode::uses_codex_backend);

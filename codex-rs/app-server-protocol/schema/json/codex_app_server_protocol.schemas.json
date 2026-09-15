@@ -4601,6 +4601,46 @@
           "properties": {
             "method": {
               "enum": [
+                "project/changed"
+              ],
+              "title": "Project/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ProjectChangedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Project/changedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/project/updated"
+              ],
+              "title": "Thread/project/updatedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadProjectUpdatedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/project/updatedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "thread/environment/connected"
               ],
               "title": "Thread/environment/connectedNotificationMethod",
@@ -4855,6 +4895,26 @@
             "params"
           ],
           "title": "Item/autoApprovalReview/completedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "autoApprovalReview/strictReviewRequired"
+              ],
+              "title": "AutoApprovalReview/strictReviewRequiredNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/StrictReviewRequiredNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "AutoApprovalReview/strictReviewRequiredNotification",
           "type": "object"
         },
         {
@@ -6508,6 +6568,12 @@
         },
         "type": "object"
       },
+      "AgentMessageDelivery": {
+        "enum": [
+          "async"
+        ],
+        "type": "string"
+      },
       "AgentMessageDeltaNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -7562,6 +7628,15 @@
             "type": "object"
           }
         ]
+      },
+      "CliAuthCredentialsStoreMode": {
+        "enum": [
+          "file",
+          "keyring",
+          "auto",
+          "ephemeral"
+        ],
+        "type": "string"
       },
       "CodexErrorInfo": {
         "description": "This translation layer make sure that we expose codex error code in camel case.\n\nWhen an upstream HTTP status is available (for example, from the Responses API or a provider), it is forwarded in `httpStatusCode` on the relevant `codexErrorInfo` variant.",
@@ -8922,10 +8997,26 @@
               }
             ]
           },
+          "chatgptBaseUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "checkForUpdateOnStartup": {
             "type": [
               "boolean",
               "null"
+            ]
+          },
+          "cliAuthCredentialsStore": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/CliAuthCredentialsStoreMode"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "computerUse": {
@@ -13210,6 +13301,19 @@
       "McpResourceReadParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
+          "connectorId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "originCallId": {
+            "description": "Originating MCP tool call used to select the resource's app.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "server": {
             "type": "string"
           },
@@ -13238,6 +13342,13 @@
               "$ref": "#/definitions/v2/ResourceContent"
             },
             "type": "array"
+          },
+          "originCallId": {
+            "description": "Originating call when the server applied app-specific resource scoping.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -14618,6 +14729,8 @@
           "enterprise_cbp_usage_based",
           "enterprise",
           "edu",
+          "edu_plus",
+          "edu_pro",
           "unknown"
         ],
         "type": "string"
@@ -16007,6 +16120,86 @@
         "required": [
           "cols",
           "rows"
+        ],
+        "type": "object"
+      },
+      "Project": {
+        "properties": {
+          "createdAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "position": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "roots": {
+            "items": {
+              "$ref": "#/definitions/v2/ProjectRoot"
+            },
+            "type": "array"
+          },
+          "updatedAt": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "createdAt",
+          "id",
+          "metadata",
+          "name",
+          "position",
+          "roots",
+          "updatedAt"
+        ],
+        "type": "object"
+      },
+      "ProjectChangeType": {
+        "enum": [
+          "created",
+          "updated",
+          "deleted"
+        ],
+        "type": "string"
+      },
+      "ProjectChangedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "changeType": {
+            "$ref": "#/definitions/v2/ProjectChangeType"
+          },
+          "projectId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "changeType",
+          "projectId"
+        ],
+        "title": "ProjectChangedNotification",
+        "type": "object"
+      },
+      "ProjectRoot": {
+        "properties": {
+          "path": {
+            "$ref": "#/definitions/v2/AbsolutePathBuf"
+          }
+        },
+        "required": [
+          "path"
         ],
         "type": "object"
       },
@@ -18620,6 +18813,29 @@
         ],
         "type": "object"
       },
+      "StrictReviewRequiredNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "startedAtMs": {
+            "description": "Unix timestamp (in milliseconds) when this review started.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "startedAtMs",
+          "threadId",
+          "turnId"
+        ],
+        "title": "StrictReviewRequiredNotification",
+        "type": "object"
+      },
       "SubAgentActivityKind": {
         "enum": [
           "started",
@@ -18891,6 +19107,13 @@
             "description": "Usually the first user message in the thread, if available.",
             "type": "string"
           },
+          "projectId": {
+            "description": "Canonical project assignment owned by app-server, if any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "recencyAt": {
             "description": "Unix timestamp (in seconds) used for thread recency ordering.",
             "format": "int64",
@@ -18972,6 +19195,7 @@
           "id",
           "modelProvider",
           "preview",
+          "projectId",
           "sessionId",
           "source",
           "status",
@@ -19583,6 +19807,17 @@
           },
           {
             "properties": {
+              "delivery": {
+                "anyOf": [
+                  {
+                    "$ref": "#/definitions/v2/AgentMessageDelivery"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              },
               "id": {
                 "type": "string"
               },
@@ -20604,6 +20839,26 @@
           "threadId"
         ],
         "title": "ThreadNameUpdatedNotification",
+        "type": "object"
+      },
+      "ThreadProjectUpdatedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "projectId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "projectId",
+          "threadId"
+        ],
+        "title": "ThreadProjectUpdatedNotification",
         "type": "object"
       },
       "ThreadQueueChangedNotification": {

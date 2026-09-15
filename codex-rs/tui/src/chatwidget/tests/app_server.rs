@@ -344,21 +344,17 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     set_chatgpt_auth(&mut chat);
     set_fast_mode_test_catalog(&mut chat);
+    chat.set_feature_enabled(Feature::Apps, /*enabled*/ true);
     let thread_id = ThreadId::new();
     let mut session = configured_thread_session(thread_id);
     session.cwd = test_path_buf("/tmp/original-workspace").abs();
     chat.handle_thread_session(session);
-    let generation = chat.connector_scope_generation();
-    chat.on_connectors_loaded(
-        Ok(crate::app_event::ConnectorsSnapshot {
-            connectors: vec![
-                serde_json::from_str(r#"{"id":"old","name":"Old","isAccessible":true}"#)
-                    .expect("valid app"),
-            ],
-        }),
-        /*is_final*/ true,
-    );
-    chat.prefetch_connectors();
+    let previous_generation = chat.connector_scope_generation();
+    let old_app = serde_json::from_str(r#"{"id":"old","name":"Old","isAccessible":true}"#)
+        .expect("valid app");
+    chat.connectors.mention_snapshot = Some(crate::app_event::ConnectorsSnapshot {
+        connectors: vec![old_app],
+    });
     let _ = drain_insert_history(&mut rx);
 
     chat.handle_server_notification(
@@ -366,9 +362,9 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
         /*replay_kind*/ None,
     );
 
-    assert_ne!(chat.connector_scope_generation(), generation);
+    assert_ne!(chat.connector_scope_generation(), previous_generation);
     assert!(chat.connectors_for_mentions().is_none());
-    assert!(chat.connectors.prefetch_in_flight);
+    assert!(chat.connectors.mention_refresh_in_flight);
     assert_eq!(chat.current_model(), "gpt-5.4");
     assert_eq!(
         chat.current_reasoning_effort(),
@@ -625,6 +621,7 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         text: "Yes. What do you need?".to_string(),
         phase: Some(MessagePhase::FinalAnswer),
         memory_citation: None,
+        delivery: None,
     };
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -752,6 +749,39 @@ async fn live_app_server_guardian_warning_notification_renders_message() {
         rendered.contains("Automatic approval review denied the requested action."),
         "expected guardian warning notification message, got {rendered}"
     );
+}
+
+#[tokio::test]
+async fn live_app_server_strict_review_required_notification_renders_message() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+    begin_exec(&mut chat, "cmd-1", "printf 'streamed output\\n'");
+    drain_insert_history(&mut rx);
+
+    chat.handle_server_notification(
+        ServerNotification::StrictReviewRequired(
+            codex_app_server_protocol::StrictReviewRequiredNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                started_at_ms: 1_000,
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one warning history cell");
+    assert_chatwidget_snapshot!("strict_review_required", lines_to_single_string(&cells[0]));
+    chat.on_exec_command_output_delta("cmd-1", "streamed output\n");
+    assert!(
+        lines_to_single_string(
+            &chat
+                .active_cell_transcript_lines(/*width*/ 80)
+                .expect("strict review should preserve the active command")
+        )
+        .contains("streamed output")
+    );
+    assert!(chat.bottom_pane.is_task_running());
 }
 
 #[tokio::test]
@@ -926,6 +956,41 @@ async fn live_app_server_command_output_delta_transcript_snapshot() {
         "live_app_server_command_output_delta_interrupted",
         completed
     );
+}
+
+#[tokio::test]
+async fn live_app_server_sub_agent_activity_renders_once() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let activity = AppServerThreadItem::SubAgentActivity {
+        id: "activity-1".to_string(),
+        kind: codex_app_server_protocol::SubAgentActivityKind::Interacted,
+        agent_thread_id: ThreadId::new().to_string(),
+        agent_path: "/root/researcher".to_string(),
+    };
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
+            item: activity.clone(),
+        }),
+        /*replay_kind*/ None,
+    );
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: activity,
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let rendered = lines_to_single_string(&cells[0]);
+    assert_chatwidget_snapshot!("app_server_sub_agent_activity_renders_once", rendered);
 }
 
 #[tokio::test]
@@ -1205,6 +1270,7 @@ async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
         .to_string(),
         phase: Some(MessagePhase::FinalAnswer),
         memory_citation: None,
+        delivery: None,
     }];
     chat.handle_server_notification(
         ServerNotification::TurnCompleted(TurnCompletedNotification {
