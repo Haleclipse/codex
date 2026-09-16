@@ -211,6 +211,7 @@ fn format_labeled_requests_snapshot(
 }
 
 fn enable_deferred_tool_world_state_without_agents(config: &mut Config) {
+    config.update_plan_enabled = true;
     config.agents_enabled = false;
     config
         .features
@@ -1148,6 +1149,7 @@ async fn apps_guidance_and_deferred_namespace_appear_after_recovery_within_a_tur
     let mut builder = search_capable_apps_builder(apps_server.chatgpt_base_url.clone())
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config
                 .features
                 .enable(Feature::DefaultModeRequestUserInput)

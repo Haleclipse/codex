@@ -138,17 +138,6 @@ impl ThreadHistoryTurnChange {
             duration_ms: turn.duration_ms,
         }
     }
-
-    fn from_turn(turn: &Turn) -> Self {
-        Self {
-            turn_id: turn.id.clone(),
-            status: turn.status.clone(),
-            error: turn.error.clone(),
-            started_at: turn.started_at,
-            completed_at: turn.completed_at,
-            duration_ms: turn.duration_ms,
-        }
-    }
 }
 
 /// Coalesces per-rollout-item changes into an end-of-batch view. It preserves
@@ -234,7 +223,9 @@ impl ThreadHistoryChangeAccumulator {
 }
 
 pub struct ThreadHistoryBuilder {
-    turns: Vec<Turn>,
+    // Retain the builder representation so late completions can reuse each
+    // finished turn's item index without adding it to the public Turn type.
+    turns: Vec<PendingTurn>,
     current_turn: Option<PendingTurn>,
     next_item_index: i64,
     current_rollout_index: usize,
@@ -266,14 +257,14 @@ impl ThreadHistoryBuilder {
 
     pub fn finish(mut self) -> Vec<Turn> {
         self.finish_current_turn();
-        self.turns
+        self.turns.into_iter().map(Turn::from).collect()
     }
 
     pub fn active_turn_snapshot(&self) -> Option<Turn> {
         self.current_turn
             .as_ref()
             .map(Turn::from)
-            .or_else(|| self.turns.last().cloned())
+            .or_else(|| self.turns.last().map(Turn::from))
     }
 
     /// Returns the id of the active turn without materializing its items.
@@ -289,7 +280,12 @@ impl ThreadHistoryBuilder {
             .as_ref()
             .filter(|turn| turn.id == turn_id)
             .map(Turn::from)
-            .or_else(|| self.turns.iter().find(|turn| turn.id == turn_id).cloned())
+            .or_else(|| {
+                self.turns
+                    .iter()
+                    .find(|turn| turn.id == turn_id)
+                    .map(Turn::from)
+            })
     }
 
     /// Returns the index of the active turn snapshot within the finished turn list.
@@ -1226,7 +1222,7 @@ impl ThreadHistoryBuilder {
                 turn.status = TurnStatus::Interrupted;
                 turn.completed_at = payload.completed_at;
                 turn.duration_ms = payload.duration_ms;
-                let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
+                let changed_turn = ThreadHistoryTurnChange::from_pending_turn(turn);
                 self.record_changed_turn(changed_turn);
                 return;
             }
@@ -1294,7 +1290,7 @@ impl ThreadHistoryBuilder {
             }
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
-            let changed_turn = ThreadHistoryTurnChange::from_turn(turn);
+            let changed_turn = ThreadHistoryTurnChange::from_pending_turn(turn);
             self.record_changed_turn(changed_turn);
             return;
         }
@@ -1347,7 +1343,7 @@ impl ThreadHistoryBuilder {
             if turn.items.is_empty() && !turn.opened_explicitly && !turn.saw_compaction {
                 return;
             }
-            self.turns.push(Turn::from(turn));
+            self.turns.push(turn);
         }
     }
 
@@ -1362,6 +1358,7 @@ impl ThreadHistoryBuilder {
         PendingTurn {
             id,
             items: Vec::new(),
+            item_index: TurnItemIndex::default(),
             error: None,
             status: TurnStatus::Completed,
             started_at: None,
@@ -1392,7 +1389,7 @@ impl ThreadHistoryBuilder {
         let changed_item = {
             let turn = self.ensure_turn();
             let changed_item = tracking_changes.then(|| (turn.id.clone(), item.clone()));
-            turn.items.push(item);
+            turn.item_index.push(&mut turn.items, item);
             changed_item
         };
         if let Some((turn_id, item)) = changed_item {
@@ -1406,7 +1403,7 @@ impl ThreadHistoryBuilder {
             && turn.id == turn_id
         {
             let changed_item = {
-                let item = upsert_turn_item(&mut turn.items, item);
+                let item = turn.item_index.upsert(&mut turn.items, item);
                 tracking_changes.then(|| (turn.id.clone(), item.clone()))
             };
             if let Some((turn_id, item)) = changed_item {
@@ -1417,7 +1414,7 @@ impl ThreadHistoryBuilder {
 
         if let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) {
             let changed_item = {
-                let item = upsert_turn_item(&mut turn.items, item);
+                let item = turn.item_index.upsert(&mut turn.items, item);
                 tracking_changes.then(|| (turn.id.clone(), item.clone()))
             };
             if let Some((turn_id, item)) = changed_item {
@@ -1436,7 +1433,7 @@ impl ThreadHistoryBuilder {
         let tracking_changes = self.is_tracking_changes();
         let changed_item = {
             let turn = self.ensure_turn();
-            let item = upsert_turn_item(&mut turn.items, item);
+            let item = turn.item_index.upsert(&mut turn.items, item);
             tracking_changes.then(|| (turn.id.clone(), item.clone()))
         };
         if let Some((turn_id, item)) = changed_item {
@@ -1545,22 +1542,54 @@ fn convert_dynamic_tool_content_items(
         .collect()
 }
 
-fn upsert_turn_item(items: &mut Vec<ThreadItem>, item: ThreadItem) -> &ThreadItem {
-    if let Some(existing_item_index) = items
-        .iter()
-        .position(|existing_item| existing_item.id() == item.id())
-    {
-        items[existing_item_index] = item;
-        return &items[existing_item_index];
+const TURN_ITEM_INDEX_THRESHOLD: usize = 32;
+
+/// Lazily indexes a turn's append-only item list. Replacements keep the same ID
+/// and position; duplicate IDs continue to resolve to their first occurrence.
+/// Keep this index with its turn, including after completion and across rollback.
+#[derive(Default)]
+struct TurnItemIndex {
+    positions: Option<HashMap<String, usize>>,
+}
+
+impl TurnItemIndex {
+    fn push(&mut self, items: &mut Vec<ThreadItem>, item: ThreadItem) {
+        if let Some(positions) = &mut self.positions {
+            positions
+                .entry(item.id().to_string())
+                .or_insert(items.len());
+        }
+        items.push(item);
     }
-    let inserted_item_index = items.len();
-    items.push(item);
-    &items[inserted_item_index]
+
+    fn upsert<'a>(&mut self, items: &'a mut Vec<ThreadItem>, item: ThreadItem) -> &'a ThreadItem {
+        if self.positions.is_none() && items.len() >= TURN_ITEM_INDEX_THRESHOLD {
+            let mut positions = HashMap::with_capacity(items.len());
+            for (index, existing) in items.iter().enumerate() {
+                positions.entry(existing.id().to_string()).or_insert(index);
+            }
+            self.positions = Some(positions);
+        }
+
+        let existing_index = match &self.positions {
+            Some(positions) => positions.get(item.id()).copied(),
+            None => items.iter().position(|existing| existing.id() == item.id()),
+        };
+        if let Some(index) = existing_index {
+            items[index] = item;
+            &items[index]
+        } else {
+            let index = items.len();
+            self.push(items, item);
+            &items[index]
+        }
+    }
 }
 
 struct PendingTurn {
     id: String,
     items: Vec<ThreadItem>,
+    item_index: TurnItemIndex,
     error: Option<TurnError>,
     status: TurnStatus,
     started_at: Option<i64>,
@@ -1677,6 +1706,41 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn indexed_sleep_item(id: &str, duration_ms: u64) -> ThreadItem {
+        ThreadItem::Sleep(CoreSleepItem {
+            id: id.to_string(),
+            duration_ms,
+        })
+    }
+
+    #[test]
+    fn pushed_duplicates_resolve_to_first_occurrence_before_and_after_indexing() {
+        for count in [2, TURN_ITEM_INDEX_THRESHOLD, TURN_ITEM_INDEX_THRESHOLD * 2] {
+            let mut index = TurnItemIndex::default();
+            let mut items = Vec::new();
+            let original = indexed_sleep_item("duplicate", /*duration_ms*/ 1);
+            for _ in 0..count {
+                index.push(&mut items, original.clone());
+            }
+            let updated = indexed_sleep_item("duplicate", /*duration_ms*/ 2);
+            index.upsert(&mut items, updated.clone());
+            // Appends after index activation must also keep the first position.
+            index.push(&mut items, original.clone());
+            index.upsert(&mut items, updated.clone());
+            let appended = indexed_sleep_item("appended", /*duration_ms*/ 3);
+            index.push(
+                &mut items,
+                indexed_sleep_item("appended", /*duration_ms*/ 1),
+            );
+            index.upsert(&mut items, appended.clone());
+
+            let mut expected = vec![original; count + 1];
+            expected[0] = updated;
+            expected.push(appended);
+            assert_eq!(items, expected);
+        }
+    }
 
     #[test]
     fn builds_multiple_turns_with_reasoning_items() {
@@ -2061,6 +2125,27 @@ mod tests {
                 duration_ms: 1_000,
             })]
         );
+    }
+
+    #[test]
+    fn indexed_items_stay_with_their_turn_after_rollback() {
+        let mut builder = ThreadHistoryBuilder::new();
+        let mut expected: Vec<_> = (0..64)
+            .map(|i| indexed_sleep_item(&i.to_string(), /*duration_ms*/ 1))
+            .collect();
+        for turn_id in ["retained", "discarded"] {
+            builder.ensure_turn().id = turn_id.into();
+            for item in &expected {
+                builder.upsert_item_in_current_turn(item.clone());
+            }
+            builder.finish_current_turn();
+            // Reuse IDs at different positions in the other turn.
+            expected.reverse();
+        }
+        builder.handle_thread_rollback(&ThreadRolledBackEvent { num_turns: 1 });
+        expected[0] = indexed_sleep_item("0", /*duration_ms*/ 2);
+        builder.upsert_item_in_turn_id("retained", expected[0].clone());
+        assert_eq!(builder.finish()[0].items, expected);
     }
 
     #[test]

@@ -773,6 +773,7 @@ async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -792,6 +793,7 @@ async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
         response_rx.await.expect("terminate reply"),
         Ok(codex_code_mode_protocol::WaitOutcome::LiveCell(
             codex_code_mode_protocol::RuntimeResponse::Terminated {
+                code_mode_host_duration: Some(Duration::ZERO),
                 cell_id: CellId::new("1".to_string()),
                 content_items: Vec::new(),
             }
@@ -1096,6 +1098,7 @@ async fn mismatched_initial_response_fails_connection_and_closes_cell_once() {
             id: RequestId::new(/*value*/ 2),
             result: WireResult::Ok {
                 value: WireRuntimeResponse::Yielded {
+                    code_mode_host_duration_ns: 0,
                     cell_id: CellId::new("2".to_string()).into(),
                     content_items: Vec::new(),
                 },
@@ -1143,6 +1146,7 @@ async fn mismatched_wait_response_fails_connection() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("2".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -1187,6 +1191,7 @@ async fn mismatched_terminate_response_fails_connection() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::MissingCell(WireRuntimeResponse::Terminated {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("2".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -1239,6 +1244,7 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -1252,6 +1258,7 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
         response_rx.await.expect("wait reply"),
         Ok(codex_code_mode_protocol::WaitOutcome::LiveCell(
             codex_code_mode_protocol::RuntimeResponse::Yielded {
+                code_mode_host_duration: Some(Duration::ZERO),
                 cell_id: CellId::new("1".to_string()),
                 content_items: Vec::new(),
             }
@@ -1416,6 +1423,7 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -1429,6 +1437,7 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
         second_rx.await.expect("second wait reply"),
         Ok(codex_code_mode_protocol::WaitOutcome::LiveCell(
             codex_code_mode_protocol::RuntimeResponse::Yielded {
+                code_mode_host_duration: Some(Duration::ZERO),
                 cell_id: CellId::new("1".to_string()),
                 content_items: Vec::new(),
             }
@@ -1492,6 +1501,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
             id: RequestId::new(/*value*/ 2),
             result: WireResult::Ok {
                 value: WireRuntimeResponse::Terminated {
+                    code_mode_host_duration_ns: 0,
                     cell_id: CellId::new("1".to_string()).into(),
                     content_items: Vec::new(),
                 },
@@ -1506,6 +1516,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -1591,6 +1602,7 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
             id: RequestId::new(/*value*/ 2),
             result: WireResult::Ok {
                 value: WireRuntimeResponse::Terminated {
+                    code_mode_host_duration_ns: 0,
                     cell_id: CellId::new("1".to_string()).into(),
                     content_items: Vec::new(),
                 },
@@ -1606,6 +1618,7 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -1652,6 +1665,7 @@ async fn session_accepts_more_than_4096_cells_without_growing_a_tombstone_set() 
                 id: RequestId::new(request_id),
                 result: WireResult::Ok {
                     value: WireRuntimeResponse::Yielded {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new(cell_id.clone()).into(),
                         content_items: Vec::new(),
                     },

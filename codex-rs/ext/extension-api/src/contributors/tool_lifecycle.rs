@@ -123,6 +123,8 @@ pub struct ToolStartInput<'a> {
     pub turn_store: &'a ExtensionData,
     /// Current turn submission id.
     pub turn_id: &'a str,
+    /// Trusted causal root of the owning turn, absent when unknown or ambiguous.
+    pub root_turn_id: Option<&'a str>,
     /// Model-visible tool call id.
     pub call_id: &'a str,
     /// Tool name as routed by the host.

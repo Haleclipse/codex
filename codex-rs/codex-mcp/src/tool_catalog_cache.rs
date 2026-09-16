@@ -150,11 +150,24 @@ impl McpToolCatalogCacheContext {
     }
 
     pub(crate) fn current_tools(&self) -> Option<Vec<ToolInfo>> {
-        lock_unpoisoned(&self.entry.state)
+        self.current_tools_or(/*fallback*/ None)
+    }
+
+    /// Prefers the current catalog, retaining a capture's fallback across expiry but not opt-out.
+    pub(crate) fn current_tools_or(
+        &self,
+        fallback: Option<Vec<ToolInfo>>,
+    ) -> Option<Vec<ToolInfo>> {
+        let state = lock_unpoisoned(&self.entry.state);
+        if state.disabled_by_server {
+            return None;
+        }
+        state
             .snapshot
             .as_ref()
             .filter(|snapshot| snapshot.published_at.elapsed() <= TOOL_CATALOG_CACHE_TTL)
             .map(|snapshot| snapshot.tools.clone())
+            .or(fallback)
     }
 
     pub(crate) fn begin_fetch(&self) -> McpToolCatalogFetchTicket {

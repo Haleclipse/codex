@@ -974,6 +974,7 @@ fn apply_plugin_mcp_server_policy(config: &mut McpServerConfig, policy: &PluginM
         if let Some(approval_mode) = tool_policy.approval_mode {
             tool_config.approval_mode = Some(approval_mode);
         }
+        tool_config.restrict_output_token_limit(tool_policy.output_token_limit);
     }
 }
 
@@ -1449,7 +1450,7 @@ pub fn apply_configured_plugin_mcp_server_policies(
                 }
             }
             for (tool_name, tool_policy) in &policy.tools {
-                if tool_policy.approval_mode.is_some() {
+                if tool_policy.approval_mode.is_some() || tool_policy.output_token_limit.is_some() {
                     server.tools.entry(tool_name.clone()).or_default();
                 }
             }
@@ -1467,6 +1468,12 @@ pub fn apply_configured_plugin_mcp_server_policies(
                             .restrict_to(approval_mode),
                     );
                 }
+                tool_config.restrict_output_token_limit(
+                    policy
+                        .tools
+                        .get(tool_name)
+                        .and_then(|tool_policy| tool_policy.output_token_limit),
+                );
             }
         }
     }

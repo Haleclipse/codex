@@ -831,6 +831,9 @@ fn load_oauth_tokens_from_file_with_lock_held(
             false
         } else {
             entry.server_url == url
+                // Escaped names may also match another server's stored, escaped name.
+                // Only accept a legacy unescaped entry under this identity's own key.
+                && (!server_name.starts_with("local:") || stored_key == &key)
                 && (entry.server_name == local_server_name
                     || (stored_key == &key && entry.server_name == server_name))
         };

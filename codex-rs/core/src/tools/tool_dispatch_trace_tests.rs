@@ -100,6 +100,7 @@ impl codex_code_mode::CodeModeSession for MissingCellCodeModeSession {
         Box::pin(async move {
             Ok(codex_code_mode::WaitOutcome::MissingCell(
                 codex_code_mode::RuntimeResponse::Result {
+                    code_mode_host_duration: None,
                     error_text: Some(format!("exec cell {cell_id} not found")),
                     cell_id,
                     content_items: Vec::new(),

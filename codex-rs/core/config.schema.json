@@ -778,6 +778,9 @@
             "local_thread_store_compression": {
               "type": "boolean"
             },
+            "local_thread_store_shared_compression": {
+              "type": "boolean"
+            },
             "mcp_2026_07_28": {
               "type": "boolean"
             },
@@ -805,6 +808,9 @@
             "non_prefixed_mcp_tool_names": {
               "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
             },
+            "omit_app_server_notification_media": {
+              "type": "boolean"
+            },
             "personality": {
               "type": "boolean"
             },
@@ -815,6 +821,9 @@
               "type": "boolean"
             },
             "plugins": {
+              "type": "boolean"
+            },
+            "powershell_shell_version": {
               "type": "boolean"
             },
             "prevent_idle_sleep": {
@@ -903,6 +912,9 @@
             },
             "skip_host_skill_discovery": {
               "type": "boolean"
+            },
+            "sleep_tool": {
+              "$ref": "#/definitions/FeatureToml_for_SleepToolConfigToml"
             },
             "sqlite": {
               "type": "boolean"
@@ -1256,6 +1268,16 @@
         },
         {
           "$ref": "#/definitions/RolloutBudgetConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_SleepToolConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/SleepToolConfigToml"
         }
       ]
     },
@@ -1944,7 +1966,7 @@
     },
     "McpServerToolConfig": {
       "additionalProperties": false,
-      "description": "Per-tool approval settings for a single MCP server tool.",
+      "description": "Per-tool settings for a single MCP server tool.",
       "properties": {
         "approval_mode": {
           "allOf": [
@@ -1953,6 +1975,12 @@
             }
           ],
           "description": "Approval mode for this tool."
+        },
+        "output_token_limit": {
+          "description": "Token budget for this tool's output, before the standard 20% serialization allowance.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -2968,7 +2996,7 @@
           "additionalProperties": {
             "$ref": "#/definitions/McpServerToolConfig"
           },
-          "description": "Per-tool approval settings keyed by tool name.",
+          "description": "Per-tool policy settings keyed by tool name.",
           "type": "object"
         }
       },
@@ -3496,6 +3524,37 @@
       },
       "type": "object"
     },
+    "SleepToolConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/definitions/SleepToolMode"
+        }
+      },
+      "type": "object"
+    },
+    "SleepToolMode": {
+      "description": "How the sleep tool is selected when its feature gate is enabled.",
+      "oneOf": [
+        {
+          "description": "Preserve the existing model and legacy clock configuration defaults.",
+          "enum": [
+            "model_driven"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Register sleep regardless of the model or legacy clock configuration.",
+          "enum": [
+            "always_on"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ThreadStoreToml": {
       "oneOf": [
         {
@@ -3866,6 +3925,12 @@
               "select_around_text_object": null,
               "select_inner_text_object": null,
               "yank_line": null
+            },
+            "vim_search": {
+              "backward": null,
+              "forward": null,
+              "next": null,
+              "previous": null
             },
             "vim_text_object": {
               "backtick": null,
@@ -4695,6 +4760,19 @@
             "yank_line": null
           }
         },
+        "vim_search": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TuiVimSearchKeymap"
+            }
+          ],
+          "default": {
+            "backward": null,
+            "forward": null,
+            "next": null,
+            "previous": null
+          }
+        },
         "vim_text_object": {
           "allOf": [
             {
@@ -5346,6 +5424,45 @@
       },
       "type": "object"
     },
+    "TuiVimSearchKeymap": {
+      "additionalProperties": false,
+      "description": "Search motions shared by Vim normal and operator-pending input.",
+      "properties": {
+        "backward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Search backward in the active buffer (`?`)."
+        },
+        "forward": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Search forward in the active buffer (`/`)."
+        },
+        "next": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Repeat the accepted search (`n`)."
+        },
+        "previous": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Repeat in the opposite direction (`N`)."
+        }
+      },
+      "type": "object"
+    },
     "TuiVimTextObjectKeymap": {
       "additionalProperties": false,
       "description": "Vim text-object keybindings for modal editing inside text areas.",
@@ -5429,7 +5546,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "default": true,
+          "default": false,
           "type": "boolean"
         }
       },
@@ -5931,6 +6048,9 @@
         "local_thread_store_compression": {
           "type": "boolean"
         },
+        "local_thread_store_shared_compression": {
+          "type": "boolean"
+        },
         "mcp_2026_07_28": {
           "type": "boolean"
         },
@@ -5958,6 +6078,9 @@
         "non_prefixed_mcp_tool_names": {
           "$ref": "#/definitions/FeatureToml_for_NonPrefixedMcpToolNamesConfigToml"
         },
+        "omit_app_server_notification_media": {
+          "type": "boolean"
+        },
         "personality": {
           "type": "boolean"
         },
@@ -5968,6 +6091,9 @@
           "type": "boolean"
         },
         "plugins": {
+          "type": "boolean"
+        },
+        "powershell_shell_version": {
           "type": "boolean"
         },
         "prevent_idle_sleep": {
@@ -6056,6 +6182,9 @@
         },
         "skip_host_skill_discovery": {
           "type": "boolean"
+        },
+        "sleep_tool": {
+          "$ref": "#/definitions/FeatureToml_for_SleepToolConfigToml"
         },
         "sqlite": {
           "type": "boolean"

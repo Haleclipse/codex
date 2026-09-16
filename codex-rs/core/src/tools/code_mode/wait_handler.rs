@@ -94,6 +94,7 @@ impl CodeModeWaitHandler {
                 })?;
                 let exec = ExecContext { session, turn };
                 let started_at = std::time::Instant::now();
+                telemetry.cell_id = Some(args.cell_id.clone());
                 let cell_id = codex_code_mode::CellId::new(args.cell_id);
                 let wait_response = if args.terminate {
                     exec.session
@@ -152,8 +153,14 @@ impl CodeModeWaitHandler {
                             );
                     }
                 }
+                if let Some(code_mode_host_duration) = wait_response.code_mode_host_duration() {
+                    telemetry.record_code_mode_host_duration(code_mode_host_duration);
+                }
                 exec.session.services.elicitations.wait_until_clear().await;
-                handle_runtime_response(&exec, wait_response.into(), args.max_tokens, started_at)
+                let wall_time = wait_response
+                    .code_mode_host_duration()
+                    .unwrap_or_else(|| started_at.elapsed());
+                handle_runtime_response(&exec, wait_response.into(), args.max_tokens, wall_time)
                     .await
                     .map_err(FunctionCallError::RespondToModel)
                     .map(boxed_tool_output)

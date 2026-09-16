@@ -1198,6 +1198,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
             })),
             RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
                 ThreadSettingsAppliedEvent {
+                    thread_id: Some(parent_thread_id),
                     thread_settings: ThreadSettingsSnapshot {
                         model: "parent-only-model".to_string(),
                         model_provider_id: "parent-only-provider".to_string(),

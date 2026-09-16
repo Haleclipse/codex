@@ -214,6 +214,111 @@ async fn received_response_input_images(server: &wiremock::MockServer) -> Result
 }
 
 #[tokio::test]
+async fn turn_start_omits_notification_media_without_changing_model_input() -> Result<()> {
+    let responses = vec![create_final_assistant_message_sse_response("Done")?];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .enable_feature(Feature::OmitAppServerNotificationMedia)
+        .write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            experimental_raw_events: true,
+            ..Default::default()
+        })
+        .await?;
+
+    let _: TurnStartResponse = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id,
+                input: vec![
+                    V2UserInput::Text {
+                        text: "Describe this image".to_string(),
+                        text_elements: Vec::new(),
+                    },
+                    V2UserInput::Image {
+                        url: TINY_PNG_DATA_URL.to_string(),
+                        detail: None,
+                    },
+                ],
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let mut user_message_notifications = Vec::new();
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_matching_notification(
+                    "item notification or turn completion",
+                    |notification| {
+                        matches!(
+                            notification.method.as_str(),
+                            "item/started"
+                                | "item/completed"
+                                | "rawResponseItem/completed"
+                                | "turn/completed"
+                        )
+                    },
+                )
+                .await?;
+            if notification.method == "turn/completed" {
+                return Ok::<(), anyhow::Error>(());
+            }
+
+            let params = notification.params.context("item notification params")?;
+            let item = &params["item"];
+            let item_type = item["type"].as_str();
+            if item_type == Some("userMessage")
+                || (item_type == Some("message") && item["role"] == "user")
+            {
+                let content = item["content"].as_array().context("user message content")?;
+                if !content
+                    .iter()
+                    .any(|item| item["text"] == "Describe this image")
+                {
+                    continue;
+                }
+                assert_eq!(content.len(), 1);
+                assert!(matches!(
+                    content[0]["type"].as_str(),
+                    Some("text" | "input_text")
+                ));
+                user_message_notifications.push(notification.method);
+            }
+        }
+    })
+    .await??;
+
+    user_message_notifications.sort();
+    assert_eq!(
+        user_message_notifications,
+        vec![
+            "item/completed",
+            "item/started",
+            "rawResponseItem/completed"
+        ]
+    );
+
+    let model_input_images = received_response_input_images(&server).await?;
+    assert_eq!(model_input_images.len(), 1);
+    assert_eq!(model_input_images[0]["image_url"], TINY_PNG_DATA_URL);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn turn_start_with_empty_input_runs_model_request() -> Result<()> {
     let responses = vec![create_final_assistant_message_sse_response("Done")?];
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
@@ -1245,7 +1350,10 @@ async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .enable_feature(Feature::Goals)
-        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_root_config(&format!(
+            "chatgpt_base_url = \"{}\"\ntools.update_plan.enabled = true",
+            server.uri()
+        ))
         .write(codex_home.path())?;
     mount_analytics_capture(&server, codex_home.path()).await?;
 
@@ -3939,7 +4047,10 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .enable_feature(Feature::Collab)
-        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_root_config(&format!(
+            "chatgpt_base_url = \"{}\"\ntools.update_plan.enabled = true",
+            server.uri()
+        ))
         .write(codex_home.path())?;
     mount_analytics_capture(&server, codex_home.path()).await?;
 
@@ -4380,6 +4491,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected(
         .send_thread_shell_command_request(ThreadShellCommandParams {
             thread_id: child_thread_id.clone(),
             command: "echo blocked".to_string(),
+            timeout_ms: None,
         })
         .await?;
     let direct_shell_error: JSONRPCError = timeout(

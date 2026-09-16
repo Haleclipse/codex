@@ -45,6 +45,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::SandboxPermissions;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::FileSystemAccessMode;
@@ -66,6 +67,8 @@ use core_test_support::PathBufExt;
 use core_test_support::TempDirExt;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
+use core_test_support::responses::assert_parent_turn;
+use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -1364,10 +1367,22 @@ async fn build_guardian_prompt_items_explains_network_access_review_scope() -> a
     Ok(())
 }
 
-#[test]
-fn guardian_write_stdin_preserves_input_and_foreign_cwd() -> serde_json::Result<()> {
+#[test_case::test_case(SandboxPermissions::UseDefault)]
+#[test_case::test_case(SandboxPermissions::RequireEscalated)]
+#[test_case::test_case(SandboxPermissions::WithAdditionalPermissions)]
+fn guardian_write_stdin_preserves_input_and_foreign_cwd(
+    sandbox_permissions: SandboxPermissions,
+) -> serde_json::Result<()> {
     let cwd = PathUri::parse("file:///C:/workspace").expect("valid executor cwd");
     let input = "confirm\n";
+    let additional_permissions =
+        if sandbox_permissions == SandboxPermissions::WithAdditionalPermissions {
+            Some(serde_json::from_value(
+                serde_json::json!({"network":{"enabled":true}}),
+            )?)
+        } else {
+            None
+        };
     let action = GuardianApprovalRequest::WriteStdin {
         id: "terminal-open".to_string(),
         approval_id: "terminal-write".to_string(),
@@ -1376,20 +1391,23 @@ fn guardian_write_stdin_preserves_input_and_foreign_cwd() -> serde_json::Result<
         input: input.to_string(),
         cwd: cwd.clone(),
         tty: true,
+        sandbox_permissions,
+        additional_permissions: additional_permissions.clone(),
     };
 
-    assert_eq!(
-        guardian_approval_request_to_json(&action)?,
-        serde_json::json!({
-            "tool": "write_stdin",
-            "environment_id": "windows-executor",
-            "session_id": 1000,
-            "chars": input,
-            "cwd": r"C:\workspace",
-            "sandbox_permissions": "require_escalated",
-            "tty": true,
-        }),
-    );
+    let mut expected = serde_json::json!({
+        "tool": "write_stdin",
+        "environment_id": "windows-executor",
+        "session_id": 1000,
+        "chars": input,
+        "cwd": r"C:\workspace",
+        "sandbox_permissions": sandbox_permissions,
+        "tty": true,
+    });
+    if let Some(permissions) = additional_permissions {
+        expected["additional_permissions"] = serde_json::to_value(permissions)?;
+    }
+    assert_eq!(guardian_approval_request_to_json(&action)?, expected);
     assert_eq!(
         guardian_assessment_action(&action),
         GuardianAssessmentAction::WriteStdin {
@@ -3284,6 +3302,10 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
         .await;
 
         let (session, turn) = guardian_test_session_and_turn_with_base_url(server.uri()).await;
+        turn.turn_metadata_state
+            .set_parent_turn_id("upstream-parent-turn".to_string());
+        turn.turn_metadata_state
+            .set_root_turn_id("causal-root-turn".to_string());
         seed_guardian_parent_history(&session, &turn).await;
 
         let initial_request = GuardianApprovalRequest::ExecCommand {
@@ -3402,6 +3424,8 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
             )
             .await;
 
+        // A conflicting input removes the known root while the trunk review is in flight.
+        turn.turn_metadata_state.mark_root_turn_ambiguous();
         let third_decision = review_approval_request(
             &session,
             &turn,
@@ -3416,11 +3440,27 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
         assert_eq!(third_decision, ReviewDecision::Approved);
         let requests = server.requests().await;
         assert_eq!(requests.len(), 4);
+        let first_request_body = serde_json::from_slice::<serde_json::Value>(&requests[0])?;
         let second_request_body = serde_json::from_slice::<serde_json::Value>(&requests[1])?;
         let failed_ephemeral_request_body =
             serde_json::from_slice::<serde_json::Value>(&requests[2])?;
         let retried_ephemeral_request_body =
             serde_json::from_slice::<serde_json::Value>(&requests[3])?;
+        let mut reviewer_turn_ids = std::collections::BTreeSet::new();
+        for (body, expected_root) in [
+            (&first_request_body, Some("causal-root-turn")),
+            (&second_request_body, Some("causal-root-turn")),
+            (&failed_ephemeral_request_body, None),
+            (&retried_ephemeral_request_body, None),
+        ] {
+            assert_parent_turn(body, Some(turn.sub_id.as_str()))?;
+            assert_root_turn(body, expected_root)?;
+            assert_ne!(body["client_metadata"]["turn_id"], turn.sub_id);
+            reviewer_turn_ids.insert(
+                body["client_metadata"]["turn_id"].as_str().expect("reviewer turn id")
+            );
+        }
+        assert_eq!(reviewer_turn_ids.len(), 4);
         assert_eq!(
             second_request_body["prompt_cache_key"],
             failed_ephemeral_request_body["prompt_cache_key"],

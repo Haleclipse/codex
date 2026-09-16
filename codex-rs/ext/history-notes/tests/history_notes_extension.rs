@@ -230,14 +230,27 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
         ),
     ] {
         server.reset().await;
+        let mut response = json!({"encrypted_output": "enc_history"});
+        let mut expected_output =
+            vec![json!({"type": "encrypted_content", "encrypted_content": "enc_history"})];
+        if namespace == "history" && name == "read_item" {
+            // Images are not part of the text budget sent to the backend.
+            let data = "cG5n".repeat(1_000);
+            response["images"] = json!([
+                {"data": data, "mime_type": "image/png", "detail": "original"},
+                {"data": "anBlZw==", "mime_type": "image/jpeg", "detail": "high"}
+            ]);
+            expected_output.extend([
+                json!({"type": "input_image", "image_url": format!("data:image/png;base64,{data}"), "detail": "original"}),
+                json!({"type": "input_image", "image_url": "data:image/jpeg;base64,anBlZw==", "detail": "high"})
+            ]);
+        }
         Mock::given(method("POST"))
             .and(path(format!(
                 "/backend-api/codex/alpha/{namespace}/v2/{name}"
             )))
             .and(header("x-openai-actor-authorization", "actor-biscuit"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "encrypted_output": "enc_history"
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
             .mount(&server)
             .await;
         let tool_name = ToolName::namespaced(namespace, name);
@@ -245,12 +258,29 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
             .iter()
             .find(|tool| tool.tool_name() == tool_name)
             .expect("exposed tool");
-        tool.handle(tool_call(tool_name, arguments.clone())).await?;
+        let call = tool_call(tool_name, arguments.clone());
+        let output = tool.handle(call.clone()).await?;
+        assert_eq!(
+            serde_json::to_value(output.to_response_item(&call.call_id, &call.payload))?,
+            json!({"type": "function_call_output", "call_id": call.call_id, "output": expected_output})
+        );
         arguments["context"] = json!({
             "session_id": "session-123",
             "current_agent_name": "/root/worker",
         });
         let requests = server.received_requests().await.expect("recorded requests");
+        for request in &requests {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    request
+                        .headers
+                        .get("x-openai-tool-output-truncation-policy")
+                        .expect("truncation policy header")
+                        .to_str()?
+                )?,
+                json!({"mode": "bytes", "limit": 1024})
+            );
+        }
         assert_eq!(
             requests
                 .iter()
@@ -259,6 +289,39 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
             vec![arguments]
         );
     }
+
+    // Plaintext backend responses must keep attachments out of text and logs too.
+    server.reset().await;
+    let text_result = json!({"content": "look: [image 1]", "n_chars": 15, "next_offset_chars": 15});
+    let mut response = text_result.clone();
+    response["images"] = json!([
+        {"data": "cG5n", "mime_type": "image/png", "detail": "original"}
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/backend-api/codex/alpha/history/v2/read_item"))
+        .and(header("x-openai-actor-authorization", "actor-biscuit"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .mount(&server)
+        .await;
+    let tool_name = ToolName::namespaced("history", "read_item");
+    let read_item = tools
+        .iter()
+        .find(|tool| tool.tool_name() == tool_name)
+        .expect("history.read_item");
+    let call = tool_call(tool_name, json!({"window_id": "window", "item_id": "item"}));
+    let output = read_item.handle(call.clone()).await?;
+    assert_eq!(output.log_output(), text_result.to_string());
+    assert_eq!(
+        serde_json::to_value(output.to_response_item(&call.call_id, &call.payload))?,
+        json!({
+            "type": "function_call_output",
+            "call_id": call.call_id,
+            "output": [
+                {"type": "input_text", "text": text_result.to_string()},
+                {"type": "input_image", "image_url": "data:image/png;base64,cG5n", "detail": "original"}
+            ]
+        })
+    );
 
     for result in [
         json!({"text": ""}),

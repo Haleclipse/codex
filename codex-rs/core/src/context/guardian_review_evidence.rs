@@ -95,14 +95,14 @@ impl GuardianReviewEvidence {
         }
     }
 
-    /// Returns bounded answers whose original, host-observed tool calls remain in history.
+    /// Returns bounded answers whose original tool calls remain in current or retained history.
     pub fn user_input_fragments(&self, history: &dyn ConversationHistorySnapshot) -> Vec<String> {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         state
             .user_inputs
             .iter()
             .filter(|(recorded_call_id, _)| {
-                history.items().any(|item| {
+                history.items().chain(history.review_items()).any(|item| {
                     matches!(
                         item,
                         ResponseItem::FunctionCall { call_id, .. }

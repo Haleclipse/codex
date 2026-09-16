@@ -68,6 +68,45 @@ pub(super) fn resolve_token_budget(
     Some(token_budget)
 }
 
+/// Applies model activation defaults before thread extensions are initialized.
+pub(super) fn apply_model_defaults(config: &mut Config, model_info: &ModelInfo) {
+    let Some(model_defaults) = model_info
+        .model_messages
+        .as_ref()
+        .and_then(|messages| messages.token_budget.as_ref())
+    else {
+        return;
+    };
+    if !model_defaults.enabled {
+        return;
+    }
+
+    let has_explicit_config = config.token_budget.is_some()
+        || config
+            .config_layer_stack
+            .effective_config()
+            .get("features")
+            .and_then(|features| features.get("token_budget"))
+            .is_some();
+    if has_explicit_config {
+        return;
+    }
+
+    if config.features.enable(Feature::TokenBudget).is_err() {
+        return;
+    }
+    // Managed requirements can pin the feature off even when enable() succeeds.
+    if !config.features.enabled(Feature::TokenBudget) {
+        return;
+    }
+
+    // Keep prompts unresolved so later turns and model switches use their own defaults.
+    config.token_budget = Some(TokenBudgetConfig {
+        use_history_notes_extension: model_defaults.use_history_notes_extension,
+        ..TokenBudgetConfig::default()
+    });
+}
+
 pub(super) async fn maybe_record(
     sess: &Session,
     turn_context: &TurnContext,

@@ -1,5 +1,6 @@
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use crate::notification_media::without_notification_media;
 use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::request_processors::populate_thread_turns_from_history;
@@ -13,6 +14,7 @@ use crate::thread_status::ThreadWatchActiveGuard;
 use crate::thread_status::ThreadWatchManager;
 use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
 use codex_app_server_protocol::AdditionalPermissionProfile as V2AdditionalPermissionProfile;
+use codex_app_server_protocol::AuthRecoveryNotification;
 use codex_app_server_protocol::CodexErrorInfo as V2CodexErrorInfo;
 use codex_app_server_protocol::CommandAction as V2ParsedCommand;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
@@ -90,6 +92,7 @@ use codex_app_server_protocol::guardian_auto_approval_review_notification;
 use codex_app_server_protocol::item_event_to_server_notification;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
+use codex_features::Feature;
 use codex_guardian_v2::StrictReviewReason;
 use codex_protocol::ThreadId;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
@@ -248,6 +251,30 @@ pub(crate) async fn apply_bespoke_event_handling(
                     EnvironmentConnectionNotification {
                         thread_id: conversation_id.to_string(),
                         environment_id: event.environment_id,
+                    },
+                ))
+                .await;
+        }
+        EventMsg::AuthRecoveryStarted(event) => {
+            outgoing
+                .send_server_notification(ServerNotification::AuthRecoveryStarted(
+                    AuthRecoveryNotification {
+                        thread_id: conversation_id.to_string(),
+                        turn_id: event_turn_id,
+                        provider: event.provider,
+                        message: event.message,
+                    },
+                ))
+                .await;
+        }
+        EventMsg::AuthRecoveryCompleted(event) => {
+            outgoing
+                .send_server_notification(ServerNotification::AuthRecoveryCompleted(
+                    AuthRecoveryNotification {
+                        thread_id: conversation_id.to_string(),
+                        turn_id: event_turn_id,
+                        provider: event.provider,
+                        message: event.message,
                     },
                 ))
                 .await;
@@ -1043,11 +1070,14 @@ pub(crate) async fn apply_bespoke_event_handling(
                 _ => None,
             };
             if should_emit {
-                let notification = item_event_to_server_notification(
+                let mut notification = item_event_to_server_notification(
                     EventMsg::ItemStarted(event),
                     &conversation_id.to_string(),
                     &event_turn_id,
                 );
+                if conversation.enabled(Feature::OmitAppServerNotificationMedia) {
+                    notification = without_notification_media(notification);
+                }
                 outgoing.send_server_notification(notification).await;
             }
             if let Some(params) = dynamic_tool_call_params {
@@ -1068,11 +1098,14 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &event.item,
             )
             .await;
-            let notification = item_event_to_server_notification(
+            let mut notification = item_event_to_server_notification(
                 EventMsg::ItemCompleted(event),
                 &conversation_id.to_string(),
                 &event_turn_id,
             );
+            if conversation.enabled(Feature::OmitAppServerNotificationMedia) {
+                notification = without_notification_media(notification);
+            }
             outgoing.send_server_notification(notification).await;
         }
         msg @ (EventMsg::PatchApplyUpdated(_) | EventMsg::TerminalInteraction(_)) => {
@@ -1104,13 +1137,17 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::RawResponseItem(raw_response_item_event) => {
-            maybe_emit_raw_response_item_completed(
-                conversation_id,
-                &event_turn_id,
-                raw_response_item_event.item,
-                &outgoing,
-            )
-            .await;
+            let mut notification = ServerNotification::RawResponseItemCompleted(
+                RawResponseItemCompletedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event_turn_id,
+                    item: raw_response_item_event.item,
+                },
+            );
+            if conversation.enabled(Feature::OmitAppServerNotificationMedia) {
+                notification = without_notification_media(notification);
+            }
+            outgoing.send_server_notification(notification).await;
         }
         EventMsg::RawResponseCompleted(raw_response_completed_event) => {
             let notification = RawResponseCompletedNotification {
@@ -1484,22 +1521,6 @@ async fn complete_command_execution_item(
     };
     outgoing
         .send_server_notification(ServerNotification::ItemCompleted(notification))
-        .await;
-}
-
-async fn maybe_emit_raw_response_item_completed(
-    conversation_id: ThreadId,
-    turn_id: &str,
-    item: codex_protocol::models::ResponseItem,
-    outgoing: &ThreadScopedOutgoingMessageSender,
-) {
-    let notification = RawResponseItemCompletedNotification {
-        thread_id: conversation_id.to_string(),
-        turn_id: turn_id.to_string(),
-        item,
-    };
-    outgoing
-        .send_server_notification(ServerNotification::RawResponseItemCompleted(notification))
         .await;
 }
 
@@ -2180,6 +2201,7 @@ mod tests {
     use codex_protocol::plan_tool::StepStatus;
     use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::AskForApproval;
+    use codex_protocol::protocol::AuthRecoveryEvent;
     use codex_protocol::protocol::CreditsSnapshot;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::GuardianAssessmentEvent;
@@ -3418,11 +3440,11 @@ mod tests {
                 }),
             },
             conversation_id,
-            conversation,
-            thread_manager,
-            outgoing,
-            thread_state,
-            thread_watch_manager,
+            Arc::clone(&conversation),
+            Arc::clone(&thread_manager),
+            outgoing.clone(),
+            Arc::clone(&thread_state),
+            thread_watch_manager.clone(),
             Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
             "test-provider".to_string(),
         )
@@ -3436,6 +3458,52 @@ mod tests {
                 assert!(n.turn.items.is_empty());
             }
             other => bail!("unexpected message: {other:?}"),
+        }
+
+        for (phase, method, event) in [
+            (
+                "started",
+                "modelProvider/authRecoveryStarted",
+                EventMsg::AuthRecoveryStarted as fn(AuthRecoveryEvent) -> EventMsg,
+            ),
+            (
+                "completed",
+                "modelProvider/authRecoveryCompleted",
+                EventMsg::AuthRecoveryCompleted,
+            ),
+        ] {
+            let message = format!("Authentication recovery {phase}.");
+            apply_bespoke_event_handling(
+                Event {
+                    id: "turn-1".to_string(),
+                    msg: event(AuthRecoveryEvent {
+                        provider: "test-provider".to_string(),
+                        message: message.clone(),
+                    }),
+                },
+                conversation_id,
+                Arc::clone(&conversation),
+                Arc::clone(&thread_manager),
+                outgoing.clone(),
+                Arc::clone(&thread_state),
+                thread_watch_manager.clone(),
+                Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
+                "test-provider".to_string(),
+            )
+            .await;
+
+            assert_eq!(
+                serde_json::to_value(recv_broadcast_notification(&mut rx).await?)?,
+                json!({
+                    "method": method,
+                    "params": {
+                        "threadId": conversation_id.to_string(),
+                        "turnId": "turn-1",
+                        "provider": "test-provider",
+                        "message": message,
+                    }
+                })
+            );
         }
         Ok(())
     }

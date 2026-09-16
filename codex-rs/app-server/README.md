@@ -98,6 +98,7 @@ legacy alias for declaring the `openai/form` extension.
   "capabilities": {
     "extensions": {
       "openai/form": {},
+      "openai/elicitation": { "form": {} },
       "io.modelcontextprotocol/ui": {
         "mimeTypes": ["text/html;profile=mcp-app"]
       }
@@ -105,6 +106,15 @@ legacy alias for declaring the `openai/form` extension.
   }
 }
 ```
+
+`openai/elicitation.form: {}` declares support for forms received as
+`mode: "openaiForm"`. It does not follow from the legacy capability.
+App-server retains only the `form` key under `openai/elicitation`, preserving
+its value when present. Form requests require an object-valued `form`
+declaration. A bare namespace does not imply form support. User verification
+requests are not implemented.
+Clients must only advertise features supported by both the client and the
+connected app-server.
 
 App-server keeps the complete value under `io.modelcontextprotocol/ui`, rather
 than deriving a WebView boolean, so clients can advertise additional supported
@@ -162,7 +172,7 @@ Example with notification opt-out:
 
 - `server/diagnostics` — experimental; read process-local memory measurements and registered diagnostic gauges.
 - `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread. Experimental `projectId` assigns a durable thread to an existing project; ephemeral threads expose the same project identity in live responses without creating a stored/listable assignment. Experimental `historyMode` selects the persisted history contract: when omitted, durable threads use `"paginated"` if the active thread store supports `thread/turns/list` and `thread/items/list`, while ephemeral threads and stores without that support use `"legacy"`. When the request includes a `cwd` and the resolved sandbox is `workspace-write` or full access, app-server also marks that project as trusted in the user `config.toml`. Pass `sessionStartSource: "clear"` when starting a replacement thread after clearing the current session so `SessionStart` hooks receive `source: "clear"` instead of the default `"startup"`. Experimental `allowProviderModelFallback` lets providers backed by an authoritative static model catalog replace an unavailable requested `model` with the catalog default; dynamic or cached catalogs preserve the requested model. Experimental `runtimeWorkspaceRoots` supplies the runtime workspace roots used when app-server creates default environment selections; paths must be absolute. For permissions, prefer experimental `permissions` profile selection by id; the legacy `sandbox` shorthand is still accepted but cannot be combined with `permissions`. Deprecated experimental `multiAgentMode` is ignored; use Ultra reasoning effort for proactive multi-agent behavior. Experimental `environments` selects the sticky execution environments for turns on the thread; omit it to use the server default, pass `[]` to disable environments, or pass explicit environment ids with per-environment `cwd` and optional environment-native `runtimeWorkspaceRoots`. Explicit environments ignore the top-level roots; omitted per-environment roots default to that environment's `cwd`, while an empty list explicitly selects no roots. Experimental `selectedCapabilityRoots` selects environment-owned plugin or standalone-skill roots using environment-native absolute paths. Skills found below those roots are listed and read through the owning environment. Stdio MCP servers declared by selected plugins are started in that environment, and HTTP MCP connections use that environment's HTTP client.
-- `thread/resume` — reopen an existing thread by id so subsequent `turn/start` calls append to it. Accepts the same permission override rules as `thread/start`.
+- `thread/resume` — reopen an existing thread by id so subsequent `turn/start` calls append to it. When loading a saved thread, an omitted `cwd` uses the cwd from the latest retained settings snapshot explicitly owned by that thread, or its startup cwd if none exists. Older snapshots without an owner ID do not override the startup cwd. Resume does not read older history solely to recover cwd. Successful compaction checkpoints the current thread settings so they remain available within that replay window. An explicit `cwd` overrides that default. Accepts the same permission override rules as `thread/start`.
 - `thread/fork` — fork an existing thread into a new thread id by copying the stored history; pass an optional `lastTurnId` to copy history only through that turn, inclusive, and drop later turns from the fork. An in-progress `lastTurnId` boundary is rejected. Experimental `beforeTurnId` instead copies history strictly before the referenced turn, including when that turn is in progress, and cannot be combined with `lastTurnId`. If both boundaries are null while the source thread is mid-turn, the fork records the same interruption marker as `turn/interrupt` instead of inheriting an unmarked partial turn suffix. The returned `thread.forkedFromId` points at the source thread when known. Accepts `ephemeral: true` for an in-memory temporary fork, emits `thread/started` (including the current `thread.status`), and auto-subscribes you to turn/item events for the new thread. Clients can pass `excludeTurns: true` when they plan to page fork history via `thread/turns/list` instead of receiving the full turn array immediately. Experimental `deferGoalContinuation: true` carries the source thread's current goal into the fork and runs an explicit turn before automatic continuation resumes. Deferred goal continuation is persisted until that turn starts and cannot be combined with `ephemeral: true`. Accepts the same permission override rules as `thread/start`.
 - `thread/start`, `thread/resume`, and `thread/fork` responses include the legacy `sandbox` compatibility projection. `instructionSources` lists loaded instruction files using each source environment's native absolute path syntax, including files loaded from remote environments. Experimental clients can read `runtimeWorkspaceRoots` for the thread-scoped runtime roots and `activePermissionProfile` for the named or implicit built-in profile identity/provenance when known. Their deprecated experimental `multiAgentMode` field, and the corresponding thread setting, always report `explicitRequestOnly`; Ultra reasoning effort is the source of proactive multi-agent behavior.
 - `thread/list` — page through stored threads; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `sectionId`, `cwd`, and `searchTerm` filters. Experimental `projectId` filters one project, while `null` selects unassigned threads. Set `sortKey` to `"section_position"` when listing a section in its persisted manual order. Experimental clients can use `parentThreadId` for direct spawned children or `ancestorThreadId` for spawned descendants at any depth; the two filters are mutually exclusive. Review and Guardian threads are not included because they do not participate in that spawn-edge lifecycle. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded. Subagent threads also include `parentThreadId` when the immediate parent is known.
@@ -453,6 +463,28 @@ To branch from a stored session, call `thread/fork` with the `thread.id`. This c
 ```
 
 Like `thread/resume`, full-history hydration is deprecated for paginated `thread/fork` and emits `deprecationNotice`. Clients should pass `excludeTurns: true` to return only thread metadata in `thread.turns` and page history with `thread/turns/list` and `thread/items/list`. Metadata-only forks do not replay restored `thread/tokenUsage/updated`. Ephemeral forks of paginated threads require `excludeTurns: true`.
+
+### Listing projects
+
+`project/list` accepts optional `sortKey` (`position` or `recencyAt`) and
+`sortDirection` (`asc` or `desc`), alongside `limit` and the opaque `cursor`.
+Omitting `sortKey` preserves manual position order. A non-null `sortDirection`
+requires an explicit key; it defaults to `asc` for `position` and `desc` for `recencyAt`.
+
+```json
+{ "sortKey": "recencyAt", "sortDirection": "desc", "limit": 50, "cursor": null }
+```
+
+Every project response includes `recencyAt`: the newest non-archived, explicitly
+assigned thread's recency in Unix seconds, across all sources, or `null` when none
+exist. Like `thread/list`, thread recency starts at creation and advances at turn
+start, not for background output. Removing or archiving members can lower project
+recency. Task activity does not change project `updatedAt` or emit `project/changed`.
+
+Nulls sort last in either direction; project IDs break ties in the same direction.
+Cursor anchors retain millisecond precision. Continue with the same sort options;
+existing position cursors remain supported. Pagination is a live view, so concurrent
+activity can move projects across a cursor.
 
 ### Example: List threads (with pagination & filters)
 
@@ -901,7 +933,14 @@ Use `thread/shellCommand` for the TUI `!` workflow. The request returns immediat
 This API runs unsandboxed with full access; it does not inherit the thread
 sandbox policy.
 
-If the thread already has an active turn, the command runs as an auxiliary action on that turn. In that case, progress is emitted as standard `item/*` notifications on the existing turn and the formatted output is injected into the turn’s message stream:
+Set `timeoutMs` to a non-negative integer to control command execution time.
+Omitting it or setting it to `null` preserves the one-hour default (3,600,000 ms).
+Values above one hour are supported; `0` requests an immediate timeout, not
+unlimited execution. Invalid values are rejected before execution. This deadline
+does not change the immediate RPC acknowledgement, and `turn/interrupt` can still
+cancel execution before the deadline.
+
+If the thread already has an active turn, the command runs as an auxiliary action on that turn. A timeout ends only the shell command, not the active turn. Progress is emitted as standard `item/*` notifications on the existing turn and the formatted output is injected into the turn’s message stream:
 
 - `item/started` with `item: { "type": "commandExecution", "source": "userShell", ... }`
 - zero or more `item/commandExecution/outputDelta`
@@ -918,6 +957,13 @@ If the thread does not already have an active turn, the server starts a standalo
 ```json
 { "method": "thread/shellCommand", "id": 26, "params": { "threadId": "thr_b", "command": "git status --short" } }
 { "id": 26, "result": {} }
+```
+
+For example, allow up to eight hours for a workflow command:
+
+```json
+{ "method": "thread/shellCommand", "id": 27, "params": { "threadId": "thr_b", "command": "./workflow.sh", "timeoutMs": 28800000 } }
+{ "id": 27, "result": {} }
 ```
 
 ### Example: Start a turn (send user input)
@@ -1727,6 +1773,8 @@ The app-server streams JSON-RPC notifications while a turn is running. Each turn
 - `model/safetyBuffering/updated` — `{ threadId, turnId, model, useCases, reasons, showBufferingUi, fasterModel }` when a response enters safety buffering. `fasterModel` is nullable. This notification is transient and is not persisted in rollout history.
 - `model/rerouted` — `{ threadId, turnId, fromModel, toModel, reason }` when the backend reroutes a request to a different model (for example, due to high-risk cyber safety checks).
 - `model/verification` — `{ threadId, turnId, verifications }` when the backend flags additional account verification, such as `trustedAccessForCyber`.
+- `modelProvider/authRecoveryStarted` — `{ threadId, turnId, provider, message }` when model-provider authentication recovery begins.
+- `modelProvider/authRecoveryCompleted` — `{ threadId, turnId, provider, message }` when model-provider authentication recovery succeeds.
 - `turn/moderationMetadata` — experimental; `{ threadId, turnId, metadata }` when a first-party backend supplies turn-scoped moderation metadata for client-side presentation.
 
 `turn/started` carries no items. `turn/completed` carries only the final agent message as a summary fallback; continue consuming `item/*` notifications for the full canonical item list.
@@ -1855,6 +1903,8 @@ Order of messages:
 
 When stdin approvals are enabled, a `write_stdin` approval sets `kind: "writeStdin"`, references the original terminal command's `itemId`, and has its own `approvalId`. The request belongs to the current turn, which may differ from the turn that opened the terminal. With `approvalsReviewer: "auto_review"`, the `item/autoApprovalReview/*` notifications likewise target the original command item and carry an action of type `writeStdin` with `approvalId`, `processId`, `stdin`, and `cwd`. For stdin approvals, `cwd` is the terminal’s launch directory, not its current working directory. Approving or denying a stdin write does not start, complete, or change the status of the parent command-execution item.
 
+Non-empty input is reviewed when strict auto-review is active, the terminal bypassed the sandbox at launch, or its retained permissions differ from the current environment's policy, including additional grants and permission changes between turns. Changing permission settings does not re-sandbox or stop existing processes. Input is rejected when the original environment is unavailable, the retained filesystem sandbox cannot enforce current denied-read restrictions, or environment-owned network restrictions changed; empty output polls and non-TTY interrupts remain available without review. Approval reasons describe retained authority and user-visible grants even for clients that do not receive the experimental `additionalPermissions` field. Internal grant paths remain private.
+
 For reviewed stdin, the complete formatted action and approval reason must fit within 8,000 bytes. Oversized or truncated actions are rejected before any bytes reach the terminal, rather than reviewing a shortened input and executing the full input.
 
 ### File change approvals
@@ -1891,16 +1941,25 @@ Order of messages:
 
 1. `mcpServer/elicitation/request` (request) — includes `threadId`, nullable `turnId`, `serverName`, and either:
    - a form request: `{ "mode": "form", "message": "...", "requestedSchema": { ... } }`
-   - an OpenAI extended form request: `{ "mode": "openai/form", "message": "...", "requestedSchema": { ... } }`
+   - an OpenAI form request: `{ "mode": "openaiForm", "message": "...", "requestedSchema": { ... } }`
+   - a legacy OpenAI extended form request: `{ "mode": "openai/form", "message": "...", "requestedSchema": { ... } }`
    - a URL request: `{ "mode": "url", "message": "...", "url": "...", "elicitationId": "..." }`
 2. Client response — `{ "action": "accept", "content": ... }`, `{ "action": "decline", "content": null }`, or `{ "action": "cancel", "content": null }`.
 3. `serverRequest/resolved` — `{ threadId, requestId }` confirms the pending request has been resolved or cleared, including lifecycle cleanup on turn start/complete/interrupt.
 
 `turnId` is best-effort. When the elicitation is correlated with an active turn, the request includes that turn id; otherwise it is `null`.
 
-For `openai/form`, app-server forwards `requestedSchema` as opaque JSON. The
-client owns validation and rendering of supported field types and must return a
-valid `decline` or `cancel` response when it cannot render a form.
+MCP `openai/elicitation/create` requests must explicitly specify `mode: "form"`.
+App-server forwards them as `mode: "openaiForm"`, preserving
+`requestedSchema` as opaque JSON, including `x-openai-*` annotations. The legacy
+`openai/form` route remains independent and also preserves its schema.
+
+The client owns validation and rendering. Graphical clients show an unsupported
+state for unknown semantic inputs, never a partial form or generic approval,
+and wait for the user to decline or cancel instead of returning a JSON-RPC
+error. The TUI automatically declines OpenAI forms, including requests replayed
+from another client. Capability advertisement describes the session's initial
+client, not all clients that may later attach.
 
 For MCP tool approval elicitations, form request `meta` includes
 `codex_approval_kind: "mcp_tool_call"` and may include `persist: "session"`,
@@ -2411,7 +2470,7 @@ Codex supports these authentication modes. The current mode is surfaced in `acco
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated` on success.
 - `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `apikey`, `bedrockApiKey`, `bedrockAccessKeys`, `chatgpt`, `personalAccessToken`, or `null`) and includes the current ChatGPT `planType` when available.
-- `account/rateLimits/read` — fetch ChatGPT rate limits, an optional effective monthly credit limit, whether spend control has been reached, and the earned rate-limit resets currently available, including expiry details when provided by the backend. Rate-limit updates arrive via `account/rateLimits/updated` (notify); reset-credit data is snapshot-only.
+- `account/rateLimits/read` — fetch ChatGPT rate limits, an optional effective monthly credit limit, whether spend control has been reached, and the earned rate-limit resets currently available, including expiry details when provided by the backend. Rate-limit updates arrive via `account/rateLimits/updated` (notify); reset-credit and backend-banner data are snapshot-only.
 - `account/rateLimitResetCredit/consume` — consume one earned reset using a caller-provided idempotency key, optionally selecting a reset-credit ID returned by `account/rateLimits/read`.
 - `account/usage/read` — fetch ChatGPT account token-activity summary and daily buckets, or pass a valid thread UUID as `threadId` to read estimated credits, optional cost, and usage breakdowns for one thread using the app-server's active account. The optional `threadUsage` response field is absent on older servers and `null` when the billing route is unavailable.
 - `account/workspaceMessages/read` — fetch active workspace messages, including workspace notification headlines when available.
@@ -2653,6 +2712,8 @@ Field notes:
 - `resetsAt` is a Unix timestamp (seconds) for the next reset.
 - `rateLimitReachedType` identifies the backend-classified limit state when one has been reached.
 - `individualLimit` describes the effective monthly credit limit when available. In an `account/rateLimits/read` response, `null` means no monthly limit is available. In a sparse `account/rateLimits/updated` notification, nullable account metadata may be unavailable and does not clear a previously observed value.
+- `accountId` identifies the account in the usage snapshot when the backend supplies it.
+- `rateLimitUpsell` carries the optional backend-owned `rate_limit_upsell` object from the same usage request, preserving its nested snake_case fields. The backend controls eligibility; clients do not evaluate an experiment or issue another request for it. A missing, null, or unsupported banner leaves the existing client UI in place. Banners whose account or user does not match the authenticated identity are omitted. Sparse notifications do not clear this snapshot-only field.
 - `rateLimitResetCredits` contains the available earned-reset count when the backend provides it; otherwise it is `null`.
 - `rateLimitResetCredits.credits` is `null` when only the count is available. An empty array means details were fetched and no available credits were returned.
 - The backend may cap `rateLimitResetCredits.credits`, so `availableCount` is the authoritative total and can be greater than the number of detail rows.

@@ -942,7 +942,9 @@ fn guardian_elicitation_review_request(
                 "guardian MCP elicitation review does not support this elicitation mode",
             );
         }
-        Elicitation::OpenAiForm { .. } => return GuardianElicitationReview::NotRequested,
+        Elicitation::OpenAiForm { .. } | Elicitation::OpenAiElicitationForm { .. } => {
+            return GuardianElicitationReview::NotRequested;
+        }
     };
 
     let Some(meta) = meta.as_ref().map(|meta| &meta.0.0) else {

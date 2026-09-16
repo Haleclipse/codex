@@ -463,6 +463,7 @@ fn host_to_client_v1_variants_are_pinned() {
             request_id(/*value*/ 3),
             HostResponse::WaitCompleted {
                 outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                    code_mode_host_duration_ns: 0,
                     cell_id: cell_id("cell-1"),
                     content_items: content_items(),
                 }),
@@ -474,6 +475,7 @@ fn host_to_client_v1_variants_are_pinned() {
                         "Yielded": {
                             "cell_id": "cell-1",
                             "content_items": content_items_json(),
+                            "code_mode_host_duration_ns": 0,
                         },
                     },
                 },
@@ -483,6 +485,7 @@ fn host_to_client_v1_variants_are_pinned() {
             request_id(/*value*/ 4),
             HostResponse::WaitCompleted {
                 outcome: WireWaitOutcome::MissingCell(WireRuntimeResponse::Result {
+                    code_mode_host_duration_ns: 0,
                     cell_id: cell_id("missing-cell"),
                     content_items: Vec::new(),
                     error_text: Some("cell not found".to_string()),
@@ -496,6 +499,7 @@ fn host_to_client_v1_variants_are_pinned() {
                             "cell_id": "missing-cell",
                             "content_items": [],
                             "error_text": "cell not found",
+                            "code_mode_host_duration_ns": 0,
                         },
                     },
                 },
@@ -540,6 +544,7 @@ fn host_to_client_v1_variants_are_pinned() {
             id: request_id(/*value*/ 7),
             result: WireResult::Ok {
                 value: WireRuntimeResponse::Terminated {
+                    code_mode_host_duration_ns: 0,
                     cell_id: cell_id("cell-1"),
                     content_items: Vec::new(),
                 },
@@ -551,7 +556,11 @@ fn host_to_client_v1_variants_are_pinned() {
             "result": {
                 "status": "ok",
                 "value": {
-                    "Terminated": { "cell_id": "cell-1", "content_items": [] },
+                    "Terminated": {
+                        "cell_id": "cell-1",
+                        "content_items": [],
+                        "code_mode_host_duration_ns": 0,
+                    },
                 },
             },
         }),
@@ -798,6 +807,7 @@ fn every_nested_v1_object_rejects_unknown_fields() {
             "Yielded": {
                 "cell_id": "cell-1",
                 "content_items": [],
+                "code_mode_host_duration_ns": 0,
                 "unexpected": true,
             },
         }))

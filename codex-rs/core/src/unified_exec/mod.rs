@@ -55,6 +55,7 @@ mod process;
 mod process_manager;
 mod process_state;
 mod shell_snapshot;
+mod stdin_approval;
 
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
@@ -66,6 +67,8 @@ pub(crate) use process::NoopSpawnLifecycle;
 pub(crate) use process::SpawnLifecycle;
 pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;
+pub(crate) use stdin_approval::TerminalPermissions;
+pub(crate) use stdin_approval::TerminalSandboxSource;
 
 pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
 pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 10_000;
@@ -187,9 +190,7 @@ struct ProcessEntry {
     hook_command: String,
     tty: bool,
     environment_id: String,
-    // The successful launch bypassed sandboxing required by its ambient policy.
-    // Preserve this across turns so subsequent stdin writes can require approval.
-    escalated: bool,
+    permissions: TerminalPermissions,
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,

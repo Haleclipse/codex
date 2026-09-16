@@ -5,7 +5,9 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::StartThreadOptions;
+use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
+use codex_core::TurnStartOptions;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ThreadStoreConfig;
@@ -39,6 +41,7 @@ use core_test_support::fs_wait;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::hooks::trust_hooks;
 use core_test_support::managed_network_requirements_loader;
+use core_test_support::responses;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -1704,6 +1707,11 @@ async fn async_hook_context_is_injected_into_the_active_turn() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
+    let first_request = requests[0].body_json();
+    let turn_id = first_request["client_metadata"]["turn_id"]
+        .as_str()
+        .context("first model request should include its turn ID")?;
+    responses::assert_root_turn(&requests[1].body_json(), Some(turn_id))?;
     assert!(
         requests[1]
             .message_input_texts("developer")
@@ -1714,8 +1722,12 @@ async fn async_hook_context_is_injected_into_the_active_turn() -> Result<()> {
     Ok(())
 }
 
+#[test_case::test_case(/*automatic_continuation*/ false; "user_turn")]
+#[test_case::test_case(/*automatic_continuation*/ true; "automatic_continuation")]
 #[tokio::test]
-async fn async_hook_finishing_while_idle_waits_for_the_next_turn() -> Result<()> {
+async fn async_hook_finishing_while_idle_waits_for_the_next_turn(
+    automatic_continuation: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1785,12 +1797,22 @@ async fn async_hook_finishing_while_idle_waits_for_the_next_turn() -> Result<()>
     );
 
     let next_prompt = "observe the buffered async context";
-    test.codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+    let next_turn = if automatic_continuation {
+        TurnInputRequest::new(TurnInput::ResponseItem(responses::user_message_item(
+            next_prompt,
+        )))
+        .on_start(TurnStartOptions {
+            root_turn_id: Some(first_turn_id.clone()),
+            parent_turn_id: Some(first_turn_id.clone()),
+            ..Default::default()
+        })
+    } else {
+        TurnInputRequest::user_input(vec![UserInput::Text {
             text: next_prompt.to_string(),
             text_elements: Vec::new(),
-        }]))
-        .await?;
+        }])
+    };
+    test.codex.start_turn_if_idle(next_turn).await?;
 
     let mut warning_event = None;
     timeout(Duration::from_secs(5), async {
@@ -1819,6 +1841,10 @@ async fn async_hook_finishing_while_idle_waits_for_the_next_turn() -> Result<()>
         .context("second model request should include its turn ID")?
         .to_string();
     assert_ne!(first_turn_id, second_turn_id);
+    responses::assert_root_turn(
+        &requests[1].body_json(),
+        (!automatic_continuation).then_some(second_turn_id.as_str()),
+    )?;
     assert_eq!(
         warning_event
             .context("buffered async hook warning should be delivered during the next turn")?

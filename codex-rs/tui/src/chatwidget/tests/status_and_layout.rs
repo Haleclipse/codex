@@ -1918,8 +1918,10 @@ async fn workspace_owner_credits_nudge_completion_renders_feedback() {
     let mut rendered_cases = Vec::new();
     for (result, expected) in cases {
         let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-        chat.start_add_credits_nudge_email_request(AddCreditsNudgeCreditType::Credits);
-        chat.finish_add_credits_nudge_email_request(result);
+        let request_id = chat
+            .start_add_credits_nudge_email_request(AddCreditsNudgeCreditType::Credits)
+            .expect("start notification");
+        chat.finish_add_credits_nudge_email_request(request_id, result);
         let rendered = drain_insert_history(&mut rx)
             .into_iter()
             .map(|lines| lines_to_single_string(&lines))
@@ -1954,14 +1956,24 @@ async fn workspace_owner_usage_limit_nudge_completion_renders_feedback() {
     let mut rendered_cases = Vec::new();
     for (result, expected) in cases {
         let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-        chat.start_add_credits_nudge_email_request(AddCreditsNudgeCreditType::UsageLimit);
-        chat.finish_add_credits_nudge_email_request(result);
+        let request_id = chat
+            .start_add_credits_nudge_email_request(AddCreditsNudgeCreditType::UsageLimit)
+            .expect("start notification");
+        assert!(
+            chat.start_add_credits_nudge_email_request(AddCreditsNudgeCreditType::Credits)
+                .is_none()
+        );
+        chat.finish_add_credits_nudge_email_request(request_id, result);
         let rendered = drain_insert_history(&mut rx)
             .into_iter()
             .map(|lines| lines_to_single_string(&lines))
             .collect::<String>();
         assert!(rendered.contains(expected), "rendered: {rendered}");
         rendered_cases.push(rendered);
+        assert!(
+            chat.start_add_credits_nudge_email_request(AddCreditsNudgeCreditType::Credits)
+                .is_some()
+        );
     }
 
     assert_chatwidget_snapshot!(

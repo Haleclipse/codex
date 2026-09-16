@@ -1113,7 +1113,7 @@ async fn load_plugins_applies_plugin_mcp_server_policy() {
       "default_tools_approval_mode": "prompt",
       "enabled_tools": ["read", "search"],
       "tools": {
-        "search": { "approval_mode": "prompt" }
+        "search": { "approval_mode": "prompt", "output_token_limit": 8000 }
       }
     }
   }
@@ -1134,6 +1134,7 @@ disabled_tools = ["delete"]
 
 [plugins."sample@test".mcp_servers.sample.tools.search]
 approval_mode = "approve"
+output_token_limit = 12000
 "#;
 
     let outcome =
@@ -1154,6 +1155,7 @@ approval_mode = "approve"
         server.tools.get("search"),
         Some(&McpServerToolConfig {
             approval_mode: Some(AppToolApproval::Approve),
+            output_token_limit: std::num::NonZeroUsize::new(8_000),
         })
     );
 }
@@ -4127,6 +4129,20 @@ plugins = true
         vec!["other-mcp".to_string(), "sample-mcp".to_string()]
     );
     assert!(api_key_outcome.plugin.apps.is_empty());
+
+    let no_auth_outcome = test_plugins_manager_with_options(
+        tmp.path().to_path_buf(),
+        Some(Product::Codex),
+        /*auth_mode*/ None,
+    )
+    .read_plugin_for_config(&config, &request)
+    .await
+    .unwrap();
+    assert_eq!(
+        no_auth_outcome.plugin.mcp_server_names,
+        vec!["other-mcp".to_string(), "sample-mcp".to_string()]
+    );
+    assert!(no_auth_outcome.plugin.apps.is_empty());
 }
 
 #[tokio::test]
@@ -4166,7 +4182,11 @@ plugins = true
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let manager = test_plugins_manager(tmp.path().to_path_buf());
+    let manager = test_plugins_manager_with_options(
+        tmp.path().to_path_buf(),
+        Some(Product::Codex),
+        Some(AuthMode::Chatgpt),
+    );
     let outcome = manager
         .read_plugin_for_config(
             &config,
@@ -4606,19 +4626,23 @@ enabled = false
     );
 
     let config = load_config(tmp.path(), &repo_root).await;
-    let outcome = test_plugins_manager(tmp.path().to_path_buf())
-        .read_plugin_for_config(
-            &config,
-            &PluginReadRequest {
-                plugin_name: "toolkit".to_string(),
-                marketplace_path: AbsolutePathBuf::try_from(
-                    repo_root.join(".agents/plugins/marketplace.json"),
-                )
-                .unwrap(),
-            },
-        )
-        .await
-        .unwrap();
+    let outcome = test_plugins_manager_with_options(
+        tmp.path().to_path_buf(),
+        Some(Product::Codex),
+        Some(AuthMode::Chatgpt),
+    )
+    .read_plugin_for_config(
+        &config,
+        &PluginReadRequest {
+            plugin_name: "toolkit".to_string(),
+            marketplace_path: AbsolutePathBuf::try_from(
+                repo_root.join(".agents/plugins/marketplace.json"),
+            )
+            .unwrap(),
+        },
+    )
+    .await
+    .unwrap();
 
     assert_eq!(outcome.plugin.details_unavailable_reason, None);
     assert_eq!(
@@ -5875,6 +5899,94 @@ plugins = true
 }
 
 #[tokio::test]
+async fn recommended_plugins_cache_clear_rejects_stale_fetch_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let server = MockServer::start().await;
+    let request_started = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::clone(&request_started);
+    let (release_response, released) = std::sync::mpsc::channel();
+    let released = std::sync::Mutex::new(released);
+    let old_response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "enabled": true,
+        "plugins": [{"id": "plugin_old", "name": "old", "display_name": "Old"}]
+    }));
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/suggested/codex"))
+        .respond_with(move |_: &wiremock::Request| {
+            started.notify_one();
+            // Wiremock runs its own server thread. Dropping the sender also releases it.
+            let _ = released.lock().unwrap().recv();
+            old_response.clone()
+        })
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/suggested/codex"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "enabled": true,
+            "plugins": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut config = load_config(tmp.path(), tmp.path()).await;
+    config.chatgpt_base_url = server.uri();
+    let manager = test_plugins_manager(tmp.path().to_path_buf());
+    let old_lookup = manager.recommended_plugins_mode_for_config(&config, Some(&auth));
+    tokio::pin!(old_lookup);
+    tokio::select! {
+        biased;
+        _ = request_started.notified() => {}
+        mode = old_lookup.as_mut() => panic!("old fetch finished before release: {mode:?}"),
+    }
+
+    manager.clear_recommended_plugins_cache();
+    release_response
+        .send(())
+        .expect("release old HTTP response");
+
+    // Keep the old initializer unpolled until the new fetch publishes. An invalidated
+    // fetch must not overwrite the fresh result.
+    let new_mode = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.recommended_plugins_mode_for_config(&config, Some(&auth)),
+    )
+    .await
+    .expect("new lookup should finish independently of the invalidated fetch");
+    assert_eq!(
+        new_mode,
+        RecommendedPluginsMode::Endpoint {
+            plugins: Vec::new()
+        }
+    );
+    assert_eq!(
+        old_lookup.await,
+        RecommendedPluginsMode::Endpoint {
+            plugins: vec![RecommendedPlugin {
+                config_id: "old@openai-curated-remote".to_string(),
+                remote_plugin_id: "plugin_old".to_string(),
+                display_name: "Old".to_string(),
+            }]
+        }
+    );
+    assert_eq!(
+        manager
+            .recommended_plugins_mode_for_config(&config, Some(&auth))
+            .await,
+        new_mode
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn recommended_plugin_candidates_filter_installed_and_disabled_plugins() {
     let tmp = tempfile::tempdir().unwrap();
     write_file(
@@ -6980,7 +7092,6 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
         scope: crate::remote::RemotePluginScope::Workspace,
         discoverability: Some(crate::remote::RemotePluginShareDiscoverability::Listed),
         authenticated_account_id: Some("account-123".to_string()),
-        capabilities: Default::default(),
     };
     let change = |name: &str| EffectivePluginsChange {
         materialized_remote_plugins: vec![materialization(name)],
@@ -7094,6 +7205,121 @@ remote_plugin = true
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     server.verify().await;
+}
+
+#[tokio::test]
+async fn reconcile_remote_installed_plugins_reports_cached_state_changes() {
+    let codex_home = TempDir::new().unwrap();
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
+    write_cached_plugin(
+        codex_home.path(),
+        REMOTE_WORKSPACE_MARKETPLACE_NAME,
+        "linear",
+    );
+    let plugin_root = codex_home
+        .path()
+        .join("plugins/cache/workspace-directory/linear/local");
+    write_file(
+        &plugin_root.join(".mcp.json"),
+        r#"{"mcpServers":{"example":{"command":"unused"}}}"#,
+    );
+    write_file(
+        &plugin_root.join("hooks/hooks.json"),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo hook"}]}]}}"#,
+    );
+    let server = MockServer::start().await;
+    let mut config = load_config(codex_home.path(), codex_home.path()).await;
+    config.chatgpt_base_url = format!("{}/backend-api", server.uri());
+    let auth_manager = test_auth_manager(Some(AuthMode::Chatgpt));
+    let auth = auth_manager.auth_cached().expect("test ChatGPT auth");
+    let manager = test_plugins_manager_with_auth_manager(
+        codex_home.path().to_path_buf(),
+        Some(Product::Codex),
+        auth_manager,
+    );
+    let change = RemotePluginChange {
+        plugin_id: "linear@workspace-directory".to_string(),
+        capabilities: RemotePluginCapabilities {
+            has_mcps: true,
+            has_hooks: true,
+            has_skills: true,
+            ..Default::default()
+        },
+    };
+    // None represents an uninstall. Reinstalling its retained bundle must report an
+    // activation even though the known previous snapshot has no entry for the plugin.
+    for (enabled, changes) in [
+        (Some(true), Vec::new()),
+        (Some(false), vec![change.clone()]),
+        (Some(false), Vec::new()),
+        (Some(true), vec![change.clone()]),
+        (None, vec![change.clone()]),
+        (Some(true), vec![change.clone()]),
+        (Some(true), Vec::new()),
+    ] {
+        if enabled.is_none() {
+            // Fail cleanup before it reaches the bundle; removal hints must survive.
+            write_file(
+                &codex_home
+                    .path()
+                    .join("plugins/cache/openai-curated-remote"),
+                "not a directory",
+            );
+        }
+        let plugins = enabled
+            .into_iter()
+            .map(|enabled| {
+                serde_json::json!({
+                    "id": "plugins~Plugin_linear",
+                    "name": "linear",
+                    "scope": "WORKSPACE",
+                    "discoverability": "LISTED",
+                    "installation_policy": "AVAILABLE",
+                    "authentication_policy": "ON_USE",
+                    "release": {
+                        "version": "local",
+                        "display_name": "Linear",
+                        "description": "Test plugin",
+                        "interface": {},
+                    },
+                    "enabled": enabled,
+                })
+            })
+            .collect::<Vec<_>>();
+        // No download URL: every installed pass must reuse the cached version.
+        Mock::given(method("GET"))
+            .and(path("/backend-api/ps/plugins/installed"))
+            .and(query_param("includeDownloadUrls", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plugins": plugins,
+                "pagination": { "next_page_token": null },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            manager
+                .reconcile_remote_installed_plugins(&config, Some(&auth))
+                .await
+                .expect("reconcile cached plugin state"),
+            RemoteInstalledPluginBundleSyncOutcome {
+                changed_plugins: changes,
+                ..Default::default()
+            }
+        );
+        assert!(plugin_root.exists());
+        if enabled.is_none() {
+            assert_eq!(
+                manager.plugins_for_config(&config).await,
+                PluginLoadOutcome::default()
+            );
+        }
+        server.verify().await;
+        server.reset().await;
+    }
 }
 
 #[tokio::test]

@@ -275,6 +275,10 @@ impl GoalService {
                 .map(|goal| (goal, Some(previous_goal)))?
         };
 
+        if let Some(runtime) = runtime.as_ref() {
+            runtime.invalidate_turn_lineage().await;
+        }
+
         if objective.is_some() {
             fill_empty_thread_preview_if_possible(state_db, thread_id, &goal).await;
         }
@@ -316,6 +320,9 @@ impl GoalService {
                 GoalServiceError::Internal(format!("failed to clear thread goal: {err}"))
             })?;
         let cleared = cleared_goal.is_some();
+        if cleared && let Some(runtime) = runtime.as_ref() {
+            runtime.invalidate_turn_lineage().await;
+        }
         drop(goal_state_permit);
         drop(runtime);
 

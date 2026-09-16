@@ -20,6 +20,7 @@ mod reverse_jsonl_scanner;
 mod rollout_file_name;
 mod rollout_reference_index;
 pub(crate) mod search;
+mod seekable_reader;
 pub(crate) mod session_index;
 mod sqlite_metrics;
 pub mod state_db;
@@ -76,11 +77,14 @@ pub static INTERACTIVE_SESSION_SOURCES: LazyLock<Vec<SessionSource>> = LazyLock:
 });
 
 pub use codex_protocol::protocol::SessionMeta;
+pub use compression::RolloutCompressionMode;
 pub use compression::RolloutLineReader;
 pub use compression::existing_rollout_path;
 pub use compression::open_rollout_line_reader;
 pub use compression::plain_rollout_path;
 pub use compression::spawn_rollout_compression_worker;
+pub use seekable_reader::open_rollout_seekable_reader;
+pub use seekable_reader::rollout_contains_prefix;
 
 /// Materializes a compressed rollout as plain JSONL before another rollout references it.
 pub async fn materialize_rollout_for_reference(

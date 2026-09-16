@@ -48,6 +48,7 @@ fn model_with_approval_messages(
     let mut model = model_info_from_slug(slug);
     model.model_messages = Some(ModelMessages {
         persistent_instructions: None,
+        tools: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: Some(ApprovalMessages {
@@ -74,6 +75,7 @@ fn model_with_permission_messages(
     let mut model = model_info_from_slug(slug);
     model.model_messages = Some(ModelMessages {
         persistent_instructions: None,
+        tools: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: None,
@@ -230,6 +232,7 @@ async fn catalog_non_on_request_approval_messages_are_sent_in_initial_permission
         let mut model = model_info_from_slug(model_slug);
         model.model_messages = Some(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: None,
             instructions_variables: None,
             approvals: Some(approvals),

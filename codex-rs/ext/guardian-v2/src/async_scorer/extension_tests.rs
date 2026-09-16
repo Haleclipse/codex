@@ -9,6 +9,9 @@ use anyhow::Result;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::LoaderOverrides;
+use codex_core::context::ContextualUserFragment;
+use codex_core::context::InternalContextSource;
+use codex_core::context::InternalModelContextFragment;
 use codex_core::context::NodeReplReviewEvidence;
 use codex_extension_api::ConversationHistorySnapshot;
 use codex_extension_api::ExtensionData;
@@ -41,6 +44,8 @@ use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TruncationPolicy;
@@ -52,6 +57,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -227,6 +233,7 @@ async fn installed_extension_reconnects_after_auth_refresh() -> Result<()> {
                 thread_store,
                 turn_store: &turn_store,
                 turn_id: "turn-1",
+                root_turn_id: None,
                 call_id,
                 tool_name: &tool_name,
                 mcp_tool: None,
@@ -276,6 +283,20 @@ async fn installed_extension_reconnects_after_auth_refresh() -> Result<()> {
             .collect::<Vec<_>>(),
         expected_requests
     );
+    let requests = server
+        .connections()
+        .into_iter()
+        .flatten()
+        .map(|request| request.body_json())
+        .collect::<Vec<_>>();
+    for request in &requests {
+        responses::assert_parent_turn(request, Some("turn-1"))?;
+        responses::assert_root_turn(request, /*expected*/ None)?;
+    }
+    assert_ne!(
+        requests[0]["client_metadata"]["turn_id"],
+        requests[1]["client_metadata"]["turn_id"]
+    );
     Ok(())
 }
 
@@ -323,9 +344,36 @@ impl ExtensionMetrics for RecordingMetrics {
 
 struct TestConversationHistory(Vec<ResponseItem>);
 
+struct TestRetainedHistory {
+    current: TestConversationHistory,
+    retained: Vec<ResponseItem>,
+}
+
+impl ConversationHistorySnapshot for TestRetainedHistory {
+    fn history_version(&self) -> u64 {
+        self.current.history_version()
+    }
+
+    fn user_message_revision(&self) -> u64 {
+        self.current.user_message_revision()
+    }
+
+    fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
+        self.current.items()
+    }
+
+    fn review_items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
+        Box::new(self.retained.iter())
+    }
+}
+
 impl ConversationHistorySnapshot for TestConversationHistory {
     fn history_version(&self) -> u64 {
         0
+    }
+
+    fn user_message_revision(&self) -> u64 {
+        self.0.iter().filter(|item| item.is_user_message()).count() as u64
     }
 
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
@@ -439,6 +487,7 @@ async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
             thread_store,
             turn_store: &turn_store,
             turn_id: "turn-1",
+            root_turn_id: None,
             call_id: "call-2",
             tool_name: &tool_name,
             mcp_tool: None,
@@ -518,6 +567,7 @@ async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
             thread_store,
             turn_store: &turn_store,
             turn_id: "turn-1",
+            root_turn_id: None,
             call_id: "ordinary-call",
             tool_name: &ordinary_tool,
             mcp_tool: None,
@@ -952,6 +1002,7 @@ async fn sample_configured_conversation_history_with_source(
             thread_store,
             turn_store: &turn_store,
             turn_id: "turn-1",
+            root_turn_id: Some("root-turn"),
             call_id: "call-1",
             tool_name: &tool_name,
             mcp_tool: None,
@@ -1027,6 +1078,7 @@ impl GuardianFailureFixture {
                 thread_store,
                 turn_store: &turn_store,
                 turn_id: "turn-1",
+                root_turn_id: None,
                 call_id: "call-1",
                 tool_name: &tool_name,
                 mcp_tool: None,
@@ -1208,6 +1260,7 @@ classifier_instructions = "Predict future violations.\n# Security Policy\n{{ ten
         request["input"][1],
         json!({
             "type": "message",
+            "id": request["input"][1]["id"],
             "role": "developer",
             "content": [{
                 "type": "input_text",
@@ -1246,6 +1299,7 @@ max_classifier_instruction_tokens = 256
         request["input"][1],
         json!({
             "type": "message",
+            "id": request["input"][1]["id"],
             "role": "developer",
             "content": [{
                 "type": "input_text",
@@ -1334,6 +1388,7 @@ max_recent_non_user_entries = 8
         request["input"][1],
         json!({
             "type": "message",
+            "id": request["input"][1]["id"],
             "role": "developer",
             "content": [{
                 "type": "input_text",
@@ -1735,6 +1790,7 @@ async fn contributor_uses_model_defaults_and_preserves_local_overrides() -> Resu
         request["input"][1],
         json!({
             "type": "message",
+            "id": request["input"][1]["id"],
             "role": "developer",
             "content": [{
                 "type": "input_text",
@@ -1872,6 +1928,9 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
         .as_str()
         .expect("classifier thread ID");
     assert_ne!(ThreadId::from_string(classifier_thread_id)?, thread_id);
+    let classifier_turn_id = request["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("classifier turn ID");
     let turn_metadata: serde_json::Value = serde_json::from_str(
         request["client_metadata"]["x-codex-turn-metadata"]
             .as_str()
@@ -1883,7 +1942,9 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
             "session_id": request["client_metadata"]["session_id"],
             "thread_id": classifier_thread_id,
             "guardian_classifier_source_thread_id": thread_id.to_string(),
-            "turn_id": "turn-1",
+            "turn_id": classifier_turn_id,
+            "parent_turn_id": "turn-1",
+            "root_turn_id": "root-turn",
             "thread_source": "guardian_classifier",
         })
     );
@@ -1892,7 +1953,8 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
         request["client_metadata"]["x-codex-window-id"],
         format!("{classifier_thread_id}:0")
     );
-    assert_eq!(request["client_metadata"]["turn_id"], "turn-1");
+    assert_eq!(request["client_metadata"]["parent_turn_id"], "turn-1");
+    assert_eq!(request["client_metadata"]["root_turn_id"], "root-turn");
     assert_eq!(request["reasoning"]["effort"], "low");
     assert_eq!(request["reasoning"]["context"], "all_turns");
     assert!(request.get("text").is_none());
@@ -1900,6 +1962,7 @@ async fn contributor_samples_tool_calls_with_the_existing_luna_pool() -> Result<
         request["input"][1],
         json!({
             "type": "message",
+            "id": request["input"][1]["id"],
             "role": "developer",
             "content": [{
                 "type": "input_text",
@@ -2180,7 +2243,7 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
                 /*extension_metrics*/ None,
             )
             .await,
-        Some(ReviewDecision::Approved)
+        None
     );
 
     let turn_store = ExtensionData::new("turn-1");
@@ -2200,6 +2263,7 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
             thread_store,
             turn_store: &turn_store,
             turn_id: "turn-1",
+            root_turn_id: None,
             call_id: "protected.md",
             tool_name: &tool_name,
             mcp_tool: None,
@@ -2218,6 +2282,84 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
         "protected models must not spawn Guardian v2 classifiers"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_score_survives_compaction_and_internal_context_but_not_user_input() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let (_, test, registry) = sample_configured_conversation_history(
+        Vec::new(),
+        r#"{"path":"README.md"}"#,
+        Some(TEST_GUARDIAN_POLICY),
+        "[features]\ntoken_budget = true\n[features.guardianv2]\nenabled = true\n",
+        /*model_defaults*/ None,
+    )
+    .await?;
+    let session_store = ExtensionData::new("session-1");
+    let thread_store = test.codex.thread_extension_data();
+    let progress = thread_store.get::<GuardianV2ScoreProgress>().unwrap();
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+        while progress.latest_scored_tool_call.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    thread_store.insert(SecurityRiskScore {
+        scores: BTreeMap::from([("action_risk".to_owned(), 0.25)]),
+        call_id: None,
+        action: None,
+        sampled_at: None,
+    });
+
+    test.codex
+        .inject_response_items(vec![ContextualUserFragment::into(
+            InternalModelContextFragment::new(
+                InternalContextSource::from_static("goal"),
+                "Continue inspecting the repository.",
+            ),
+        )])
+        .await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(
+        registry
+            .fast_approval_decision(
+                &session_store,
+                thread_store,
+                "review action",
+                /*extension_metrics*/ None,
+            )
+            .await,
+        Some(ReviewDecision::Approved),
+    );
+
+    test.codex
+        .inject_response_items(vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_owned(),
+            content: vec![ContentItem::InputText {
+                text: "Stop. Do not change any files.".to_owned(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }])
+        .await?;
+    assert_eq!(
+        registry
+            .fast_approval_decision(
+                &session_store,
+                thread_store,
+                "review action",
+                /*extension_metrics*/ None
+            )
+            .await,
+        None,
+    );
     Ok(())
 }
 
@@ -2281,6 +2423,7 @@ async fn contributor_counts_failed_thread_lookups_toward_score_lag() -> Result<(
             thread_store,
             turn_store: &turn_store,
             turn_id: "turn-1",
+            root_turn_id: None,
             call_id: "missing.md",
             tool_name: &tool_name,
             mcp_tool: None,
@@ -2321,6 +2464,7 @@ async fn contributor_uses_catalog_policy_without_a_configured_override() -> Resu
         request["input"][1],
         json!({
             "type": "message",
+            "id": request["input"][1]["id"],
             "role": "developer",
             "content": [{
                 "type": "input_text",
@@ -2363,6 +2507,7 @@ async fn contributor_preserves_uncapped_classifier_instructions() -> Result<()> 
         request["input"][1],
         json!({
             "type": "message",
+            "id": request["input"][1]["id"],
             "role": "developer",
             "content": [{
                 "type": "input_text",
@@ -2659,6 +2804,15 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
             .inject_response_items(conversation_history.0.clone()),
     )
     .await?;
+    let mut retained: Vec<ResponseItem> = serde_json::from_value(json!([
+        {"type":"function_call", "name":"check_repository", "arguments":"{}", "call_id":"before"},
+        {"type":"function_call_output", "call_id":"before", "output":"repository is private"}
+    ]))?;
+    retained.extend(conversation_history.0.clone());
+    let conversation_history = TestRetainedHistory {
+        retained,
+        current: conversation_history,
+    };
     thread_store.insert(parent_model);
 
     registry.tool_lifecycle_contributors()[0]
@@ -2667,6 +2821,7 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
             thread_store,
             turn_store: &turn_store,
             turn_id: "turn-1",
+            root_turn_id: None,
             call_id: "call-1",
             tool_name: &tool_name,
             mcp_tool: None,
@@ -2703,6 +2858,9 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
         serde_json::to_value(&latest_compaction)?
     );
     assert_eq!(request["input"][3]["role"], "user");
+    let transcript = serde_json::to_string(&request["input"][3])?;
+    assert!(transcript.contains("tool check_repository call"));
+    assert!(transcript.contains("tool check_repository result: repository is private"));
 
     let previous_score = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         loop {
@@ -2737,6 +2895,7 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
             thread_store,
             turn_store: &turn_store,
             turn_id: "turn-1",
+            root_turn_id: None,
             call_id: "call-2",
             tool_name: &tool_name,
             mcp_tool: None,

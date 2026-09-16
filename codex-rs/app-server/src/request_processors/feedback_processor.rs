@@ -185,6 +185,9 @@ impl FeedbackRequestProcessor {
 
         let mut attachment_paths = Vec::new();
         let mut seen_attachment_paths = HashSet::new();
+        // File priority after logs and generated diagnostics: reported thread, subagent
+        // descendants (oldest to newest within the retained recent set), guardian rollout,
+        // sandbox log, tool caches, then caller files. Keep this order for size budgeting.
         if include_logs {
             for feedback_thread_id in &feedback_thread_ids {
                 let Some(rollout_path) = self

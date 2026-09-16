@@ -8,6 +8,8 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::openai_models::ToolMessage;
+use codex_protocol::openai_models::ToolMessages;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
@@ -63,9 +65,16 @@ async fn persistent_async_message_guidance_follows_tool_availability(
                     effort: ReasoningEffort::Persistent,
                     description: ReasoningEffort::Persistent.to_string(),
                 });
-            if let Some(messages) = model.model_messages.as_mut() {
-                messages.persistent_instructions = None;
-            }
+            let messages = model
+                .model_messages
+                .as_mut()
+                .expect("model instruction metadata");
+            messages.persistent_instructions = None;
+            messages.tools = Some(ToolMessages {
+                send_user_message_async: Some(ToolMessage {
+                    description: Some("Catalog async message description.".to_string()),
+                }),
+            });
         })
         .with_config(|config| {
             config.model_reasoning_effort = Some(ReasoningEffort::Persistent);
@@ -110,8 +119,15 @@ async fn persistent_async_message_guidance_follows_tool_availability(
     Ok(())
 }
 
+#[test_case(None; "fallback_description")]
+#[test_case(Some(ToolMessages { send_user_message_async: None }); "missing_tool")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage::default()) }); "missing_description")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some("Catalog async message description.".to_string()) }) }); "catalog_description")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some(String::new()) }) }); "empty_description")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn send_user_message_async_emits_item_and_does_not_end_the_turn() -> Result<()> {
+async fn send_user_message_async_emits_item_and_does_not_end_the_turn(
+    tool_messages: Option<ToolMessages>,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     const CALL_ID: &str = "async-message-call";
@@ -139,12 +155,25 @@ async fn send_user_message_async_emits_item_and_does_not_end_the_turn() -> Resul
         ],
     )
     .await;
+    let expected_description = tool_messages
+        .as_ref()
+        .and_then(|tools| tools.send_user_message_async.as_ref())
+        .and_then(|tool| tool.description.as_deref())
+        .unwrap_or(
+            "Send a concise message that needs the user's attention during ongoing work. The tool returns immediately without ending the turn or waiting for a reply; any reply arrives asynchronously as a new user message.\nOnly use this tool to ask for missing information, preferences, constraints, clarification, or approval. The message should be concise, easy to read and understand, and at the right level of abstraction that is appropriate for the user and task at hand.",
+        )
+        .to_string();
     let test = test_codex()
-        .with_model_info_override("gpt-5.2", |model| {
+        .with_model_info_override("gpt-5.2", move |model| {
             model.tool_mode = Some(ToolMode::CodeModeOnly);
             model
                 .experimental_supported_tools
                 .push("send_user_message_async".to_string());
+            model
+                .model_messages
+                .as_mut()
+                .expect("model instruction metadata")
+                .tools = tool_messages;
         })
         .build_with_auto_env(&server)
         .await?;
@@ -207,16 +236,16 @@ async fn send_user_message_async_emits_item_and_does_not_end_the_turn() -> Resul
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
-    assert!(
-        requests[0].body_json()["tools"]
+    for request in &requests {
+        let body = request.body_json();
+        let tool = body["tools"]
             .as_array()
-            .is_some_and(|tools| {
-                tools.iter().any(|tool| {
-                    tool["type"] == "function" && tool["name"] == "send_user_message_async"
-                })
-            }),
-        "the async message tool should be directly visible to the model"
-    );
+            .expect("request tools")
+            .iter()
+            .find(|tool| tool["type"] == "function" && tool["name"] == "send_user_message_async")
+            .expect("the async message tool should be directly visible to the model");
+        assert_eq!(tool["description"], expected_description);
+    }
     assert_eq!(
         requests[1].function_call_output_text(CALL_ID),
         Some(r#"{"accepted":true}"#.to_string())

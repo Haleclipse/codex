@@ -24,6 +24,7 @@ mod service_error;
 mod startup_error;
 mod stdio_server_launcher;
 mod utils;
+mod www_authenticate;
 
 pub use auth_status::McpAuthState;
 pub use auth_status::McpLoginRequirement;

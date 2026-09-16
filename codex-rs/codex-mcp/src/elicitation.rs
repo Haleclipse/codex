@@ -320,19 +320,24 @@ impl ElicitationRequestManager {
 
                 let should_surface_form_in_full_access = router.full_access_form_input_enabled()
                     && permission_prompt_is_auto_approved
-                    && matches!(
-                        &elicitation,
+                    && !elicitation
+                        .meta()
+                        .is_some_and(|meta| meta.contains_key(APPROVAL_KIND_KEY))
+                    && match &elicitation {
                         Elicitation::Mcp(
                             rmcp::model::ElicitRequestParams::FormElicitationParams {
-                                meta,
                                 requested_schema,
                                 ..
-                            }
-                        ) if !requested_schema.properties.is_empty()
-                            && !meta
-                                .as_ref()
-                                .is_some_and(|meta| meta.contains_key(APPROVAL_KIND_KEY))
-                    );
+                            },
+                        ) => !requested_schema.properties.is_empty(),
+                        Elicitation::OpenAiElicitationForm {
+                            requested_schema, ..
+                        } => requested_schema
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|properties| !properties.is_empty()),
+                        Elicitation::Mcp(_) | Elicitation::OpenAiForm { .. } => false,
+                    };
 
                 if !should_surface_form_in_full_access {
                     if elicitation_is_rejected_by_policy(approval_policy) {
@@ -412,6 +417,15 @@ impl ElicitationRequestManager {
                         message,
                         requested_schema,
                     },
+                    Elicitation::OpenAiElicitationForm {
+                        meta,
+                        message,
+                        requested_schema,
+                    } => ElicitationRequest::OpenAiElicitationForm {
+                        meta,
+                        message,
+                        requested_schema,
+                    },
                 };
                 let (tx, rx) = oneshot::channel();
                 let _active_elicitation = lifecycle.as_ref().map(ElicitationLifecycle::start);
@@ -475,7 +489,9 @@ fn can_auto_accept_elicitation(elicitation: &Elicitation) -> bool {
             // Auto-accept confirm/approval elicitations without schema requirements.
             requested_schema.properties.is_empty()
         }
-        Elicitation::Mcp(_) | Elicitation::OpenAiForm { .. } => false,
+        Elicitation::Mcp(_)
+        | Elicitation::OpenAiForm { .. }
+        | Elicitation::OpenAiElicitationForm { .. } => false,
     }
 }
 

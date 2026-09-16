@@ -5,6 +5,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::StartedCell;
@@ -17,6 +18,7 @@ use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireResult;
+use codex_code_mode_protocol::host::WireRuntimeResponse;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -58,6 +60,11 @@ enum CellMessage {
     Closed,
 }
 
+struct InitialRequest {
+    id: RequestId,
+    received_at: Instant,
+}
+
 impl HostPeer {
     pub(super) fn new(outgoing_tx: mpsc::Sender<EncodedFrame>) -> Self {
         Self {
@@ -97,11 +104,7 @@ impl HostPeer {
         }
     }
 
-    fn initial_response(
-        &self,
-        id: RequestId,
-        result: Result<codex_code_mode_protocol::host::WireRuntimeResponse, String>,
-    ) {
+    fn initial_response(&self, id: RequestId, result: Result<WireRuntimeResponse, String>) {
         let message = HostToClient::InitialResponse {
             id,
             result: WireResult::from_result(result),
@@ -213,6 +216,7 @@ impl HostPeer {
         request_id: RequestId,
         started: StartedCell,
         active_cell_permit: OwnedSemaphorePermit,
+        received_at: Instant,
     ) -> oneshot::Receiver<()> {
         let (initial_response_sent_tx, initial_response_sent_rx) = oneshot::channel();
         let key = (session_id, started.cell_id.clone());
@@ -242,7 +246,10 @@ impl HostPeer {
             drive_cell(
                 peer,
                 key,
-                request_id,
+                InitialRequest {
+                    id: request_id,
+                    received_at,
+                },
                 started,
                 messages_rx,
                 initial_response_sent_tx,
@@ -411,7 +418,7 @@ impl HostPeer {
 async fn drive_cell(
     peer: Arc<HostPeer>,
     key: (SessionId, CellId),
-    request_id: RequestId,
+    request: InitialRequest,
     started: StartedCell,
     mut messages_rx: mpsc::Receiver<CellMessage>,
     initial_response_sent_tx: oneshot::Sender<()>,
@@ -424,7 +431,15 @@ async fn drive_cell(
         tokio::select! {
             biased;
             result = &mut initial_response => {
-                peer.initial_response(request_id, result.map(Into::into));
+                // Freeze the request duration before response conversion or delivery.
+                let code_mode_host_duration = request.received_at.elapsed();
+                peer.initial_response(
+                    request.id,
+                    result.and_then(|response| {
+                        let response = response.with_code_mode_host_duration(code_mode_host_duration);
+                        WireRuntimeResponse::try_from(response).map_err(|error| error.to_string())
+                    }),
+                );
                 if let Some(initial_response_sent_tx) = initial_response_sent_tx.take() {
                     let _ = initial_response_sent_tx.send(());
                 }
@@ -448,7 +463,15 @@ async fn drive_cell(
     };
 
     if closed {
-        peer.initial_response(request_id, initial_response.await.map(Into::into));
+        let result = initial_response.await;
+        let code_mode_host_duration = request.received_at.elapsed();
+        peer.initial_response(
+            request.id,
+            result.and_then(|response| {
+                let response = response.with_code_mode_host_duration(code_mode_host_duration);
+                WireRuntimeResponse::try_from(response).map_err(|error| error.to_string())
+            }),
+        );
         if let Some(initial_response_sent_tx) = initial_response_sent_tx.take() {
             let _ = initial_response_sent_tx.send(());
         }

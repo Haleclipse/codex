@@ -449,6 +449,7 @@ impl App {
             chat_widget.last_terminal_title = previous_terminal_title;
         }
         chat_widget.remote_connection = self.chat_widget.remote_connection.clone();
+        chat_widget.inherit_backend_banner_state(&mut self.chat_widget);
         for (thread_id, entry) in self.agent_navigation.ordered_threads() {
             chat_widget.set_collab_agent_metadata(
                 thread_id,
@@ -706,8 +707,15 @@ impl App {
                 if started.blocks_direct_input {
                     self.mark_primary_thread_parent_owned(thread_id);
                 }
+                // A full usage read can finish before thread/start. Apply its cached fallback
+                // after attachment but before the initial prompt or queued draft is submitted.
+                let recovery_was_pending = self.chat_widget.hold_rate_limit_recovery();
                 self.enqueue_primary_thread_session(started.session, started.turns)
                     .await?;
+                self.apply_backend_banner_fallback(app_server).await;
+                if !recovery_was_pending {
+                    self.chat_widget.finish_rate_limit_recovery();
+                }
                 self.chat_widget.maybe_send_next_queued_input();
             }
             Err(err) => {

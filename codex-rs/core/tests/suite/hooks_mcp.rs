@@ -13,6 +13,7 @@ use codex_core::config::Config;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_utils_path_uri::LegacyAppPathString;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -233,7 +234,7 @@ print({python_output_literal})
     Ok(())
 }
 
-fn write_mcp_tool_hook(
+pub(super) fn write_mcp_tool_hook(
     home: &Path,
     event_name: &str,
     matcher: Option<&str>,
@@ -285,7 +286,7 @@ fn insert_rmcp_test_server(
                 args: Vec::new(),
                 env: None,
                 env_vars: Vec::new(),
-                cwd: None,
+                cwd: Some(LegacyAppPathString::from_path(config.cwd.as_path())),
             },
             environment_id,
             enabled: true,

@@ -9,6 +9,7 @@ use codex_config::types::MemoriesConfig;
 use codex_core::Prompt;
 use codex_core::RolloutRecorder;
 use codex_core::config::Config;
+use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -292,7 +293,7 @@ mod job {
 
         let mut prompt = Prompt::default();
         prompt.input = vec![ResponseItem::Message {
-            id: None,
+            id: Some(ResponseItemId::new("msg")),
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
                 text: build_stage_one_input_message(

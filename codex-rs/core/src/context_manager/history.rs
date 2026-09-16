@@ -1,3 +1,6 @@
+//! Model history and bounded original evidence for approval review.
+//! Compaction replaces only model history; explicit resets also replace retained evidence.
+
 use crate::context::ContextualUserFragment;
 use crate::context::ModelSwitchInstructions;
 use crate::context::world_state::PersistentModeState;
@@ -14,6 +17,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ConversationHistorySnapshot;
+use codex_guardian_context::SectionHistory;
+use codex_guardian_context::TranscriptHistory;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::AgentMessageInputContent;
@@ -21,7 +26,6 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
@@ -37,8 +41,7 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
-use codex_utils_output_truncation::truncate_function_output_items_with_policy;
-use codex_utils_output_truncation::truncate_text;
+use codex_utils_output_truncation::truncate_function_output_payload;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -50,8 +53,12 @@ pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector. Snapshots share the vector until a
     /// caller needs to mutate it, avoiding deep copies for read-only history consumers.
     items: Arc<Vec<ResponseItemEnvelope>>,
+    /// Starts at the first compaction; ordinary history snapshots need no second payload copy.
+    review_history: Option<TranscriptHistory>,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
+    /// Monotonic user-input/reset revision, independent of compaction's history generation.
+    user_message_revision: u64,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
@@ -70,12 +77,36 @@ pub(crate) struct ContextManager {
 
 struct SharedConversationHistory {
     items: Arc<Vec<ResponseItemEnvelope>>,
+    review_history: Option<TranscriptHistory>,
     history_version: u64,
+    user_message_revision: u64,
+}
+
+pub(crate) enum HistoryReplacement {
+    Compaction,
+    Reset,
 }
 
 impl ConversationHistorySnapshot for SharedConversationHistory {
+    fn review_items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
+        match &self.review_history {
+            Some(history) => history.items(),
+            None => self.items(),
+        }
+    }
+
+    fn review_history_version(&self) -> u64 {
+        self.review_history
+            .as_ref()
+            .map_or(self.history_version, TranscriptHistory::generation)
+    }
+
     fn history_version(&self) -> u64 {
         self.history_version
+    }
+
+    fn user_message_revision(&self) -> u64 {
+        self.user_message_revision
     }
 
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
@@ -98,7 +129,9 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Arc::new(Vec::new()),
+            review_history: None,
             history_version: 0,
+            user_message_revision: 0,
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
@@ -110,7 +143,9 @@ impl ContextManager {
     pub(crate) fn conversation_history_snapshot(&self) -> Arc<dyn ConversationHistorySnapshot> {
         Arc::new(SharedConversationHistory {
             items: Arc::clone(&self.items),
+            review_history: self.review_history.clone(),
             history_version: self.history_version,
+            user_message_revision: self.user_message_revision,
         })
     }
 
@@ -171,7 +206,7 @@ impl ContextManager {
         self.record_items_with_metadata(items.into_iter().map(|item| (item, None)), policy);
     }
 
-    /// Records history envelopes while preserving their history-only metadata.
+    /// Records output while preserving its history-only metadata.
     pub(crate) fn record_annotated_items(
         &mut self,
         items: &[ResponseItemEnvelope],
@@ -196,11 +231,30 @@ impl ContextManager {
                 continue;
             }
 
-            let processed = ResponseItemEnvelope {
-                item: Self::process_item(item, policy),
+            let mut processed = ResponseItemEnvelope {
+                item: item.clone(),
                 metadata: metadata.cloned(),
             };
+            if let ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } = &mut processed.item
+            {
+                // The override already includes the tool's serialization allowance.
+                let policy = metadata
+                    .and_then(|metadata| metadata.fallback_token_limit_override)
+                    .map(TruncationPolicy::Tokens)
+                    .unwrap_or(policy * 1.2);
+                truncate_function_output_payload(output, policy, estimate_audio_token_count);
+            }
+            if let Some(review_history) = &mut self.review_history
+                && !matches!(item, ResponseItem::Message { role, content, .. }
+                if role == "user" && is_contextual_user_message_content(content))
+            {
+                review_history.record(&processed.item);
+            }
             Arc::make_mut(&mut self.items).push(processed);
+            if crate::context::is_user_authorization_message(item) {
+                self.user_message_revision = self.user_message_revision.saturating_add(1);
+            }
         }
     }
 
@@ -302,6 +356,30 @@ impl ContextManager {
     }
 
     pub(crate) fn replace_annotated(&mut self, items: Vec<ResponseItemEnvelope>) {
+        self.user_message_revision = self.user_message_revision.saturating_add(1);
+        if let Some(review_history) = &mut self.review_history {
+            review_history.reset(items.iter().map(|item| &item.item).filter(|item| {
+                !matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "user" && is_contextual_user_message_content(content))
+            }));
+        }
+        self.items = Arc::new(items);
+        self.history_version = self.history_version.saturating_add(1);
+        self.world_state_baseline = None;
+    }
+
+    /// Compaction changes the model's history without changing the user's authorization.
+    pub(crate) fn replace_compacted(&mut self, items: Vec<ResponseItemEnvelope>) {
+        if self.review_history.is_none() {
+            let mut retained = TranscriptHistory::new(self.history_version.saturating_add(1));
+            for item in self.raw_items().filter(|item| {
+                !matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "user" && is_contextual_user_message_content(content))
+            }) {
+                retained.record(item);
+            }
+            self.review_history = Some(retained);
+        }
         self.items = Arc::new(items);
         self.history_version = self.history_version.saturating_add(1);
         self.world_state_baseline = None;
@@ -473,55 +551,6 @@ impl ContextManager {
         normalize::strip_audio_when_unsupported(input_modalities, items);
     }
 
-    fn process_item(item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
-        let policy_with_serialization_budget = policy * 1.2;
-        match item {
-            ResponseItem::FunctionCallOutput {
-                id,
-                call_id,
-                name,
-                namespace,
-                output,
-                internal_chat_message_metadata_passthrough: metadata,
-            } => ResponseItem::FunctionCallOutput {
-                id: id.clone(),
-                call_id: call_id.clone(),
-                name: name.clone(),
-                namespace: namespace.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
-                internal_chat_message_metadata_passthrough: metadata.clone(),
-            },
-            ResponseItem::CustomToolCallOutput {
-                id,
-                call_id,
-                name,
-                output,
-                internal_chat_message_metadata_passthrough: metadata,
-            } => ResponseItem::CustomToolCallOutput {
-                id: id.clone(),
-                call_id: call_id.clone(),
-                name: name.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
-                internal_chat_message_metadata_passthrough: metadata.clone(),
-            },
-            ResponseItem::AdditionalTools { .. }
-            | ResponseItem::Message { .. }
-            | ResponseItem::AgentMessage { .. }
-            | ResponseItem::Reasoning { .. }
-            | ResponseItem::LocalShellCall { .. }
-            | ResponseItem::FunctionCall { .. }
-            | ResponseItem::ToolSearchCall { .. }
-            | ResponseItem::ToolSearchOutput { .. }
-            | ResponseItem::WebSearchCall { .. }
-            | ResponseItem::ImageGenerationCall { .. }
-            | ResponseItem::CustomToolCall { .. }
-            | ResponseItem::Compaction { .. }
-            | ResponseItem::CompactionTrigger { .. }
-            | ResponseItem::ContextCompaction { .. }
-            | ResponseItem::Other => item.clone(),
-        }
-    }
-
     /// Walk backward from a rollback cut and trim contiguous pre-turn context-update items.
     ///
     /// Returns the adjusted cut index after removing contextual developer/user items immediately
@@ -567,25 +596,6 @@ impl ContextManager {
             }
         }
         cut_idx
-    }
-}
-
-pub(crate) fn truncate_function_output_payload(
-    output: &FunctionCallOutputPayload,
-    policy: TruncationPolicy,
-) -> FunctionCallOutputPayload {
-    let body = match &output.body {
-        FunctionCallOutputBody::Text(content) => {
-            FunctionCallOutputBody::Text(truncate_text(content, policy))
-        }
-        FunctionCallOutputBody::ContentItems(items) => FunctionCallOutputBody::ContentItems(
-            truncate_function_output_items_with_policy(items, policy, estimate_audio_token_count),
-        ),
-    };
-
-    FunctionCallOutputPayload {
-        body,
-        success: output.success,
     }
 }
 

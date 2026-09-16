@@ -241,6 +241,10 @@ impl ConversationHistorySnapshot for AllContributors {
         0
     }
 
+    fn user_message_revision(&self) -> u64 {
+        0
+    }
+
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
         Box::new(std::iter::empty())
     }

@@ -262,7 +262,7 @@ pub(crate) struct ListSelectionView {
     active_tab_idx: Option<usize>,
     state: ScrollState,
     completion: Option<ViewCompletion>,
-    dismiss_after_child_accept: bool,
+    pub(super) dismiss_after_child_accept: bool,
     app_event_tx: AppEventSender,
     is_searchable: bool,
     search_query: String,
@@ -273,6 +273,7 @@ pub(crate) struct ListSelectionView {
     name_column_width: Option<usize>,
     filtered_indices: Vec<usize>,
     last_selected_actual_idx: Option<usize>,
+    rendered_item_count: std::cell::Cell<usize>,
     header: Box<dyn Renderable>,
     initial_selected_idx: Option<usize>,
     side_content: Box<dyn Renderable>,
@@ -408,6 +409,7 @@ impl ListSelectionView {
             name_column_width: params.name_column_width,
             filtered_indices: Vec::new(),
             last_selected_actual_idx: None,
+            rendered_item_count: std::cell::Cell::new(0),
             header,
             initial_selected_idx: params.initial_selected_idx,
             side_content: params.side_content,
@@ -1198,6 +1200,7 @@ impl Renderable for ListSelectionView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.rendered_item_count.set(0);
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -1317,7 +1320,7 @@ impl Renderable for ListSelectionView {
                 width: effective_rows_width.max(1),
                 height: list_area.height,
             };
-            match self.row_display {
+            let rendered_rows = match self.row_display {
                 SelectionRowDisplay::Wrapped => render_rows_with_col_width_mode(
                     render_area,
                     buf,
@@ -1337,6 +1340,7 @@ impl Renderable for ListSelectionView {
                     column_width,
                 ),
             };
+            self.rendered_item_count.set(rendered_rows.items);
         }
 
         // -- Side content (preview panel) --
@@ -1430,6 +1434,12 @@ impl Renderable for ListSelectionView {
                 hint.clone().dim().render(hint_area, buf);
             }
         }
+    }
+}
+
+impl ListSelectionView {
+    pub(crate) fn rendered_item_count(&self) -> usize {
+        self.rendered_item_count.get()
     }
 }
 

@@ -94,21 +94,11 @@ impl LocalThreadStore {
             }
             let rollout_path = match representation {
                 LineageRepresentation::Existing => rollout_path,
-                LineageRepresentation::PlainForReference => {
-                    let rollout_path = super::helpers::scoped_rollout_path(
-                        self.config.codex_home.clone(),
-                        rollout_path.as_path(),
-                        "Codex home",
-                    )?;
-                    codex_rollout::materialize_rollout_for_reference(rollout_path.as_path())
-                        .await
-                        .map_err(|err| ThreadStoreError::Internal {
-                            message: format!(
-                                "failed to materialize referenced rollout {}: {err}",
-                                rollout_path.display()
-                            ),
-                        })?
-                }
+                LineageRepresentation::PlainForReference => super::helpers::scoped_rollout_path(
+                    self.config.codex_home.clone(),
+                    rollout_path.as_path(),
+                    "Codex home",
+                )?,
             };
             let meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
                 .await
@@ -130,6 +120,26 @@ impl LocalThreadStore {
                     "source rollout is not paginated",
                 ));
             }
+            let rollout_path = match representation {
+                LineageRepresentation::Existing => rollout_path,
+                LineageRepresentation::PlainForReference
+                    if next_rollout_id.is_none() && meta.meta.history_base.is_none() =>
+                {
+                    // A newly shared standalone source must remain readable by older binaries.
+                    codex_rollout::materialize_rollout_for_reference(rollout_path.as_path())
+                        .await
+                        .map_err(|err| ThreadStoreError::Internal {
+                            message: format!(
+                                "failed to materialize referenced rollout {}: {err}",
+                                rollout_path.display()
+                            ),
+                        })?
+                }
+                // Already-shared compressed history requires a compatible reader regardless of
+                // new forks. Read it without publishing decoded copies into ancestors' folders;
+                // their owners may concurrently archive or unarchive those immutable files.
+                LineageRepresentation::PlainForReference => rollout_path,
+            };
             if let Some(end) = end {
                 validate_cutoff_bounds(requested_thread_id, rollout_path.as_path(), &end).await?;
             }
@@ -238,16 +248,22 @@ async fn validate_cutoff_bounds(
             "cutoff cannot include source session metadata",
         ));
     }
-    let file_len = tokio::fs::metadata(rollout_path)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!(
-                "failed to read lineage metadata {}: {err}",
-                rollout_path.display()
-            ),
-        })?
-        .len();
-    if end.end_byte_offset > file_len {
+    let path = rollout_path.to_path_buf();
+    let end_byte_offset = end.end_byte_offset;
+    let contains_prefix = tokio::task::spawn_blocking(move || {
+        codex_rollout::rollout_contains_prefix(&path, end_byte_offset)
+    })
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to join rollout prefix validation: {err}"),
+    })?
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!(
+            "failed to read lineage metadata {}: {err}",
+            rollout_path.display()
+        ),
+    })?;
+    if !contains_prefix {
         return Err(malformed_lineage(
             requested_thread_id,
             "cutoff byte offset is past the source rollout",

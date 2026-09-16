@@ -386,8 +386,33 @@ async fn replays_nested_archived_lineage_from_frozen_prefix() {
         turn_complete("child-turn"),
     ];
     assert_eq!(
-        serde_json::to_value(context.items).expect("serialize context"),
+        serde_json::to_value(&context.items).expect("serialize context"),
+        serde_json::to_value(&expected).expect("serialize expected context")
+    );
+    // The same frozen lineage must replay from compressed files, without materializing or
+    // accidentally including the archived root's records after the inherited cutoff.
+    for path in [&archived_root, &middle_path, &child_path] {
+        let input = std::fs::File::open(path).expect("open rollout");
+        let output = std::fs::File::create(path.with_extension("jsonl.zst"))
+            .expect("create compressed rollout");
+        zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+        std::fs::remove_file(path).expect("remove plain rollout");
+    }
+    let compressed_context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load compressed lineage model context");
+    assert_eq!(
+        serde_json::to_value(compressed_context.items).expect("serialize compressed context"),
         serde_json::to_value(expected).expect("serialize expected context")
+    );
+    assert!(
+        [archived_root, middle_path, child_path]
+            .iter()
+            .all(|path| !path.exists())
     );
 }
 

@@ -35,6 +35,41 @@ impl Session {
         }
     }
 
+    /// Injects hook context while classifying its actual receiving turn atomically.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn provenance and turn state updates must remain atomic"
+    )]
+    pub(crate) async fn inject_hook_context_if_running(
+        &self,
+        input: Vec<ResponseItem>,
+        source_turn_id: Option<&str>,
+    ) -> Result<(), Vec<ResponseItem>> {
+        let mut active = self.active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return Err(input);
+        };
+        let Some(task) = active_turn.task.as_ref() else {
+            return Err(input);
+        };
+        if source_turn_id != Some(task.turn_context.sub_id.as_str()) {
+            task.turn_context
+                .turn_metadata_state
+                .mark_root_turn_ambiguous();
+        }
+        self.input_queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                active_turn.turn_state.as_ref(),
+                input
+                    .into_iter()
+                    .map(ResponseItemEnvelope::new)
+                    .map(PendingTurnInput::ResponseItem)
+                    .collect(),
+            )
+            .await;
+        Ok(())
+    }
+
     /// Preserves trusted client provenance while items wait for an active turn.
     #[expect(
         clippy::await_holding_invalid_type,
@@ -51,6 +86,11 @@ impl Session {
             .collect::<Vec<_>>();
         let mut active = self.active_turn.lock().await;
         if let Some(active_turn) = active.as_mut() {
+            if let Some(task) = active_turn.task.as_ref() {
+                task.turn_context
+                    .turn_metadata_state
+                    .mark_root_turn_ambiguous();
+            }
             self.input_queue
                 .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                     active_turn.turn_state.as_ref(),
@@ -72,6 +112,7 @@ impl Session {
             && matches!(&item, ResponseItem::Message { role, .. } if role == "developer"))
         .then_some(CodexHarnessMetadata {
             client_authored: true,
+            ..Default::default()
         });
 
         ResponseItemEnvelope { item, metadata }
@@ -82,9 +123,7 @@ impl Session {
         turn_context: &TurnContext,
         items: Vec<ResponseItemEnvelope>,
     ) {
-        if !self.enabled(Feature::RetainClientDeveloperMessages)
-            || items.iter().all(|item| item.metadata.is_none())
-        {
+        if items.iter().all(|item| item.metadata.is_none()) {
             let items = items
                 .into_iter()
                 .map(ResponseItemEnvelope::into_item)

@@ -2,9 +2,9 @@ use codex_exec_server::HttpHeader;
 use http::header::WWW_AUTHENTICATE;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct InsufficientScopeChallenge {
-    pub(super) www_authenticate_header: String,
-    pub(super) required_scope: Option<String>,
+pub(crate) struct InsufficientScopeChallenge {
+    pub(crate) www_authenticate_header: String,
+    pub(crate) required_scope: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,7 +64,7 @@ impl BearerChallenge {
 
 /// Finds a Bearer insufficient-scope challenge among all `WWW-Authenticate`
 /// response header field values.
-pub(super) fn insufficient_scope_challenge(
+pub(crate) fn insufficient_scope_challenge(
     headers: &[HttpHeader],
 ) -> Option<InsufficientScopeChallenge> {
     headers

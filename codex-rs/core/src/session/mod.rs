@@ -201,6 +201,7 @@ use crate::config::PermissionProfileState;
 use crate::config::StartedNetworkProxy;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
+use crate::context_manager::HistoryReplacement;
 use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerSource;
@@ -477,28 +478,34 @@ const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyb
 
 impl Session {
     /// Spawn and initialize a new session.
-    pub(crate) async fn spawn(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
-        let parent_trace = match args.parent_trace {
-            Some(trace) => {
-                if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
-                    Some(trace)
-                } else {
-                    warn!("ignoring invalid thread spawn trace carrier");
-                    None
+    /// Hide the concrete startup future from callers while keeping initialization lazy.
+    #[inline(never)]
+    pub(crate) fn spawn(
+        args: SessionSpawnArgs,
+    ) -> BoxFuture<'static, CodexResult<(Arc<Self>, SessionIo)>> {
+        Box::pin(async move {
+            let parent_trace = match args.parent_trace {
+                Some(trace) => {
+                    if codex_otel::context_from_w3c_trace_context(&trace).is_some() {
+                        Some(trace)
+                    } else {
+                        warn!("ignoring invalid thread spawn trace carrier");
+                        None
+                    }
                 }
+                None => None,
+            };
+            let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
+            if let Some(trace) = parent_trace.as_ref() {
+                let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
             }
-            None => None,
-        };
-        let thread_spawn_span = info_span!("thread_spawn", otel.name = "thread_spawn");
-        if let Some(trace) = parent_trace.as_ref() {
-            let _ = set_parent_from_w3c_trace_context(&thread_spawn_span, trace);
-        }
-        Self::spawn_internal(SessionSpawnArgs {
-            parent_trace,
-            ..args
+            Self::spawn_internal(SessionSpawnArgs {
+                parent_trace,
+                ..args
+            })
+            .instrument(thread_spawn_span)
+            .await
         })
-        .instrument(thread_spawn_span)
-        .await
     }
 
     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
@@ -667,6 +674,10 @@ impl Session {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
+        // Intentionally resolve `enabled` and `use_history_notes_extension` only at
+        // thread startup. Both activation flags stay fixed for this thread runtime,
+        // even if the selected model changes later.
+        token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
         let configured_config = Arc::clone(&config);
         let multi_agent_version = config.multi_agent_version_override().or_else(|| {
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)
@@ -1321,6 +1332,26 @@ impl Session {
         }
     }
 
+    /// Render the request copy without changing instructions persisted or inherited by forks.
+    pub(crate) async fn get_prompt_base_instructions(&self) -> BaseInstructions {
+        let config = self.get_config().await;
+        let instructions = self.get_base_instructions().await;
+        if !config.update_plan_enabled
+            && config.model_catalog.is_none()
+            && matches!(
+                instructions.provenance,
+                Some(BaseInstructionsProvenance::Model { .. })
+            )
+        {
+            BaseInstructions {
+                text: crate::context::without_update_plan_instructions(&instructions.text),
+                ..instructions
+            }
+        } else {
+            instructions
+        }
+    }
+
     // Merges connector IDs into the session-level explicit connector selection.
     #[tracing::instrument(
         level = "trace",
@@ -1541,7 +1572,11 @@ impl Session {
             .collect();
         {
             let mut state = self.state.lock().await;
-            state.replace_annotated_history(history, reference_context_item);
+            state.replace_annotated_history(
+                history,
+                reference_context_item,
+                HistoryReplacement::Reset,
+            );
             if let Some(world_state) = world_state_baseline {
                 state.history.set_world_state_baseline(world_state);
             }
@@ -1657,6 +1692,9 @@ impl Session {
                 previous_permission_profile != updated_permission_profile;
             let mcp_inputs_changed =
                 self.mcp_inputs_differ(&state.session_configuration, &updated, &updates);
+            let root_service_tier_changed = updated.parent_thread_id.is_none()
+                && state.session_configuration.step_settings.service_tier
+                    != updated.step_settings.service_tier;
             if mcp_inputs_changed {
                 self.mark_mcp_runtime_dirty();
             }
@@ -1673,6 +1711,15 @@ impl Session {
                     .update_thread_config(&environment_config);
             }
             state.session_configuration = updated;
+            if root_service_tier_changed {
+                self.services.agent_control.set_root_service_tier(
+                    state
+                        .session_configuration
+                        .step_settings
+                        .service_tier
+                        .clone(),
+                );
+            }
             let new_config = notify_config_contributors
                 .then(|| self.build_effective_session_config(&state.session_configuration));
             let commit = SessionSettingsCommit {
@@ -3301,12 +3348,28 @@ impl Session {
         Ok(world_state)
     }
 
-    /// Captures one request-scoped view of dynamic state.
+    /// Retains the step captured for execution.
+    pub(crate) async fn set_last_known_step_context(&self, step_context: &Arc<StepContext>) {
+        let turn_state = {
+            let active_turn = self.active_turn.lock().await;
+            active_turn.as_ref().and_then(|active_turn| {
+                active_turn
+                    .task
+                    .as_ref()
+                    .filter(|task| task.turn_context.sub_id == step_context.turn.sub_id)
+                    .map(|_| Arc::clone(&active_turn.turn_state))
+            })
+        };
+        if let Some(turn_state) = turn_state {
+            turn_state.lock().await.last_known_step_context = Some(Arc::clone(step_context));
+        }
+    }
+
+    /// Captures one request-scoped view of dynamic state and retains it for the active turn.
     ///
     /// This may refresh filesystem-derived state. Normal turns should call it only from
     /// `run_turn` and pass the result down; standalone request or history boundaries may capture
-    /// their own step.
-    #[tracing::instrument(name = "step_context.capture", level = "info", skip_all)]
+    /// their own step. Use speculative capture for a step that may not execute.
     pub(crate) async fn capture_step_context(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -3326,9 +3389,53 @@ impl Session {
         cancellation_token: &CancellationToken,
         required_servers: &[String],
     ) -> CodexResult<Arc<StepContext>> {
+        let step_context = self
+            .capture_step_context_inner(turn_context, cancellation_token, required_servers)
+            .await?;
+        self.set_last_known_step_context(&step_context).await;
+        Ok(step_context)
+    }
+
+    /// Prepares a candidate step without replacing the active turn's retained context.
+    /// The caller must retain it explicitly if it is selected for execution.
+    async fn capture_speculative_step_context(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+    ) -> CodexResult<Arc<StepContext>> {
+        self.capture_step_context_inner(
+            turn_context,
+            cancellation_token,
+            /*required_servers*/ &[],
+        )
+        .await
+    }
+
+    #[tracing::instrument(name = "step_context.capture", level = "info", skip_all)]
+    async fn capture_step_context_inner(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        cancellation_token: &CancellationToken,
+        required_servers: &[String],
+    ) -> CodexResult<Arc<StepContext>> {
         // Capture once before asynchronous planning; all request consumers
         // retain this immutable settings version even if the turn is updated.
-        let settings = turn_context.current_settings.load_full();
+        let mut settings = turn_context.current_settings.load_full();
+        if matches!(
+            turn_context.session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ) {
+            let root_service_tier = self.services.agent_control.root_service_tier();
+            if settings.selected().service_tier != root_service_tier {
+                let mut selected = settings.selected().clone();
+                selected.service_tier = root_service_tier;
+                settings = Arc::new(ResolvedStepSettings::new(
+                    Arc::new(selected),
+                    Arc::clone(&settings.model_info),
+                    self.features.enabled(Feature::FastMode),
+                ));
+            }
+        }
         let token_budget = token_budget::resolve_token_budget(
             turn_context.configured_token_budget.as_ref(),
             turn_context.use_model_token_budget_defaults,
@@ -3403,13 +3510,14 @@ impl Session {
         });
         extension_data.insert(selected_plugins.clone());
         turn_context.extension_data.insert(selected_plugins);
-        // Tool planning still uses the admitted turn. Migrating it to the
-        // captured model is a separate step from diagnostic activation.
+        // Tool availability still follows the admitted turn; the async message
+        // description comes from the captured step model.
         let tool_router = turn::built_tools(
             self.as_ref(),
             turn_context.as_ref(),
             // TODO(CDXENT-441): use the step scoped model
             turn_context.model_info(),
+            settings.model_info.model_messages.as_ref(),
             &environments,
             &mcp,
             &extension_data,
@@ -3569,11 +3677,18 @@ impl Session {
                 .map(|id| id.to_string()),
             window_id: Some(metadata.window_ids.window_id.to_string()),
         };
+        // Wait for accepted updates to finish persisting, then keep later updates from
+        // overtaking the current settings snapshot while its checkpoint is written.
+        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
         // Compaction starts a new history window, so its WorldState baseline must be full.
         let mut world_state_item = None;
         {
             let mut state = self.state.lock().await;
-            state.replace_annotated_history(items, reference_context_item.clone());
+            state.replace_annotated_history(
+                items,
+                reference_context_item.clone(),
+                HistoryReplacement::Compaction,
+            );
             if let Some(world_state) = world_state_baseline {
                 let snapshot = world_state.snapshot();
                 world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
@@ -3581,17 +3696,19 @@ impl Session {
             }
         }
 
-        self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-            .await;
+        let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
         // Persist the baseline after the replacement history that established it.
         if let Some(world_state_item) = world_state_item {
-            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
-                .await;
+            rollout_items.push(RolloutItem::WorldState(world_state_item));
         }
         if let Some(turn_context_item) = reference_context_item {
-            self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
-                .await;
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item));
         }
+        // The frozen turn context must not override current settings in persisted metadata.
+        rollout_items.push(RolloutItem::EventMsg(
+            thread_settings::applied_event(self).await,
+        ));
+        self.persist_rollout_items(&rollout_items).await;
         {
             let mut state = self.state.lock().await;
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
@@ -3712,11 +3829,10 @@ impl Session {
             .plugins_manager
             .plugins_for_config(&turn_context.config.plugins_config_input())
             .await;
-        let features = turn_context.config.features.get();
-        let recommended_plugin_candidates = if features.enabled(Feature::Apps)
-            && features.enabled(Feature::Plugins)
-            && (features.enabled(Feature::ToolSuggest)
-                || features.enabled(Feature::RecommendedPlugins))
+        let recommended_plugin_candidates = if turn_context
+            .config
+            .features
+            .plugin_recommendations_enabled()
         {
             let auth = self.services.auth_manager.auth().await;
             let plugins_config = turn_context.config.plugins_config_input();

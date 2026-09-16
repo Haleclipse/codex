@@ -69,7 +69,7 @@ impl ChatWidget {
             startup_offset
                 .saturating_add(draft.cursor)
                 .saturating_add(cursor_adjustment)
-        } else if existing_has_content {
+        } else if existing_has_content || !startup_has_content {
             existing_cursor
         } else {
             self.restore_composer_state(Self::composer_state_from_user_message(
@@ -118,7 +118,8 @@ impl ChatWidget {
     }
 
     pub(crate) fn submit_initial_user_message_if_pending(&mut self) {
-        if self.suppress_initial_user_message_submit {
+        if self.suppress_initial_user_message_submit || self.input_queue.rate_limit_recovery_pending
+        {
             return;
         }
         #[cfg(any(target_os = "windows", test))]

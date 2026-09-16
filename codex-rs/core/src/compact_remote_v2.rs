@@ -260,6 +260,8 @@ async fn run_remote_compact_task_inner_impl(
             if !should_retry_with_current_model(&error) {
                 return Err(error);
             }
+            sess.set_last_known_step_context(fallback_step_context)
+                .await;
             let fallback_turn_context = &fallback_step_context.turn;
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
@@ -367,11 +369,12 @@ struct RemoteCompactionV2Output {
 
 async fn run_remote_compaction_request_v2(
     sess: &Session,
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     responses_metadata: &CodexResponsesMetadata,
 ) -> CodexResult<RemoteCompactionV2Output> {
+    let turn_context = &step_context.turn;
     let max_retries = turn_context
         .provider
         .info()
@@ -386,7 +389,7 @@ async fn run_remote_compaction_request_v2(
                 &turn_context.session_telemetry,
                 turn_context.reasoning_effort().cloned(),
                 turn_context.reasoning_summary(),
-                turn_context.config.service_tier.clone(),
+                step_context.settings.service_tier.clone(),
                 responses_metadata,
                 &InferenceTraceContext::disabled(),
             )
@@ -881,6 +884,7 @@ mod tests {
                     None,
                     Some(CodexHarnessMetadata {
                         client_authored: true,
+                        ..Default::default()
                     }),
                     Some(CodexHarnessMetadata::default()),
                     None,
@@ -904,6 +908,7 @@ mod tests {
                         item: client.clone(),
                         metadata: Some(CodexHarnessMetadata {
                             client_authored: true,
+                            ..Default::default()
                         }),
                     },
                 );

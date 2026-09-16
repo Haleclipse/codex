@@ -347,6 +347,7 @@ fn runtime_response(
         runtime::CellEvent::Yielded { content_items } => Ok(RuntimeResponse::Yielded {
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
+            code_mode_host_duration: None,
         }),
         runtime::CellEvent::Completed {
             content_items,
@@ -355,10 +356,12 @@ fn runtime_response(
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
             error_text,
+            code_mode_host_duration: None,
         }),
         runtime::CellEvent::Terminated { content_items } => Ok(RuntimeResponse::Terminated {
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
+            code_mode_host_duration: None,
         }),
         runtime::CellEvent::Pending { .. } => {
             Err("cell returned a pending frontier unexpectedly".to_string())
@@ -391,6 +394,7 @@ fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
         error_text: Some(format!("exec cell {cell_id} not found")),
         cell_id,
         content_items: Vec::new(),
+        code_mode_host_duration: None,
     }
 }
 

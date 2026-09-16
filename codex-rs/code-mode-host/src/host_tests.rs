@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
+use std::time::Instant;
 
 use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
 use codex_code_mode_protocol::host::Capability;
@@ -594,6 +595,7 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
                 request: execute_request("text(\"hello\");"),
             },
             CancellationToken::new(),
+            Instant::now(),
         )
         .await;
 

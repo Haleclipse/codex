@@ -19,6 +19,7 @@ pub(crate) enum KeymapContext {
     Editor,
     VimNormal,
     VimOperator,
+    VimSearch,
     VimTextObject,
     Pager,
     List,
@@ -35,6 +36,7 @@ impl KeymapContext {
             Self::Editor => "editor",
             Self::VimNormal => "vim_normal",
             Self::VimOperator => "vim_operator",
+            Self::VimSearch => "vim_search",
             Self::VimTextObject => "vim_text_object",
             Self::Pager => "pager",
             Self::List => "list",
@@ -46,7 +48,7 @@ impl KeymapContext {
     pub(crate) const fn allows_plain_chord_prefix(self) -> bool {
         matches!(
             self,
-            Self::VimNormal | Self::VimOperator | Self::VimTextObject
+            Self::VimNormal | Self::VimOperator | Self::VimSearch | Self::VimTextObject
         )
     }
 
@@ -57,7 +59,9 @@ impl KeymapContext {
 
         matches!(
             (self, other),
-            (Self::List, Self::Approval)
+            (Self::VimSearch, Self::VimNormal | Self::VimOperator)
+                | (Self::VimNormal | Self::VimOperator, Self::VimSearch)
+                | (Self::List, Self::Approval)
                 | (Self::Approval, Self::List)
                 | (Self::List, Self::Agents)
                 | (Self::Agents, Self::List)
@@ -75,7 +79,11 @@ impl KeymapContext {
     const fn is_main_editor(self) -> bool {
         matches!(
             self,
-            Self::Editor | Self::VimNormal | Self::VimOperator | Self::VimTextObject
+            Self::Editor
+                | Self::VimNormal
+                | Self::VimOperator
+                | Self::VimSearch
+                | Self::VimTextObject
         )
     }
 }
@@ -304,6 +312,7 @@ define_runtime_action_bindings! {
         start_change_operator,
         cancel_operator,
     ],
+    "vim_search" => VimSearch, vim_search, vim_search [forward, backward, next, previous],
     "vim_operator" => VimOperator, vim_operator, vim_operator [
         delete_line,
         yank_line,

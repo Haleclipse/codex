@@ -1,5 +1,5 @@
-//! Handles persistent thread-settings updates shared by standalone settings
-//! submissions and turn-input submission.
+//! Handles persistent thread-settings updates and serializes their persistence
+//! with compaction checkpoints.
 
 use super::session::Session;
 use super::session::SessionSettingsUpdate;
@@ -13,6 +13,7 @@ use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use std::sync::Arc;
+use tokio::sync::SemaphorePermit;
 
 /// Applies standalone thread settings and reports invalid overrides through the
 /// normal event stream.
@@ -75,12 +76,22 @@ pub(super) fn prepare_update(overrides: ThreadSettingsOverrides) -> SessionSetti
     }
 }
 
+/// Acquires the shared permit before capturing or changing persistent settings.
+pub(super) async fn acquire_persistence_lock(session: &Session) -> SemaphorePermit<'_> {
+    session
+        .thread_settings_persistence
+        .acquire()
+        .await
+        .unwrap_or_else(|_| unreachable!("thread settings persistence semaphore is never closed"))
+}
+
 /// Applies persistent settings and emits the resulting thread-owned snapshot.
 pub(super) async fn apply_update(
     session: &Session,
     submission_id: String,
     updates: SessionSettingsUpdate,
 ) -> ConstraintResult<()> {
+    let _settings_guard = acquire_persistence_lock(session).await;
     let commit = session.update_settings(updates).await?;
     emit_applied(session, submission_id, commit.snapshot).await;
     Ok(())
@@ -93,6 +104,7 @@ pub(super) async fn emit_applied(
     snapshot: ThreadSettingsSnapshot,
 ) {
     let msg = EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
+        thread_id: Some(session.thread_id()),
         thread_settings: snapshot,
     });
     session
@@ -103,9 +115,10 @@ pub(super) async fn emit_applied(
         .await;
 }
 
-/// Builds the current thread-settings event for synthesized fork history.
+/// Builds a current thread-owned snapshot for fork and compaction persistence.
 pub(super) async fn applied_event(session: &Session) -> EventMsg {
     EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
+        thread_id: Some(session.thread_id()),
         thread_settings: session.thread_settings_snapshot().await,
     })
 }

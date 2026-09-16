@@ -3,6 +3,7 @@ use anyhow::Result;
 use chrono::Utc;
 use codex_config::config_toml::RealtimeWsMode;
 use codex_config::config_toml::RealtimeWsVersion;
+use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_core::test_support::auth_manager_from_auth;
 use codex_history::InitialHistory;
@@ -20,6 +21,7 @@ use codex_protocol::protocol::ConversationStartTransport;
 use codex_protocol::protocol::ConversationTextParams;
 use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
@@ -31,6 +33,7 @@ use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::RealtimeTranscriptEntry;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::WebSocketConnectionConfig;
@@ -56,6 +59,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use test_case::test_case;
+use test_case::test_matrix;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
@@ -509,12 +513,23 @@ async fn conversation_start_defaults_to_v2_and_gpt_realtime_1_5() -> Result<()> 
     Ok(())
 }
 
+#[test_matrix(
+    [ConversationStartTransport::Websocket, ConversationStartTransport::ExistingCall { call_id: "rtc_existing".to_string() }],
+    [None, Some(ThreadSource::User)]
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conversation_existing_call_attaches_without_creating_another_call() -> Result<()> {
+async fn conversation_websocket_transports_send_codex_headers_without_creating_a_call(
+    transport: ConversationStartTransport,
+    thread_source: Option<ThreadSource>,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let realtime_server = start_websocket_server(vec![vec![vec![]]]).await;
+    let realtime_server = start_websocket_server(vec![vec![vec![json!({
+        "type": "session.started",
+        "session": { "id": "rtc_existing", "instructions": "backend prompt" }
+    })]]])
+    .await;
     let realtime_ws_base_url = realtime_server.uri().to_string();
     let mut builder = test_codex().with_config(move |config| {
         config.experimental_realtime_ws_backend_prompt = Some("backend prompt".to_string());
@@ -522,8 +537,17 @@ async fn conversation_existing_call_attaches_without_creating_another_call() -> 
         config.realtime.session_type = RealtimeWsMode::Transcription;
     });
     let test = builder.build_with_auto_env(&server).await?;
+    let conversation = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            thread_source: thread_source.clone(),
+            environments: Some(test.codex.config_snapshot().await.environments.environments),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+    let codex = &conversation.thread;
 
-    test.codex
+    codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
             client_managed_handoffs: false,
             delegation_ack_filler: None,
@@ -541,33 +565,62 @@ async fn conversation_existing_call_attaches_without_creating_another_call() -> 
             realtime_end_instructions: None,
             prompt: None,
             realtime_session_id: None,
-            transport: Some(ConversationStartTransport::ExistingCall {
-                call_id: "rtc_existing".to_string(),
-            }),
+            transport: Some(transport.clone()),
             version: Some(RealtimeConversationVersion::V3),
             voice: None,
         }))
         .await?;
 
-    let started = wait_for_event_match(&test.codex, |msg| match msg {
+    let started = wait_for_event_match(codex, |msg| match msg {
         EventMsg::RealtimeConversationStarted(started) => Some(Ok(started.clone())),
         EventMsg::Error(err) => Some(Err(err.clone())),
         _ => None,
     })
     .await
-    .expect("existing call sideband attachment failed");
+    .expect("realtime websocket connection failed");
+    let (expected_uri, expected_realtime_session_id) = match transport {
+        ConversationStartTransport::Websocket => (
+            "/v1/live?model=gpt-live-1-codex",
+            Some(conversation.thread_id.to_string()),
+        ),
+        ConversationStartTransport::ExistingCall { .. } => ("/v1/live/rtc_existing", None),
+        ConversationStartTransport::Webrtc { .. } => unreachable!("websocket transports only"),
+    };
     assert_eq!(
         (started.version, started.realtime_session_id),
-        (RealtimeConversationVersion::V3, None)
+        (
+            RealtimeConversationVersion::V3,
+            expected_realtime_session_id.clone()
+        )
     );
 
     let handshake = realtime_server.single_handshake();
-    assert_eq!(handshake.uri(), "/v1/live/rtc_existing");
+    assert_eq!(handshake.uri(), expected_uri);
     assert_eq!(
         handshake.header("authorization").as_deref(),
         Some("Bearer dummy")
     );
-    assert_eq!(handshake.header("x-session-id"), None);
+    assert_eq!(
+        handshake.header("x-session-id"),
+        expected_realtime_session_id
+    );
+    assert_eq!(
+        (
+            handshake.header("session-id"),
+            handshake.header("thread-id")
+        ),
+        (
+            Some(conversation.session_configured.session_id.to_string()),
+            Some(conversation.thread_id.to_string()),
+        )
+    );
+    assert_eq!(
+        handshake
+            .header("x-codex-turn-metadata")
+            .map(|value| serde_json::from_str::<Value>(&value))
+            .transpose()?,
+        thread_source.map(|source| json!({ "thread_source": source }))
+    );
     assert!(
         server
             .received_requests()
@@ -575,25 +628,36 @@ async fn conversation_existing_call_attaches_without_creating_another_call() -> 
             .context("mock server should record requests")?
             .iter()
             .all(|request| !request.url.path().ends_with("/realtime/calls")),
-        "attaching to an existing call must not create another realtime call"
+        "websocket transports must not create another realtime call over HTTP"
     );
 
-    test.codex.submit(Op::RealtimeConversationClose).await?;
-    let _closed = wait_for_event_match(&test.codex, |msg| match msg {
+    codex.submit(Op::RealtimeConversationClose).await?;
+    let _closed = wait_for_event_match(codex, |msg| match msg {
         EventMsg::RealtimeConversationClosed(closed) => Some(closed.clone()),
         _ => None,
     })
     .await;
+    codex.shutdown_and_wait().await?;
+    test.codex.shutdown_and_wait().await?;
     realtime_server.shutdown().await;
     Ok(())
 }
 
-#[test_case(None, "gpt-live-1-codex"; "default model")]
-#[test_case(Some("session-override-model"), "session-override-model"; "explicit model")]
+#[test_case(None, "gpt-live-1-codex", None, None; "default model without source")]
+#[test_case(Some("session-override-model"), "session-override-model", None, None; "explicit model without source")]
+#[test_case(None, "gpt-live-1-codex", Some(ThreadSource::User), Some("user".to_string()); "user source")]
+#[test_case(None, "gpt-live-1-codex", Some(ThreadSource::Feature("voice_chat".to_string())), Some("voice_chat".to_string()); "voice chat source")]
+#[test_case(None, "gpt-live-1-codex", Some(ThreadSource::Feature("realtime_voice".to_string())), Some("realtime_voice".to_string()); "realtime voice source")]
+#[test_case(None, "gpt-live-1-codex", Some(ThreadSource::GuardianReview), Some("guardian_review".to_string()); "child shares parent session")]
+#[test_case(None, "gpt-live-1-codex", Some(ThreadSource::Feature("x".repeat(/*n*/ 256))), Some("x".repeat(/*n*/ 256)); "source at byte limit")]
+#[test_case(None, "gpt-live-1-codex", Some(ThreadSource::Feature("x".repeat(/*n*/ 257))), None; "oversized source omitted")]
+#[test_case(None, "gpt-live-1-codex", Some(ThreadSource::Feature("é\r\n\"".to_string())), Some("é\r\n\"".to_string()); "source escaped for headers")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
     model: Option<&str>,
     expected_model: &str,
+    thread_source: Option<ThreadSource>,
+    expected_source: Option<String>,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -626,7 +690,34 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
         });
     let test = builder.build_with_auto_env(&server).await?;
 
-    test.codex
+    let mut options = StartThreadOptions {
+        thread_source: thread_source.clone(),
+        environments: Some(test.codex.config_snapshot().await.environments.environments),
+        ..StartThreadOptions::new(test.config.clone())
+    };
+    let conversation = if thread_source == Some(ThreadSource::GuardianReview) {
+        options.session_source = Some(SessionSource::Internal(InternalSessionSource::Guardian));
+        let child = test
+            .thread_manager
+            .spawn_internal_session(test.session_configured.thread_id, options)
+            .await?;
+        assert_eq!(
+            child.session_configured.session_id,
+            test.session_configured.session_id
+        );
+        assert_ne!(
+            child.session_configured.session_id.to_string(),
+            child.session_configured.thread_id.to_string()
+        );
+        child
+    } else {
+        test.thread_manager.start_thread(options).await?
+    };
+    let codex = &conversation.thread;
+    assert_eq!(codex.config_snapshot().await.thread_source, thread_source);
+    let requested_realtime_session_id = Uuid::new_v4().to_string();
+
+    codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
             client_managed_handoffs: false,
             delegation_ack_filler: None,
@@ -639,11 +730,14 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
             model: model.map(str::to_string),
             output_modality: RealtimeOutputModality::Audio,
             include_startup_context: false,
-            initial_items: Vec::new(),
+            initial_items: vec![ConversationTextParams {
+                text: "private voice transcript".to_string(),
+                role: ConversationTextRole::User,
+            }],
             realtime_start_instructions: None,
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
-            realtime_session_id: None,
+            realtime_session_id: Some(requested_realtime_session_id.clone()),
             transport: Some(ConversationStartTransport::Webrtc {
                 sdp: "v=offer\r\n".to_string(),
             }),
@@ -652,7 +746,7 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
         }))
         .await?;
 
-    let created = wait_for_event_match(&test.codex, |msg| match msg {
+    let created = wait_for_event_match(codex, |msg| match msg {
         EventMsg::RealtimeConversationSdp(created) => Some(Ok(created.clone())),
         EventMsg::Error(err) => Some(Err(err.clone())),
         _ => None,
@@ -662,8 +756,10 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
     assert_eq!(created.sdp, "v=answer\r\n");
 
     let request = capture.single_request();
-    let expected_session_id = test.session_configured.session_id.to_string();
-    let expected_thread_id = test.session_configured.thread_id.to_string();
+    let expected_session_id = conversation.session_configured.session_id.to_string();
+    let expected_thread_id = conversation.session_configured.thread_id.to_string();
+    assert_ne!(requested_realtime_session_id, expected_session_id);
+    assert_ne!(requested_realtime_session_id, expected_thread_id);
     assert_eq!(
         (
             request.url.path(),
@@ -680,6 +776,14 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
                 .headers
                 .get("thread-id")
                 .and_then(|value| value.to_str().ok()),
+            request
+                .headers
+                .get("x-session-id")
+                .and_then(|value| value.to_str().ok()),
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
         ),
         (
             "/backend-api/codex/realtime/calls",
@@ -687,8 +791,25 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
             Some("quicksilver=v2"),
             Some(expected_session_id.as_str()),
             Some(expected_thread_id.as_str()),
+            Some(requested_realtime_session_id.as_str()),
+            Some("Bearer Access Token"),
         )
     );
+    let metadata = request
+        .headers
+        .get("x-codex-turn-metadata")
+        .map(|value| serde_json::from_slice::<Value>(value.as_bytes()))
+        .transpose()?;
+    // A continuous Voice call has no single backing turn. Only the saved source belongs here.
+    assert_eq!(
+        metadata,
+        expected_source.map(|source| json!({ "thread_source": source }))
+    );
+    for value in request.headers.values() {
+        let value = value.to_str()?;
+        assert!(!value.contains("backend prompt"));
+        assert!(!value.contains("private voice transcript"));
+    }
     let body: Value =
         serde_json::from_slice(&request.body).context("backend body should be JSON")?;
     assert_eq!(
@@ -704,12 +825,14 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
         })
     );
 
-    test.codex.submit(Op::RealtimeConversationClose).await?;
-    let _closed = wait_for_event_match(&test.codex, |msg| match msg {
+    codex.submit(Op::RealtimeConversationClose).await?;
+    let _closed = wait_for_event_match(codex, |msg| match msg {
         EventMsg::RealtimeConversationClosed(closed) => Some(closed.clone()),
         _ => None,
     })
     .await;
+    codex.shutdown_and_wait().await?;
+    test.codex.shutdown_and_wait().await?;
     realtime_server.shutdown().await;
     Ok(())
 }

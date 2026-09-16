@@ -109,6 +109,9 @@ impl CodeModeExecuteHandler {
             .initial_response()
             .await
             .map_err(FunctionCallError::RespondToModel)?;
+        if let Some(code_mode_host_duration) = response.code_mode_host_duration() {
+            telemetry.record_code_mode_host_duration(code_mode_host_duration);
+        }
         // Record the raw runtime boundary. The model-visible custom-tool output
         // is produced by `handle_runtime_response` and later linked through
         // `CodeCell.output_item_ids` in the reduced trace.
@@ -131,7 +134,10 @@ impl CodeModeExecuteHandler {
                 });
         }
         exec.session.services.elicitations.wait_until_clear().await;
-        handle_runtime_response(&exec, response, args.max_output_tokens, started_at)
+        let wall_time = response
+            .code_mode_host_duration()
+            .unwrap_or_else(|| started_at.elapsed());
+        handle_runtime_response(&exec, response, args.max_output_tokens, wall_time)
             .await
             .map_err(FunctionCallError::RespondToModel)
     }

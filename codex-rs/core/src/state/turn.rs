@@ -21,6 +21,7 @@ use tokio::sync::oneshot;
 use crate::agent::control::AgentExecutionGuard;
 use crate::mcp_tool_call::McpToolApprovalMetadata;
 use crate::session::TurnInputQueue;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -100,6 +101,9 @@ pub(crate) struct TurnState {
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
+    /// The last step captured for execution or selected from a speculative fallback.
+    /// Remains absent until a step is captured; standalone local compaction has no step.
+    pub(crate) last_known_step_context: Option<Arc<StepContext>>,
 }
 
 pub(crate) struct PendingRequestPermissions {

@@ -20,9 +20,9 @@ use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::RuntimePathPrepends;
 #[cfg(unix)]
 use crate::tools::runtimes::apply_zsh_fork_path_prepend;
-use crate::tools::runtimes::disable_powershell_profile_for_elevated_windows_sandbox;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
+use crate::tools::runtimes::prepare_powershell_command_for_elevated_windows_sandbox;
 use crate::tools::runtimes::zsh_fork;
 use crate::tools::sandboxing::Approvable;
 use crate::tools::sandboxing::ApprovalAction;
@@ -35,6 +35,8 @@ use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::unified_exec::NoopSpawnLifecycle;
+use crate::unified_exec::TerminalPermissions;
+use crate::unified_exec::TerminalSandboxSource;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -106,7 +108,7 @@ pub struct UnifiedExecRuntime<'a> {
 pub(crate) struct UnifiedExecAttempt {
     pub(crate) process: UnifiedExecProcess,
     pub(crate) metrics_sidecar: Option<PluginMetricsSidecar>,
-    pub(crate) escalated: bool,
+    pub(crate) permissions: TerminalPermissions,
 }
 
 fn unified_exec_options(
@@ -399,11 +401,12 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                 *script = format!("{exports}\n{script}");
             }
         }
-        let command = disable_powershell_profile_for_elevated_windows_sandbox(
+        let command = prepare_powershell_command_for_elevated_windows_sandbox(
             &command,
             Some(&req.shell_type),
             attempt.sandbox_requested,
             attempt.windows_sandbox_level,
+            environment_is_remote,
         );
         let command = if matches!(req.shell_type, ShellType::PowerShell) {
             prefix_powershell_script_with_utf8(&command)
@@ -414,6 +417,22 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
             .as_ref()
             .map(PluginMetricsSidecar::additional_permissions);
         let additional_permissions = merge_permission_profiles(
+            req.additional_permissions.as_ref(),
+            sidecar_permissions.as_ref(),
+        );
+        let permissions = TerminalPermissions::for_launch(
+            &req.turn_environment,
+            &ctx.step_context.turn,
+            if self.uses_executor_managed_process_sandbox(req) {
+                TerminalSandboxSource::Executor
+            } else {
+                TerminalSandboxSource::Native
+            },
+            if attempt.is_escalated() {
+                SandboxPermissions::RequireEscalated
+            } else {
+                SandboxPermissions::UseDefault
+            },
             req.additional_permissions.as_ref(),
             sidecar_permissions.as_ref(),
         );
@@ -476,7 +495,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
                     return Ok(UnifiedExecAttempt {
                         process,
                         metrics_sidecar,
-                        escalated: attempt.is_escalated(),
+                        permissions,
                     });
                 }
                 None => {
@@ -521,7 +540,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecAttempt> for UnifiedExecRunt
         Ok(UnifiedExecAttempt {
             process,
             metrics_sidecar,
-            escalated: attempt.is_escalated(),
+            permissions,
         })
     }
 }

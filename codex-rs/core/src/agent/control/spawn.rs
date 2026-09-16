@@ -19,7 +19,7 @@ use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_utils_path_uri::PathUri;
 
-const AGENT_NAMES: &str = include_str!("../agent_names.txt");
+const AGENT_NAMES: &str = include_str!("../../../assets/agent/agent_names.txt");
 
 struct SpawnAgentThreadInheritance {
     environments: Option<TurnEnvironmentSnapshot>,
@@ -415,6 +415,7 @@ impl AgentControl {
                     CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
                 })?;
         }
+        config.service_tier = self.root_service_tier();
         if let Some(model) = stored_model {
             config.model = Some(model);
         }
@@ -881,8 +882,11 @@ impl AgentControl {
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
             if multi_agent_version == MultiAgentVersion::V2 {
                 let parent_config = parent_thread.session.get_config().await;
-                let parent_usage_hints =
-                    resolve_usage_hints(&parent_config.multi_agent_v2, /*catalog*/ None);
+                let parent_usage_hints = resolve_usage_hints(
+                    &parent_config.multi_agent_v2,
+                    /*catalog*/ None,
+                    !parent_config.update_plan_enabled,
+                );
                 [parent_usage_hints.root, parent_usage_hints.subagent]
                     .into_iter()
                     .flatten()
@@ -1040,7 +1044,12 @@ impl AgentControl {
                 .as_ref()
                 .map(|hints| hints.subagent.clone())
                 .unwrap_or_else(|| {
-                    resolve_usage_hints(&config.multi_agent_v2, /*catalog*/ None).subagent
+                    resolve_usage_hints(
+                        &config.multi_agent_v2,
+                        /*catalog*/ None,
+                        !config.update_plan_enabled,
+                    )
+                    .subagent
                 })
         {
             let subagent_usage_hint_message = ContextualUserFragment::into(subagent_usage_hint);

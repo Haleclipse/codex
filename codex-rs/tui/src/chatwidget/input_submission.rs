@@ -114,6 +114,16 @@ impl ChatWidget {
         if self.misalignment_policy_violation {
             return (false, None);
         }
+        if self.input_queue.rate_limit_recovery_pending {
+            self.input_queue
+                .queued_user_messages
+                .push_back(QueuedUserMessage::from(user_message));
+            self.input_queue
+                .queued_user_message_history_records
+                .push_back(history_record);
+            self.refresh_pending_input_preview();
+            return (true, None);
+        }
         if !self.is_session_configured() {
             tracing::warn!("cannot submit user message before session is configured; queueing");
             self.input_queue
@@ -394,6 +404,7 @@ impl ChatWidget {
         if !self.submit_op(op.clone()) {
             return (false, None);
         }
+        self.dismiss_backend_banner_for_new_turn();
         if render_in_history {
             self.input_queue.user_turn_pending_start = true;
         }

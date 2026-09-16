@@ -231,8 +231,8 @@ async fn high_level_discovery_matches_the_existing_plugin_provider() -> TestResu
       "enabled_tools": ["read", "deploy", "trusted", "package-only"],
       "disabled_tools": ["package-denied"],
       "tools": {
-        "read": {"approval_mode": "prompt"},
-        "deploy": {"approval_mode": "approve"},
+        "read": {"approval_mode": "prompt", "output_token_limit": 12000},
+        "deploy": {"approval_mode": "approve", "output_token_limit": 4000},
         "trusted": {"approval_mode": "approve"}
       }
     },
@@ -255,6 +255,10 @@ disabled_tools = ["write"]
 
 [plugins."selected-root".mcp_servers.first.tools.read]
 approval_mode = "approve"
+output_token_limit = 8000
+
+[plugins."selected-root".mcp_servers.first.tools.deploy]
+output_token_limit = 9000
 
 [plugins."selected-root".mcp_servers.first.tools.trusted]
 approval_mode = "approve"
@@ -308,18 +312,21 @@ default_tools_approval_mode = "auto"
                     "read".to_string(),
                     McpServerToolConfig {
                         approval_mode: Some(AppToolApproval::Prompt),
+                        output_token_limit: std::num::NonZeroUsize::new(8_000),
                     },
                 ),
                 (
                     "deploy".to_string(),
                     McpServerToolConfig {
                         approval_mode: Some(AppToolApproval::Prompt),
+                        output_token_limit: std::num::NonZeroUsize::new(4_000),
                     },
                 ),
                 (
                     "trusted".to_string(),
                     McpServerToolConfig {
                         approval_mode: Some(AppToolApproval::Approve),
+                        ..Default::default()
                     },
                 ),
             ]),

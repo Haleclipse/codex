@@ -44,6 +44,7 @@ members = [
     "core-api",
     "core-plugins",
     "diagnostics",
+    "guardian-context",
     "hooks",
     "history",
     "http-client",
@@ -141,7 +142,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.151.0"
+version = "0.152.0"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -212,6 +213,7 @@ codex-install-context = { path = "install-context" }
 codex-file-search = { path = "file-search" }
 codex-file-watcher = { path = "file-watcher" }
 codex-git-utils = { path = "git-utils" }
+codex-guardian-context = { path = "guardian-context" }
 codex-hooks = { path = "hooks" }
 codex-history = { path = "history" }
 codex-keyring-store = { path = "keyring-store" }

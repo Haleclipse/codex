@@ -289,7 +289,11 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
     let fresh_temp = active_path.with_file_name("rollout-fresh.jsonl.zst.tmp");
     fs::write(&fresh_temp, "fresh temp")?;
 
-    worker::run(home.path().to_path_buf()).await?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
 
     assert!(!active_path.exists());
     assert!(compressed_rollout_path(&active_path).exists());
@@ -319,44 +323,72 @@ async fn worker_waits_for_rollout_maintenance_before_compressing() -> anyhow::Re
     let guard = crate::try_acquire_rollout_maintenance_lock(home.path())?
         .expect("claim rollout maintenance lock");
 
-    worker::run(home.path().to_path_buf()).await?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
     assert!(path.exists());
     assert!(!compressed_rollout_path(&path).exists());
 
     drop(guard);
-    worker::run(home.path().to_path_buf()).await?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
     assert!(!path.exists());
     assert!(compressed_rollout_path(&path).exists());
     Ok(())
 }
 
 #[tokio::test]
-async fn worker_skips_archived_paginated_fork_pointer_chain() -> anyhow::Result<()> {
-    let home = TempDir::new()?;
-    let thread_id = ThreadId::from_string(&Uuid::from_u128(15).to_string())?;
-    let source_uuid = Uuid::from_u128(16);
-    let source_rollout_id = ThreadId::from_string(&source_uuid.to_string())?;
-    let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
-    write_rollout(&source_path, thread_id, "referenced source")?;
-    set_old_mtime(&source_path)?;
+async fn worker_compresses_archived_fork_chain_only_with_shared_mode() -> anyhow::Result<()> {
+    for mode in [
+        RolloutCompressionMode::Standalone,
+        RolloutCompressionMode::IncludeShared,
+    ] {
+        // Each mode gets a fresh home, without bypassing the worker's maintenance cooldown.
+        let home = TempDir::new()?;
+        let thread_id = ThreadId::from_string(&Uuid::from_u128(15).to_string())?;
+        let source_uuid = Uuid::from_u128(16);
+        let source_rollout_id = ThreadId::from_string(&source_uuid.to_string())?;
+        let source_path = rollout_path(home.path(), "2025-01-03T12-00-00", source_uuid);
+        write_rollout(&source_path, thread_id, "referenced source")?;
+        set_old_mtime(&source_path)?;
 
-    let child_uuid = Uuid::from_u128(17);
-    let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", child_uuid);
-    write_rollout(&child_path, thread_id, "fork child")?;
-    set_history_base(
-        child_path.as_path(),
-        HistoryPosition {
-            thread_id: source_rollout_id,
-            end_ordinal_exclusive: 2,
-            end_byte_offset: std::fs::metadata(source_path.as_path())?.len(),
-        },
-    )?;
-    set_old_mtime(&child_path)?;
+        let child_uuid = Uuid::from_u128(17);
+        let child_path = archived_rollout_path(home.path(), "2025-01-03T12-00-01", child_uuid);
+        write_rollout(&child_path, thread_id, "fork child")?;
+        set_history_base(
+            child_path.as_path(),
+            HistoryPosition {
+                thread_id: source_rollout_id,
+                end_ordinal_exclusive: 2,
+                end_byte_offset: std::fs::metadata(source_path.as_path())?.len(),
+            },
+        )?;
+        set_old_mtime(&child_path)?;
+        let original_source = fs::read(&source_path)?;
+        let original_child = fs::read(&child_path)?;
 
-    worker::run(home.path().to_path_buf()).await?;
+        worker::run(home.path().to_path_buf(), mode).await?;
 
-    assert!(source_path.exists());
-    assert!(child_path.exists());
+        for (path, original) in [
+            (&source_path, original_source),
+            (&child_path, original_child),
+        ] {
+            match mode {
+                RolloutCompressionMode::Standalone => assert_eq!(fs::read(path)?, original),
+                RolloutCompressionMode::IncludeShared => {
+                    assert!(!path.exists(), "shared compression should replace {path:?}");
+                    let mut restored = Vec::new();
+                    crate::open_rollout_seekable_reader(path)?.read_to_end(&mut restored)?;
+                    assert_eq!(restored, original);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -383,7 +415,11 @@ async fn worker_skips_source_referenced_by_archived_compressed_rollout() -> anyh
     )?;
     compress_now(child_path.as_path())?;
 
-    worker::run(home.path().to_path_buf()).await?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
 
     assert!(source_path.exists());
     Ok(())
@@ -402,7 +438,11 @@ async fn worker_skips_unreadable_metadata_without_blocking_other_compression() -
     let unreadable_path = rollout_path(home.path(), "2025-01-03T12-00-01", Uuid::from_u128(21));
     fs::write(unreadable_path.as_path(), "{not json}\n")?;
 
-    worker::run(home.path().to_path_buf()).await?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
 
     assert!(!source_path.exists());
     assert!(compressed_rollout_path(&source_path).exists());
@@ -476,7 +516,11 @@ async fn compression_preserves_rollout_permissions() -> anyhow::Result<()> {
     fs::set_permissions(&rollout_path, fs::Permissions::from_mode(0o600))?;
     set_old_mtime(&rollout_path)?;
 
-    worker::run(home.path().to_path_buf()).await?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
 
     let compressed_path = compressed_rollout_path(&rollout_path);
     assert!(!rollout_path.exists());
@@ -558,7 +602,11 @@ async fn compression_preserves_read_only_rollout_permissions() -> anyhow::Result
     fs::set_permissions(&rollout_path, fs::Permissions::from_mode(0o400))?;
     let source_modified = fs::metadata(&rollout_path)?.modified()?;
 
-    worker::run(home.path().to_path_buf()).await?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
 
     let compressed_path = compressed_rollout_path(&rollout_path);
     let compressed_metadata = fs::metadata(&compressed_path)?;
@@ -579,7 +627,11 @@ async fn worker_skips_existing_compressed_archived_rollouts() -> anyhow::Result<
     let compressed_path = compressed_rollout_path(&rollout_path);
     set_old_mtime(&compressed_path)?;
 
-    worker::run(home.path().to_path_buf()).await?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
 
     assert!(!rollout_path.exists());
     assert!(compressed_path.exists());
@@ -603,7 +655,11 @@ async fn worker_skips_when_fresh_run_marker_exists() -> anyhow::Result<()> {
     fs::create_dir_all(marker_dir.as_path())?;
     fs::write(marker_dir.join("rollout-compression.lock"), "recent run")?;
 
-    worker::run(home.path().to_path_buf()).await?;
+    worker::run(
+        home.path().to_path_buf(),
+        RolloutCompressionMode::Standalone,
+    )
+    .await?;
 
     assert!(rollout_path.exists());
     assert!(!compressed_rollout_path(&rollout_path).exists());

@@ -33,6 +33,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use uuid::Uuid;
 
 use super::CLASSIFICATION_TOKEN_USAGE_METRIC;
 use super::INITIAL_WEBSOCKET_CONNECTIONS;
@@ -55,7 +56,10 @@ impl LunaSampler {
     }
 }
 
-fn assert_connection_metadata(server: &responses::WebSocketTestServer) -> Result<String> {
+fn assert_connection_metadata(
+    server: &responses::WebSocketTestServer,
+    expected_lineage: &[(&str, Option<&str>)],
+) -> Result<String> {
     let handshake = server.single_handshake();
     let thread_id = handshake.header("thread-id").expect("classifier thread ID");
     ThreadId::from_string(&thread_id)?;
@@ -72,32 +76,43 @@ fn assert_connection_metadata(server: &responses::WebSocketTestServer) -> Result
             Some(format!("{thread_id}:0")),
         ]
     );
-    for request in server.single_connection() {
+    let requests = server.single_connection();
+    assert_eq!(requests.len(), expected_lineage.len());
+    for (request, (parent_turn_id, root_turn_id)) in requests.iter().zip(expected_lineage) {
         let mut metadata = request.body_json()["client_metadata"].clone();
-        let turn_id = metadata["turn_id"].clone();
+        let turn_id = metadata["turn_id"]
+            .as_str()
+            .expect("classifier turn ID")
+            .to_owned();
+        assert_eq!(Uuid::parse_str(&turn_id)?.get_version_num(), 7);
+        assert_ne!(turn_id.as_str(), *parent_turn_id);
         metadata["x-codex-turn-metadata"] = serde_json::from_str(
             metadata["x-codex-turn-metadata"]
                 .as_str()
                 .expect("serialized turn metadata"),
         )?;
-        assert_eq!(
-            metadata,
-            json!({
+        let mut expected = json!({
+            "session_id": "session-1",
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+            "parent_turn_id": parent_turn_id,
+            "x-openai-subagent": "guardian",
+            "x-codex-window-id": format!("{thread_id}:0"),
+            "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+            "x-codex-turn-metadata": {
                 "session_id": "session-1",
                 "thread_id": thread_id,
+                "guardian_classifier_source_thread_id": "thread-1",
                 "turn_id": turn_id,
-                "x-openai-subagent": "guardian",
-                "x-codex-window-id": format!("{thread_id}:0"),
-                "ws_request_header_x_openai_internal_codex_responses_lite": "true",
-                "x-codex-turn-metadata": {
-                    "session_id": "session-1",
-                    "thread_id": thread_id,
-                    "guardian_classifier_source_thread_id": "thread-1",
-                    "turn_id": turn_id,
-                    "thread_source": "guardian_classifier",
-                },
-            })
-        );
+                "parent_turn_id": parent_turn_id,
+                "thread_source": "guardian_classifier",
+            },
+        });
+        if let Some(root_turn_id) = root_turn_id {
+            expected["root_turn_id"] = json!(root_turn_id);
+            expected["x-codex-turn-metadata"]["root_turn_id"] = json!(root_turn_id);
+        }
+        assert_eq!(metadata, expected);
     }
     Ok(thread_id)
 }
@@ -174,7 +189,7 @@ async fn connect_sampler(config: LunaSamplerConfig) -> Result<LunaSampler> {
     Ok(sampler)
 }
 
-fn sample_request(turn_id: &str) -> LunaSamplingRequest {
+fn sample_request(parent_turn_id: &str) -> LunaSamplingRequest {
     LunaSamplingRequest {
         instructions: "Return high for high risk or low for low risk.".to_owned(),
         trusted_review_evidence: Vec::new(),
@@ -185,7 +200,8 @@ fn sample_request(turn_id: &str) -> LunaSamplingRequest {
         parent_compaction: None,
         parent_compaction_hash: None,
         reasoning_effort: ReasoningEffort::None,
-        turn_id: turn_id.to_owned(),
+        parent_turn_id: parent_turn_id.to_owned(),
+        root_turn_id: None,
     }
 }
 
@@ -359,8 +375,14 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
         ],
     ];
     let idle_server = responses::start_websocket_server(vec![scripted_requests.clone()]).await;
-    let refreshed =
-        responses::start_websocket_server(vec![vec![scripted_requests[1].clone()]]).await;
+    let refreshed = responses::start_websocket_server(vec![vec![
+        scripted_requests[1].clone(),
+        vec![
+            ev_assistant_message("sample-3", "low"),
+            ev_completed("response-3"),
+        ],
+    ]])
+    .await;
     let server = responses::start_websocket_server(vec![scripted_requests]).await;
     let base_url = proxy_websocket_servers_with_prewarm_limit(
         &[&idle_server, &server, &refreshed],
@@ -435,7 +457,8 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
             parent_compaction: None,
             parent_compaction_hash: None,
             reasoning_effort: ReasoningEffort::None,
-            turn_id: "turn-1".to_owned(),
+            parent_turn_id: "turn-1".to_owned(),
+            root_turn_id: Some("turn-1".to_owned()),
         })
         .await?;
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -462,12 +485,15 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
             parent_compaction: None,
             parent_compaction_hash: None,
             reasoning_effort: ReasoningEffort::Medium,
-            turn_id: "turn-2".to_owned(),
+            parent_turn_id: "turn-2".to_owned(),
+            root_turn_id: Some("root-2".to_owned()),
         })
         .await?;
 
     assert_eq!(first, "low");
     assert_eq!(second, "high");
+    // Reuse the same socket after a nested owner, now with unknown root lineage.
+    assert_eq!(sampler.sample(sample_request("turn-3")).await?, "low");
     let mut requests = server.single_connection();
     assert_eq!(requests.len(), 1);
     assert_eq!(
@@ -475,8 +501,13 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
         Some("Bearer refreshed".to_owned())
     );
     requests.extend(refreshed.single_connection());
-    assert_eq!(requests.len(), 2);
-    let thread_id = assert_connection_metadata(&server)?;
+    assert_eq!(requests.len(), 3);
+    let thread_id = assert_connection_metadata(&server, &[("turn-1", Some("turn-1"))])?;
+    assert_connection_metadata(&refreshed, &[("turn-2", Some("root-2")), ("turn-3", None)])?;
+    assert_ne!(
+        requests[1].body_json()["client_metadata"]["turn_id"],
+        requests[2].body_json()["client_metadata"]["turn_id"]
+    );
     assert_ne!(
         Some(thread_id),
         idle_server.single_handshake().header("thread-id")
@@ -496,12 +527,8 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
         assert_eq!(request["tool_choice"], "none");
         assert!(request.get("text").is_none());
         assert_eq!(request["prompt_cache_key"], "guardian-v2:thread-1");
-        assert_eq!(
-            request["client_metadata"]["turn_id"],
-            format!("turn-{}", index + 1)
-        );
         assert!(request.get("tools").is_none());
-        let effort = if index == 0 { "none" } else { "medium" };
+        let effort = if index == 1 { "medium" } else { "none" };
         assert_eq!(request["reasoning"]["effort"], effort);
         assert_eq!(request["reasoning"]["context"], "all_turns");
     }
@@ -631,7 +658,8 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
             parent_compaction: None,
             parent_compaction_hash: None,
             reasoning_effort: ReasoningEffort::None,
-            turn_id: "turn-1".to_owned(),
+            parent_turn_id: "turn-1".to_owned(),
+            root_turn_id: Some("turn-1".to_owned()),
         }),
     )
     .await??;
@@ -744,9 +772,13 @@ async fn sampler_grows_its_pool_for_overlapping_requests() -> Result<()> {
     ))
     .await?;
 
+    let mut first_request = sample_request("turn-1");
+    first_request.root_turn_id = Some("root-1".to_owned());
+    let mut second_request = sample_request("turn-2");
+    second_request.root_turn_id = Some("root-2".to_owned());
     let outputs = tokio::try_join!(
-        sampler.sample(sample_request("turn-1")),
-        sampler.sample(sample_request("turn-2")),
+        sampler.sample(first_request),
+        sampler.sample(second_request),
         sampler.sample(sample_request("turn-3")),
     )?;
 
@@ -756,18 +788,26 @@ async fn sampler_grows_its_pool_for_overlapping_requests() -> Result<()> {
     );
     let mut thread_ids = HashSet::new();
     let mut turn_ids = HashSet::new();
+    let mut parent_turn_ids = HashSet::new();
     for server in [&first, &second, &third] {
         assert_eq!(server.single_connection().len(), 1);
-        assert!(thread_ids.insert(assert_connection_metadata(server)?));
-        turn_ids.insert(
-            server.single_connection()[0].body_json()["client_metadata"]["turn_id"]
-                .as_str()
-                .expect("turn ID")
-                .to_owned(),
-        );
+        let metadata = server.single_connection()[0].body_json()["client_metadata"].clone();
+        let parent_turn_id = metadata["parent_turn_id"].as_str().expect("owning turn ID");
+        let expected_root = match parent_turn_id {
+            "turn-1" => Some("root-1"),
+            "turn-2" => Some("root-2"),
+            "turn-3" => None,
+            other => panic!("unexpected owning turn: {other}"),
+        };
+        assert!(thread_ids.insert(assert_connection_metadata(
+            server,
+            &[(parent_turn_id, expected_root)]
+        )?));
+        assert!(turn_ids.insert(metadata["turn_id"].as_str().expect("turn ID").to_owned()));
+        parent_turn_ids.insert(parent_turn_id.to_owned());
     }
     assert_eq!(
-        turn_ids,
+        parent_turn_ids,
         HashSet::from_iter([
             "turn-1".to_owned(),
             "turn-2".to_owned(),
@@ -904,7 +944,11 @@ async fn sampler_retries_expired_websockets_on_another_warm_connection() -> Resu
     ))
     .await?;
 
-    let output = sampler.sample(sample_request("turn-1")).await?;
+    let mut request = sample_request("turn-1");
+    request.trusted_review_evidence = vec!["trusted review".to_owned()];
+    request.trusted_skill_paths = vec!["/skills/review/SKILL.md".to_owned()];
+    request.root_turn_id = Some("root-turn".to_owned());
+    let output = sampler.sample(request).await?;
 
     assert_eq!(output, "low");
     let expired_requests = expired.single_connection();
@@ -912,19 +956,29 @@ async fn sampler_retries_expired_websockets_on_another_warm_connection() -> Resu
     assert_eq!(expired_requests.len(), 1);
     assert_eq!(healthy_requests.len(), 1);
     assert_ne!(
-        assert_connection_metadata(&expired)?,
-        assert_connection_metadata(&healthy)?
+        assert_connection_metadata(&expired, &[("turn-1", Some("root-turn"))])?,
+        assert_connection_metadata(&healthy, &[("turn-1", Some("root-turn"))])?
     );
     let mut expired_request = expired_requests[0].body_json();
     let mut healthy_request = healthy_requests[0].body_json();
+    assert_eq!(
+        expired_request["client_metadata"]["turn_id"],
+        healthy_request["client_metadata"]["turn_id"],
+    );
     for request in [&mut expired_request, &mut healthy_request] {
-        assert_eq!(request["client_metadata"]["turn_id"], "turn-1");
         request
             .as_object_mut()
             .expect("request object")
             .remove("client_metadata");
     }
     assert_eq!(expired_request, healthy_request);
+    let input: Vec<ResponseItem> = serde_json::from_value(healthy_request["input"].clone())?;
+    let ids = input
+        .iter()
+        .map(|item| item.id().expect("classifier input item ID"))
+        .collect::<HashSet<_>>();
+    assert_eq!(ids.len(), input.len());
+    assert!(ids.iter().all(|id| id.is_prefixed()));
     Ok(())
 }
 
@@ -959,10 +1013,11 @@ async fn sampler_assigns_a_fresh_identity_when_replacing_aged_connections() -> R
     }
     assert_eq!(sampler.sample(sample_request("turn-2")).await?, "low");
 
-    let thread_ids = [&first, &second, &replacement]
-        .into_iter()
-        .map(assert_connection_metadata)
-        .collect::<Result<HashSet<_>>>()?;
+    let thread_ids = HashSet::from([
+        assert_connection_metadata(&first, &[])?,
+        assert_connection_metadata(&second, &[("turn-1", None)])?,
+        assert_connection_metadata(&replacement, &[("turn-2", None)])?,
+    ]);
     assert_eq!(thread_ids.len(), 3);
     assert_eq!(second.single_connection().len(), 1);
     assert_eq!(replacement.single_connection().len(), 1);

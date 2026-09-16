@@ -1,3 +1,5 @@
+use codex_extension_api::ToolCallOutcome;
+use codex_extension_api::ToolName;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::protocol::TokenUsage;
 use codex_state::ThreadGoalStatus;
@@ -24,6 +26,8 @@ struct GoalAccountingInner {
     turns: HashMap<String, GoalTurnAccounting>,
     wall_clock: GoalWallClockAccounting,
     budget_limit_reported_goal_id: Option<String>,
+    execution_failure_goal_id: Option<String>,
+    consecutive_execution_failure_turns: u8,
     last_accounted_descendant_token_usage: i64,
 }
 
@@ -33,6 +37,8 @@ struct GoalTurnAccounting {
     last_accounted_token_usage: TokenUsage,
     active_goal_id: Option<String>,
     account_tokens: bool,
+    failed_execution: bool,
+    successful_tool: bool,
 }
 
 #[derive(Debug)]
@@ -93,6 +99,58 @@ impl GoalAccountingState {
         self.inner().current_turn_id.clone()
     }
 
+    pub(crate) fn record_tool_outcome(
+        &self,
+        turn_id: &str,
+        tool_name: &ToolName,
+        outcome: ToolCallOutcome,
+    ) {
+        let mut inner = self.inner();
+        let Some(turn) = inner.turns.get_mut(turn_id) else {
+            return;
+        };
+        if turn.active_goal_id.is_none() {
+            return;
+        }
+
+        match outcome {
+            ToolCallOutcome::Completed { success: true } => {
+                turn.successful_tool = true;
+                inner.execution_failure_goal_id = None;
+                inner.consecutive_execution_failure_turns = 0;
+            }
+            ToolCallOutcome::Failed {
+                handler_executed: true,
+            } if tool_name.is_default_namespace() && tool_name.name == "exec" => {
+                turn.failed_execution = true;
+            }
+            ToolCallOutcome::Completed { success: false }
+            | ToolCallOutcome::Failed { .. }
+            | ToolCallOutcome::Blocked
+            | ToolCallOutcome::Aborted => {}
+        }
+    }
+
+    pub(crate) fn execution_failure_goal(&self, turn_id: &str) -> Option<String> {
+        let mut inner = self.inner();
+        let turn = inner.turns.get(turn_id)?;
+        let goal_id = turn.active_goal_id.clone()?;
+        if turn.successful_tool {
+            return None;
+        }
+        if !turn.failed_execution {
+            return None;
+        }
+
+        if inner.execution_failure_goal_id.as_deref() != Some(goal_id.as_str()) {
+            inner.execution_failure_goal_id = Some(goal_id.clone());
+            inner.consecutive_execution_failure_turns = 0;
+        }
+        inner.consecutive_execution_failure_turns =
+            inner.consecutive_execution_failure_turns.saturating_add(1);
+        (inner.consecutive_execution_failure_turns >= 3).then_some(goal_id)
+    }
+
     /// Acquires the per-thread progress-accounting permit.
     ///
     /// Hold the returned permit from before taking a progress snapshot until after the persistent
@@ -104,15 +162,16 @@ impl GoalAccountingState {
         self.progress_accounting_lock.acquire().await
     }
 
-    pub(crate) fn turn_is_current_active_goal(&self, turn_id: &str) -> bool {
+    pub(crate) fn current_active_goal_id_for_turn(&self, turn_id: &str) -> Option<String> {
         let inner = self.inner();
         if inner.current_turn_id.as_deref() != Some(turn_id) {
-            return false;
+            return None;
         }
-        let Some(turn) = inner.turns.get(turn_id) else {
-            return false;
-        };
-        turn.account_tokens && turn.active_goal_id.is_some()
+        let turn = inner.turns.get(turn_id)?;
+        if !turn.account_tokens {
+            return None;
+        }
+        turn.active_goal_id.clone()
     }
 
     pub(crate) fn record_token_usage(
@@ -176,6 +235,10 @@ impl GoalAccountingState {
         }
         let goal_changed = inner.wall_clock.active_goal_id.as_deref() != Some(goal_id.as_str());
         let turn = inner.turns.get_mut(turn_id.as_str())?;
+        if turn.active_goal_id.as_deref() != Some(goal_id.as_str()) {
+            turn.failed_execution = false;
+            turn.successful_tool = false;
+        }
         turn.active_goal_id = Some(goal_id.clone());
         if goal_changed {
             turn.reset_baseline_to_current();
@@ -207,6 +270,8 @@ impl GoalAccountingState {
         }
         inner.wall_clock.clear_active_goal();
         inner.budget_limit_reported_goal_id = None;
+        inner.execution_failure_goal_id = None;
+        inner.consecutive_execution_failure_turns = 0;
         Some(turn_id)
     }
 
@@ -219,6 +284,8 @@ impl GoalAccountingState {
         }
         inner.wall_clock.clear_active_goal();
         inner.budget_limit_reported_goal_id = None;
+        inner.execution_failure_goal_id = None;
+        inner.consecutive_execution_failure_turns = 0;
     }
 
     pub(crate) fn progress_snapshot(&self, turn_id: &str) -> Option<GoalProgressSnapshot> {
@@ -385,6 +452,8 @@ impl Default for GoalAccountingInner {
             turns: HashMap::new(),
             wall_clock: GoalWallClockAccounting::new(),
             budget_limit_reported_goal_id: None,
+            execution_failure_goal_id: None,
+            consecutive_execution_failure_turns: 0,
             last_accounted_descendant_token_usage: 0,
         }
     }
@@ -408,6 +477,8 @@ impl GoalTurnAccounting {
             current_token_usage,
             active_goal_id: None,
             account_tokens,
+            failed_execution: false,
+            successful_tool: false,
         }
     }
 

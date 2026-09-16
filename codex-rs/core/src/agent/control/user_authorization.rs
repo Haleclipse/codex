@@ -39,7 +39,6 @@ impl AgentControl {
             .services
             .thread_extension_data
             .get::<GuardianReviewEvidence>();
-        let mut user_message_count = 0usize;
         let mut latest_user_turn_id = None;
         let mut messages = root_history
             .raw_items()
@@ -49,7 +48,6 @@ impl AgentControl {
                     (!is_summary_message(&message)
                         && !message.trim_start().starts_with("<user_action>"))
                     .then(|| {
-                        user_message_count = user_message_count.saturating_add(1);
                         latest_user_turn_id = item.turn_id().map(str::to_owned);
                         GuardianRootMessage::User(
                             guardian_truncate_text(&message, MAX_ROOT_MESSAGE_TOKENS).0,
@@ -89,10 +87,7 @@ impl AgentControl {
             .map(|(turn_id, evidence)| evidence.trusted_skill_paths(turn_id))
             .unwrap_or_default();
         Some(GuardianRootSnapshot {
-            authorization_version: GuardianAuthorizationVersion {
-                user_message_count,
-                ..authorization_version
-            },
+            authorization_version,
             messages,
             trusted_skill_paths,
         })

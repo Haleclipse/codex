@@ -113,6 +113,8 @@ enum ClassificationOutcome {
 #[derive(Default)]
 struct GuardianV2ScoreProgress {
     latest_tool_call: AtomicUsize,
+    // Setup and reset calls must not consume the first JS execution allowance.
+    js_executions: AtomicUsize,
     latest_scored_tool_call: AtomicUsize,
     latest_failed_tool_call: AtomicUsize,
     // Serialize successful score publication with its authorization metadata.
@@ -261,6 +263,44 @@ impl ApprovalReviewContributor for GuardianV2Extension {
                     record_fast_decision(extension_metrics.as_deref(), "deferred", "out_of_scope");
                     return None;
                 }
+                // The first REPL execution never waits for synchronous Guardian review.
+                // The async classifier still runs, and later calls use the normal policy.
+                if action.get("tool_name").and_then(serde_json::Value::as_str) == Some("js")
+                    && action
+                        .get("connector_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("node_repl")
+                    && thread_store
+                        .get::<GuardianV2ScoreProgress>()?
+                        .js_executions
+                        .load(Ordering::Acquire)
+                        == 1
+                {
+                    record_fast_decision(
+                        extension_metrics.as_deref(),
+                        "approved",
+                        "initial_cua_call",
+                    );
+                    return Some(ReviewDecision::Approved);
+                }
+            } else if thread_store.get::<ModelInfo>().is_some() {
+                let manager = self.thread_manager.upgrade()?;
+                let thread_id = ThreadId::from_string(thread_store.level_id()).ok()?;
+                let thread = manager.get_thread(thread_id).await.ok()?;
+                let config = thread.config().await;
+                let model = thread_store.get::<ModelInfo>()?;
+                if config
+                    .config_layer_stack
+                    .requirements()
+                    .auto_review_required_for_model(&model.slug)
+                {
+                    record_fast_decision(
+                        extension_metrics.as_deref(),
+                        "deferred",
+                        "required_model",
+                    );
+                    return None;
+                }
             }
             let Some(score_progress) = thread_store.get::<GuardianV2ScoreProgress>() else {
                 record_fast_decision(extension_metrics.as_deref(), "deferred", "missing_score");
@@ -382,6 +422,14 @@ impl GuardianV2Extension {
             }
             return;
         }
+        if input.mcp_tool.is_some_and(|tool| {
+            let info = tool.tool_info();
+            is_node_repl_backed_server(&info.server_name) && info.tool.name == "js"
+        }) {
+            score_progress
+                .js_executions
+                .fetch_add(/*val*/ 1, Ordering::Relaxed);
+        }
         let metrics = score_progress.metrics.clone();
         let sampled_at = SystemTime::now();
         let tool_call_index = score_progress
@@ -391,6 +439,7 @@ impl GuardianV2Extension {
         let event_sink = Arc::clone(&self.event_sink);
         let thread_id = input.thread_store.level_id().to_owned();
         let turn_id = input.turn_id.to_owned();
+        let root_turn_id = input.root_turn_id.map(str::to_owned);
         let thread_context: Result<_, String> = async {
             let parsed_thread_id =
                 ThreadId::from_string(&thread_id).map_err(|error| error.to_string())?;
@@ -497,12 +546,18 @@ impl GuardianV2Extension {
         let review_model_override = parent_model
             .as_ref()
             .and_then(|model| model.auto_review_model_override.clone());
-        let conversation_history = Arc::clone(&input.conversation_history);
         // Snapshot before spawning so a delayed sample cannot see later reviews.
         let guardian_evidence = input
             .thread_store
             .get_or_init(GuardianReviewEvidence::default);
         let sync_reviews = guardian_evidence.snapshot();
+        let authorization_version =
+            guardian_evidence.authorization_version(input.conversation_history.as_ref());
+        let trusted_user_inputs =
+            guardian_evidence.user_input_fragments(input.conversation_history.as_ref());
+        let transcript = guardian_config
+            .transcript
+            .build(input.conversation_history.review_items());
         let local_trusted_skill_paths = guardian_evidence.trusted_skill_paths(input.turn_id);
         let node_repl_images = if guardian_config.transcript.include_images {
             input
@@ -513,6 +568,9 @@ impl GuardianV2Extension {
         } else {
             Vec::new()
         };
+        let rendered_images = guardian_config
+            .transcript
+            .images(input.conversation_history.review_items(), node_repl_images);
 
         tokio::spawn(async move {
             let mut truncations = ClassificationTruncations::default();
@@ -537,28 +595,17 @@ impl GuardianV2Extension {
                 .as_ref()
                 .map(|snapshot| snapshot.authorization_version);
             let root_conversation = root_snapshot.map(|snapshot| snapshot.messages);
-            let authorization_version =
-                guardian_evidence.authorization_version(conversation_history.as_ref());
             let score_authorization = ScoreAuthorization {
                 local: authorization_version,
                 root: root_authorization_version,
             };
-            let trusted_user_inputs =
-                guardian_evidence.user_input_fragments(conversation_history.as_ref());
-            let transcript = guardian_config
-                .transcript
-                .build(conversation_history.items());
             truncations.extend(transcript.truncations);
-            let rendered_images = guardian_config
-                .transcript
-                .images(conversation_history.items(), node_repl_images);
             truncations.record(
                 "transcript_image",
                 rendered_images.omitted_bytes,
                 /*retained_bytes*/ 0,
             );
             let images = rendered_images.images;
-            drop(conversation_history);
             let planned_action = match action.render(guardian_config.max_action_tokens) {
                 Ok(RenderedAction {
                     text,
@@ -663,7 +710,8 @@ impl GuardianV2Extension {
                         parent_compaction,
                         parent_compaction_hash,
                         reasoning_effort: guardian_config.reasoning_effort.clone(),
-                        turn_id: turn_id.clone(),
+                        parent_turn_id: turn_id.clone(),
+                        root_turn_id,
                     })
                     .await
                 {

@@ -33,6 +33,8 @@ use core_test_support::responses::assert_parent_turn;
 use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_completed_with_tokens;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_tool_search_call;
@@ -1119,6 +1121,249 @@ async fn spawned_child_receives_forked_parent_context(
     assert_parent_turn(&reused_child_body, Some(followup_parent_turn_id))?;
     assert_root_turn(&followup_parent_body, Some(followup_parent_turn_id))?;
     assert_root_turn(&reused_child_body, Some(followup_parent_turn_id))?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GrandchildParentContext {
+    FullHistory,
+    LastTurn,
+    NoHistory,
+    Compacted,
+}
+
+#[test_case(GrandchildParentContext::FullHistory, ThreadHistoryMode::Legacy; "legacy full history")]
+#[test_case(GrandchildParentContext::LastTurn, ThreadHistoryMode::Legacy; "legacy last turn")]
+#[test_case(GrandchildParentContext::NoHistory, ThreadHistoryMode::Legacy; "legacy no history")]
+#[test_case(GrandchildParentContext::FullHistory, ThreadHistoryMode::Paginated; "paginated full history")]
+#[test_case(GrandchildParentContext::LastTurn, ThreadHistoryMode::Paginated; "paginated last turn")]
+#[test_case(GrandchildParentContext::NoHistory, ThreadHistoryMode::Paginated; "paginated no history")]
+#[test_case(GrandchildParentContext::Compacted, ThreadHistoryMode::Legacy; "legacy full history after compaction")]
+#[test_case(GrandchildParentContext::Compacted, ThreadHistoryMode::Paginated; "paginated full history after compaction")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grandchild_full_fork_preserves_context_baseline(
+    parent_context: GrandchildParentContext,
+    history_mode: ThreadHistoryMode,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const ROOT_PROMPT: &str = "root: delegate the context check";
+    const CHILD_TASK: &str = "child: delegate the context check";
+    const GRANDCHILD_TASK: &str = "grandchild: check inherited context";
+    const ROOT_CALL: &str = "root-context-baseline-spawn";
+    const CHILD_CALL: &str = "child-context-baseline-spawn";
+    const INSTRUCTIONS: &str = "UNIQUE_CONTEXT_BASELINE_DEVELOPER_INSTRUCTIONS";
+    const COMPACT_PROMPT: &str = "CONTEXT_BASELINE_COMPACTION_PROMPT";
+    const COMPACT_SUMMARY: &str = "CONTEXT_BASELINE_COMPACTION_SUMMARY";
+    const PRELUDE_CALL: &str = "context-baseline-prelude-call";
+
+    let server = start_mock_server().await;
+    let (parent_fork_turns, compact_parent) = match parent_context {
+        GrandchildParentContext::FullHistory => ("all", false),
+        GrandchildParentContext::LastTurn => ("1", false),
+        GrandchildParentContext::NoHistory => ("none", false),
+        GrandchildParentContext::Compacted => ("all", true),
+    };
+    let root_spawn_args = serde_json::to_string(&json!({
+        "task_name": "child",
+        "message": CHILD_TASK,
+        "fork_turns": parent_fork_turns,
+    }))?;
+    let root_log = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, ROOT_PROMPT)
+                && !body_contains(req, CHILD_TASK)
+                && !body_contains(req, GRANDCHILD_TASK)
+                && !body_contains(req, ROOT_CALL)
+        },
+        sse(vec![
+            ev_response_created("baseline-root"),
+            ev_function_call_with_namespace(
+                ROOT_CALL,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &root_spawn_args,
+            ),
+            ev_completed("baseline-root"),
+        ]),
+    )
+    .await;
+    let child_spawn_args = serde_json::to_string(&json!({
+        "task_name": "grandchild",
+        "message": GRANDCHILD_TASK,
+        "fork_turns": "all",
+    }))?;
+    if compact_parent {
+        mount_sse_once_match(
+            &server,
+            |req: &wiremock::Request| {
+                body_contains(req, CHILD_TASK)
+                    && !body_contains(req, ROOT_CALL)
+                    && !body_contains(req, PRELUDE_CALL)
+                    && !body_contains(req, COMPACT_SUMMARY)
+            },
+            sse(vec![
+                ev_response_created("baseline-prelude"),
+                ev_function_call(
+                    PRELUDE_CALL,
+                    "update_plan",
+                    r#"{"plan":[{"step":"Check inherited context","status":"in_progress"}]}"#,
+                ),
+                ev_completed_with_tokens("baseline-prelude", /*total_tokens*/ 250_000),
+            ]),
+        )
+        .await;
+        mount_sse_once_match(
+            &server,
+            |req: &wiremock::Request| body_contains(req, COMPACT_PROMPT),
+            sse(vec![
+                ev_response_created("baseline-compaction"),
+                ev_assistant_message("baseline-summary", COMPACT_SUMMARY),
+                ev_completed("baseline-compaction"),
+            ]),
+        )
+        .await;
+    }
+    let child_log = mount_sse_once_match(
+        &server,
+        move |req: &wiremock::Request| {
+            body_contains(
+                req,
+                if compact_parent {
+                    COMPACT_SUMMARY
+                } else {
+                    CHILD_TASK
+                },
+            ) && !body_contains(req, GRANDCHILD_TASK)
+                && !body_contains(req, ROOT_CALL)
+                && !body_contains(req, CHILD_CALL)
+                && !body_contains(req, COMPACT_PROMPT)
+        },
+        sse(vec![
+            ev_response_created("baseline-child"),
+            ev_function_call_with_namespace(
+                CHILD_CALL,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &child_spawn_args,
+            ),
+            ev_completed("baseline-child"),
+        ]),
+    )
+    .await;
+    let grandchild_log = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, GRANDCHILD_TASK) && !body_contains(req, CHILD_CALL)
+        },
+        sse(vec![
+            ev_response_created("baseline-grandchild"),
+            ev_assistant_message("baseline-grandchild-answer", "done"),
+            ev_completed("baseline-grandchild"),
+        ]),
+    )
+    .await;
+    let _parent_followups = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![ev_completed("baseline-parent-finished-1")]),
+            sse(vec![ev_completed("baseline-parent-finished-2")]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_history_mode(history_mode)
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config.model = Some(V2_DEFAULT_MODEL.to_string());
+            config.agent_default_subagent_model = Some(V2_DEFAULT_MODEL.to_string());
+            config.developer_instructions = Some(INSTRUCTIONS.to_string());
+            if compact_parent {
+                config.update_plan_enabled = true;
+                // Use local compaction so the test controls the replacement history.
+                config.model_provider.name = "test-provider".to_string();
+                config
+                    .features
+                    .disable(Feature::RemoteCompactionV2)
+                    .expect("test config should allow feature update");
+                config.compact_prompt = Some(COMPACT_PROMPT.to_string());
+                config.model_auto_compact_token_limit = Some(200_000);
+                config.model_context_window = Some(1_000_000);
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn(ROOT_PROMPT).await?;
+    let root_request = root_log.single_request();
+    let mut descendant_requests = Vec::new();
+    for (mock, agent_name) in [
+        (&child_log, "/root/child"),
+        (&grandchild_log, "/root/child/grandchild"),
+    ] {
+        let request = timeout(Duration::from_secs(/*secs*/ 10), async {
+            loop {
+                let request = mock.requests().into_iter().find(|request| {
+                    request.body_json()["client_metadata"]["x-codex-turn-metadata"]
+                        .as_str()
+                        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                        .is_some_and(|metadata| metadata["agent_name"] == agent_name)
+                        && (!compact_parent || request.body_contains_text(COMPACT_SUMMARY))
+                });
+                if let Some(request) = request {
+                    break request;
+                }
+                sleep(Duration::from_millis(/*millis*/ 10)).await;
+            }
+        })
+        .await?;
+        let thread_id = ThreadId::from_string(
+            request.body_json()["client_metadata"]["thread_id"]
+                .as_str()
+                .expect("descendant thread id"),
+        )?;
+        let thread = test.thread_manager.get_thread(thread_id).await?;
+        timeout(Duration::from_secs(/*secs*/ 10), async {
+            while !matches!(thread.agent_status().await, AgentStatus::Completed(_)) {
+                sleep(Duration::from_millis(/*millis*/ 10)).await;
+            }
+        })
+        .await?;
+        descendant_requests.push(request);
+    }
+    let context_counts = [
+        &root_request,
+        &descendant_requests[0],
+        &descendant_requests[1],
+    ]
+    .map(|request| {
+        (
+            request
+                .message_input_texts("developer")
+                .iter()
+                .filter(|text| text.contains(INSTRUCTIONS))
+                .count(),
+            request
+                .message_input_texts("user")
+                .iter()
+                .filter(|text| text.contains("<environment_context>"))
+                .count(),
+        )
+    });
+    assert_eq!(
+        context_counts,
+        [(1, 1); 3],
+        "Initial context should appear once per agent: {parent_context:?}, {history_mode:?}"
+    );
+    assert!(!descendant_requests[1].body_contains_text(CHILD_TASK));
     Ok(())
 }
 

@@ -1,10 +1,12 @@
 use crate::client::ModelClient;
+use crate::client::X_CODEX_TURN_METADATA_HEADER;
 use crate::context::ContextualUserFragment;
 use crate::context::RealtimeDelegation;
 use crate::context::RealtimeDelegationSource;
 use crate::realtime_context::build_realtime_startup_context;
 use crate::realtime_context::truncate_realtime_text_to_token_budget;
 use crate::realtime_prompt::prepare_realtime_backend_prompt;
+use crate::responses_metadata::THREAD_SOURCE_KEY;
 use crate::session::session::Session;
 use anyhow::Context;
 use async_channel::Receiver;
@@ -61,6 +63,7 @@ use codex_protocol::protocol::RealtimeVoicesList;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_string::approx_token_count;
 use codex_utils_string::take_bytes_at_char_boundary;
+use codex_utils_string::to_ascii_json_string;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::header::AUTHORIZATION;
@@ -92,6 +95,7 @@ const AUDIO_IN_QUEUE_CAPACITY: usize = 256;
 const TEXT_IN_QUEUE_CAPACITY: usize = 64;
 const HANDOFF_OUT_QUEUE_CAPACITY: usize = 64;
 const OUTPUT_EVENTS_QUEUE_CAPACITY: usize = 256;
+const REALTIME_THREAD_SOURCE_MAX_BYTES: usize = 256;
 const REALTIME_STARTUP_CONTEXT_TOKEN_BUDGET: usize = 5_300;
 const REALTIME_ASSISTANT_OUTPUT_TOKEN_BUDGET: usize = 1_000;
 const REALTIME_INITIAL_ITEMS_MAX_COUNT: usize = 128;
@@ -1269,6 +1273,14 @@ async fn prepare_realtime_start(
         Some(sess.session_id().to_string()),
         Some(sess.thread_id().to_string()),
     ));
+    // Voice calls can span zero or many backing turns; send only the saved thread source.
+    if let Some(thread_source) = sess.thread_config_snapshot().await.thread_source
+        && thread_source.as_str().len() <= REALTIME_THREAD_SOURCE_MAX_BYTES
+        && let Ok(metadata) = to_ascii_json_string(&json!({ THREAD_SOURCE_KEY: thread_source }))
+        && let Ok(metadata) = HeaderValue::from_str(&metadata)
+    {
+        extra_headers.insert(X_CODEX_TURN_METADATA_HEADER, metadata);
+    }
     Ok(PreparedRealtimeConversationStart {
         api_provider,
         realtime_sideband_base_url,

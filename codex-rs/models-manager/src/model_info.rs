@@ -52,6 +52,7 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     if let Some(base_instructions) = &config.base_instructions {
         let model_messages = model.model_messages.get_or_insert(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: None,
             instructions_variables: None,
             approvals: None,
@@ -192,6 +193,7 @@ fn local_model_messages_for_slug(slug: &str) -> ModelMessages {
     match slug {
         "gpt-5.2-codex" | "exp-codex-personality" => ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: Some(format!(
                 "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
             )),
@@ -211,6 +213,7 @@ fn local_model_messages_for_slug(slug: &str) -> ModelMessages {
         },
         _ => ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: Some(BASE_INSTRUCTIONS.to_string()),
             instructions_variables: None,
             approvals: None,

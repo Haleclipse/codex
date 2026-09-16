@@ -2000,6 +2000,8 @@ fn executor_stop_hook_fixture() -> (
     let source = ExecutorPluginHookSource {
         plugin_id: PluginId::parse("computer-use@openai-bundled").expect("valid plugin ID"),
         environment_id: "executor-a".to_string(),
+        mcp_environment_id: None,
+        mcp_metadata: None,
         plugin_root: "file:///plugins/computer-use"
             .parse()
             .expect("valid plugin root URI"),
@@ -2036,6 +2038,8 @@ fn executor_stop_hook_fixture() -> (
             source_path: HandlerSourcePath::ExecutorScoped {
                 plugin_id: PluginId::parse("computer-use@openai-bundled").expect("valid plugin ID"),
                 environment_id: "executor-a".to_string(),
+                mcp_environment_id: None,
+                mcp_metadata: None,
                 manifest_path: "file:///plugins/computer-use/.codex-plugin/plugin.json"
                     .parse()
                     .expect("valid plugin manifest URI"),
@@ -2202,21 +2206,103 @@ async fn executor_stop_hooks_run_unless_regular_hooks_block_without_stopping() {
 }
 
 #[test]
-fn executor_stop_hooks_register_only_the_first_environment_and_handler() {
-    let (mut engine, _, _, _, mut first_source) = executor_stop_hook_fixture();
-    let expected_handlers = engine.handlers.clone();
-    let first_group = &mut first_source.hooks.stop[0];
-    let mut second_handler = first_group.hooks[0].clone();
-    let HookHandlerConfig::McpTool { tool, .. } = &mut second_handler else {
-        panic!("executor Stop handler should be an MCP tool");
-    };
-    *tool = "second_turn_ended".to_string();
-    first_group.hooks.push(second_handler);
+fn executor_stop_hooks_register_each_target_environment_once() {
+    let (mut engine, _, _, _, first_source) = executor_stop_hook_fixture();
+    let mut expected_handlers = engine.handlers.clone();
+    let mut duplicate_target = first_source.clone();
+    duplicate_target.plugin_id = PluginId::parse("chrome@openai-bundled").expect("valid plugin ID");
     let mut second_source = first_source.clone();
     second_source.environment_id = "executor-b".to_string();
+    let mut second_handler = expected_handlers[0].clone();
+    second_handler.display_order = 1;
+    let HandlerSourcePath::ExecutorScoped { environment_id, .. } = &mut second_handler.source_path
+    else {
+        panic!("executor Stop handler should have an executor source");
+    };
+    *environment_id = second_source.environment_id.clone();
+    expected_handlers.push(second_handler);
+    engine.set_executor_hooks(vec![first_source, duplicate_target, second_source]);
+
+    assert_eq!(engine.handlers, expected_handlers);
+}
+
+#[tokio::test]
+async fn executor_interrupt_hooks_register_and_run() {
+    let (mut engine, calls, stop_request, expected_stop_call, mut source) =
+        executor_stop_hook_fixture();
+    source.hooks.subagent_stop = source.hooks.stop.clone();
+    source.hooks.interrupt = source.hooks.stop.clone();
+    engine.set_executor_hooks(vec![source]);
+
+    assert_eq!(
+        engine
+            .handlers
+            .iter()
+            .map(|handler| handler.event_name)
+            .collect::<Vec<_>>(),
+        vec![
+            HookEventName::SubagentStop,
+            HookEventName::Stop,
+            HookEventName::Interrupt,
+        ]
+    );
+    assert_eq!(engine.preview_interrupt(), Vec::new());
+
+    let outcome = engine
+        .run_interrupt(InterruptRequest {
+            session_id: stop_request.session_id,
+            turn_id: stop_request.turn_id,
+            cwd: stop_request.cwd,
+            transcript_path: stop_request.transcript_path,
+            model: stop_request.model,
+            permission_mode: stop_request.permission_mode,
+            request_metadata: stop_request.request_metadata,
+        })
+        .await;
+    wait_for_mcp_calls(&calls, /*count*/ 1).await;
+
+    assert!(outcome.hook_events.is_empty());
+    assert_eq!(
+        *calls.lock().expect("lock MCP calls"),
+        vec![expected_stop_call]
+    );
+}
+
+#[test]
+fn executor_hooks_register_events_from_each_environment() {
+    let (mut engine, _, _, _, mut first_source) = executor_stop_hook_fixture();
+    first_source.hooks.interrupt = std::mem::take(&mut first_source.hooks.stop);
+    engine.set_executor_hooks(vec![first_source.clone()]);
+    let mut expected_handlers = engine.handlers.clone();
+    let mut second_source = first_source.clone();
+    second_source.environment_id = "executor-b".to_string();
+    second_source.hooks.stop = std::mem::take(&mut second_source.hooks.interrupt);
+    let mut second_handler = expected_handlers[0].clone();
+    second_handler.event_name = HookEventName::Stop;
+    second_handler.display_order = 1;
+    let HandlerSourcePath::ExecutorScoped { environment_id, .. } = &mut second_handler.source_path
+    else {
+        panic!("executor Stop handler should have an executor source");
+    };
+    *environment_id = second_source.environment_id.clone();
+    expected_handlers.push(second_handler);
+
     engine.set_executor_hooks(vec![first_source, second_source]);
 
     assert_eq!(engine.handlers, expected_handlers);
+}
+
+#[tokio::test]
+async fn executor_stop_hooks_use_an_admitted_mcp_environment() {
+    let (mut engine, calls, request, mut expected_call, mut source) = executor_stop_hook_fixture();
+    source.mcp_environment_id = Some("local".to_string());
+    engine.set_executor_hooks(vec![source]);
+
+    engine.run_stop(request).await;
+    wait_for_mcp_calls(&calls, /*count*/ 1).await;
+
+    expected_call.environment_id = Some("local".to_string());
+    assert_eq!(*calls.lock().expect("lock MCP calls"), vec![expected_call]);
 }
 
 #[tokio::test]
@@ -2482,6 +2568,7 @@ async fn mcp_interrupt_hooks_expand_event_input_and_bound_timeout() {
             transcript_path: None,
             model: "gpt-test".to_string(),
             permission_mode: "default".to_string(),
+            request_metadata: None,
         })
         .await;
 

@@ -582,6 +582,8 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
 
     fn model_defaults(guidance_message: &str) -> ModelTokenBudgetConfig {
         ModelTokenBudgetConfig {
+            enabled: false,
+            use_history_notes_extension: false,
             reminder_threshold_tokens: 6_144,
             reminder_message_template: "Reminder: {n_remaining} tokens remain.".to_string(),
             guidance_message: guidance_message.to_string(),

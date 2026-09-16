@@ -13,7 +13,7 @@ use crate::store::PluginStore;
 use codex_hooks::plugin_hook_declarations;
 use codex_plugin::PluginId;
 
-/// Runtime categories affected by a bundle change, before runtime policy filtering.
+/// Runtime categories affected by a plugin change, before runtime policy filtering.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemotePluginCapabilities {
     pub has_mcps: bool,
@@ -23,7 +23,7 @@ pub struct RemotePluginCapabilities {
 }
 
 impl RemotePluginCapabilities {
-    pub(super) async fn include_active_bundle(
+    pub(crate) async fn include_active_bundle(
         &mut self,
         store: &PluginStore,
         plugin_id: &PluginId,

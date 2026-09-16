@@ -915,6 +915,7 @@ async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Res
                         serde_json::from_value(serde_json::json!({
                             "command": rmcp_test_server_bin,
                             "environment_id": environment_id,
+                            "cwd": config.cwd,
                             "omit_tools_from": omit_tools_from,
                         }))
                         .expect("test MCP server config should be valid"),
@@ -1149,6 +1150,7 @@ async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure() -> 
                         serde_json::from_value(serde_json::json!({
                             "command": rmcp_test_server_bin,
                             "environment_id": environment_id,
+                            "cwd": config.cwd,
                             "omit_tools_from": omit_tools_from,
                         }))
                         .expect("test MCP server config should be valid"),
@@ -1595,11 +1597,36 @@ text(output.output);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_update_plan_nested_tool_result_is_empty_object() -> Result<()> {
+async fn code_mode_does_not_expose_update_plan_by_default() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn(
+        &server,
+        "inspect the available tools",
+        r#"
+text(JSON.stringify({
+  callable: typeof tools.update_plan === "function",
+  listed: ALL_TOOLS.some(({ name }) => name === "update_plan"),
+}));
+"#,
+    )
+    .await?;
+
+    let (output, _) = custom_tool_output_body_and_success(&second_mock.single_request(), "call-1");
+    assert_eq!(
+        serde_json::from_str::<Value>(&output)?,
+        serde_json::json!({ "callable": false, "listed": false })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_update_plan_nested_tool_result_is_empty_object() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, second_mock) = run_code_mode_turn_with_config(
         &server,
         "use exec to run update_plan",
         r#"
@@ -1608,6 +1635,7 @@ const result = await tools.update_plan({
 });
 text(JSON.stringify(result));
 "#,
+        |config| config.update_plan_enabled = true,
     )
     .await?;
 
@@ -4347,6 +4375,7 @@ async fn code_mode_node_repl_screenshots_can_be_captured_without_guardian_transc
         let mcp = serde_json::from_value(serde_json::json!({
             "command": mcp_server_bin,
             "environment_id": remote_aware_environment_id(),
+            "cwd": config.cwd,
             "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
             "omit_tools_from": ["deferred"],
         }))
@@ -4440,6 +4469,7 @@ async fn code_mode_node_repl_image_flag_without_enhanced_stays_disabled(
             let mcp = serde_json::from_value(serde_json::json!({
                 "command": mcp_server_bin,
                 "environment_id": remote_aware_environment_id(),
+                "cwd": config.cwd,
                 "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
                 "omit_tools_from": ["deferred"],
             }))
@@ -4508,6 +4538,8 @@ await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated"
 #[test_case("node_repl", true, true, false, Some("unbounded"); "text_fallback_without_context_bound")]
 #[test_case("node_repl", true, true, false, Some("small"); "text_fallback_with_insufficient_context")]
 #[test_case("node_repl", true, true, false, Some("large_prompt"); "images_resume_after_prompt_pressure")]
+#[test_case("node_repl", true, true, false, Some("buffered"); "multimodal_reviewer_preserves_model_owned_fallback_buffer")]
+#[test_case("node_repl", true, true, false, Some("rollover"); "multimodal_reviewer_rollover_replays_evidence")]
 #[test_case("cua_repl", false, false, false, None; "cua_disabled")]
 #[test_case("cua_repl", true, false, false, None; "cua_manually_enabled_text_only")]
 #[test_case("cua_repl", true, true, false, None; "cua_manually_enabled_multimodal")]
@@ -4537,6 +4569,8 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
     const PRIVATE_IMAGE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let server = responses::start_mock_server().await;
     let mcp_server_bin = remote_aware_stdio_server_bin()?;
+    let reviewer_rollover = reviewer_constraint == Some("rollover");
+    let reviewer_token_budget = matches!(reviewer_constraint, Some("buffered" | "rollover"));
     let check_detail = enhanced_transcripts && transcript_images && reviewer_constraint.is_none();
     let mut large_image = Cursor::new(Vec::new());
     if check_detail {
@@ -4559,7 +4593,11 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                     .iter_mut()
                     .find(|model| model.slug == "gpt-5.6-luna")
                     .expect("API-key Guardian reviewer");
-                if check_detail {
+                if reviewer_token_budget {
+                    reviewer.context_window = Some(100_000);
+                    reviewer.max_context_window = Some(100_000);
+                    reviewer.auto_compact_token_limit = Some(50_000);
+                } else if check_detail {
                     reviewer.use_responses_lite = false;
                 } else if reviewer_constraint == Some("unsupported") {
                     reviewer.input_modalities =
@@ -4574,6 +4612,12 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                 .features
                 .enable(Feature::CodeMode)
                 .expect("enable Code Mode");
+            if reviewer_token_budget {
+                config
+                    .features
+                    .enable(Feature::TokenBudget)
+                    .expect("enable token budget");
+            }
             config
                 .features
                 .set_enabled(
@@ -4588,6 +4632,7 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
             let mcp: McpServerConfig = serde_json::from_value(serde_json::json!({
                 "command": mcp_server_bin,
                 "environment_id": remote_aware_environment_id(),
+                "cwd": config.cwd,
                 "env": {
                     "MCP_TEST_ENABLE_NODE_REPL_JS": "1",
                     "MCP_TEST_IMAGE_DATA_URL": format!("data:image/png;base64,{}", BASE64_STANDARD.encode(large_image.into_inner())),
@@ -4609,7 +4654,8 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
     let test = builder.build_with_auto_env(&server).await?;
     wait_for_mcp_server(&test.codex, repl_server).await?;
     let images_enabled = auto_review_required || (enhanced_transcripts && transcript_images);
-    let reviewer_images = images_enabled && reviewer_constraint.is_none();
+    let reviewer_images =
+        images_enabled && (reviewer_constraint.is_none() || reviewer_token_budget);
     let snapshot_padding = if images_enabled && reviewer_constraint != Some("large_prompt") {
         2_500
     } else {
@@ -4638,12 +4684,13 @@ await tools.mcp__node_repl__js({ code: 'nodeRepl.empty()' });
 await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
 if (LARGE_IMAGE) await tools.mcp__node_repl__image_scenario({ scenario: "invalid_image_bytes_then_image" });
 await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated", justification: "review" });
-await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
+if (!REVIEWER_ROLLOVER) await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
 if (LARGE_IMAGE) await tools.mcp__node_repl__image({});
 await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_escalated", justification: "review again" });
 "#
     .replace("node_repl", repl_server)
     .replace("SNAPSHOT_PADDING", &snapshot_padding.to_string())
+    .replace("REVIEWER_ROLLOVER", &reviewer_rollover.to_string())
     .replace("LARGE_IMAGE", &check_detail.to_string());
     let response_mock = responses::mount_sse_sequence(
         &server,
@@ -4672,7 +4719,14 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
             ]),
             sse(vec![
                 ev_assistant_message("guardian", r#"{"outcome":"allow"}"#),
-                ev_completed("resp-guardian"),
+                if reviewer_token_budget {
+                    responses::ev_completed_with_tokens(
+                        "resp-guardian",
+                        /*total_tokens*/ if reviewer_rollover { 70_000 } else { 60_000 },
+                    )
+                } else {
+                    ev_completed("resp-guardian")
+                },
             ]),
             sse(vec![
                 ev_assistant_message("guardian-again", r#"{"outcome":"allow"}"#),
@@ -4773,6 +4827,44 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
             reviewer_image_urls
         }
     );
+    if reviewer_rollover {
+        let second_request = guardian_requests[1];
+        let second_prompt = second_request
+            .message_input_text_groups("user")
+            .last()
+            .expect("post-rollover Guardian review prompt")
+            .join("");
+        assert!(second_prompt.contains(">>> TRANSCRIPT START\n"));
+        assert!(!second_prompt.contains(">>> TRANSCRIPT DELTA START\n"));
+        assert!(second_prompt.contains(NODE_REPL_DOM_MIDDLE));
+        assert_eq!(
+            second_request.message_input_image_urls("user"),
+            vec![PRIVATE_IMAGE.to_string()],
+            "browser screenshots must be replayed into the fresh reviewer window"
+        );
+        assert!(
+            second_request
+                .message_input_texts("developer")
+                .iter()
+                .any(|text| text.contains("Previous context window id:")),
+            "Guardian should roll over before rebuilding browser evidence"
+        );
+    } else if reviewer_token_budget {
+        let second_request = guardian_requests[1];
+        let second_prompt = second_request
+            .message_input_text_groups("user")
+            .last()
+            .expect("buffered Guardian review prompt")
+            .join("");
+        assert!(second_prompt.contains(">>> TRANSCRIPT DELTA START\n"));
+        assert!(
+            second_request
+                .message_input_texts("developer")
+                .iter()
+                .all(|text| !text.contains("Previous context window id:")),
+            "Guardian should preserve the reviewer model's fallback buffer before rolling over"
+        );
+    }
     let parent_request = requests.last().expect("parent turn should complete");
     let parent_input = serde_json::to_string(&parent_request.input())?;
     assert!(!parent_input.contains("data:image/png;base64,"));
@@ -5744,6 +5836,7 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
+        config.update_plan_enabled = true;
         let _ = config.features.enable(Feature::CodeMode);
         config.code_mode.excluded_tool_namespaces = vec!["excluded".to_string()];
     });
@@ -5846,6 +5939,7 @@ async fn code_mode_omits_configured_mcp_server_tools() -> Result<()> {
             model.supports_search_tool = false;
         })
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             let _ = config.features.enable(Feature::CodeMode);
             let mut servers = config.mcp_servers.get().clone();
             servers.insert(
@@ -5853,6 +5947,7 @@ async fn code_mode_omits_configured_mcp_server_tools() -> Result<()> {
                 serde_json::from_value(serde_json::json!({
                     "command": rmcp_test_server_bin,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "omit_tools_from": ["code_mode"],
                 }))
                 .expect("test MCP server config should be valid"),
@@ -5944,6 +6039,7 @@ async fn code_mode_only_keeps_mcp_tools_direct_when_nested_exposure_is_omitted()
                 serde_json::from_value(serde_json::json!({
                     "command": rmcp_test_server_bin,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "omit_tools_from": ["code_mode"],
                 }))
                 .expect("test MCP server config should be valid"),
@@ -6037,6 +6133,7 @@ async fn code_mode_only_can_call_mcp_tools_hidden_from_direct_and_deferred_expos
                 serde_json::from_value(serde_json::json!({
                     "command": rmcp_test_server_bin,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "omit_tools_from": ["direct", "deferred"],
                     "supports_parallel_tool_calls": true,
                 }))

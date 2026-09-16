@@ -28,6 +28,7 @@ fn settings_item(
 ) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
         ThreadSettingsAppliedEvent {
+            thread_id: None,
             thread_settings: ThreadSettingsSnapshot {
                 model: "gpt-5".to_string(),
                 model_provider_id: "openai".to_string(),

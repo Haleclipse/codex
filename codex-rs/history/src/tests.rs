@@ -72,6 +72,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             item: response_item.clone(),
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
+                fallback_token_limit_override: Some(20_000),
             }),
         }),
     };
@@ -84,7 +85,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             "ordinal": 7,
             "type": "response_item",
             "payload": response_item,
-            "metadata": { "client_authored": true },
+            "metadata": { "client_authored": true, "fallback_token_limit_override": 20_000 },
         })
     );
     assert_eq!(serialized["payload"].get("metadata"), None);
@@ -97,6 +98,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
         envelope.metadata,
         Some(CodexHarnessMetadata {
             client_authored: true,
+            fallback_token_limit_override: Some(20_000),
         })
     );
     Ok(())
@@ -184,6 +186,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
                 item: developer_message.clone(),
                 metadata: Some(CodexHarnessMetadata {
                     client_authored: true,
+                    ..Default::default()
                 }),
             },
             ResponseItemEnvelope::new(compaction_item.clone()),
@@ -216,6 +219,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
                 item: developer_message,
                 metadata: Some(CodexHarnessMetadata {
                     client_authored: true,
+                    ..Default::default()
                 }),
             },
             ResponseItemEnvelope {
@@ -277,6 +281,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
         item: response_item.clone(),
         metadata: Some(CodexHarnessMetadata {
             client_authored: true,
+            ..Default::default()
         }),
     };
     let response_line = serde_json::to_value(RolloutItem::ResponseItem(envelope.clone()))?;

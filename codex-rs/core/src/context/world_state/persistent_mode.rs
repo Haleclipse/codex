@@ -10,7 +10,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use serde::Deserialize;
 use serde::Serialize;
 
-const DEFAULT_INSTRUCTIONS: &str = include_str!("../../../templates/persistent_mode.md");
+const DEFAULT_INSTRUCTIONS: &str = include_str!("../../../assets/persistent_mode.md");
 const REPLACEMENT_NOTICE: &str = "These persistent-mode instructions replace all previously provided persistent-mode instructions.";
 const REMOVAL_NOTICE: &str =
     "The previously provided persistent-mode instructions no longer apply.";

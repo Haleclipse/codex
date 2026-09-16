@@ -3,6 +3,9 @@ mod common;
 #[path = "common/relay.rs"]
 mod relay_support;
 
+#[path = "relay/registration_retry_tests.rs"]
+mod registration_retry;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;

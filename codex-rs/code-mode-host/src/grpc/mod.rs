@@ -9,6 +9,7 @@ mod waits;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::WaitRequest;
@@ -131,6 +132,7 @@ impl GrpcCodeModeHost {
         request: proto::ExecuteRequest,
         callback_traceparent: Option<String>,
     ) -> Result<Response<GrpcStream<proto::ExecuteEvent>>, Status> {
+        let received_at = Instant::now();
         let session = self.state.session(&request.session_id)?;
         validation::identifier(&request.execution_id, "execution ID")?;
         let request_permit = self.state.request_permit()?;
@@ -177,10 +179,15 @@ impl GrpcCodeModeHost {
                     biased;
                     _ = sender.closed() => {}
                     response = started.initial_response() => {
-                        let event = response.map(|response| proto::ExecuteEvent {
-                            event: Some(proto::execute_event::Event::Outcome(
-                                conversions::execution_outcome(response),
-                            )),
+                        // Freeze timing before conversion or transport backpressure.
+                        let code_mode_host_duration = received_at.elapsed();
+                        let event = response.and_then(|response| {
+                            let response = response.with_code_mode_host_duration(code_mode_host_duration);
+                            let outcome = conversions::execution_outcome(response)
+                                .map_err(|error| error.to_string())?;
+                            Ok(proto::ExecuteEvent {
+                                event: Some(proto::execute_event::Event::Outcome(outcome)),
+                            })
                         }).map_err(Status::internal);
                         let _ = sender.send(event).await;
                     }
@@ -218,6 +225,7 @@ impl GrpcCodeModeHost {
         &self,
         request: proto::WaitRequest,
     ) -> Result<Response<proto::WaitResponse>, Status> {
+        let received_at = Instant::now();
         let session = self.state.session(&request.session_id)?;
         validation::identifier(&request.cell_id, "cell ID")?;
         validation::identifier(&request.wait_id, "wait ID")?;
@@ -239,7 +247,10 @@ impl GrpcCodeModeHost {
                 outcome.map_err(Status::failed_precondition)?
             }
         };
-        Ok(Response::new(conversions::wait_response(outcome)))
+        let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
+        let response = conversions::wait_response(outcome)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(response))
     }
 
     async fn cancel_wait_request(
@@ -257,11 +268,15 @@ impl GrpcCodeModeHost {
         &self,
         request: proto::TerminateRequest,
     ) -> Result<Response<proto::WaitResponse>, Status> {
+        let received_at = Instant::now();
         let session = self.state.session(&request.session_id)?;
         validation::identifier(&request.cell_id, "cell ID")?;
         let _permit = self.state.request_permit()?;
-        let result = session.terminate(CellId::new(request.cell_id)).await?;
-        Ok(Response::new(conversions::wait_response(result)))
+        let outcome = session.terminate(CellId::new(request.cell_id)).await?;
+        let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
+        let response = conversions::wait_response(outcome)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(Response::new(response))
     }
 }
 

@@ -2,7 +2,6 @@ use super::super::TextArea;
 use super::VimAction;
 use crate::keymap::KeyChordMatch;
 use crate::keymap::KeyChordMatcher;
-use crate::keymap::KeymapContextSet;
 use crate::keymap::RuntimeKeymap;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -15,6 +14,7 @@ fn vim_textarea(text: &str, cursor: usize) -> TextArea {
     textarea.insert_str(text);
     textarea.set_cursor(cursor);
     textarea.set_vim_enabled(/*enabled*/ true);
+    textarea.enable_vim_search();
     textarea
 }
 
@@ -22,16 +22,16 @@ fn keys(textarea: &mut TextArea, keys: &str) {
     let keymap = RuntimeKeymap::defaults();
     let mut matcher = KeyChordMatcher::default();
     for key in keys.chars() {
-        let code = if key == '\n' {
-            KeyCode::Enter
-        } else {
-            KeyCode::Char(key)
+        let code = match key {
+            '\n' => KeyCode::Enter,
+            '\x1b' => KeyCode::Esc,
+            ch => KeyCode::Char(ch),
         };
         let event = KeyEvent::new(code, KeyModifiers::NONE);
         match matcher.advance(
             event,
             &keymap.chords,
-            KeymapContextSet::new(textarea.keymap_context()),
+            textarea.keymap_contexts(),
             Instant::now(),
         ) {
             KeyChordMatch::PassThrough => textarea.input(event),
@@ -167,7 +167,7 @@ fn repeat_omits_ineffective_deletions_before_inserted_text() {
     ] {
         let mut textarea = vim_textarea("one two\n", cursor);
         keys(&mut textarea, "i");
-        textarea.apply_vim_insert_action(action);
+        textarea.apply_vim_insert_action(action.clone());
         keys(&mut textarea, "X");
         escape(&mut textarea);
         textarea.set_cursor(repeat_cursor);
@@ -619,4 +619,58 @@ fn find_and_navigation_have_visual_snapshot_coverage() {
     gg: alpha beta\ngamma delta
     ^
     "###);
+}
+
+#[test]
+fn search_motions_compose_with_operators_and_repeat() {
+    for (commands, text, cursor, mode) in [
+        ("/b\n", "a b c b d b", 2, "Normal"),
+        ("/b\nn", "a b c b d b", 6, "Normal"),
+        ("/b\nnN", "a b c b d b", 2, "Normal"),
+        ("/b\nnnn", "a b c b d b", 2, "Normal"),
+        ("?b\n", "a b c b d b", 10, "Normal"),
+        ("?b\nn", "a b c b d b", 6, "Normal"),
+        ("?b\nN", "a b c b d b", 2, "Normal"),
+        ("d/b\n", "b c b d b", 0, "Normal"),
+        ("c/b\n", "b c b d b", 0, "Insert"),
+        ("y/b\np", "aa  b c b d b", 3, "Normal"),
+        ("/b\ndn", "a b d b", 2, "Normal"),
+        ("?b\ndN", "a b", 2, "Normal"),
+        ("?b\nd?b\n", "a b c b", 6, "Normal"),
+        ("?b\ny?b\n", "a b c b d b", 6, "Normal"),
+        ("d/missing\n", "a b c b d b", 0, "Normal"),
+        ("/b\nc?missing\x1bn", "a b c b d b", 6, "Normal"),
+        ("c/b\nX\x1bl.", "XXb d b", 1, "Normal"),
+    ] {
+        let mut area = vim_textarea("a b c b d b", /*cursor*/ 0);
+        keys(&mut area, commands);
+        assert_eq!(
+            (area.text(), area.cursor(), area.vim_mode_label()),
+            (text, cursor, Some(mode)),
+            "{commands:?}"
+        );
+    }
+    for (cursor, commands, expected) in [
+        (1, "d/xyz\n", "a\nxyz"),
+        (0, "d/xyz\n", "xyz"),
+        (0, "c/xyz\nQ\x1b", "Q\nxyz"),
+        (1, "c/xyz\nQ\x1b", "aQ\nxyz"),
+        (0, "y/xyz\np", "abc\nabc\nxyz"),
+    ] {
+        let mut area = vim_textarea("abc\nxyz", cursor);
+        keys(&mut area, commands);
+        assert_eq!(area.text(), expected, "{commands:?}");
+    }
+}
+
+#[test]
+fn search_skips_atomic_elements_and_partial_graphemes() {
+    let mut area = vim_textarea("é e\u{301}\n", /*cursor*/ 0);
+    area.insert_element("[photo.png]");
+    keys(&mut area, "/photo\n");
+    assert_eq!(area.cursor(), "[photo.png]".len());
+    keys(&mut area, "/\u{301}\n");
+    assert_eq!(area.cursor(), "[photo.png]".len());
+    keys(&mut area, "/e\u{301}\n");
+    assert_eq!(area.cursor(), "[photo.png]é ".len());
 }

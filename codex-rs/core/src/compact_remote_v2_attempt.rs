@@ -39,7 +39,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
 ) -> CodexResult<RemoteCompactV2Attempt> {
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = sess.get_prompt_base_instructions().await;
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
             &mut history,
@@ -104,7 +104,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     };
     let compaction_output_result = run_remote_compaction_request_v2(
         sess,
-        turn_context.as_ref(),
+        step_context,
         client_session,
         &prompt,
         &responses_metadata,

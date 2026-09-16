@@ -7,6 +7,7 @@ mod executor_hooks;
 mod git_policy;
 mod http_client_selector;
 pub mod installed_marketplaces;
+mod loaded_cache_metrics;
 pub mod loader;
 mod manager;
 pub mod manifest;

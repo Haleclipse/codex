@@ -29,6 +29,7 @@ use codex_login::default_client::default_headers;
 use codex_model_provider::AgentIdentitySessionFallback;
 use codex_model_provider::ProviderAuthScope;
 use codex_model_provider::SharedModelProvider;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
@@ -43,6 +44,7 @@ use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
+use uuid::Uuid;
 
 use super::trusted_skills::GuardianTrustedSkillsFragment;
 use super::trusted_tools::GuardianTrustedToolFragment;
@@ -106,8 +108,10 @@ pub struct LunaSamplingRequest {
     pub parent_compaction_hash: Option<String>,
     /// Reasoning budget explicitly selected for this request.
     pub reasoning_effort: ReasoningEffort,
-    /// Owning turn identifier used for request attribution.
-    pub turn_id: String,
+    /// Owning turn that initiated this classification, not the classifier turn.
+    pub parent_turn_id: String,
+    /// Trusted causal root of the owning turn, absent when unknown or ambiguous.
+    pub root_turn_id: Option<String>,
 }
 
 /// Failures returned while connecting or sampling the Luna model.
@@ -428,7 +432,10 @@ impl LunaSampler {
 
     /// Sends one tool-less classification request on an exclusively leased WebSocket.
     pub async fn sample(&self, request: LunaSamplingRequest) -> Result<String, LunaSamplerError> {
-        let turn_id = request.turn_id;
+        // A classification is its own inference turn; retries keep that identity.
+        let turn_id = Uuid::now_v7().to_string();
+        let parent_turn_id = request.parent_turn_id;
+        let root_turn_id = request.root_turn_id;
         let mut input = vec![
             ResponseItem::AdditionalTools {
                 id: None,
@@ -504,6 +511,14 @@ impl LunaSampler {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         });
+        // Assign IDs once so retries reuse the same input item identities.
+        for item in &mut input {
+            if item.id().is_none()
+                && let Some(prefix) = item.id_prefix()
+            {
+                item.set_id(Some(ResponseItemId::new(prefix)));
+            }
+        }
         let mut request = ResponsesApiRequest {
             model: MODEL.to_owned(),
             instructions: String::new(),
@@ -578,24 +593,30 @@ impl LunaSampler {
                     self.config.service_tier.clone()
                 };
             let thread_id = &lease.connection.thread_id;
-            let turn_metadata = json!({
+            let mut turn_metadata = json!({
                 "session_id": self.config.session_id,
                 "thread_id": thread_id,
                 "guardian_classifier_source_thread_id": self.config.thread_id,
                 "turn_id": turn_id,
+                "parent_turn_id": parent_turn_id,
                 "thread_source": "guardian_classifier",
-            })
-            .to_string();
-            request.client_metadata = Some(HashMap::from([
+            });
+            let mut client_metadata = HashMap::from([
                 ("session_id".to_owned(), self.config.session_id.clone()),
                 ("thread_id".to_owned(), thread_id.clone()),
                 ("turn_id".to_owned(), turn_id.clone()),
+                ("parent_turn_id".to_owned(), parent_turn_id.clone()),
                 ("x-openai-subagent".to_owned(), "guardian".to_owned()),
                 // Classifier requests do not advance their own context window.
                 ("x-codex-window-id".to_owned(), format!("{thread_id}:0")),
                 (RESPONSES_LITE_METADATA_KEY.to_owned(), "true".to_owned()),
-                (TURN_METADATA_KEY.to_owned(), turn_metadata),
-            ]));
+            ]);
+            if let Some(root_turn_id) = &root_turn_id {
+                client_metadata.insert("root_turn_id".to_owned(), root_turn_id.clone());
+                turn_metadata["root_turn_id"] = json!(root_turn_id);
+            }
+            client_metadata.insert(TURN_METADATA_KEY.to_owned(), turn_metadata.to_string());
+            request.client_metadata = Some(client_metadata);
             let mut stream = match lease
                 .connection
                 .connection

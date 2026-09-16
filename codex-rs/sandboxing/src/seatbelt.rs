@@ -22,7 +22,7 @@ const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl
 const MACOS_SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network_policy.sbpl");
 const MACOS_SEATBELT_PREFERENCES_POLICY: &str = include_str!("seatbelt_preferences_policy.sbpl");
 const MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS: &str =
-    include_str!("restricted_read_only_platform_defaults.sbpl");
+    include_str!("seatbelt_read_only_platform_defaults.sbpl");
 // Ordinary processes need system scratch directories for compatibility, but filesystem helpers
 // must not inherit scratch access beyond the paths their permission profile explicitly grants.
 const MACOS_PROCESS_PLATFORM_DEFAULTS: &str = r#"

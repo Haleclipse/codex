@@ -156,4 +156,8 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
     }
 }
 
-impl CoreToolRuntime for SleepHandler {}
+impl CoreToolRuntime for SleepHandler {
+    fn is_builtin_control_tool(&self) -> bool {
+        true
+    }
+}

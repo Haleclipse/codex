@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::remote::RemoteInstalledPluginBundleSyncOutcome;
-use crate::remote::RemotePluginRemoval;
+use crate::remote::RemotePluginChange;
 use crate::remote::RemotePluginServiceConfig;
 use crate::remote::sync_remote_installed_plugin_bundles_once;
 use crate::test_support::write_file;
@@ -141,7 +141,7 @@ async fn capabilities_union_cached_versions_and_sync_reports_removal() -> anyhow
         )
         .await?,
         RemoteInstalledPluginBundleSyncOutcome {
-            removed_plugins: vec![RemotePluginRemoval {
+            changed_plugins: vec![RemotePluginChange {
                 plugin_id: plugin_id.as_key(),
                 capabilities: RemotePluginCapabilities {
                     has_apps: true,

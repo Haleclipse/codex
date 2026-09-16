@@ -221,6 +221,7 @@ fn compacted_summary_only_output(summary: &str) -> Vec<ResponseItem> {
 
 fn test_codex() -> TestCodexBuilder {
     base_test_codex().with_config(|config| {
+        config.update_plan_enabled = true;
         let _ = config.features.disable(Feature::RemoteCompactionV2);
     })
 }

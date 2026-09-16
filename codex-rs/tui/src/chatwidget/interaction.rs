@@ -180,6 +180,7 @@ impl ChatWidget {
                     self.flush_completed_command_activity();
                 }
                 let input_result = self.bottom_pane.handle_key_event(key_event);
+                self.sync_backend_banner_view();
                 if should_pause_active_goal {
                     self.pause_active_goal_for_interrupt();
                 }

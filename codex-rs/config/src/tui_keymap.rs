@@ -324,6 +324,21 @@ pub struct TuiVimOperatorKeymap {
     pub cancel: Option<KeybindingsSpec>,
 }
 
+/// Search motions shared by Vim normal and operator-pending input.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct TuiVimSearchKeymap {
+    /// Search forward in the active buffer (`/`).
+    pub forward: Option<KeybindingsSpec>,
+    /// Search backward in the active buffer (`?`).
+    pub backward: Option<KeybindingsSpec>,
+    /// Repeat the accepted search (`n`).
+    pub next: Option<KeybindingsSpec>,
+    /// Repeat in the opposite direction (`N`).
+    pub previous: Option<KeybindingsSpec>,
+}
+
 /// Vim text-object keybindings for modal editing inside text areas.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -469,6 +484,8 @@ pub struct TuiKeymap {
     pub vim_normal: TuiVimNormalKeymap,
     #[serde(default)]
     pub vim_operator: TuiVimOperatorKeymap,
+    #[serde(default)]
+    pub vim_search: TuiVimSearchKeymap,
     #[serde(default)]
     pub vim_text_object: TuiVimTextObjectKeymap,
     #[serde(default)]

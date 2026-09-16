@@ -13,6 +13,7 @@ use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
 use crate::context_manager::ContextManager;
+use crate::context_manager::HistoryReplacement;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
@@ -132,8 +133,12 @@ impl SessionState {
         &mut self,
         items: Vec<ResponseItemEnvelope>,
         reference_context_item: Option<TurnContextItem>,
+        replacement: HistoryReplacement,
     ) {
-        self.history.replace_annotated(items);
+        match replacement {
+            HistoryReplacement::Compaction => self.history.replace_compacted(items),
+            HistoryReplacement::Reset => self.history.replace_annotated(items),
+        }
         self.history
             .set_reference_context_item(reference_context_item);
         self.auto_compact_window.clear_prefill();

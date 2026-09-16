@@ -565,21 +565,24 @@ async fn load_config_resolves_non_prefixed_mcp_tool_servers() -> std::io::Result
 #[tokio::test]
 async fn load_config_resolves_update_plan_enabled() -> std::io::Result<()> {
     let codex_home = tempdir()?;
-    let config_toml = toml::from_str(
-        r#"
-[tools.update_plan]
-enabled = false
-"#,
-    )
-    .expect("TOML deserialization should succeed");
-    let config = Config::load_from_base_config_with_overrides(
-        config_toml,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
+    for (config_toml, expected_enabled) in [
+        ("", false),
+        ("[tools.update_plan]", false),
+        ("[tools.update_plan]\nenabled = false", false),
+        ("[tools.update_plan]\nenabled = true", true),
+    ] {
+        let config = Config::load_from_base_config_with_overrides(
+            toml::from_str(config_toml).expect("TOML deserialization should succeed"),
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await?;
 
-    assert!(!config.update_plan_enabled);
+        assert_eq!(
+            config.update_plan_enabled, expected_enabled,
+            "{config_toml}"
+        );
+    }
     Ok(())
 }
 
@@ -6773,6 +6776,7 @@ approval_mode = "approve"
         server.tools.get("search"),
         Some(&McpServerToolConfig {
             approval_mode: Some(AppToolApproval::Approve),
+            ..Default::default()
         })
     );
 }
@@ -6816,6 +6820,7 @@ approval_mode = "approve"
         tool,
         &McpServerToolConfig {
             approval_mode: Some(AppToolApproval::Approve),
+            ..Default::default()
         }
     );
 }
@@ -11599,7 +11604,9 @@ max_concurrent_threads_per_session = 17
     for wait_agent_enabled in [true, false] {
         let mut config = config.clone();
         config.wait_agent_enabled = wait_agent_enabled;
-        let usage_hints = resolve_usage_hints(&config, /*catalog*/ None);
+        let usage_hints = resolve_usage_hints(
+            &config, /*catalog*/ None, /*omit_update_plan_instructions*/ false,
+        );
         for hint in [usage_hints.root, usage_hints.subagent] {
             let hint = hint.expect("default usage hints should be present").body();
             assert!(hint.contains(concurrency_guidance));
@@ -11616,6 +11623,7 @@ max_concurrent_threads_per_session = 17
             root: Some(String::new()),
             subagent: Some(String::new()),
         }),
+        /*omit_update_plan_instructions*/ false,
     );
     assert!(usage_hints.root.is_none() && usage_hints.subagent.is_none());
 }
@@ -11623,12 +11631,12 @@ max_concurrent_threads_per_session = 17
 #[test]
 fn multi_agent_v2_model_override_exposure_preserves_configured_usage_hints() {
     let config_toml = toml::from_str(
-        r#"[features.multi_agent_v2]
+        r###"[features.multi_agent_v2]
 enabled = true
-root_agent_usage_hint_text = "Root guidance."
-subagent_usage_hint_text = "Subagent guidance."
+root_agent_usage_hint_text = "## Plan tool\nRoot guidance."
+subagent_usage_hint_text = "## `update_plan`\nSubagent guidance."
 expose_spawn_agent_model_overrides = true
-"#,
+"###,
     )
     .expect("multi-agent v2 config should parse");
 
@@ -11636,11 +11644,11 @@ expose_spawn_agent_model_overrides = true
     assert!(config.expose_spawn_agent_model_overrides);
     assert_eq!(
         config.root_agent_usage_hint_text.as_deref(),
-        Some("Root guidance.")
+        Some("## Plan tool\nRoot guidance.")
     );
     assert_eq!(
         config.subagent_usage_hint_text.as_deref(),
-        Some("Subagent guidance.")
+        Some("## `update_plan`\nSubagent guidance.")
     );
     let usage_hints = resolve_usage_hints(
         &config,
@@ -11648,6 +11656,7 @@ expose_spawn_agent_model_overrides = true
             root: Some("Catalog root base.".to_string()),
             subagent: Some("Catalog subagent base.".to_string()),
         }),
+        /*omit_update_plan_instructions*/ true,
     );
     assert_eq!(
         (
@@ -11655,8 +11664,8 @@ expose_spawn_agent_model_overrides = true
             usage_hints.subagent.map(|hint| hint.body()),
         ),
         (
-            Some("Root guidance.".to_string()),
-            Some("Subagent guidance.".to_string()),
+            Some("## Plan tool\nRoot guidance.".to_string()),
+            Some("## `update_plan`\nSubagent guidance.".to_string()),
         )
     );
 }
@@ -11668,9 +11677,13 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
 
     let mut config = resolve_multi_agent_v2_config(&config_toml);
     assert!(config.expose_spawn_agent_model_overrides);
-    let usage_hints = resolve_usage_hints(&config, /*catalog*/ None);
+    let usage_hints = resolve_usage_hints(
+        &config, /*catalog*/ None, /*omit_update_plan_instructions*/ false,
+    );
     config.expose_spawn_agent_model_overrides = false;
-    let usage_hints_without_model_overrides = resolve_usage_hints(&config, /*catalog*/ None);
+    let usage_hints_without_model_overrides = resolve_usage_hints(
+        &config, /*catalog*/ None, /*omit_update_plan_instructions*/ false,
+    );
 
     for (hint, hint_without_model_overrides) in [
         (usage_hints.root, usage_hints_without_model_overrides.root),
@@ -11785,6 +11798,7 @@ subagent_usage_hint_text = ""
             root: Some("catalog root".to_string()),
             subagent: Some("catalog subagent".to_string()),
         }),
+        /*omit_update_plan_instructions*/ false,
     );
     assert_eq!(
         (

@@ -22,6 +22,6 @@ impl ContextualUserFragment for GuardianNodeReplPolicy {
     }
 
     fn body(&self) -> String {
-        include_str!("../guardian/node_repl_policy.md").to_string()
+        include_str!("../../assets/guardian/node_repl_policy.md").to_string()
     }
 }

@@ -23,7 +23,9 @@ pub enum McpServerConnectionStatus {
     Disabled,
 }
 
-/// Extension ID for OpenAI form elicitation.
+/// Extension ID for OpenAI elicitation modes.
+pub const OPENAI_ELICITATION_EXTENSION_ID: &str = "openai/elicitation";
+/// Extension ID for legacy OpenAI form elicitation.
 pub const OPENAI_FORM_EXTENSION_ID: &str = "openai/form";
 /// Extension ID for standard MCP form elicitations that require user-entered input.
 pub const OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID: &str = "openai/standard-form-input";

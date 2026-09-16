@@ -80,6 +80,7 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
         config.tool_registry.error_on_tool_collisions = true;
+        config.update_plan_enabled = true;
         if pre_compact {
             config.model_auto_compact_token_limit = Some(0);
         }
@@ -231,6 +232,7 @@ async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> 
     .await;
 
     let mut builder = test_codex().with_config(|config| {
+        config.update_plan_enabled = true;
         config
             .features
             .enable(Feature::UnifiedExec)

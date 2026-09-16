@@ -21,13 +21,22 @@ const OPEN_ROLLOUT_LINE_READER_RETRY_DELAY: Duration = Duration::from_millis(50)
 const TEMP_SUFFIX: &str = ".tmp";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Whether cold files belonging to shared rollout lineages may be compressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RolloutCompressionMode {
+    /// Preserve compatibility with readers that require shared lineages to remain plain JSONL.
+    Standalone,
+    /// Requires every reader of this Codex home to support compressed shared lineages.
+    IncludeShared,
+}
+
 /// Starts a best-effort background job that compresses cold local rollout files.
 ///
 /// The worker is fire-and-forget: failures are logged, startup is not blocked,
 /// and a run marker under `codex_home` prevents overlapping or too-frequent
 /// compression runs from the same local store.
-pub fn spawn_rollout_compression_worker(codex_home: PathBuf) {
-    worker::spawn(codex_home)
+pub fn spawn_rollout_compression_worker(codex_home: PathBuf, mode: RolloutCompressionMode) {
+    worker::spawn(codex_home, mode)
 }
 
 /// Returns the modified time for the existing plain or compressed rollout file.
@@ -247,6 +256,7 @@ mod worker {
     use crate::RolloutReferenceIndex;
     use crate::SESSIONS_SUBDIR;
 
+    use super::RolloutCompressionMode;
     use super::RolloutFile;
     use super::metrics;
     use super::path;
@@ -324,7 +334,7 @@ mod worker {
         }
     }
 
-    pub(super) fn spawn(codex_home: PathBuf) {
+    pub(super) fn spawn(codex_home: PathBuf, mode: RolloutCompressionMode) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             metrics::run("skipped_no_runtime");
             warn!(
@@ -334,7 +344,7 @@ mod worker {
             return;
         };
         handle.spawn(async move {
-            if let Err(err) = run(codex_home.clone()).await {
+            if let Err(err) = run(codex_home.clone(), mode).await {
                 warn!(
                     "rollout compression worker failed for {}: {err}",
                     codex_home.display()
@@ -343,7 +353,7 @@ mod worker {
         });
     }
 
-    pub(super) async fn run(codex_home: PathBuf) -> io::Result<()> {
+    pub(super) async fn run(codex_home: PathBuf, mode: RolloutCompressionMode) -> io::Result<()> {
         let Some(_maintenance_guard) =
             crate::try_acquire_rollout_maintenance_lock(codex_home.as_path())?
         else {
@@ -391,8 +401,14 @@ mod worker {
                 if started_at.elapsed() >= WORKER_MAX_RUNTIME {
                     break;
                 }
-                compress_rollouts_in_root(root.as_path(), started_at, &reference_index, &mut stats)
-                    .await?;
+                compress_rollouts_in_root(
+                    root.as_path(),
+                    started_at,
+                    &reference_index,
+                    mode,
+                    &mut stats,
+                )
+                .await?;
             }
             Ok::<_, io::Error>(stats)
         }
@@ -433,6 +449,7 @@ mod worker {
         root: &Path,
         started_at: Instant,
         reference_index: &RolloutReferenceIndex,
+        mode: RolloutCompressionMode,
         stats: &mut CompressionStats,
     ) -> io::Result<()> {
         if !tokio::fs::try_exists(root).await.unwrap_or(false) {
@@ -501,12 +518,14 @@ mod worker {
                     metrics::file("skipped_unreadable_meta");
                     continue;
                 };
-                if reference_index.reference_count(rollout_id) > 0 {
+                if mode == RolloutCompressionMode::Standalone
+                    && reference_index.reference_count(rollout_id) > 0
+                {
                     stats.skipped = stats.skipped.saturating_add(1);
                     metrics::file("skipped_referenced");
                     continue;
                 }
-                if meta.meta.history_base.is_some() {
+                if mode == RolloutCompressionMode::Standalone && meta.meta.history_base.is_some() {
                     stats.skipped = stats.skipped.saturating_add(1);
                     metrics::file("skipped_fork_pointer");
                     continue;
@@ -745,6 +764,8 @@ mod worker {
     fn encode_zstd_to_writer(source: &Path, output: impl Write) -> io::Result<()> {
         let mut input = File::open(source)?;
         let mut encoder = zstd::stream::write::Encoder::new(output, COMPRESSION_LEVEL)?;
+        // Preserve fast byte-bound checks for paginated history without decoding the whole file.
+        encoder.set_pledged_src_size(Some(input.metadata()?.len()))?;
         io::copy(&mut input, &mut encoder)?;
         encoder.finish()?;
         Ok(())

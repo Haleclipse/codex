@@ -17,6 +17,8 @@ use codex_protocol::openai_models::ModelTokenBudgetConfig;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::openai_models::ToolMessage;
+use codex_protocol::openai_models::ToolMessages;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_GUIDANCE_OPEN_TAG;
@@ -428,6 +430,8 @@ async fn active_model_switch_resolves_token_budget_from_original_preferences(
                     .as_mut()
                     .expect("model messages")
                     .token_budget = (initial_model || destination_has_guidance).then(|| ModelTokenBudgetConfig {
+                    enabled: false,
+                    use_history_notes_extension: false,
                     reminder_threshold_tokens: if initial_model { 8_000 } else { 2_000 },
                     reminder_message_template: format!(
                         "Reminder for {slug}: {{n_remaining}} tokens remain."
@@ -1123,6 +1127,90 @@ async fn model_activation_uses_destination_metadata_defaults(
     assert_eq!(
         requests.iter().map(request_turn_id).collect::<Vec<_>>(),
         vec![request.turn_id; 3],
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_user_message_async_description_follows_mid_turn_model_changes() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            paused_response("resp-1", "pause-before-async-message-model-change"),
+            sse_completed("resp-2"),
+        ],
+    )
+    .await;
+    let test = step_settings_test()
+        .with_config(|config| {
+            for model in &mut config
+                .model_catalog
+                .as_mut()
+                .expect("controlled model catalog")
+                .models
+            {
+                model
+                    .experimental_supported_tools
+                    .push("send_user_message_async".to_string());
+                model
+                    .model_messages
+                    .as_mut()
+                    .expect("model instruction metadata")
+                    .tools = Some(ToolMessages {
+                    send_user_message_async: Some(ToolMessage {
+                        description: Some(format!("Async message description for {}.", model.slug)),
+                    }),
+                });
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let paused = start_paused_turn(&test.codex).await?;
+    assert_eq!(
+        submit_turn_settings(
+            &test.codex,
+            &paused.turn_id,
+            TurnSettingsUpdate {
+                model: Some(MODEL_B.to_string()),
+                ..Default::default()
+            }
+        )
+        .await?,
+        TurnSettingsUpdateOutcome::Applied
+    );
+    answer_paused_turn(&test.codex, &paused.turn_id).await?;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::Error(error) => panic!("model activation failed: {}", error.message),
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+
+    assert_eq!(
+        response_mock
+            .requests()
+            .iter()
+            .map(|request| {
+                let body = request.body_json();
+                let tool = body["tools"]
+                    .as_array()
+                    .expect("request tools")
+                    .iter()
+                    .find(|tool| tool["name"] == "send_user_message_async")
+                    .expect("async message tool");
+                json!({"model": body["model"], "description": tool["description"]})
+            })
+            .collect::<Vec<_>>(),
+        [MODEL_A, MODEL_B]
+            .map(|model| json!({
+                "model": model,
+                "description": format!("Async message description for {model}."),
+            }))
+            .to_vec(),
     );
 
     Ok(())

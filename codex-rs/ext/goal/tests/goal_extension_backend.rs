@@ -836,6 +836,67 @@ async fn turn_error_blocks_goal() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn failed_execution_turns_block_goal_unless_a_tool_succeeds() -> anyhow::Result<()> {
+    for (recovery_turn, status_only_turn, blocking_turn) in
+        [(None, None, 3), (Some(2), None, 5), (None, Some(2), 4)]
+    {
+        let runtime = test_runtime().await?;
+        let thread_id = test_thread_id()?;
+        seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+        let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+        harness.start_turn("turn-1", &TokenUsage::default()).await;
+
+        let tools = harness.tools();
+        tool_by_name(&tools, "create_goal")
+            .handle(tool_call(
+                "create_goal",
+                "call-create-goal",
+                json!({ "objective": "ship goal extension backend" }),
+            ))
+            .await?;
+
+        for turn in 1..=blocking_turn {
+            let turn_id = format!("turn-{turn}");
+            if turn > 1 {
+                harness.start_turn(&turn_id, &TokenUsage::default()).await;
+            }
+            if status_only_turn != Some(turn) {
+                harness
+                    .notify_tool_finish_with_outcome(
+                        &turn_id,
+                        &format!("call-exec-{turn}"),
+                        "exec",
+                        ToolCallOutcome::Failed {
+                            handler_executed: true,
+                        },
+                    )
+                    .await;
+            }
+            if recovery_turn == Some(turn) {
+                harness
+                    .notify_tool_finish(&turn_id, "call-recovery", "shell")
+                    .await;
+            }
+            harness.stop_turn(&turn_id).await;
+
+            let goal = runtime
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+            let expected = if turn == blocking_turn {
+                codex_state::ThreadGoalStatus::Blocked
+            } else {
+                codex_state::ThreadGoalStatus::Active
+            };
+            assert_eq!(expected, goal.status);
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn usage_limit_budget_limited_goal_accounts_remaining_progress() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;
@@ -1684,6 +1745,22 @@ impl GoalExtensionHarness {
     }
 
     async fn notify_tool_finish(&self, turn_id: &str, call_id: &str, tool_name: &str) {
+        self.notify_tool_finish_with_outcome(
+            turn_id,
+            call_id,
+            tool_name,
+            ToolCallOutcome::Completed { success: true },
+        )
+        .await;
+    }
+
+    async fn notify_tool_finish_with_outcome(
+        &self,
+        turn_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        outcome: ToolCallOutcome,
+    ) {
         let turn_store = ExtensionData::new(turn_id);
         let tool_name = codex_extension_api::ToolName::plain(tool_name);
         for contributor in self.registry.tool_lifecycle_contributors() {
@@ -1696,7 +1773,7 @@ impl GoalExtensionHarness {
                     call_id,
                     tool_name: &tool_name,
                     source: ToolCallSource::Direct,
-                    outcome: ToolCallOutcome::Completed { success: true },
+                    outcome,
                 })
                 .await;
         }

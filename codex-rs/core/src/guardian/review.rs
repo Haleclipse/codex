@@ -5,6 +5,7 @@ use codex_analytics::GuardianReviewFailureReason;
 use codex_analytics::GuardianReviewTerminalStatus;
 use codex_analytics::GuardianReviewTrackContext;
 use codex_analytics::GuardianReviewedAction;
+use codex_async_utils::THREAD_STACK_SIZE_BYTES;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_extension_api::ThreadIdleCause;
 use codex_features::Feature;
@@ -806,6 +807,7 @@ pub(crate) fn spawn_approval_request_review(
     let runtime = session.services.runtime_handle.clone();
     let spawn_result = std::thread::Builder::new()
         .name("codex-approval-review".to_string())
+        .stack_size(THREAD_STACK_SIZE_BYTES)
         .spawn(move || {
             let decision = runtime.block_on(run_guardian_review(
                 session, context, review_id, request, reasons, options,

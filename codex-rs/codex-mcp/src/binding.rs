@@ -268,6 +268,18 @@ impl PreparedMcpCall {
             .tool_approval_mode(&self.tool_info.tool.name)
     }
 
+    /// Returns the explicit output budget captured with this call's effective server config.
+    pub fn output_token_limit(&self) -> Option<usize> {
+        self.config
+            .mcp_server_catalog
+            .server(&self.server_name)?
+            .config()
+            .tools
+            .get(self.tool_info.tool.name.as_ref())?
+            .output_token_limit
+            .map(std::num::NonZeroUsize::get)
+    }
+
     pub fn plugin_id(&self) -> Option<&str> {
         self.plugin_id.as_deref()
     }

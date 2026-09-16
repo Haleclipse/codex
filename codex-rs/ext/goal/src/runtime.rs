@@ -39,6 +39,7 @@ pub(crate) struct GoalRuntimeConfig {
 pub(crate) enum ActiveGoalStopReason {
     TurnError,
     UsageLimit,
+    ExecutionUnavailable { expected_goal_id: String },
 }
 
 struct GoalRuntimeInner {
@@ -132,6 +133,19 @@ impl GoalRuntimeHandle {
 
     pub(crate) fn root_accounting_state(&self) -> Option<Arc<GoalAccountingState>> {
         self.inner.root_accounting_state.clone()
+    }
+
+    pub(crate) async fn invalidate_turn_lineage(&self) {
+        let Some(thread_manager) = self.inner.thread_manager.upgrade() else {
+            return;
+        };
+        let Ok(thread) = thread_manager.get_thread(self.inner.thread_id).await else {
+            return;
+        };
+        thread.thread_extension_data().remove::<TurnStartOptions>();
+        if let Some(turn_id) = self.inner.accounting_state.current_turn_id() {
+            thread.invalidate_turn_lineage(turn_id.as_str()).await;
+        }
     }
 
     pub(crate) async fn goal_state_permit(&self) -> Result<SemaphorePermit<'_>, String> {
@@ -264,21 +278,33 @@ impl GoalRuntimeHandle {
         // Hold this through accounting and the status update so external goal
         // mutations and idle continuation cannot interleave between them.
         let _goal_state_permit = self.goal_state_permit().await?;
-        if !self
+        let Some(accounting_goal_id) = self
             .inner
             .accounting_state
-            .turn_is_current_active_goal(turn_id)
+            .current_active_goal_id_for_turn(turn_id)
+        else {
+            return Ok(());
+        };
+        if let ActiveGoalStopReason::ExecutionUnavailable { expected_goal_id } = &reason
+            && accounting_goal_id != *expected_goal_id
         {
             return Ok(());
         }
 
-        let (event_name, status) = match reason {
+        let (event_name, status, expected_goal_id) = match reason {
             ActiveGoalStopReason::TurnError => {
-                ("turn-error", codex_state::ThreadGoalStatus::Blocked)
+                ("turn-error", codex_state::ThreadGoalStatus::Blocked, None)
             }
-            ActiveGoalStopReason::UsageLimit => {
-                ("usage-limit", codex_state::ThreadGoalStatus::UsageLimited)
-            }
+            ActiveGoalStopReason::UsageLimit => (
+                "usage-limit",
+                codex_state::ThreadGoalStatus::UsageLimited,
+                None,
+            ),
+            ActiveGoalStopReason::ExecutionUnavailable { expected_goal_id } => (
+                "execution-unavailable",
+                codex_state::ThreadGoalStatus::Blocked,
+                Some(expected_goal_id),
+            ),
         };
         self.account_active_goal_progress(
             turn_id,
@@ -299,6 +325,12 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         };
+        if expected_goal_id
+            .as_ref()
+            .is_some_and(|expected_goal_id| active_goal.goal_id != *expected_goal_id)
+        {
+            return Ok(());
+        }
         let can_stop = active_goal.status == codex_state::ThreadGoalStatus::Active
             || (active_goal.status == codex_state::ThreadGoalStatus::BudgetLimited
                 && status == codex_state::ThreadGoalStatus::UsageLimited);
@@ -411,13 +443,21 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         }
-        let item = continuation_steering_item(&protocol_goal_from_state(goal));
+        let start_options = thread
+            .thread_extension_data()
+            .get::<TurnStartOptions>()
+            .map(|options| options.as_ref().clone())
+            .unwrap_or_default();
+        let item = continuation_steering_item(
+            &protocol_goal_from_state(goal),
+            thread.config().await.update_plan_enabled,
+        );
 
         match thread
             .start_turn_if_idle(
                 TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(TurnStartOptions {
                     turn_trigger: Some("goal".to_string()),
-                    ..Default::default()
+                    ..start_options
                 }),
             )
             .await
@@ -444,10 +484,13 @@ impl GoalRuntimeHandle {
             .is_some_and(|turn_id| {
                 self.inner
                     .accounting_state
-                    .turn_is_current_active_goal(turn_id.as_str())
+                    .current_active_goal_id_for_turn(turn_id.as_str())
+                    .is_some()
             });
         if !current_turn_is_goal_active {
-            self.inner.accounting_state.clear_active_goal();
+            self.inner
+                .accounting_state
+                .reset_idle_progress_baseline_and_clear_active_goal();
         }
         Ok(())
     }

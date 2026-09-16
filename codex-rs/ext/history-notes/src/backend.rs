@@ -14,6 +14,7 @@ use serde_json::json;
 const HISTORY_NOTES_BACKEND_TIMEOUT: Duration = Duration::from_secs(35);
 const ENCRYPTED_TOOL_ARGUMENTS_HEADER: &str = "x-openai-encrypted-tool-arguments";
 const TOOL_OUTPUT_TRUNCATION_POLICY_HEADER: &str = "x-openai-tool-output-truncation-policy";
+const OPERATION_ERROR_PREFIX: &str = "Unable to perform operation:";
 
 #[derive(Clone)]
 pub(crate) struct HistoryNotesBackend {
@@ -44,23 +45,24 @@ impl HistoryNotesBackend {
             }),
         );
 
-        let provider =
-            self.provider.api_provider().await.map_err(|error| {
-                format!("History backend provider could not be resolved: {error}")
-            })?;
-        let auth = self
-            .provider
-            .api_auth()
-            .await
-            .map_err(|error| format!("History backend auth could not be resolved: {error}"))?;
+        let provider = self.provider.api_provider().await.map_err(|_| {
+            format!("{OPERATION_ERROR_PREFIX} Could not resolve the backend provider.")
+        })?;
+        let auth = self.provider.api_auth().await.map_err(|_| {
+            format!("{OPERATION_ERROR_PREFIX} Could not resolve backend authentication.")
+        })?;
 
         let mut request = provider.build_request(Method::POST, path);
-        let encoded_truncation_policy = serde_json::to_string(&truncation_policy)
-            .map_err(|error| format!("Could not encode tool output truncation policy: {error}"))?;
+        let encoded_truncation_policy =
+            serde_json::to_string(&truncation_policy).map_err(|_| {
+                format!("{OPERATION_ERROR_PREFIX} Could not encode the output truncation policy.")
+            })?;
         request.headers.insert(
             TOOL_OUTPUT_TRUNCATION_POLICY_HEADER,
-            HeaderValue::from_str(&encoded_truncation_policy).map_err(|error| {
-                format!("Invalid tool output truncation policy header: {error}")
+            HeaderValue::from_str(&encoded_truncation_policy).map_err(|_| {
+                format!(
+                    "{OPERATION_ERROR_PREFIX} Could not construct the output truncation policy header."
+                )
             })?,
         );
         if matches!(
@@ -77,17 +79,16 @@ impl HistoryNotesBackend {
         }
         request.body = Some(RequestBody::Json(arguments));
         request.timeout = Some(HISTORY_NOTES_BACKEND_TIMEOUT);
-        let request = auth
-            .apply_auth(request)
-            .await
-            .map_err(|error| format!("History backend auth failed: {error}"))?;
+        let request = auth.apply_auth(request).await.map_err(|_| {
+            format!("{OPERATION_ERROR_PREFIX} Could not apply backend authentication.")
+        })?;
         let response = ReqwestTransport::from_http_client(create_client())
             .execute(request)
             .await
-            .map_err(|error| format!("History backend request failed: {error}"))?;
+            .map_err(|_| format!("{OPERATION_ERROR_PREFIX} The backend request failed."))?;
 
         serde_json::from_slice(&response.body)
-            .map_err(|error| format!("History backend returned invalid JSON: {error}"))
+            .map_err(|_| format!("{OPERATION_ERROR_PREFIX} The backend returned invalid JSON."))
     }
 }
 

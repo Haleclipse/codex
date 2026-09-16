@@ -505,6 +505,7 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         upgrade: None,
         model_messages: Some(ModelMessages {
             persistent_instructions: None,
+            tools: None,
             instructions_template: Some("base instructions".to_string()),
             instructions_variables: None,
             approvals: None,

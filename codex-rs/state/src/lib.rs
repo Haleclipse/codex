@@ -26,6 +26,7 @@ pub use model::LogRow;
 pub use model::Phase2JobClaimOutcome;
 pub use model::Project;
 pub use model::ProjectRoot;
+pub use model::ProjectSortKey;
 pub use model::ProjectsPage;
 pub use model::QueuedUserSubmissionRecord;
 pub use model::RolloutMigrationCursor;

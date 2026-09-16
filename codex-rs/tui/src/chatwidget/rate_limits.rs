@@ -1,7 +1,15 @@
 //! Rate-limit warning, prompt, and notice surfaces for `ChatWidget`.
 
 use super::*;
+pub(super) const WORKSPACE_NUDGE_VIEW_ID: &str = "workspace-usage-nudge";
+use crate::bottom_pane::ActionableBanner;
 use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
+use uuid::Uuid;
+
+pub(super) struct PendingCreditsNudge {
+    request_id: Uuid,
+    credit_type: AddCreditsNudgeCreditType,
+}
 
 pub(super) const NUDGE_MODEL_SLUG: &str = "gpt-5.6-luna";
 pub(super) const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
@@ -162,11 +170,31 @@ fn has_usable_workspace_credits(credits: &CreditsSnapshot) -> bool {
 }
 
 impl ChatWidget {
+    pub(crate) fn hold_rate_limit_recovery(&mut self) -> bool {
+        std::mem::replace(&mut self.input_queue.rate_limit_recovery_pending, true)
+    }
+
+    pub(crate) fn finish_rate_limit_recovery(&mut self) {
+        if std::mem::take(&mut self.input_queue.rate_limit_recovery_pending) {
+            self.submit_initial_user_message_if_pending();
+            self.maybe_send_next_queued_input();
+        }
+    }
+
     pub(crate) fn on_rate_limit_snapshot(&mut self, snapshot: Option<RateLimitSnapshot>) {
         self.on_rate_limit_snapshot_from(snapshot, RateLimitSnapshotSource::AccountUsage);
     }
 
     pub(crate) fn on_rolling_rate_limit_snapshot(&mut self, snapshot: RateLimitSnapshot) {
+        if let (Some(previous), Some(current)) = (
+            self.codex_rate_limit_reached_type,
+            snapshot.rate_limit_reached_type,
+        ) && previous != current
+        {
+            // Do not keep a credits CTA when a newer notification requires a different remedy.
+            // An absent aggregate limit type is not a contradiction of model-scoped recovery.
+            self.clear_backend_banner();
+        }
         // Rolling app-server notifications are sparse. Preserve metadata learned from the full read.
         self.on_rate_limit_snapshot_from(Some(snapshot), RateLimitSnapshotSource::RollingUpdate);
     }
@@ -354,7 +382,10 @@ impl ChatWidget {
     }
 
     pub(super) fn maybe_show_pending_rate_limit_prompt(&mut self) {
-        if self.rate_limit_switch_prompt_hidden() {
+        if self.has_applicable_backend_banner() {
+            return;
+        }
+        if self.rate_limit_switch_prompt_hidden() || self.current_model() == NUDGE_MODEL_SLUG {
             self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
             return;
         }
@@ -489,11 +520,11 @@ impl ChatWidget {
             },
         ];
 
-        self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: Some(title.to_string()),
-            subtitle: Some(prompt.to_string()),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
+        self.bottom_pane.show_actionable_banner(ActionableBanner {
+            view_id: Some(WORKSPACE_NUDGE_VIEW_ID),
+            title: title.to_string(),
+            description: prompt.to_string(),
+            actions: items,
             initial_selected_idx: Some(1),
             ..Default::default()
         });
@@ -502,19 +533,32 @@ impl ChatWidget {
     pub(crate) fn start_add_credits_nudge_email_request(
         &mut self,
         credit_type: AddCreditsNudgeCreditType,
-    ) -> bool {
-        self.add_credits_nudge_email_in_flight = Some(credit_type);
-        true
+    ) -> Option<Uuid> {
+        if self.add_credits_nudge_email_in_flight.is_some() {
+            return None;
+        }
+        let request_id = Uuid::new_v4();
+        self.add_credits_nudge_email_in_flight = Some(PendingCreditsNudge {
+            request_id,
+            credit_type,
+        });
+        Some(request_id)
     }
 
     pub(crate) fn finish_add_credits_nudge_email_request(
         &mut self,
+        request_id: Uuid,
         result: Result<AddCreditsNudgeEmailStatus, String>,
     ) {
-        let credit_type = self
+        let Some(pending) = self
             .add_credits_nudge_email_in_flight
-            .take()
-            .unwrap_or(AddCreditsNudgeCreditType::Credits);
+            .as_ref()
+            .filter(|pending| pending.request_id == request_id)
+        else {
+            return;
+        };
+        let credit_type = pending.credit_type;
+        self.add_credits_nudge_email_in_flight = None;
         let message = match (credit_type, result) {
             (AddCreditsNudgeCreditType::Credits, Ok(AddCreditsNudgeEmailStatus::Sent)) => {
                 "Workspace owner notified."

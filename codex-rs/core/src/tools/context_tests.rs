@@ -230,8 +230,11 @@ fn mcp_tool_output_response_item_preserves_content_items() {
     }
 }
 
-#[test]
-fn mcp_tool_output_code_mode_result_preserves_content_without_private_metadata() {
+#[test_case::test_case(TruncationPolicy::Bytes(64); "byte budget")]
+#[test_case::test_case(TruncationPolicy::Tokens(1); "token budget")]
+fn mcp_tool_output_code_mode_result_preserves_content_without_private_metadata(
+    truncation_policy: TruncationPolicy,
+) {
     let large_content = "large structured value ".repeat(1_000);
     let output = McpToolOutput {
         result: CallToolResult {
@@ -250,12 +253,13 @@ fn mcp_tool_output_code_mode_result_preserves_content_without_private_metadata()
         tool_input: json!({}),
         wall_time: std::time::Duration::from_millis(1250),
         original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Bytes(64),
+        truncation_policy,
     };
 
-    let result = output.code_mode_result(&ToolPayload::Function {
+    let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
-    });
+    };
+    let result = output.code_mode_result(&payload);
 
     assert_eq!(
         result,

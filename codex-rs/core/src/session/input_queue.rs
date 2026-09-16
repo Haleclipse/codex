@@ -401,6 +401,7 @@ mod tests {
             item: ResponseItem::Other,
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
+                ..Default::default()
             }),
         });
         assert!(serde_json::to_value(annotated).is_err());

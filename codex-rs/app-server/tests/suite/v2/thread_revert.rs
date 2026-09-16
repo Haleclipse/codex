@@ -40,6 +40,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use codex_rollout::read_session_meta_line;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -51,16 +52,24 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
+    let updated_workspace = TempDir::new()?;
+    let saved_cwd = AbsolutePathBuf::from_absolute_path(updated_workspace.path().canonicalize()?)?
+        .into_path_buf();
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    // This fixture checks host-native cwd restoration across fork and revert.
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .without_auto_env()
         .build()
         .await?;
     initialize_experimental(&mut mcp).await?;
     let ThreadStartResponse { thread: parent, .. } = mcp
-        .start_thread(ThreadStartParams {
-            history_mode: Some(ThreadHistoryMode::Paginated),
-            ..Default::default()
+        .request(|request_id| ClientRequest::ThreadStart {
+            request_id,
+            params: ThreadStartParams {
+                history_mode: Some(ThreadHistoryMode::Paginated),
+                ..Default::default()
+            },
         })
         .await?;
     let mut parent_turns = Vec::new();
@@ -68,6 +77,7 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
         let completed = mcp
             .start_turn_and_wait_for_completion(TurnStartParams {
                 thread_id: parent.id.clone(),
+                cwd: Some(parent.cwd.as_path().to_path_buf()),
                 input: vec![UserInput::Text {
                     text: text.to_string(),
                     text_elements: Vec::new(),
@@ -82,6 +92,7 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
             request_id,
             params: ThreadForkParams {
                 thread_id: parent.id.clone(),
+                cwd: Some(codex_home.path().to_string_lossy().into_owned()),
                 ..Default::default()
             },
         })
@@ -114,6 +125,7 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
         let completed = mcp
             .start_turn_and_wait_for_completion(TurnStartParams {
                 thread_id: child.id.clone(),
+                cwd: Some(saved_cwd.clone()),
                 input: vec![UserInput::Text {
                     text: text.to_string(),
                     text_elements: Vec::new(),
@@ -156,10 +168,11 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
         mcp.shutdown_gracefully().await?;
         mcp = TestAppServer::builder()
             .with_codex_home(codex_home.path())
+            .without_auto_env()
             .build()
             .await?;
         initialize_experimental(&mut mcp).await?;
-        let _: ThreadResumeResponse = mcp
+        let ThreadResumeResponse { cwd, .. } = mcp
             .request(|request_id| ClientRequest::ThreadResume {
                 request_id,
                 params: ThreadResumeParams {
@@ -168,6 +181,12 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
                 },
             })
             .await?;
+        if expected_cutoff == fork_cutoff {
+            assert_eq!(cwd.as_path(), saved_cwd);
+        } else {
+            // Only parent-owned snapshots remain after reverting into inherited history.
+            assert_eq!(cwd.as_path(), child_meta.cwd);
+        }
         mcp.start_turn_and_wait_for_completion(TurnStartParams {
             thread_id: child.id.clone(),
             input: vec![UserInput::Text {

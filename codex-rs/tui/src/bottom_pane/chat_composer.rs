@@ -21,6 +21,8 @@
 //! popup-specific handler if a popup is visible and otherwise to
 //! [`ChatComposer::handle_key_event_without_popup`]. After every handled key, we call
 //! [`ChatComposer::sync_popups`] so UI state follows the latest buffer/cursor.
+//! Fresh Vim drafts start in Insert; Normal `/` and `?` search the composer.
+//! Backspace on an empty Vim search query cancels search and any pending operator.
 //!
 //! # Completion and Popup Dismissal
 //!
@@ -59,6 +61,7 @@
 //! `Ctrl+R` opens a reverse incremental search mode. The footer becomes the search input; once the
 //! query is non-empty, the composer body previews the current match. `Enter` accepts the preview as
 //! an editable draft and `Esc` restores the draft that was active when search started.
+//! Vim queries stay draft-local.
 //!
 //! Slash commands are staged for local history instead of being recorded immediately. Command
 //! recall is a two-phase handoff: stage the submitted slash text here, then record it after
@@ -291,6 +294,7 @@ mod footer_state;
 mod history_search;
 mod popup_state;
 mod slash_input;
+mod vim_search;
 
 use self::attachment_state::AttachmentState;
 use self::draft_state::ComposerMentionBinding;
@@ -961,13 +965,17 @@ impl ChatComposer {
 
     /// Return the contexts whose handlers can consume the next composer key.
     pub(crate) fn keymap_contexts(&self) -> KeymapContextSet {
+        if self.draft.textarea.vim_query().is_some() {
+            return KeymapContextSet::new(KeymapContext::Editor);
+        }
         if self.history_search.is_some() {
             return KeymapContextSet::new(KeymapContext::Composer);
         }
         if !self.draft.input_enabled || self.popups.active() {
             return KeymapContextSet::default();
         }
-        KeymapContextSet::new(KeymapContext::Composer).with(self.draft.textarea.keymap_context())
+        let contexts = self.draft.textarea.keymap_contexts();
+        contexts.with(KeymapContext::Composer)
     }
 
     pub fn set_collaboration_mode_indicator(
@@ -1090,7 +1098,10 @@ impl ChatComposer {
             return None;
         }
 
-        if let Some(pos) = self.history_search_cursor_pos(area) {
+        if let Some(pos) = self
+            .vim_search_cursor_pos(area)
+            .or_else(|| self.history_search_cursor_pos(area))
+        {
             return Some(pos);
         }
 
@@ -1212,6 +1223,10 @@ impl ChatComposer {
     pub fn handle_paste(&mut self, pasted: String) -> bool {
         let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
         let pasted = sanitize_user_text(pasted.into());
+        if let Some(query) = self.draft.textarea.vim_query_mut() {
+            query.editor.insert_str(&pasted);
+            return true;
+        }
         let char_count = pasted.chars().count();
         if char_count > LARGE_PASTE_CHAR_THRESHOLD {
             let placeholder = self.next_large_paste_placeholder(char_count);
@@ -1373,6 +1388,7 @@ impl ChatComposer {
     /// commands, not as candidate literal paste text. It also resets transient
     /// footer mode so the visible hints match the new editing surface.
     pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
+        self.draft.textarea.enable_vim_search();
         self.draft.textarea.set_vim_enabled(enabled);
         self.draft.paste_burst.clear_after_explicit_paste();
         self.footer.mode = reset_mode_after_activity(self.footer.mode);
@@ -1974,6 +1990,13 @@ impl ChatComposer {
             return (InputResult::None, false);
         }
 
+        if self.history_search.is_none()
+            && !self.popups.active()
+            && self.draft.textarea.wants_vim_search_key(key_event)
+        {
+            return self.handle_input_basic(key_event);
+        }
+
         if self.history_search.is_some() {
             return self.handle_history_search_key(key_event);
         }
@@ -1995,9 +2018,11 @@ impl ChatComposer {
         result
     }
 
-    /// Return true if any popup or history search is active.
+    /// Whether a popup or query owns input.
     pub(crate) fn popup_active(&self) -> bool {
-        self.history_search.is_some() || self.popups.active()
+        self.history_search.is_some()
+            || self.draft.textarea.vim_query().is_some()
+            || self.popups.active()
     }
 
     #[inline]
@@ -3126,7 +3151,7 @@ impl ChatComposer {
                 | InputResult::ServiceTierCommand(_)
                 | InputResult::CommandWithArgs(_, _, _)
         ) {
-            self.draft.textarea.enter_vim_normal_mode();
+            self.draft.textarea.enter_vim_insert_mode();
         }
     }
 
@@ -3386,6 +3411,7 @@ impl ChatComposer {
             slash_input::args_elements(prepared_rest, prepared_rest_offset, &prepared_elements);
         let trimmed_rest = prepared_rest.trim();
         args_elements = Self::trim_text_elements(prepared_rest, trimmed_rest, args_elements);
+        self.draft.textarea.enter_vim_insert_mode();
         Some((trimmed_rest.to_string(), args_elements))
     }
 
@@ -3476,26 +3502,6 @@ impl ChatComposer {
         if self.draft.textarea.is_vim_normal_mode() && self.draft.textarea.is_vim_operator_pending()
         {
             return self.handle_input_basic(key_event);
-        }
-        if self.draft.textarea.is_vim_normal_mode()
-            && self.is_empty()
-            && matches!(
-                key_event,
-                KeyEvent {
-                    code: KeyCode::Char('/'),
-                    modifiers: KeyModifiers::NONE,
-                    kind: KeyEventKind::Press | KeyEventKind::Repeat,
-                    ..
-                }
-            )
-        {
-            self.footer.mode = reset_mode_after_activity(self.footer.mode);
-            self.draft.textarea.set_text_clearing_elements("/");
-            self.draft
-                .textarea
-                .set_cursor(self.draft.textarea.text().len());
-            self.draft.textarea.enter_vim_insert_mode();
-            return (InputResult::None, true);
         }
         if self.draft.textarea.is_vim_normal_mode()
             && self.is_empty()
@@ -3749,6 +3755,7 @@ impl ChatComposer {
         };
 
         if self.draft.is_bash_mode
+            && self.draft.textarea.vim_query().is_none()
             && matches!(input.code, KeyCode::Backspace)
             && self.draft.textarea.cursor() == 0
         {
@@ -3884,7 +3891,7 @@ impl ChatComposer {
     /// modes (Esc hint, overlay, quit reminder) can override that base when
     /// their conditions are active.
     fn footer_mode(&self) -> FooterMode {
-        if self.history_search.is_some() {
+        if self.history_search.is_some() || self.draft.textarea.vim_query().is_some() {
             return FooterMode::HistorySearch;
         }
 
@@ -3912,7 +3919,7 @@ impl ChatComposer {
     }
 
     fn custom_footer_height(&self) -> Option<u16> {
-        if self.footer.flash_visible() {
+        if self.draft.textarea.vim_query().is_some() || self.footer.flash_visible() {
             return Some(1);
         }
         self.footer
@@ -3923,7 +3930,7 @@ impl ChatComposer {
 
     pub(crate) fn sync_popups(&mut self) {
         self.sync_slash_command_elements();
-        if self.history_search.is_some() {
+        if self.history_search.is_some() || self.draft.textarea.vim_query().is_some() {
             if self.popups.current_file_query.is_some() {
                 self.app_event_tx
                     .send(AppEvent::StartFileSearch(String::new()));
@@ -4728,7 +4735,9 @@ impl ChatComposer {
                 } else {
                     popup_rect
                 };
-                if let Some(line) = self.history_search_footer_line() {
+                if let Some(input) = self.draft.textarea.vim_query() {
+                    input.render(inset_footer_hint_area(hint_rect), buf);
+                } else if let Some(line) = self.history_search_footer_line() {
                     render_footer_line(hint_rect, buf, line);
                 } else {
                     let available_width =
@@ -5015,6 +5024,7 @@ impl ChatComposer {
                 highlights.extend(
                     self.history_search_highlight_ranges()
                         .into_iter()
+                        .chain(self.draft.textarea.vim_search_highlights())
                         .map(|range| (range, search_highlight_style)),
                 );
                 if highlights.is_empty() {
@@ -6149,7 +6159,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_opens_command_popup_in_vim_normal_mode() {
+    fn slash_opens_command_popup_in_vim_insert_mode() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -6164,6 +6174,7 @@ mod tests {
             /*disable_paste_burst*/ true,
         );
         composer.set_vim_enabled(/*enabled*/ true);
+        composer.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
 
         let (result, needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -6180,7 +6191,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_command_can_be_typed_and_dispatched_after_vim_normal_slash() {
+    fn slash_command_dispatches_after_vim_insert_slash() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -6196,7 +6207,7 @@ mod tests {
         );
         composer.set_vim_enabled(/*enabled*/ true);
 
-        for ch in ['/', 'd', 'i', 'f', 'f'] {
+        for ch in ['i', '/', 'd', 'i', 'f', 'f'] {
             let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
         assert_eq!(composer.draft.textarea.text(), "/diff");
@@ -6209,13 +6220,13 @@ mod tests {
         assert!(composer.is_empty());
         assert_eq!(
             composer.vim_mode_indicator_span(),
-            Some("Vim: Normal".magenta())
+            Some("Vim: Insert".green())
         );
         assert!(matches!(result, InputResult::Command(SlashCommand::Diff)));
     }
 
     #[test]
-    fn inline_slash_command_dispatch_resets_vim_mode_to_normal() {
+    fn inline_slash_command_dispatch_resets_vim_mode_to_insert() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -6241,7 +6252,7 @@ mod tests {
         assert!(needs_redraw);
         assert_eq!(
             composer.vim_mode_indicator_span(),
-            Some("Vim: Normal".magenta())
+            Some("Vim: Insert".green())
         );
         match result {
             InputResult::CommandWithArgs(cmd, args, text_elements) => {
@@ -6251,6 +6262,13 @@ mod tests {
             }
             _ => panic!("expected CommandWithArgs"),
         }
+        composer
+            .prepare_inline_args_submission(/*record_history*/ false)
+            .unwrap();
+        for code in [KeyCode::Char('x'), KeyCode::Esc, KeyCode::Char('.')] {
+            composer.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        assert_eq!(composer.current_text(), "xx");
     }
 
     #[test]
@@ -6461,7 +6479,7 @@ mod tests {
     }
 
     #[test]
-    fn vim_mode_resets_to_normal_after_submission() {
+    fn vim_mode_resets_to_insert_after_submission() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -6492,7 +6510,7 @@ mod tests {
         assert!(composer.draft.textarea.is_vim_enabled());
         assert_eq!(
             composer.vim_mode_indicator_span(),
-            Some("Vim: Normal".magenta())
+            Some("Vim: Insert".green())
         );
         assert!(composer.is_empty());
         match result {
@@ -6502,7 +6520,7 @@ mod tests {
     }
 
     #[test]
-    fn vim_mode_resets_to_normal_after_queued_submission() {
+    fn vim_mode_resets_to_insert_after_queued_submission() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
@@ -6526,7 +6544,7 @@ mod tests {
 
         assert_eq!(
             composer.vim_mode_indicator_span(),
-            Some("Vim: Normal".magenta())
+            Some("Vim: Insert".green())
         );
         assert!(composer.is_empty());
         match result {
@@ -9784,7 +9802,7 @@ mod tests {
     }
 
     // Test helper: simulate human typing with a brief delay and flush the paste-burst buffer
-    fn type_chars_humanlike(composer: &mut ChatComposer, chars: &[char]) {
+    pub(super) fn type_chars_humanlike(composer: &mut ChatComposer, chars: &[char]) {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyEventKind;
@@ -11391,148 +11409,6 @@ mod tests {
             composer.draft.textarea.cursor(),
             composer.draft.textarea.text().len()
         );
-    }
-
-    #[test]
-    fn vim_normal_j_k_navigate_history_at_history_boundaries() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-
-        type_chars_humanlike(&mut composer, &['f', 'i', 'r', 's', 't']);
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(result, InputResult::Submitted { .. }));
-
-        type_chars_humanlike(&mut composer, &['s', 'e', 'c', 'o', 'n', 'd']);
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(result, InputResult::Submitted { .. }));
-
-        composer.set_vim_enabled(/*enabled*/ true);
-
-        let (_result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(composer.draft.textarea.text(), "second");
-        assert_eq!(composer.draft.textarea.cursor(), "second".len() - 1);
-
-        let (_result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(composer.draft.textarea.text(), "first");
-        assert_eq!(composer.draft.textarea.cursor(), "first".len() - 1);
-
-        let (_result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(composer.draft.textarea.text(), "second");
-        assert_eq!(composer.draft.textarea.cursor(), "second".len() - 1);
-
-        let (_result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert!(composer.draft.textarea.is_empty());
-        assert_eq!(
-            composer.draft.textarea.cursor(),
-            composer.draft.textarea.text().len()
-        );
-    }
-
-    #[test]
-    fn remapped_vim_normal_history_navigation_does_not_fall_back_to_j_k() {
-        use crate::key_hint;
-        use crate::keymap::RuntimeKeymap;
-
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-
-        type_chars_humanlike(&mut composer, &['f', 'i', 'r', 's', 't']);
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(result, InputResult::Submitted { .. }));
-
-        let mut keymap = RuntimeKeymap::defaults();
-        keymap.vim_normal.move_up = vec![key_hint::plain(KeyCode::F(2))];
-        keymap.vim_normal.move_down = vec![key_hint::plain(KeyCode::F(3))];
-        composer.set_keymap_bindings(&keymap);
-        composer.set_vim_enabled(/*enabled*/ true);
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert!(composer.draft.textarea.is_empty());
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
-        assert_eq!(composer.draft.textarea.text(), "first");
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
-        assert!(composer.draft.textarea.is_empty());
-    }
-
-    #[test]
-    fn vim_normal_j_k_fall_back_to_multiline_cursor_movement() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-        composer
-            .draft
-            .textarea
-            .set_text_clearing_elements("one\ntwo");
-        composer.draft.textarea.set_cursor(/*pos*/ 0);
-        composer.set_vim_enabled(/*enabled*/ true);
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(composer.draft.textarea.cursor(), "one\n".len());
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(composer.draft.textarea.cursor(), 0);
-    }
-
-    #[test]
-    fn vim_normal_operator_motion_does_not_navigate_history() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-
-        type_chars_humanlike(&mut composer, &['f', 'i', 'r', 's', 't']);
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(result, InputResult::Submitted { .. }));
-
-        type_chars_humanlike(&mut composer, &['s', 'e', 'c', 'o', 'n', 'd']);
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(result, InputResult::Submitted { .. }));
-
-        composer.set_vim_enabled(/*enabled*/ true);
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(composer.draft.textarea.text(), "second");
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert!(composer.draft.textarea.is_empty());
-        assert_eq!(composer.current_text(), "");
     }
 
     #[test]

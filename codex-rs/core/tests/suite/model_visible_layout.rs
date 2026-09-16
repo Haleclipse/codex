@@ -285,6 +285,7 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
         .with_extensions(skills_extensions())
         .with_model("gpt-5.4")
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config
                 .features
                 .enable(Feature::Personality)
@@ -399,6 +400,7 @@ async fn snapshot_model_visible_layout_cwd_change_refreshes_agents() -> Result<(
     .await;
 
     let mut builder = test_codex()
+        .with_config(|config| config.update_plan_enabled = true)
         .with_extensions(skills_extensions())
         .with_model("gpt-5.4");
     let test = builder.build(&server).await?;
@@ -511,6 +513,7 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
     let mut initial_builder = test_codex()
         .with_extensions(skills_extensions())
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config.model = Some("gpt-5.2".to_string());
         });
     let initial = initial_builder.build(&server).await?;
@@ -547,6 +550,7 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
     let mut resume_builder = test_codex()
         .with_extensions(skills_extensions())
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config.model = Some("gpt-5.4".to_string());
             config
                 .features
@@ -615,6 +619,7 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
     let mut initial_builder = test_codex()
         .with_extensions(skills_extensions())
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config.model = Some("gpt-5.2".to_string());
         });
     let initial = initial_builder.build(&server).await?;
@@ -651,6 +656,7 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
     let mut resume_builder = test_codex()
         .with_extensions(skills_extensions())
         .with_config(|config| {
+            config.update_plan_enabled = true;
             config.model = Some("gpt-5.4".to_string());
         });
     let resumed = resume_builder.restart(&server, &initial).await?;

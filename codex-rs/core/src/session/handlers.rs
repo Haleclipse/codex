@@ -95,7 +95,12 @@ pub async fn inter_agent_communication(
     }
 }
 
-pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command: String) {
+pub async fn run_user_shell_command(
+    sess: &Arc<Session>,
+    sub_id: String,
+    command: String,
+    timeout_ms: Option<u64>,
+) {
     if let Some((turn_context, cancellation_token)) =
         sess.active_turn_context_and_cancellation_token().await
     {
@@ -105,6 +110,7 @@ pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command
                 session,
                 turn_context,
                 command,
+                timeout_ms,
                 cancellation_token,
                 UserShellCommandMode::ActiveTurnAuxiliary,
             )
@@ -116,8 +122,12 @@ pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command
     let turn_context = sess
         .new_turn_with_default_settings(sub_id, Default::default())
         .await;
-    sess.spawn_task(turn_context, Vec::new(), UserShellCommandTask::new(command))
-        .await;
+    sess.spawn_task(
+        turn_context,
+        Vec::new(),
+        UserShellCommandTask::new(command, timeout_ms),
+    )
+    .await;
 }
 
 pub async fn resolve_elicitation(
@@ -325,16 +335,10 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .collect::<Vec<_>>();
     sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
         .await;
-    if sess
-        .services
+    sess.services
         .thread_extension_data
-        .remove::<NodeReplReviewEvidence>()
-        .is_some()
-    {
-        sess.guardian_review_session
-            .invalidate_for_node_repl_evidence()
-            .await;
-    }
+        .remove::<NodeReplReviewEvidence>();
+    sess.guardian_review_session.invalidate().await;
     sess.services
         .agent_control
         .rollout_budget()
@@ -675,8 +679,11 @@ pub(super) async fn submission_loop(
                     set_thread_memory_mode(&sess, sub.id.clone(), mode).await;
                     false
                 }
-                Op::RunUserShellCommand { command } => {
-                    run_user_shell_command(&sess, sub.id.clone(), command).await;
+                Op::RunUserShellCommand {
+                    command,
+                    timeout_ms,
+                } => {
+                    run_user_shell_command(&sess, sub.id.clone(), command, timeout_ms).await;
                     false
                 }
                 Op::ResolveElicitation {

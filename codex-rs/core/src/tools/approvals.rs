@@ -85,6 +85,8 @@ pub(crate) enum ApprovalAction {
         input: String,
         cwd: PathUri,
         tty: bool,
+        sandbox_permissions: SandboxPermissions,
+        additional_permissions: Option<AdditionalPermissionProfile>,
     },
     #[cfg(unix)]
     Execve {
@@ -171,6 +173,8 @@ impl ApprovalAction {
                 input,
                 cwd,
                 tty,
+                sandbox_permissions,
+                additional_permissions,
             } => PermissionRequestPayload {
                 tool_name: HookToolName::new("write_stdin"),
                 tool_input: serde_json::json!({
@@ -181,6 +185,8 @@ impl ApprovalAction {
                     "environment_id": environment_id,
                     "cwd": cwd,
                     "tty": tty,
+                    "sandbox_permissions": sandbox_permissions,
+                    "additional_permissions": additional_permissions,
                 }),
             },
             #[cfg(unix)]
@@ -297,6 +303,8 @@ impl ApprovalAction {
                 input,
                 cwd,
                 tty,
+                sandbox_permissions,
+                additional_permissions,
             } => crate::guardian::GuardianApprovalRequest::WriteStdin {
                 id,
                 approval_id,
@@ -305,6 +313,8 @@ impl ApprovalAction {
                 input,
                 cwd,
                 tty,
+                sandbox_permissions,
+                additional_permissions,
             },
             #[cfg(unix)]
             Self::Execve {
@@ -487,10 +497,11 @@ impl Session {
         action: ApprovalAction,
         ctx: ApprovalContext,
     ) -> Result<ReviewDecision, ToolError> {
-        // Stdin is a fresh sandbox approval, not an exec-policy cache hit. Strict
-        // review can route Never to Guardian, but granular restrictions still apply.
+        // Stdin that exceeds current permissions needs a fresh sandbox approval.
+        // Strict review of ordinary input follows the same routing as ordinary exec.
         let policy = ctx.review_context.turn().approval_policy();
-        if matches!(&action, ApprovalAction::WriteStdin { .. })
+        if matches!(&action, ApprovalAction::WriteStdin { sandbox_permissions, .. }
+            if sandbox_permissions.requests_sandbox_override())
             && !(ctx.strict_auto_review && matches!(policy, AskForApproval::Never))
             && let Some(reason) =
                 prompt_is_rejected_by_policy(policy, /*prompt_is_rule*/ false)
@@ -751,6 +762,7 @@ impl Session {
                 process_id,
                 input,
                 cwd,
+                additional_permissions,
                 ..
             } => {
                 self.request_command_approval(
@@ -769,7 +781,7 @@ impl Session {
                     ctx.approval_reason.clone(),
                     /*network_approval_context*/ None,
                     /*proposed_execpolicy_amendment*/ None,
-                    /*additional_permissions*/ None,
+                    additional_permissions.clone(),
                     Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
                     /*plugin_attribution_override*/ None,
                 )

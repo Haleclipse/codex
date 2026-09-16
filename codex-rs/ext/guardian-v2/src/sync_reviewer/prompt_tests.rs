@@ -32,6 +32,10 @@ impl ConversationHistorySnapshot for TestConversationHistory {
         0
     }
 
+    fn user_message_revision(&self) -> u64 {
+        0
+    }
+
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
         Box::new(self.0.iter())
     }
@@ -97,8 +101,7 @@ async fn prompt_preserves_root_authorization_reasons_and_denied_reads() -> Resul
     );
     let root = GuardianRootSnapshot {
         authorization_version: GuardianAuthorizationVersion {
-            history_version: 0,
-            user_message_count: 1,
+            user_message_revision: 1,
             user_input_response_count: 0,
         },
         messages: vec![

@@ -3,6 +3,8 @@
 //! This module contains the exhaustive `AppEvent` dispatcher and exit-mode handling. Large domain
 //! actions are delegated to focused app submodules so the central match remains the routing layer.
 
+use super::rate_limit_refresh::RateLimitReadStatus;
+use super::rate_limit_refresh::RateLimitRefreshOutcome;
 use super::resize_reflow::trailing_run_start;
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
@@ -1234,31 +1236,58 @@ impl App {
                 self.clear_thread_goal(app_server, thread_id).await;
             }
             AppEvent::SendAddCreditsNudgeEmail { credit_type } => {
-                if self
+                if let Some(request_id) = self
                     .chat_widget
                     .start_add_credits_nudge_email_request(credit_type)
                 {
-                    self.send_add_credits_nudge_email(app_server, credit_type);
+                    self.send_add_credits_nudge_email(app_server, request_id, credit_type);
                 }
             }
-            AppEvent::AddCreditsNudgeEmailFinished { result } => {
+            AppEvent::AddCreditsNudgeEmailFinished { request_id, result } => {
                 self.chat_widget
-                    .finish_add_credits_nudge_email_request(result);
+                    .finish_add_credits_nudge_email_request(request_id, result);
             }
             AppEvent::RateLimitsLoaded {
+                request_id,
                 origin,
                 hard_stop_generation,
                 result,
-            } => match result {
+            } => {
+                let accepted = match self.rate_limit_refresh_state.finish(
+                    request_id,
+                    hard_stop_generation,
+                    self.rate_limit_hard_stop_generation,
+                    if result.is_ok() {
+                        RateLimitReadStatus::Succeeded
+                    } else {
+                        RateLimitReadStatus::Failed
+                    },
+                ) {
+                    RateLimitRefreshOutcome::Apply => true,
+                    RateLimitRefreshOutcome::Ignore => false,
+                    RateLimitRefreshOutcome::RefreshRecovery => {
+                        // Start in this account's event turn; a queued refresh could cross an account change.
+                        self.refresh_rate_limits(app_server, RateLimitRefreshOrigin::Recovery);
+                        false
+                    }
+                };
+                match result {
                 Ok(response) => {
                     let rate_limit_reset_credits = response.rate_limit_reset_credits.clone();
-                    let snapshots = if hard_stop_generation == self.rate_limit_hard_stop_generation
+                    let snapshots = if accepted
                     {
+                        self.chat_widget.update_backend_banner(&response);
+                        self.apply_backend_banner_fallback(app_server).await;
                         app_server_rate_limit_snapshots(response)
                     } else {
                         Vec::new()
                     };
                     match origin {
+                        RateLimitRefreshOrigin::Recovery => {
+                            for snapshot in snapshots {
+                                self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
+                            }
+                        }
                         RateLimitRefreshOrigin::StartupPrefetch {
                             reset_hint_request_id,
                         } => {
@@ -1312,8 +1341,10 @@ impl App {
                     }
                 }
                 Err(err) => {
+                    // A failed read is not authoritative recovery. Keep the last valid banner.
                     tracing::warn!("account/rateLimits/read failed during TUI refresh: {err}");
                     match origin {
+                        RateLimitRefreshOrigin::Recovery => {},
                         RateLimitRefreshOrigin::StartupPrefetch {
                             reset_hint_request_id,
                         } => {
@@ -1349,6 +1380,14 @@ impl App {
                             );
                         }
                     }
+                }
+                }
+                if matches!(
+                    origin,
+                    RateLimitRefreshOrigin::Recovery | RateLimitRefreshOrigin::ResetConsume { .. }
+                ) && !self.rate_limit_refresh_state.has_pending_recovery()
+                {
+                    self.chat_widget.finish_rate_limit_recovery();
                 }
             },
             AppEvent::OpenTokenActivity => {
@@ -1412,6 +1451,11 @@ impl App {
                     credit_id,
                     result,
                 ) {
+                    // Reads started before redemption must not restore the pre-reset banner.
+                    self.rate_limit_hard_stop_generation =
+                        self.rate_limit_hard_stop_generation.wrapping_add(1);
+                    self.rate_limit_refresh_state.invalidate_recovery();
+                    self.chat_widget.clear_backend_banner();
                     self.refresh_rate_limits(
                         app_server,
                         RateLimitRefreshOrigin::ResetConsume { request_id },
@@ -1518,6 +1562,18 @@ impl App {
                     }
                 }
             }
+            AppEvent::FetchModels { request_id } => {
+                if self.chat_widget.model_popup_request_is_current(request_id) {
+                    app_server.fetch_models(request_id, self.app_event_tx.clone());
+                }
+            }
+            AppEvent::ModelsLoaded { request_id, result } => {
+                if self.chat_widget.on_models_loaded(request_id, result) {
+                    self.model_catalog = self.chat_widget.model_catalog();
+                    app_server.set_available_models(self.model_catalog.try_list_models()?);
+                    self.sync_active_thread_service_tier_to_cached_session().await;
+                }
+            }
             AppEvent::OpenReasoningPopup { model } => {
                 self.chat_widget.open_reasoning_popup(model);
             }
@@ -1571,8 +1627,8 @@ impl App {
                 self.chat_widget
                     .open_plan_reasoning_scope_prompt(model, effort);
             }
-            AppEvent::OpenAllModelsPopup { models } => {
-                self.chat_widget.open_all_models_popup(models);
+            AppEvent::OpenAllModelsPopup => {
+                self.chat_widget.open_all_models_popup();
             }
             AppEvent::OpenFullAccessConfirmation {
                 preset,
