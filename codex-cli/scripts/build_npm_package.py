@@ -63,11 +63,17 @@ PACKAGE_EXPANSIONS: dict[str, list[str]] = {
 
 PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
     "codex": [],
-    "codex-linux-x64": ["bwrap", "codex", "rg"],
-    "codex-linux-arm64": ["bwrap", "codex", "rg"],
-    "codex-darwin-x64": ["codex", "rg"],
-    "codex-darwin-arm64": ["codex", "rg"],
-    "codex-win32-x64": ["codex", "rg", "codex-windows-sandbox-setup", "codex-command-runner"],
+    "codex-linux-x64": ["bwrap", "codex", "codex-code-mode-host", "rg"],
+    "codex-linux-arm64": ["bwrap", "codex", "codex-code-mode-host", "rg"],
+    "codex-darwin-x64": ["codex", "codex-code-mode-host", "rg"],
+    "codex-darwin-arm64": ["codex", "codex-code-mode-host", "rg"],
+    "codex-win32-x64": [
+        "codex",
+        "codex-code-mode-host",
+        "rg",
+        "codex-windows-sandbox-setup",
+        "codex-command-runner",
+    ],
     "codex-responses-api-proxy": ["codex-responses-api-proxy"],
     "codex-sdk": [],
 }
@@ -82,6 +88,10 @@ PACKAGE_CHOICES = tuple(PACKAGE_NATIVE_COMPONENTS)
 COMPONENT_DEST_DIR: dict[str, str] = {
     "bwrap": "codex-resources",
     "codex": "codex",
+    # Must land beside `codex`: InstallContext::code_mode_host_program resolves the
+    # host from the running executable's directory when upstream's package layout
+    # (bin/ + codex-package.json) is absent, which is the case in this fork.
+    "codex-code-mode-host": "codex",
     "codex-responses-api-proxy": "codex-responses-api-proxy",
     "codex-windows-sandbox-setup": "codex",
     "codex-command-runner": "codex",

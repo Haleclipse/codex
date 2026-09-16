@@ -55,6 +55,14 @@ BINARY_COMPONENTS = {
         dest_dir="codex",
         binary_basename="codex",
     ),
+    # Sits next to `codex` because InstallContext::code_mode_host_program falls
+    # back to the running executable's directory when the package layout used by
+    # upstream (bin/ + codex-package.json) is absent, as it is in this fork.
+    "codex-code-mode-host": BinaryComponent(
+        artifact_prefix="codex-code-mode-host",
+        dest_dir="codex",
+        binary_basename="codex-code-mode-host",
+    ),
     "codex-responses-api-proxy": BinaryComponent(
         artifact_prefix="codex-responses-api-proxy",
         dest_dir="codex-responses-api-proxy",
