@@ -1,5 +1,6 @@
 use crate::context::ContextualUserFragment;
 use crate::context::ModelSwitchInstructions;
+use crate::context::world_state::PersistentModeState;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::normalize;
@@ -7,6 +8,7 @@ use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
 use crate::session::turn_context::TurnContext;
+use crate::utils::json::serialized_json_bytes;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_context_fragments::set_annotated_content;
@@ -253,8 +255,10 @@ impl ContextManager {
     // Estimate token usage using byte-based heuristics from the truncation helpers.
     // This is a coarse lower bound, not a tokenizer-accurate count.
     pub(crate) fn estimate_token_count(&self, turn_context: &TurnContext) -> Option<i64> {
-        let model_info = &turn_context.model_info;
-        let personality = turn_context.personality.or(turn_context.config.personality);
+        let model_info = &turn_context.model_info();
+        let personality = turn_context
+            .personality()
+            .or(turn_context.config.personality);
         let base_instructions = BaseInstructions {
             text: model_info.get_model_instructions(personality),
             provenance: None,
@@ -353,10 +357,12 @@ impl ContextManager {
                         return false;
                     };
                     content.retain(|content| {
+                        // Rebuild these from the next step's model and effort after rollback.
                         !matches!(
                             content.content(),
                             ContentItem::InputText { text }
                                 if ModelSwitchInstructions::matches_text(text)
+                                    || PersistentModeState::matches_text(text)
                         )
                     });
                     !content.is_empty() && set_annotated_content(&mut item.item, content).is_some()
@@ -666,8 +672,8 @@ fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
             ..
         } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
         item => {
-            let raw = serde_json::to_string(item)
-                .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
+            let raw = serialized_json_bytes(item)
+                .map(|len| i64::try_from(len).unwrap_or(i64::MAX))
                 .unwrap_or_default();
             let (image_payload_bytes, image_replacement_bytes) =
                 image_data_url_estimate_adjustment(item);

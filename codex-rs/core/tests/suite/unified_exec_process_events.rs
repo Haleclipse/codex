@@ -34,6 +34,8 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
+use core_test_support::startup::STARTUP_TIMEOUT;
+use core_test_support::startup::expect_startup;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use futures::SinkExt;
@@ -87,9 +89,12 @@ struct PushedExecServerResult {
     process_start: Value,
 }
 
-async fn read_exec_server_json(websocket: &mut WebSocketStream<TcpStream>) -> Value {
+async fn read_exec_server_json(
+    websocket: &mut WebSocketStream<TcpStream>,
+    wait: Duration,
+) -> Value {
     loop {
-        match timeout(Duration::from_secs(5), websocket.next())
+        match timeout(wait, websocket.next())
             .await
             .expect("websocket read should not time out")
             .expect("websocket should stay open")
@@ -118,7 +123,7 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
     let (stream, _) = listener.accept().await.expect("connection");
     let mut websocket = accept_async(stream).await.expect("websocket handshake");
 
-    let initialize = read_exec_server_json(&mut websocket).await;
+    let initialize = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
     assert_eq!(initialize["method"], "initialize");
     send_exec_server_json(
         &mut websocket,
@@ -128,7 +133,7 @@ async fn accept_initialized_exec_server(listener: TcpListener) -> WebSocketStrea
         }),
     )
     .await;
-    let initialized = read_exec_server_json(&mut websocket).await;
+    let initialized = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
     assert_eq!(initialized["method"], "initialized");
 
     websocket
@@ -138,7 +143,7 @@ async fn send_environment_info(
     websocket: &mut WebSocketStream<TcpStream>,
     scenario: PushedExecScenario,
 ) {
-    let info = read_exec_server_json(websocket).await;
+    let info = read_exec_server_json(websocket, STARTUP_TIMEOUT).await;
     assert_eq!(info["method"], "environment/info");
     respond_environment_info(websocket, &info["id"], scenario).await;
 }
@@ -179,7 +184,8 @@ async fn serve_exec_with_pushed_events(
     send_environment_info(&mut websocket, scenario).await;
 
     let process_start = loop {
-        let request = read_exec_server_json(&mut websocket).await;
+        // The runtime may still be finishing local setup before its first tool call.
+        let request = read_exec_server_json(&mut websocket, STARTUP_TIMEOUT).await;
         match request["method"].as_str() {
             Some("process/start") => break request,
             Some("environment/info") => {
@@ -428,7 +434,7 @@ async fn serve_exec_with_pushed_events(
 
     let mut process_read_requests = 0;
     loop {
-        let request = read_exec_server_json(&mut websocket).await;
+        let request = read_exec_server_json(&mut websocket, Duration::from_secs(/*secs*/ 5)).await;
         match request["method"].as_str() {
             Some("process/read") => {
                 process_read_requests += 1;
@@ -687,9 +693,7 @@ timeout = 900
             config.bypass_hook_trust = true;
         }
     });
-    let test = timeout(Duration::from_secs(5), builder.build(&server))
-        .await
-        .context("thread startup should connect to the fake exec-server")??;
+    let test = expect_startup(builder.build(&server)).await;
 
     let turn_permission_profile = if managed_network_configured {
         test.session_configured.permission_profile.clone()

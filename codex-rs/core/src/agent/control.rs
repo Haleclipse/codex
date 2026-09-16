@@ -52,6 +52,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::LoadThreadHistoryParams;
 use codex_thread_store::ReadThreadParams;
@@ -89,6 +90,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) root_turn_id: Option<String>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
     pub(crate) multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
+    pub(crate) cyber_access_program: Option<CyberAccessProgram>,
 }
 
 #[derive(Clone, Debug)]
@@ -183,19 +185,12 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
         input: Vec<UserInput>,
-        parent_turn_id: Option<String>,
-        root_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
         let thread = state.get_thread(agent_id).await?;
         let result = match thread
-            .start_or_steer_turn(
-                TurnInputRequest::user_input(input).on_start(TurnStartOptions {
-                    parent_turn_id,
-                    root_turn_id,
-                    ..Default::default()
-                }),
-            )
+            .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
             .await
         {
             Ok(TurnInputSubmission::Started { turn_id }) => Ok(turn_id),
@@ -220,8 +215,7 @@ impl AgentControl {
         agent_id: ThreadId,
         communication: InterAgentCommunication,
         agent_communication_context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
-        root_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
         if communication.trigger_turn {
@@ -234,8 +228,7 @@ impl AgentControl {
             &state,
             communication,
             agent_communication_context,
-            parent_turn_id,
-            root_turn_id,
+            start_options,
         )
         .await
     }
@@ -295,16 +288,14 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
-        root_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         self.submit_inter_agent_communication(
             agent_id,
             state,
             communication,
             context,
-            parent_turn_id,
-            root_turn_id,
+            start_options,
         )
         .await
     }
@@ -315,13 +306,18 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
-        parent_turn_id: Option<String>,
-        root_turn_id: Option<String>,
+        start_options: TurnStartOptions,
     ) -> CodexResult<String> {
         let communication_for_log =
             crate::agent_communication::logging_enabled().then(|| communication.clone());
-        let parent_turn_id = parent_turn_id.filter(|_| communication.trigger_turn);
-        let root_turn_id = root_turn_id.filter(|_| communication.trigger_turn);
+        let (parent_turn_id, root_turn_id) = if communication.trigger_turn {
+            (
+                start_options.parent_turn_id.clone(),
+                start_options.root_turn_id.clone(),
+            )
+        } else {
+            (None, None)
+        };
         let result = self
             .handle_thread_request_result(
                 agent_id,
@@ -329,7 +325,10 @@ impl AgentControl {
                 state
                     .send_op(
                         agent_id,
-                        Op::InterAgentCommunication { communication },
+                        Op::InterAgentCommunication {
+                            communication,
+                            start_options,
+                        },
                         parent_turn_id,
                         root_turn_id,
                     )
@@ -642,8 +641,7 @@ impl AgentControl {
                         parent_thread_id,
                         communication,
                         context,
-                        /*parent_turn_id*/ None,
-                        /*root_turn_id*/ None,
+                        TurnStartOptions::default(),
                     )
                     .await;
                 return;

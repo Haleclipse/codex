@@ -6,11 +6,13 @@ use crate::session::turn_context::TurnContext;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::format_output_omission_marker;
 use crate::unified_exec::resolve_max_tokens;
+use codex_protocol::ResponseItemId;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
@@ -64,6 +66,34 @@ pub struct ToolInvocation {
     pub tool_name: ToolName,
     pub source: ToolCallSource,
     pub payload: ToolPayload,
+}
+
+impl ToolInvocation {
+    /// Returns the Responses item that requested this call or started its code-mode cell.
+    pub(crate) async fn originating_item_id(&self) -> Option<ResponseItemId> {
+        if let ToolCallSource::CodeMode { cell_id, .. } = &self.source {
+            return self
+                .session
+                .services
+                .code_mode_service
+                .cell_originating_item_id(&codex_code_mode::CellId::new(cell_id.clone()));
+        }
+
+        self.session
+            .clone_history()
+            .await
+            .raw_items()
+            .rev()
+            .find_map(|item| match item {
+                ResponseItem::FunctionCall { id, call_id, .. }
+                | ResponseItem::CustomToolCall { id, call_id, .. }
+                    if call_id == &self.call_id =>
+                {
+                    id.clone()
+                }
+                _ => None,
+            })
+    }
 }
 
 #[derive(Clone, Debug)]

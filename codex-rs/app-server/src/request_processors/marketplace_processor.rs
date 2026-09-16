@@ -51,8 +51,10 @@ impl MarketplaceRequestProcessor {
         &self,
         params: MarketplaceRemoveParams,
     ) -> Result<MarketplaceRemoveResponse, JSONRPCErrorError> {
+        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         remove_marketplace(
-            self.config.codex_home.to_path_buf(),
+            config.codex_home.to_path_buf(),
+            config.config_layer_stack,
             CoreMarketplaceRemoveRequest {
                 marketplace_name: params.marketplace_name,
             },

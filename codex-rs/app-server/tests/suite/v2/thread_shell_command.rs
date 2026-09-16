@@ -18,6 +18,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -60,7 +61,10 @@ async fn thread_shell_command_history_responses_exclude_persisted_command_execut
     let ThreadStartResponse { thread, .. } = mcp
         .request(|request_id| ClientRequest::ThreadStart {
             request_id,
-            params: ThreadStartParams::default(),
+            params: ThreadStartParams {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..Default::default()
+            },
         })
         .await?;
     let (shell_command, expected_output) = current_shell_output_command("hello from bang")?;
@@ -228,7 +232,10 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
     let ThreadStartResponse { thread, .. } = mcp
         .request(|request_id| ClientRequest::ThreadStart {
             request_id,
-            params: ThreadStartParams::default(),
+            params: ThreadStartParams {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..Default::default()
+            },
         })
         .await?;
     let (shell_command, expected_output) = current_shell_output_command("active turn bang")?;

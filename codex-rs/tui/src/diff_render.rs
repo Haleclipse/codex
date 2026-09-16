@@ -41,12 +41,15 @@ use ratatui::style::Stylize;
 use ratatui::text::Line as RtLine;
 use ratatui::text::Span as RtSpan;
 use ratatui::widgets::Paragraph;
+use ratatui::widgets::Wrap;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use unicode_width::UnicodeWidthChar;
+
+mod preview;
 
 /// Replacement for a tab character in rendered diff content.
 const TAB_REPLACEMENT: &str = "    ";
@@ -309,13 +312,25 @@ impl DiffSummary {
 impl Renderable for FileChange {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let mut lines = vec![];
-        render_change(self, &mut lines, area.width as usize, /*lang*/ None);
+        render_change(
+            self,
+            &mut lines,
+            area.width as usize,
+            /*lang*/ None,
+            usize::MAX,
+        );
         Paragraph::new(lines).render(area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
         let mut lines = vec![];
-        render_change(self, &mut lines, width as usize, /*lang*/ None);
+        render_change(
+            self,
+            &mut lines,
+            width as usize,
+            /*lang*/ None,
+            usize::MAX,
+        );
         lines.len() as u16
     }
 }
@@ -354,7 +369,15 @@ pub(crate) fn create_diff_summary(
     wrap_cols: usize,
 ) -> Vec<RtLine<'static>> {
     let rows = collect_rows(changes);
-    render_changes_block(rows, wrap_cols, cwd)
+    render_changes_block(rows, wrap_cols, cwd, usize::MAX)
+}
+
+pub(crate) fn create_diff_preview(
+    changes: &HashMap<PathBuf, FileChange>,
+    cwd: &Path,
+    wrap_cols: usize,
+) -> Vec<RtLine<'static>> {
+    render_changes_block(collect_rows(changes), wrap_cols, cwd, preview::PREVIEW_ROWS)
 }
 
 // Shared row for per-file presentation
@@ -407,7 +430,12 @@ fn render_line_count_summary(added: usize, removed: usize) -> Vec<RtSpan<'static
     spans
 }
 
-fn render_changes_block(rows: Vec<Row<'_>>, wrap_cols: usize, cwd: &Path) -> Vec<RtLine<'static>> {
+fn render_changes_block(
+    rows: Vec<Row<'_>>,
+    wrap_cols: usize,
+    cwd: &Path,
+    mut remaining_rows: usize,
+) -> Vec<RtLine<'static>> {
     let mut out: Vec<RtLine<'static>> = Vec::new();
 
     let render_path = |row: &Row<'_>| -> Vec<RtSpan<'static>> {
@@ -443,6 +471,7 @@ fn render_changes_block(rows: Vec<Row<'_>>, wrap_cols: usize, cwd: &Path) -> Vec
     }
     out.push(RtLine::from(header_spans));
 
+    let mut omitted = false;
     for (idx, r) in rows.into_iter().enumerate() {
         // Insert a blank separator between file chunks (except before the first)
         if idx > 0 {
@@ -459,6 +488,11 @@ fn render_changes_block(rows: Vec<Row<'_>>, wrap_cols: usize, cwd: &Path) -> Vec
             out.push(RtLine::from(header));
         }
 
+        if remaining_rows == 0 && (omitted || r.added > 0 || r.removed > 0) {
+            omitted = true;
+            continue;
+        }
+
         // For renames, use the destination extension for highlighting — the
         // diff content reflects the new file, not the old one.
         let lang_path = r.move_path.unwrap_or(r.path);
@@ -466,10 +500,47 @@ fn render_changes_block(rows: Vec<Row<'_>>, wrap_cols: usize, cwd: &Path) -> Vec
         let mut lines = vec![];
         let prefix = "    ";
         let content_width = wrap_cols.saturating_sub(prefix.len());
-        render_change(r.change, &mut lines, content_width, lang.as_deref());
-        out.extend(prefix_lines(lines, prefix.into(), prefix.into()));
+        omitted |= render_change(
+            r.change,
+            &mut lines,
+            content_width,
+            lang.as_deref(),
+            remaining_rows,
+        );
+        for line in prefix_lines(lines, prefix.into(), prefix.into()) {
+            if remaining_rows != usize::MAX {
+                let rows = Paragraph::new(line.clone())
+                    .wrap(Wrap { trim: false })
+                    .line_count(wrap_cols as u16);
+                if rows > remaining_rows {
+                    out.extend(preview::rendered_prefix(
+                        line,
+                        wrap_cols as u16,
+                        remaining_rows as u16,
+                    ));
+                    remaining_rows = 0;
+                    omitted = true;
+                    break;
+                }
+                remaining_rows -= rows;
+            }
+            out.push(line);
+        }
+        if omitted {
+            remaining_rows = 0;
+        }
     }
 
+    if omitted {
+        out.push(
+            format!(
+                "  … Diff preview limited ({}).",
+                crate::ui_consts::TRANSCRIPT_HINT
+            )
+            .dim()
+            .into(),
+        );
+    }
     out
 }
 
@@ -486,14 +557,27 @@ fn render_change(
     out: &mut Vec<RtLine<'static>>,
     width: usize,
     lang: Option<&str>,
-) {
+    max_rows: usize,
+) -> bool {
+    let mut omitted = false;
     let style_context = current_diff_render_style_context();
     match change {
         FileChange::Add { content } => {
-            // Pre-highlight the entire file content as a whole.
-            let syntax_lines = lang.and_then(|l| highlight_code_to_styled_spans(content, l));
             let line_number_width = line_number_width(content.lines().count());
-            for (i, raw) in content.lines().enumerate() {
+            let end = if max_rows == usize::MAX {
+                content.len()
+            } else {
+                preview::visible_byte_count(
+                    content.split_inclusive('\n'),
+                    width.saturating_sub(line_number_width + 2),
+                    max_rows,
+                )
+            };
+            let visible_content = &content[..end];
+            omitted = visible_content.len() < content.len();
+            let syntax_lines =
+                lang.and_then(|l| highlight_code_to_styled_spans(visible_content, l));
+            for (i, raw) in visible_content.lines().enumerate() {
                 let syn = syntax_lines.as_ref().and_then(|sl| sl.get(i));
                 if let Some(spans) = syn {
                     out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
@@ -523,9 +607,21 @@ fn render_change(
             }
         }
         FileChange::Delete { content } => {
-            let syntax_lines = lang.and_then(|l| highlight_code_to_styled_spans(content, l));
             let line_number_width = line_number_width(content.lines().count());
-            for (i, raw) in content.lines().enumerate() {
+            let end = if max_rows == usize::MAX {
+                content.len()
+            } else {
+                preview::visible_byte_count(
+                    content.split_inclusive('\n'),
+                    width.saturating_sub(line_number_width + 2),
+                    max_rows,
+                )
+            };
+            let visible_content = &content[..end];
+            omitted = visible_content.len() < content.len();
+            let syntax_lines =
+                lang.and_then(|l| highlight_code_to_styled_spans(visible_content, l));
+            for (i, raw) in visible_content.lines().enumerate() {
                 let syn = syntax_lines.as_ref().and_then(|sl| sl.get(i));
                 if let Some(spans) = syn {
                     out.extend(push_wrapped_diff_line_inner_with_theme_and_color_level(
@@ -600,6 +696,9 @@ fn render_change(
                 let line_number_width = line_number_width(max_line_number);
                 let mut is_first_hunk = true;
                 for h in patch.hunks() {
+                    if out.len() >= max_rows {
+                        return true;
+                    }
                     if !is_first_hunk {
                         let spacer = format!("{:width$} ", "", width = line_number_width.max(1));
                         let spacer_span = RtSpan::styled(
@@ -614,11 +713,46 @@ fn render_change(
                     }
                     is_first_hunk = false;
 
+                    let visible_bytes = if max_rows == usize::MAX {
+                        usize::MAX
+                    } else {
+                        preview::visible_byte_count(
+                            h.lines().iter().map(|line| match line {
+                                diffy::Line::Insert(text)
+                                | diffy::Line::Delete(text)
+                                | diffy::Line::Context(text) => *text,
+                            }),
+                            width.saturating_sub(line_number_width + 2),
+                            max_rows.saturating_sub(out.len()),
+                        )
+                    };
+                    let visible_lines: Vec<_> = h
+                        .lines()
+                        .iter()
+                        .scan(visible_bytes, |remaining, line| {
+                            if *remaining == 0 {
+                                return None;
+                            }
+                            let text = match line {
+                                diffy::Line::Insert(text)
+                                | diffy::Line::Delete(text)
+                                | diffy::Line::Context(text) => *text,
+                            };
+                            let end = (*remaining).min(text.len());
+                            *remaining -= end;
+                            omitted |= end < text.len();
+                            Some(match line {
+                                diffy::Line::Insert(_) => diffy::Line::Insert(&text[..end]),
+                                diffy::Line::Delete(_) => diffy::Line::Delete(&text[..end]),
+                                diffy::Line::Context(_) => diffy::Line::Context(&text[..end]),
+                            })
+                        })
+                        .collect();
+
                     // Highlight each hunk as a single block so syntect parser
                     // state is preserved across consecutive lines.
                     let hunk_syntax_lines = diff_lang.and_then(|language| {
-                        let hunk_text: String = h
-                            .lines()
+                        let hunk_text: String = visible_lines
                             .iter()
                             .map(|line| match line {
                                 diffy::Line::Insert(text)
@@ -627,12 +761,12 @@ fn render_change(
                             })
                             .collect();
                         let syntax_lines = highlight_code_to_styled_spans(&hunk_text, language)?;
-                        (syntax_lines.len() == h.lines().len()).then_some(syntax_lines)
+                        (syntax_lines.len() == visible_lines.len()).then_some(syntax_lines)
                     });
 
                     let mut old_ln = h.old_range().start();
                     let mut new_ln = h.new_range().start();
-                    for (line_idx, l) in h.lines().iter().enumerate() {
+                    for (line_idx, l) in visible_lines.iter().enumerate() {
                         let syntax_spans = hunk_syntax_lines
                             .as_ref()
                             .and_then(|syntax_lines| syntax_lines.get(line_idx));
@@ -739,10 +873,15 @@ fn render_change(
                             }
                         }
                     }
+                    if omitted || visible_lines.len() < h.lines().len() {
+                        omitted = true;
+                        break;
+                    }
                 }
             }
         }
     }
+    omitted
 }
 
 /// Format a path for display relative to the current working directory when

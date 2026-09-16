@@ -412,6 +412,7 @@ async fn idle_queue_dispatch_preserves_client_id() -> Result<()> {
         metadata["turn_id"].as_str(),
         Some(completed.turn.id.as_str())
     );
+    assert_eq!(metadata["turn_trigger"].as_str(), Some("queue"));
     Ok(())
 }
 
@@ -715,7 +716,7 @@ async fn queue_start_without_id_starts_the_head_when_idle() -> Result<()> {
         create_final_assistant_message_sse_response("first queued message done")?,
         create_final_assistant_message_sse_response("second queued message done")?,
     ];
-    let (mut app, _codex_home, _server) = queue_app(responses).await?;
+    let (mut app, _codex_home, server) = queue_app(responses).await?;
     let thread_id = app
         .start_thread(ThreadStartParams::default())
         .await?
@@ -765,6 +766,26 @@ async fn queue_start_without_id_starts_the_head_when_idle() -> Result<()> {
         assert_eq!(completed.turn.status, TurnStatus::Completed);
     }
     assert!(list_queue(&mut app, &thread_id).await?.data.is_empty());
+
+    let requests = server
+        .received_requests()
+        .await
+        .context("mock request capture unavailable")?;
+    let response_requests = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .collect::<Vec<_>>();
+    assert_eq!(response_requests.len(), 3);
+    for request in &response_requests[1..] {
+        let metadata_header = request
+            .headers
+            .get("x-codex-turn-metadata")
+            .context("queued model request is missing its x-codex-turn-metadata header")?
+            .to_str()
+            .context("queued turn metadata header is not valid ASCII")?;
+        let metadata: Value = serde_json::from_str(metadata_header)?;
+        assert_eq!(metadata["turn_trigger"].as_str(), Some("queue"));
+    }
     Ok(())
 }
 

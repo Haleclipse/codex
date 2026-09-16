@@ -461,7 +461,7 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
         "switching models should preserve the existing model-switch message"
     );
     let expected_guidance = format!(
-        "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\nUse second-model context-window guidance.\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
+        "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\nThis context-window guidance replaces all previously provided context-window guidance.\n\nUse second-model context-window guidance.\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
     );
     assert_eq!(
         developer_texts

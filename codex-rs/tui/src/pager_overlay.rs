@@ -572,7 +572,8 @@ impl TranscriptOverlay {
             .iter()
             .any(|cell| cell.as_any().is::<SessionInfoCell>())
         {
-            self.rebuild_renderables();
+            let live_tail = self.take_live_tail_renderable();
+            self.rebuild_renderables(live_tail);
         }
         previous
     }
@@ -706,19 +707,16 @@ impl TranscriptOverlay {
                 *index = index.saturating_add(added_cells);
             }
         }
-        self.rebuild_renderables();
-        if let Some(live_tail) = live_tail {
-            self.view.renderables.push(live_tail);
-        }
+        self.rebuild_renderables(live_tail);
+        let content_height = self.view.content_height(width);
         self.view.scroll_offset = if follow_bottom {
             usize::MAX
         } else {
-            self.view.scroll_offset.saturating_add(
-                self.view
-                    .content_height(width)
-                    .saturating_sub(previous_height),
-            )
+            self.view
+                .scroll_offset
+                .saturating_add(content_height.saturating_sub(previous_height))
         };
+        self.view.last_rendered_height = Some(content_height);
         insert_at
     }
 
@@ -729,6 +727,7 @@ impl TranscriptOverlay {
     /// transcript overlay immediately reflects the same committed cells as the main transcript.
     pub(crate) fn replace_cells(&mut self, cells: Vec<Arc<dyn HistoryCell>>) {
         let follow_bottom = self.view.is_scrolled_to_bottom();
+        let live_tail = self.take_live_tail_renderable();
         self.cells = cells;
         if self
             .highlight_cell
@@ -736,7 +735,7 @@ impl TranscriptOverlay {
         {
             self.highlight_cell = None;
         }
-        self.rebuild_renderables();
+        self.rebuild_renderables(live_tail);
         if follow_bottom {
             self.view.scroll_offset = usize::MAX;
         }
@@ -760,6 +759,7 @@ impl TranscriptOverlay {
         let clamped_end = range.end.min(self.cells.len());
         let clamped_start = range.start.min(clamped_end);
         if clamped_start < clamped_end {
+            let live_tail = self.take_live_tail_renderable();
             let removed = clamped_end - clamped_start;
             if let Some(highlight_cell) = self.highlight_cell.as_mut()
                 && *highlight_cell >= clamped_start
@@ -778,7 +778,7 @@ impl TranscriptOverlay {
             {
                 self.highlight_cell = None;
             }
-            self.rebuild_renderables();
+            self.rebuild_renderables(live_tail);
         }
         if follow_bottom {
             self.view.scroll_offset = usize::MAX;
@@ -834,8 +834,9 @@ impl TranscriptOverlay {
     }
 
     pub(crate) fn set_highlight_cell(&mut self, cell: Option<usize>) {
+        let live_tail = self.take_live_tail_renderable();
         self.highlight_cell = cell;
-        self.rebuild_renderables();
+        self.rebuild_renderables(live_tail);
         if let Some(idx) = self.highlight_cell {
             self.view.scroll_chunk_into_view(idx);
         }
@@ -849,8 +850,8 @@ impl TranscriptOverlay {
         self.view.is_scrolled_to_bottom()
     }
 
-    fn rebuild_renderables(&mut self) {
-        let tail_renderable = self.take_live_tail_renderable();
+    // Detach the live tail before changing cells: their old count identifies the tail renderable.
+    fn rebuild_renderables(&mut self, tail_renderable: Option<Box<dyn Renderable>>) {
         self.view.renderables =
             Self::render_cells(&self.cells, self.highlight_cell, self.history_state);
         if let Some(tail) = tail_renderable {
@@ -914,6 +915,10 @@ impl TranscriptOverlay {
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        // Preserve following the tail before the composer changes the available height.
+        if self.view.is_scrolled_to_bottom() {
+            self.view.scroll_offset = usize::MAX;
+        }
         let top_h = area.height.saturating_sub(3);
         let top = Rect::new(area.x, area.y, area.width, top_h);
         let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
@@ -958,7 +963,7 @@ impl TranscriptOverlay {
                 }
                 other => self.view.handle_key_event(tui, other),
             },
-            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                 tui.draw(u16::MAX, |frame| {
                     self.render(frame.area(), frame.buffer);
                 })?;
@@ -1032,7 +1037,7 @@ impl StaticOverlay {
                 }
                 other => self.view.handle_key_event(tui, other),
             },
-            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                 tui.draw(u16::MAX, |frame| {
                     self.render(frame.area(), frame.buffer);
                 })?;
@@ -1493,11 +1498,21 @@ mod tests {
             "expected initial render to leave view at bottom"
         );
 
+        for height in [9, 14] {
+            term.backend_mut().resize(/*width*/ 40, height);
+            term.draw(|f| overlay.render(f.area(), f.buffer_mut()))
+                .expect("draw after composer height change");
+            assert!(overlay.is_scrolled_to_bottom());
+        }
+
         overlay.insert_cell(Arc::new(TestCell {
             lines: vec!["tail".into()],
         }));
 
         assert_eq!(overlay.view.scroll_offset, usize::MAX);
+        term.draw(|f| overlay.render(f.area(), f.buffer_mut()))
+            .expect("draw committed tail");
+        assert_snapshot!("transcript_overlay_follows_resized_tail", term.backend());
     }
 
     #[test]
@@ -1531,7 +1546,7 @@ mod tests {
         let visible_before = buffer_to_text(term.backend().buffer(), content_area);
         overlay.prepend(
             vec![Arc::new(TestCell {
-                lines: vec!["older first".into(), "older second".into()],
+                lines: (0..40).map(|i| Line::from(format!("older {i}"))).collect(),
             })],
             /*width*/ 40,
         );
@@ -1565,6 +1580,59 @@ mod tests {
         overlay.render(area, &mut buf);
 
         assert_eq!(height_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn transcript_overlay_history_rebuild_preserves_only_the_live_tail() {
+        for replace in [false, true] {
+            for tail in [
+                None,
+                Some(Vec::new()),
+                Some(vec![HyperlinkLine::from("live")]),
+            ] {
+                let mut overlay = transcript_overlay(
+                    ["first", "last"]
+                        .map(|line| {
+                            Arc::new(TestCell {
+                                lines: vec![line.into()],
+                            }) as Arc<dyn HistoryCell>
+                        })
+                        .to_vec(),
+                );
+                let key = tail.as_ref().map(|_| ActiveCellTranscriptKey {
+                    revision: 1,
+                    is_stream_continuation: false,
+                    animation_tick: None,
+                });
+                overlay.sync_live_tail(/*width*/ 40, key, |_| tail.clone());
+                let consolidated = Arc::new(TestCell {
+                    lines: vec!["first".into(), "last".into()],
+                });
+                if replace {
+                    overlay.replace_cells(vec![consolidated]);
+                } else {
+                    overlay.consolidate_cells(0..2, consolidated);
+                }
+                // A draw may arrive after the active tail has already been cleared.
+                overlay.sync_live_tail(/*width*/ 40, key, |_| tail.clone());
+                let mut reopened = transcript_overlay(overlay.cells.clone());
+                reopened.sync_live_tail(/*width*/ 40, key, |_| tail.clone());
+                let area = Rect::new(
+                    /*x*/ 0, /*y*/ 0, /*width*/ 40, /*height*/ 10,
+                );
+                let mut actual = Buffer::empty(area);
+                let mut expected = Buffer::empty(area);
+                overlay.render(area, &mut actual);
+                reopened.render(area, &mut expected);
+                assert_eq!(actual, expected);
+                if tail.is_none() {
+                    assert_snapshot!(
+                        "transcript_overlay_completed_stream",
+                        buffer_to_text(&actual, area)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

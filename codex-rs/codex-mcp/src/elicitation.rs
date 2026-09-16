@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use crate::McpConfig;
 use crate::mcp::McpPermissionPromptAutoApproveContext;
 use crate::mcp::mcp_permission_prompt_is_auto_approved;
 use anyhow::Context;
@@ -25,7 +26,6 @@ use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY;
 use codex_protocol::mcp_approval_meta::APPROVAL_KIND_TOOL_SUGGESTION;
 use codex_protocol::mcp_approval_meta::APPROVALS_REVIEWER_KEY;
 use codex_protocol::mcp_approval_meta::STRICT_AUTO_REVIEW_KEY;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -153,53 +153,48 @@ impl ElicitationRequestRouter {
 
 #[derive(Clone)]
 pub(crate) struct ElicitationAuthority {
-    pub(crate) approval_policy: AskForApproval,
-    pub(crate) permission_profile: PermissionProfile,
+    pub(crate) config: Arc<McpConfig>,
     reviewer: Option<ElicitationReviewerHandle>,
     lifecycle: Option<ElicitationLifecycle>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct ElicitationRequestManager {
     router: ElicitationRequestRouter,
-    pub(crate) authority: Arc<StdMutex<ElicitationAuthority>>,
+    pub(crate) authority: Arc<StdMutex<Option<ElicitationAuthority>>>,
 }
 
 impl ElicitationRequestManager {
     pub(crate) fn new(
-        approval_policy: AskForApproval,
-        permission_profile: PermissionProfile,
+        config: Arc<McpConfig>,
         reviewer: Option<ElicitationReviewerHandle>,
         lifecycle: Option<ElicitationLifecycle>,
         router: ElicitationRequestRouter,
     ) -> Self {
         Self {
             router,
-            authority: Arc::new(StdMutex::new(ElicitationAuthority {
-                approval_policy,
-                permission_profile,
+            authority: Arc::new(StdMutex::new(Some(ElicitationAuthority {
+                config,
                 reviewer,
                 lifecycle,
-            })),
+            }))),
         }
     }
 
     pub(crate) fn update(
         &self,
-        approval_policy: AskForApproval,
-        permission_profile: PermissionProfile,
+        config: Arc<McpConfig>,
         reviewer: Option<ElicitationReviewerHandle>,
         lifecycle: Option<ElicitationLifecycle>,
     ) -> bool {
         let Ok(mut authority) = self.authority.lock() else {
             return false;
         };
-        *authority = ElicitationAuthority {
-            approval_policy,
-            permission_profile,
+        *authority = Some(ElicitationAuthority {
+            config,
             reviewer,
             lifecycle,
-        };
+        });
         true
     }
 
@@ -237,7 +232,8 @@ impl ElicitationRequestManager {
                     });
                 }
 
-                let Ok(authority) = authority.lock().map(|authority| authority.clone()) else {
+                let Ok(Some(authority)) = authority.lock().map(|authority| authority.clone())
+                else {
                     return Ok(ElicitationResponse {
                         action: ElicitationAction::Decline,
                         content: None,
@@ -245,11 +241,19 @@ impl ElicitationRequestManager {
                     });
                 };
                 let ElicitationAuthority {
-                    approval_policy,
-                    permission_profile,
+                    config,
                     reviewer,
                     lifecycle,
                 } = authority;
+                let approval_policy = config.approval_policy.value();
+                let Some(permission_profile) = config.permission_profile_for_server(&server_name)
+                else {
+                    return Ok(ElicitationResponse {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    });
+                };
 
                 match elicitation
                     .meta()
@@ -303,7 +307,7 @@ impl ElicitationRequestManager {
 
                 let permission_prompt_is_auto_approved = mcp_permission_prompt_is_auto_approved(
                     approval_policy,
-                    &permission_profile,
+                    permission_profile,
                     McpPermissionPromptAutoApproveContext::default(),
                 );
                 if permission_prompt_is_auto_approved && can_auto_accept_elicitation(&elicitation) {

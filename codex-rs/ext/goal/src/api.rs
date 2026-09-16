@@ -345,7 +345,7 @@ impl GoalService {
         }
     }
 
-    fn runtime_for_thread(&self, thread_id: ThreadId) -> Option<Arc<GoalRuntimeHandle>> {
+    pub(crate) fn runtime_for_thread(&self, thread_id: ThreadId) -> Option<Arc<GoalRuntimeHandle>> {
         let key = thread_id.to_string();
         let mut runtimes = self.runtimes();
         let runtime = runtimes.get(&key).and_then(Weak::upgrade);

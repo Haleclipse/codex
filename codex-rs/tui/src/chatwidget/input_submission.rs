@@ -377,6 +377,11 @@ impl ChatWidget {
         // App-event submissions are handled serially, and turn/start can wait on remote work.
         // Queue the optimistic prompt first so the user's input is visible while that happens.
         // Direct submissions do not share that queue, so keep their existing failure behavior.
+        if render_in_history {
+            // Do not let a transient manual-recap progress cell become permanent terminal
+            // scrollback when the new user prompt flushes the active history cell.
+            self.clear_recap_loading();
+        }
         let render_before_submit =
             render_in_history && matches!(&self.codex_op_target, CodexOpTarget::AppEvent);
         if render_before_submit {

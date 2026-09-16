@@ -117,6 +117,7 @@ use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_shell_command::parse_command::shlex_join;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -630,26 +631,46 @@ pub(crate) async fn apply_bespoke_event_handling(
                 parsed_cmd,
                 ..
             } = ev;
-            let command_actions = parsed_cmd
-                .iter()
-                .cloned()
-                .map(|parsed| V2ParsedCommand::from_core_with_cwd(parsed, &cwd))
-                .collect::<Vec<_>>();
+            let cwd_uri = match PathUri::try_from(cwd.clone()) {
+                Ok(cwd) => cwd,
+                Err(err) => {
+                    error!(%err, "invalid command approval cwd");
+                    if let Err(err) = conversation
+                        .submit(Op::ExecApproval {
+                            id: approval_id.unwrap_or(call_id),
+                            turn_id: Some(turn_id),
+                            decision: ReviewDecision::denied("invalid command approval cwd"),
+                        })
+                        .await
+                    {
+                        error!(%err, "failed to reject invalid command approval");
+                    }
+                    return;
+                }
+            };
+            let command_presentation =
+                CommandExecutionPresentation::from_raw(&command, &parsed_cmd, &cwd_uri);
+            // Approval requests retain the exact command; only history is redacted.
+            let command_actions = match cwd_uri.to_abs_path() {
+                Ok(native_cwd) => parsed_cmd
+                    .iter()
+                    .cloned()
+                    .map(|parsed| V2ParsedCommand::from_core_with_cwd(parsed, &native_cwd))
+                    .collect(),
+                Err(_) => vec![V2ParsedCommand::Unknown {
+                    command: shlex_join(&command),
+                }],
+            };
             let presentation = if let Some(network_approval_context) =
                 network_approval_context.map(V2NetworkApprovalContext::from)
             {
                 CommandExecutionApprovalPresentation::Network(network_approval_context)
             } else {
-                let command_presentation = CommandExecutionPresentation::from_raw(
-                    &command,
-                    &parsed_cmd,
-                    &cwd.clone().into(),
-                );
                 let completion_item = CommandExecutionCompletionItem {
                     plugin_id,
                     script_path,
                     command: command_presentation.command,
-                    cwd: cwd.clone().into(),
+                    cwd: cwd.clone(),
                     command_actions: command_presentation.command_actions,
                 };
                 CommandExecutionApprovalPresentation::Command(completion_item)
@@ -965,6 +986,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             }
 
             let turn_error = TurnError {
+                misalignment: ev.misalignment.map(Into::into),
                 message: ev.message,
                 codex_error_info: ev.codex_error_info.map(V2CodexErrorInfo::from),
                 additional_details: None,
@@ -982,6 +1004,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             // We don't need to update the turn summary store for stream errors as they are intermediate error states for retries,
             // but we notify the client.
             let turn_error = TurnError {
+                misalignment: None,
                 message: ev.message,
                 codex_error_info: ev.codex_error_info.map(V2CodexErrorInfo::from),
                 additional_details: ev.additional_details,
@@ -1095,6 +1118,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 turn_id: event_turn_id,
                 response_id: raw_response_completed_event.response_id,
                 usage: raw_response_completed_event.token_usage.map(Into::into),
+                usage_metadata: raw_response_completed_event.usage_metadata.map(Into::into),
             };
             outgoing
                 .send_server_notification(ServerNotification::RawResponseCompleted(notification))
@@ -1831,6 +1855,7 @@ async fn on_request_permissions_response(
                 conversation_id,
                 &turn_id,
                 TurnError {
+                    misalignment: None,
                     message,
                     codex_error_info: None,
                     additional_details: None,
@@ -3303,6 +3328,7 @@ mod tests {
         handle_error(
             conversation_id,
             TurnError {
+                misalignment: None,
                 message: "boom".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
                 additional_details: None,
@@ -3315,6 +3341,7 @@ mod tests {
         assert_eq!(
             turn_summary.last_error,
             Some(TurnError {
+                misalignment: None,
                 message: "boom".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::InternalServerError),
                 additional_details: None,
@@ -3703,6 +3730,7 @@ mod tests {
         handle_error(
             conversation_id,
             TurnError {
+                misalignment: None,
                 message: "oops".to_string(),
                 codex_error_info: None,
                 additional_details: None,
@@ -3753,6 +3781,7 @@ mod tests {
         handle_error(
             conversation_id,
             TurnError {
+                misalignment: None,
                 message: "bad".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::Other),
                 additional_details: None,
@@ -3788,6 +3817,7 @@ mod tests {
                 assert_eq!(
                     n.turn.error,
                     Some(TurnError {
+                        misalignment: None,
                         message: "bad".to_string(),
                         codex_error_info: Some(V2CodexErrorInfo::Other),
                         additional_details: None,
@@ -4000,6 +4030,7 @@ mod tests {
         handle_error(
             conversation_a,
             TurnError {
+                misalignment: None,
                 message: "a1".to_string(),
                 codex_error_info: Some(V2CodexErrorInfo::BadRequest),
                 additional_details: None,
@@ -4021,6 +4052,7 @@ mod tests {
         handle_error(
             conversation_b,
             TurnError {
+                misalignment: None,
                 message: "b1".to_string(),
                 codex_error_info: None,
                 additional_details: None,
@@ -4057,6 +4089,7 @@ mod tests {
                 assert_eq!(
                     n.turn.error,
                     Some(TurnError {
+                        misalignment: None,
                         message: "a1".to_string(),
                         codex_error_info: Some(V2CodexErrorInfo::BadRequest),
                         additional_details: None,
@@ -4075,6 +4108,7 @@ mod tests {
                 assert_eq!(
                     n.turn.error,
                     Some(TurnError {
+                        misalignment: None,
                         message: "b1".to_string(),
                         codex_error_info: None,
                         additional_details: None,

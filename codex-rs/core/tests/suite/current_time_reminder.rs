@@ -9,6 +9,7 @@ use anyhow::anyhow;
 use chrono::DateTime;
 use chrono::Local;
 use chrono::Utc;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::SleepFuture;
 use codex_core::TimeFuture;
 use codex_core::TimeProvider;
@@ -20,6 +21,7 @@ use codex_features::Feature;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -40,6 +42,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use test_case::test_case;
 
 const FIRST_REMINDER: &str =
     "<current_time_reminder>It is 2026-06-17 17:34:15 UTC.</current_time_reminder>";
@@ -50,6 +53,15 @@ const SECOND_REMINDER: &str =
 const THIRD_REMINDER: &str =
     "<current_time_reminder>It is 2026-06-17 17:36:15 UTC.</current_time_reminder>";
 const FIRST_TIME_UNIX_SECONDS: i64 = 1_781_717_655;
+
+#[derive(Clone, Copy)]
+enum ClockSetup {
+    Configured,
+    Persistent,
+    OrdinaryEffort,
+    ExplicitlyDisabled,
+    RequiredOff,
+}
 
 struct TestTimeProvider {
     current_time: AtomicI64,
@@ -323,8 +335,13 @@ async fn current_time_reminders_can_follow_only_user_or_tool_outputs() -> Result
     Ok(())
 }
 
+#[test_case(ClockSetup::Configured; "configured")]
+#[test_case(ClockSetup::Persistent; "persistent")]
+#[test_case(ClockSetup::OrdinaryEffort; "ordinary_effort")]
+#[test_case(ClockSetup::ExplicitlyDisabled; "explicitly_disabled")]
+#[test_case(ClockSetup::RequiredOff; "required_off")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn system_time_source_adds_current_time_reminder() -> Result<()> {
+async fn system_time_source_adds_current_time_reminder(clock_setup: ClockSetup) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -333,16 +350,61 @@ async fn system_time_source_adds_current_time_reminder() -> Result<()> {
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
     .await;
-    let test = test_codex()
-        .with_config(|config| {
-            enable_current_time_reminder(config, /*interval*/ 1, CurrentTimeSource::System)
+    let mut builder = test_codex()
+        .with_pre_build_hook(move |home| {
+            let config = match clock_setup {
+                ClockSetup::Configured => Some("[features]\ncurrent_time_reminder = true\n"),
+                ClockSetup::ExplicitlyDisabled => {
+                    Some("[features]\ncurrent_time_reminder = false\n")
+                }
+                ClockSetup::Persistent | ClockSetup::OrdinaryEffort | ClockSetup::RequiredOff => {
+                    None
+                }
+            };
+            if let Some(config) = config {
+                std::fs::write(home.join("config.toml"), config)
+                    .expect("clock configuration should be written");
+            }
         })
-        .build(&server)
-        .await?;
+        .with_config(move |config| {
+            config.include_environment_context = false;
+            config.model_reasoning_effort = Some(match clock_setup {
+                ClockSetup::OrdinaryEffort => ReasoningEffort::High,
+                ClockSetup::Configured
+                | ClockSetup::Persistent
+                | ClockSetup::ExplicitlyDisabled
+                | ClockSetup::RequiredOff => ReasoningEffort::Persistent,
+            });
+        });
+    if matches!(clock_setup, ClockSetup::RequiredOff) {
+        builder = builder.with_cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                "[features]\ncurrent_time_reminder = false\n",
+            ),
+        );
+    }
+    let test = builder.build_with_auto_env(&server).await?;
 
-    test.submit_turn("what time is it?").await?;
+    test.submit_text_turn("what time is it?").await?;
 
     let request = responses.single_request();
+    assert_eq!(
+        ["curr_time", "sleep"].map(|name| request.tool_by_name("clock", name).is_some()),
+        match clock_setup {
+            ClockSetup::Configured => [true, false],
+            ClockSetup::Persistent => [true, true],
+            ClockSetup::OrdinaryEffort
+            | ClockSetup::ExplicitlyDisabled
+            | ClockSetup::RequiredOff => [false, false],
+        }
+    );
+    if matches!(
+        clock_setup,
+        ClockSetup::OrdinaryEffort | ClockSetup::ExplicitlyDisabled | ClockSetup::RequiredOff
+    ) {
+        assert!(current_time_reminders(&request).is_empty());
+        return Ok(());
+    }
     assert!(request.has_content_kinds(&["current_time.reminder"]));
     let reminders = current_time_reminders(&request);
     assert_eq!(reminders.len(), 1);

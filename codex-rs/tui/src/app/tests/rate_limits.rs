@@ -88,6 +88,7 @@ fn deliver_usage_limit_error(app: &mut App) {
     app.chat_widget.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: "Usage limit reached.".to_string(),
                 codex_error_info: Some(CodexErrorInfo::UsageLimitExceeded),
                 additional_details: None,

@@ -146,6 +146,10 @@ pub struct McpServerOAuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
+    /// Registered callback URL associated with this OAuth client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
+
     /// Fixed callback port that takes precedence over Codex's global OAuth callback port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callback_port: Option<u16>,
@@ -256,10 +260,13 @@ impl McpServerConfig {
         self.environment_id == DEFAULT_MCP_SERVER_ENVIRONMENT_ID
     }
 
-    /// Keeps local OAuth credentials compatible while isolating executor-owned servers.
+    /// Keeps local OAuth credentials compatible while reserving managed credential namespaces.
     pub fn oauth_credential_name<'a>(&self, server_name: &'a str) -> Cow<'a, str> {
         if self.is_local_environment() {
-            if server_name.starts_with("executor:") || server_name.starts_with("local:") {
+            if server_name.starts_with("executor:")
+                || server_name.starts_with("local:")
+                || server_name.starts_with("ema-idp:")
+            {
                 Cow::Owned(format!("local:{server_name}"))
             } else {
                 Cow::Borrowed(server_name)

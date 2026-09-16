@@ -178,6 +178,22 @@ async fn slash_compact_eagerly_queues_follow_up_before_turn_start() {
 }
 
 #[tokio::test]
+async fn slash_recap_requests_generation_for_current_thread() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+
+    chat.dispatch_command(SlashCommand::Recap);
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::GenerateRecap {
+            thread_id: requested_thread_id,
+        }) if requested_thread_id == thread_id
+    );
+}
+
+#[tokio::test]
 async fn queued_slash_compact_dispatches_after_active_turn() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());

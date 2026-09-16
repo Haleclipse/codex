@@ -5,6 +5,7 @@ use crate::mcp_policy::EnvironmentMcpPolicy;
 use crate::models::PermissionProfileSnapshot;
 use codex_execpolicy::RequirementsExecPolicy;
 use codex_network_proxy::EnvironmentNetworkPolicy;
+use codex_utils_path_uri::PathUri;
 
 /// Configuration supplied for a thread's selected environment.
 #[allow(clippy::large_enum_variant)]
@@ -25,6 +26,8 @@ pub enum EnvironmentConfigState {
 pub struct EnvironmentConfig {
     /// Whether shell tools may start login shells in this environment.
     pub allow_login_shell: bool,
+    /// Effective workspace roots resolved for this environment attachment.
+    pub workspace_roots: Vec<PathUri>,
     /// Resolved permissions for this thread's environment attachment.
     pub permission_profile: PermissionProfileSnapshot,
     /// Controls which environment variables shell commands may inherit.
@@ -50,6 +53,7 @@ impl std::fmt::Debug for EnvironmentConfig {
         formatter
             .debug_struct("EnvironmentConfig")
             .field("allow_login_shell", &self.allow_login_shell)
+            .field("workspace_roots", &self.workspace_roots)
             .field("permission_profile", &self.permission_profile)
             .field("shell_environment_policy", &"<redacted>")
             .field("windows_sandbox_level", &self.windows_sandbox_level)

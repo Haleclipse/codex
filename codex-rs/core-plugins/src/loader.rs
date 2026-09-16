@@ -723,7 +723,7 @@ fn is_full_git_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-fn configured_plugins_from_user_config_value(
+fn configured_plugins_from_config_value(
     user_config: &toml::Value,
 ) -> HashMap<String, PluginConfig> {
     let Some(plugins_value) = user_config.get("plugins") else {
@@ -769,7 +769,7 @@ fn configured_plugins_from_codex_home(
         }
     };
 
-    configured_plugins_from_user_config_value(&user_config)
+    configured_plugins_from_config_value(&user_config)
 }
 
 fn configured_plugin_ids(
@@ -1067,7 +1067,7 @@ pub(crate) async fn load_plugin_skill_inventory(
     }
 }
 
-fn plugin_skill_roots(
+pub(crate) fn plugin_skill_roots(
     plugin_root: &AbsolutePathBuf,
     manifest_paths: &PluginManifestPaths,
     manifest_format: PluginManifestFormat,
@@ -1391,7 +1391,7 @@ pub async fn load_plugin_mcp_servers(
     load_plugin_mcp_servers_with_policy(plugin_root, auth_mode, /*plugin_policy*/ None).await
 }
 
-/// Loads plugin MCP servers with the effective user policy for an installed plugin.
+/// Loads plugin MCP servers with the effective configuration policy for an installed plugin.
 pub async fn load_configured_plugin_mcp_servers(
     plugin_root: &Path,
     auth_mode: Option<AuthMode>,
@@ -1412,10 +1412,7 @@ pub async fn load_configured_plugin_mcp_servers(
 pub fn configured_plugin_mcp_server_policies(
     config_layer_stack: &ConfigLayerStack,
 ) -> HashMap<String, HashMap<String, PluginMcpServerConfig>> {
-    config_layer_stack
-        .effective_user_config()
-        .map(|config| configured_plugins_from_user_config_value(&config))
-        .unwrap_or_default()
+    configured_plugins_from_config_value(&config_layer_stack.effective_config())
         .into_iter()
         .map(|(plugin_id, plugin)| (plugin_id, plugin.mcp_servers))
         .collect()

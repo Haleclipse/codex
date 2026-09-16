@@ -408,8 +408,8 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     );
     assert_eq!(
         thread_json.get("historyMode").and_then(Value::as_str),
-        Some("legacy"),
-        "new threads should serialize `historyMode: legacy`"
+        Some("paginated"),
+        "durable threads should default to `historyMode: paginated` when supported"
     );
     assert_eq!(
         thread_json.get("threadSource").and_then(Value::as_str),
@@ -1097,6 +1097,7 @@ async fn thread_start_ephemeral_remains_pathless() -> Result<()> {
         thread.ephemeral,
         "ephemeral threads should be marked explicitly"
     );
+    assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
     assert_eq!(
         thread.path, None,
         "ephemeral threads should not expose a path"

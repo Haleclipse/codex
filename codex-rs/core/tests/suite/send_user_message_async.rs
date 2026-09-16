@@ -1,17 +1,23 @@
 use anyhow::Result;
+use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageDelivery;
 use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
@@ -21,6 +27,88 @@ use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use test_case::test_case;
+
+#[test_case(SessionSource::Exec, false, false; "root_without_tool")]
+#[test_case(SessionSource::Exec, true, true; "root_with_tool")]
+#[test_case(SessionSource::SubAgent(SubAgentSource::Other("test".to_string())), true, false; "subagent")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_async_message_guidance_follows_tool_availability(
+    session_source: SessionSource,
+    model_supports_tool: bool,
+    expect_tool_guidance: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.2", move |model| {
+            model.tool_mode = Some(ToolMode::CodeModeOnly);
+            model
+                .experimental_supported_tools
+                .retain(|tool| tool != "send_user_message_async");
+            if model_supports_tool {
+                model
+                    .experimental_supported_tools
+                    .push("send_user_message_async".to_string());
+            }
+            model
+                .supported_reasoning_levels
+                .push(ReasoningEffortPreset {
+                    effort: ReasoningEffort::Persistent,
+                    description: ReasoningEffort::Persistent.to_string(),
+                });
+            if let Some(messages) = model.model_messages.as_mut() {
+                messages.persistent_instructions = None;
+            }
+        })
+        .with_config(|config| {
+            config.model_reasoning_effort = Some(ReasoningEffort::Persistent);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let thread = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            session_source: Some(session_source),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?
+        .thread;
+    thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Report progress.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let request = responses.single_request();
+    let persistent_instructions = request
+        .message_input_texts("developer")
+        .into_iter()
+        .find(|text| text.starts_with("<persistent_mode>"))
+        .expect("persistent guidance should remain available to every agent");
+    assert_eq!(
+        persistent_instructions.contains("via functions.send_user_message_async"),
+        expect_tool_guidance,
+    );
+    assert_eq!(
+        request.body_json()["tools"]
+            .as_array()
+            .expect("request tools")
+            .iter()
+            .any(|tool| tool["name"] == "send_user_message_async"),
+        expect_tool_guidance,
+    );
+
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_user_message_async_emits_item_and_does_not_end_the_turn() -> Result<()> {

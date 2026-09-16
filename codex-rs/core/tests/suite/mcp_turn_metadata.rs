@@ -170,6 +170,7 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
     let server = start_mock_server().await;
     let apps_server = AppsTestServer::mount(&server).await?;
     let call_id = "calendar-call-approval";
+    let originating_item_id = "fc_calendar_approval_origin";
     let calendar_args = serde_json::to_string(&json!({
         "title": "Lunch",
         "starts_at": "2026-03-10T12:00:00Z"
@@ -196,14 +197,16 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
             ev_completed("resp-permissions"),
         ]));
     }
+    let mut calendar_call = ev_function_call_with_namespace(
+        call_id,
+        SEARCH_CALENDAR_NAMESPACE,
+        SEARCH_CALENDAR_CREATE_TOOL,
+        &calendar_args,
+    );
+    calendar_call["item"]["id"] = json!(originating_item_id);
     response_sequence.push(sse(vec![
         ev_response_created("resp-1"),
-        ev_function_call_with_namespace(
-            call_id,
-            SEARCH_CALENDAR_NAMESPACE,
-            SEARCH_CALENDAR_CREATE_TOOL,
-            &calendar_args,
-        ),
+        calendar_call,
         ev_completed("resp-1"),
     ]));
     if strict_auto_review {
@@ -350,6 +353,10 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
     assert_eq!(
         apps_tool_call.pointer("/params/_meta/callId"),
         Some(&json!(call_id))
+    );
+    assert_eq!(
+        apps_tool_call.pointer("/params/_meta/itemId"),
+        Some(&json!(originating_item_id))
     );
     assert_eq!(
         apps_tool_call

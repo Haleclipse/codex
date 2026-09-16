@@ -24,6 +24,7 @@ use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::ItemStartedNotification;
@@ -2386,6 +2387,80 @@ async fn thread_resume_can_skip_turns_for_metadata_only_resume() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_resume_warns_for_paginated_full_history_hydration() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+
+    let conversation_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let cold_resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let notice: DeprecationNoticeNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("deprecationNotice"),
+    )
+    .await??;
+    assert_eq!(
+        notice,
+        DeprecationNoticeNotification {
+            summary: "Full-history hydration is deprecated for paginated threads; use `excludeTurns: true`, then page with `thread/turns/list` and `thread/items/list`.".to_string(),
+            details: None,
+        }
+    );
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(cold_resume_id)).await??;
+
+    mcp.clear_message_buffer();
+    let loaded_resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let _: DeprecationNoticeNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("deprecationNotice"),
+    )
+    .await??;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(loaded_resume_id)).await??;
+
+    mcp.clear_message_buffer();
+    let metadata_resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(metadata_resume_id)).await??;
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_rejects_archived_session_by_id() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -3020,6 +3095,23 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
             .as_i64()
             .is_some()
     );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should record response requests");
+    let response_requests = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .collect::<Vec<_>>();
+    assert_eq!(response_requests.len(), 2);
+    let metadata_header = response_requests[1]
+        .headers
+        .get("x-codex-turn-metadata")
+        .expect("goal continuation should include turn metadata")
+        .to_str()?;
+    let metadata: serde_json::Value = serde_json::from_str(metadata_header)?;
+    assert_eq!(metadata["turn_trigger"].as_str(), Some("goal"));
 
     let status = wait_for_goal_event(
         &server,
@@ -3674,6 +3766,7 @@ async fn thread_resume_prefers_persisted_git_metadata_for_local_threads() -> Res
         session_id: conversation_id.into(),
         id: conversation_id,
         forked_from_id: None,
+        forked_from_ordinal_exclusive: None,
         parent_thread_id: None,
         timestamp: "2025-01-05T12:00:00Z".to_string(),
         cwd: repo_path.clone(),

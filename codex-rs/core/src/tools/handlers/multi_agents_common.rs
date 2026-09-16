@@ -194,13 +194,13 @@ pub(crate) fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, Fu
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let base_config = turn.config.clone();
     let mut config = (*base_config).clone();
-    config.model = Some(turn.model_info.slug.clone());
+    config.model = Some(turn.model_info().slug.clone());
     config.model_provider = turn.provider.info().clone();
     config.model_reasoning_effort = turn
-        .reasoning_effort
-        .clone()
-        .or_else(|| turn.model_info.default_reasoning_level.clone());
-    config.model_reasoning_summary = Some(turn.reasoning_summary);
+        .reasoning_effort()
+        .or(turn.model_info().default_reasoning_level.as_ref())
+        .cloned();
+    config.model_reasoning_summary = Some(turn.reasoning_summary());
     config.developer_instructions = turn.developer_instructions.clone();
     if turn.multi_agent_version == MultiAgentVersion::V2
         && let Some(developer_instructions) = turn
@@ -308,8 +308,8 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
 
     if let Some(reasoning_effort) = requested_reasoning_effort {
         validate_spawn_agent_reasoning_effort(
-            &turn.model_info.slug,
-            &turn.model_info.supported_reasoning_levels,
+            &turn.model_info().slug,
+            &turn.model_info().supported_reasoning_levels,
             &reasoning_effort,
         )?;
         config.model_reasoning_effort = Some(reasoning_effort);

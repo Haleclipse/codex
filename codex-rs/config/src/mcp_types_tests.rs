@@ -364,6 +364,7 @@ fn deserialize_streamable_http_server_config_with_oauth_client_id() {
 
             [oauth]
             client_id = "eci-prd-pub-codex-123"
+            callback_url = "http://127.0.0.1/callback/registered"
             callback_port = 9876
         "#,
     )
@@ -373,6 +374,7 @@ fn deserialize_streamable_http_server_config_with_oauth_client_id() {
         cfg.oauth,
         Some(McpServerOAuthConfig {
             client_id: Some("eci-prd-pub-codex-123".to_string()),
+            callback_url: Some("http://127.0.0.1/callback/registered".to_string()),
             callback_port: Some(9876),
         })
     );

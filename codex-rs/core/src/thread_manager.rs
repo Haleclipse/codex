@@ -55,6 +55,7 @@ use codex_protocol::mcp::OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -117,8 +118,12 @@ pub(crate) type ThreadIdGenerator = Arc<dyn Fn() -> ThreadId + Send + Sync>;
 fn capture_test_op(op: &Op) -> Option<Op> {
     match op {
         Op::Interrupt => Some(Op::Interrupt),
-        Op::InterAgentCommunication { communication } => Some(Op::InterAgentCommunication {
+        Op::InterAgentCommunication {
+            communication,
+            start_options,
+        } => Some(Op::InterAgentCommunication {
             communication: communication.clone(),
+            start_options: start_options.clone(),
         }),
         Op::Shutdown => Some(Op::Shutdown),
         _ => None,
@@ -661,6 +666,27 @@ impl ThreadManager {
 
     pub fn environment_manager(&self) -> Arc<EnvironmentManager> {
         self.state.environment_manager.clone()
+    }
+
+    /// Starts the local rollout migration path after a runtime feature enablement.
+    ///
+    /// Startup config handles the initial launch in [`thread_store_from_config`]. This covers
+    /// clients that decide to enable background migration after constructing the app-server.
+    pub fn start_background_rollout_migration(&self) {
+        let Some(store) = self
+            .state
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+        else {
+            return;
+        };
+        let store = store.clone();
+        tokio::spawn(async move {
+            if let Err(err) = store.migrate_rollouts_on_startup().await {
+                warn!("failed to migrate legacy rollouts on startup: {err}");
+            }
+        });
     }
 
     /// Refreshes every loaded thread and marks threads that are still being created.
@@ -1938,6 +1964,14 @@ impl ThreadManagerState {
             starting.retain(|runtime| runtime.strong_count() != 0);
             starting.push(Arc::downgrade(&source_changed_during_startup));
         }
+        let windows_sandbox_proxy_settings_mode = if matches!(
+            &session_source,
+            SessionSource::Internal(InternalSessionSource::Guardian)
+        ) {
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve
+        } else {
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
+        };
         let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
             config,
             allow_provider_model_fallback,
@@ -1977,8 +2011,7 @@ impl ThreadManagerState {
             external_time_provider: self.external_time_provider.clone(),
             inherited_multi_agent_version: multi_agent_version,
             git_enrichment_policy: GitEnrichmentPolicy::Fresh,
-            windows_sandbox_proxy_settings_mode:
-                codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+            windows_sandbox_proxy_settings_mode,
         }))
         .await?;
         // Enable Full Access form input only after session startup so a required MCP server cannot

@@ -128,7 +128,16 @@ impl TimeProvider for RecordingTimeProvider {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_session_inherits_parent_http_fallback() -> Result<()> {
+#[test_case(CodexAuth::from_api_key("test-api-key"), "/v1", true, "/v1/responses"; "api_key_uses_responses")]
+#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), "/backend-api/codex", false, "/backend-api/codex/responses"; "chatgpt_uses_responses_by_default")]
+#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), "/backend-api/codex", true, "/backend-api/codex/guardian"; "chatgpt_uses_guardian_when_enabled")]
+#[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), "/v1", true, "/v1/responses"; "custom_openai_url_uses_responses")]
+async fn guardian_session_inherits_parent_http_fallback(
+    auth: CodexAuth,
+    base_path: &str,
+    free_guardian: bool,
+    expected_guardian_path: &str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
         Ok(()),
@@ -136,10 +145,11 @@ async fn guardian_session_inherits_parent_http_fallback() -> Result<()> {
     );
 
     let server = start_mock_server().await;
-    Mock::given(method("GET"))
+    let websocket_fallback = Mock::given(method("GET"))
         .and(path_regex(".*/responses$"))
         .respond_with(ResponseTemplate::new(426))
-        .mount(&server)
+        .expect(1)
+        .mount_as_scoped(&server)
         .await;
 
     let responses = mount_sse_sequence(
@@ -162,12 +172,30 @@ async fn guardian_session_inherits_parent_http_fallback() -> Result<()> {
     )
     .await;
 
-    let mut builder = test_codex().with_config(|config| {
-        config.model_provider.supports_websockets = true;
-        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        config.approvals_reviewer = ApprovalsReviewer::User;
-    });
+    let base_url = format!("{}{base_path}", server.uri());
+    let mut builder = test_codex()
+        .with_auth(auth)
+        .with_pre_build_hook(move |home| {
+            fs::write(
+                home.join("config.toml"),
+                format!("[features.guardianv2]\nfree_guardian = {free_guardian}\n"),
+            )
+            .expect("Guardian endpoint configuration should be written");
+        })
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(base_url);
+            config.model_provider.supports_websockets = true;
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::User;
+        });
     let test = builder.build_with_auto_env(&server).await?;
+
+    // Let startup prewarm observe the initial reviewer before enabling Guardian.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        websocket_fallback.wait_until_satisfied(),
+    )
+    .await?;
 
     test.codex
         .start_or_steer_turn(
@@ -189,12 +217,19 @@ async fn guardian_session_inherits_parent_http_fallback() -> Result<()> {
     let requests = server.received_requests().await.unwrap_or_default();
     let websocket_attempts = requests
         .iter()
-        .filter(|request| request.method == Method::GET)
+        .filter(|request| {
+            request.method == Method::GET && request.url.path().ends_with("/responses")
+        })
         .count();
     assert_eq!(websocket_attempts, 1);
-    assert!(responses.requests().iter().any(|request| {
-        request.body_json()["client_metadata"]["x-openai-subagent"].as_str() == Some("guardian")
-    }));
+    let guardian_request = responses
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request.body_json()["client_metadata"]["x-openai-subagent"].as_str() == Some("guardian")
+        })
+        .expect("Guardian reviewer inference request");
+    assert_eq!(guardian_request.path(), expected_guardian_path);
 
     Ok(())
 }
@@ -208,6 +243,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let uses_codex_backend = auth.uses_codex_backend();
     let bundled_models = codex_models_manager::bundled_models_response()?.models;
     let catalog_auto_review = bundled_models
         .iter()
@@ -275,9 +311,20 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
     let time_provider = Arc::new(RecordingTimeProvider {
         thread_ids: Mutex::new(Vec::new()),
     });
+    let backend_base_url = format!("{}/backend-api/codex", server.uri());
     let mut builder = test_codex()
         .with_auth(auth)
+        .with_pre_build_hook(|home| {
+            fs::write(
+                home.join("config.toml"),
+                "[features.guardianv2]\nfree_guardian = true\n",
+            )
+            .expect("Guardian endpoint configuration should be written");
+        })
         .with_config(move |config| {
+            if uses_codex_backend {
+                config.model_provider.base_url = Some(backend_base_url);
+            }
             let rules_dir = config.codex_home.join("rules");
             fs::create_dir_all(&rules_dir).expect("create execution policy directory");
             let policy_justification = format!(
@@ -298,6 +345,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
             });
             config.model_context_window = Some(900_000);
             config.model_auto_compact_token_limit = Some(600_000);
+            config.service_tier = Some("priority".to_owned());
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
             config
@@ -402,6 +450,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
     );
     assert_eq!(guardian_review["model"].as_str(), Some(expected_model));
     for request in [guardian_prewarm, &guardian_review] {
+        assert_eq!(request.get("service_tier"), None);
         let metadata: serde_json::Value = serde_json::from_str(
             request["client_metadata"]["x-codex-turn-metadata"]
                 .as_str()
@@ -472,6 +521,23 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
         })
         .collect::<Vec<_>>();
     assert_eq!(guardian_context_windows, vec![Some(258_400)]);
+    for handshake in server.handshakes() {
+        let is_guardian = handshake.header("x-openai-subagent").as_deref() == Some("guardian");
+        let uses_guardian_endpoint = uses_codex_backend && is_guardian;
+        assert_eq!(
+            handshake.uri(),
+            if uses_guardian_endpoint {
+                "/backend-api/codex/guardian"
+            } else if uses_codex_backend {
+                "/backend-api/codex/responses"
+            } else {
+                "/v1/responses"
+            }
+        );
+        if uses_guardian_endpoint {
+            assert_eq!(handshake.header("x-codex-routing-hint"), None);
+        }
+    }
     server.shutdown().await;
     Ok(())
 }
@@ -766,6 +832,7 @@ async fn guardian_session_is_reused_for_consecutive_tool_reviews_without_prewarm
     let mut parent_environments = local_selections(test.config.cwd.clone());
     let parent_environment_config = EnvironmentConfig {
         allow_login_shell: test.config.permissions.allow_login_shell,
+        workspace_roots: parent_environments.environments[0].workspace_roots.clone(),
         permission_profile: PermissionProfileSnapshot::legacy(
             test.config.permissions.permission_profile().clone(),
         ),

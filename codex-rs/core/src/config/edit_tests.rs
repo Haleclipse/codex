@@ -1087,6 +1087,7 @@ fn blocking_replace_mcp_servers_round_trips() {
             scopes: None,
             oauth: Some(McpServerOAuthConfig {
                 client_id: Some("eci-prd-pub-codex-123".to_string()),
+                callback_url: Some("http://127.0.0.1/callback/example".to_string()),
                 callback_port: Some(9876),
             }),
             oauth_resource: Some("https://resource.example.com".to_string()),
@@ -1116,6 +1117,7 @@ Z-Header = \"z\"
 
 [mcp_servers.http.oauth]
 client_id = \"eci-prd-pub-codex-123\"
+callback_url = \"http://127.0.0.1/callback/example\"
 callback_port = 9876
 
 [mcp_servers.stdio]

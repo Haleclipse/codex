@@ -18,6 +18,7 @@ use crate::test_support::responses_metadata as test_responses_metadata;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
+use codex_api::ResponsesEndpoint;
 use codex_api::TransportError;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -49,6 +50,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -283,6 +285,71 @@ fn test_model_info() -> ModelInfo {
     .expect("deserialize test model info")
 }
 
+#[test]
+fn responses_lite_prefix_ids_track_thread_and_payload() -> anyhow::Result<()> {
+    let thread_id = ThreadId::new();
+    let client = test_model_client_with_thread_id(thread_id, SessionSource::Cli);
+    let mut model = test_model_info();
+    model.use_responses_lite = true;
+    let mut prompt = Prompt {
+        base_instructions: BaseInstructions {
+            text: "base instructions".to_string(),
+            provenance: None,
+        },
+        ..Default::default()
+    };
+    let build = |client: &ModelClient, prompt: &Prompt| {
+        client.build_responses_request(
+            prompt,
+            &model,
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &test_responses_metadata_for_client(
+                client,
+                /*turn_id*/ None,
+                format!("{}:0", client.state.thread_id),
+                /*parent_thread_id*/ None,
+                TestCodexResponsesRequestKind::Turn,
+            ),
+        )
+    };
+
+    let original = build(&client, &prompt)?;
+    assert_eq!(build(&client, &prompt)?, original);
+
+    prompt.base_instructions.text.push_str(" with an update");
+    let changed_instructions = build(&client, &prompt)?;
+    assert_eq!(changed_instructions.input[0], original.input[0]);
+    assert_ne!(changed_instructions.input[1].id(), original.input[1].id());
+
+    prompt.tools = vec![codex_tools::ToolSpec::Freeform(codex_tools::FreeformTool {
+        name: "exec".to_string(),
+        description: "Execute JavaScript.".to_string(),
+        defer_loading: None,
+        format: codex_tools::FreeformToolFormat {
+            r#type: "grammar".to_string(),
+            syntax: "lark".to_string(),
+            definition: "start: /.+/".to_string(),
+        },
+    })]
+    .into();
+    let changed_tools = build(&client, &prompt)?;
+    assert_ne!(
+        changed_tools.input[0].id(),
+        changed_instructions.input[0].id()
+    );
+    assert_eq!(changed_tools.input[1], changed_instructions.input[1]);
+
+    let independent = build(
+        &test_model_client_with_thread_id(ThreadId::new(), SessionSource::Cli),
+        &prompt,
+    )?;
+    assert_ne!(independent.input[0].id(), changed_tools.input[0].id());
+    assert_ne!(independent.input[1].id(), changed_tools.input[1].id());
+    Ok(())
+}
+
 fn test_session_telemetry() -> SessionTelemetry {
     SessionTelemetry::new(
         ThreadId::new(),
@@ -298,14 +365,137 @@ fn test_session_telemetry() -> SessionTelemetry {
     )
 }
 
+fn spawned_session_source() -> SessionSource {
+    SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    })
+}
+
+fn reasoning_effort_in_request(
+    model_info: &ModelInfo,
+    session_source: SessionSource,
+    effort: ReasoningEffort,
+) -> ReasoningEffort {
+    let client = test_model_client(session_source);
+    client
+        .build_responses_request(
+            &Prompt::default(),
+            model_info,
+            Some(effort),
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &test_responses_metadata_for_client(
+                &client,
+                /*turn_id*/ None,
+                format!("{}:0", client.state.thread_id),
+                /*parent_thread_id*/ None,
+                TestCodexResponsesRequestKind::Turn,
+            ),
+        )
+        .expect("build responses request")
+        .reasoning
+        .expect("request should include reasoning")
+        .effort
+        .expect("request should include reasoning effort")
+}
+
 #[test]
-fn ultra_reasoning_uses_max_for_requests() {
+fn reasoning_effort_for_requests_uses_multi_agent_override_for_ultra() {
+    let mut model_info = test_model_info();
+    model_info.multi_agent_reasoning_effort = Some(ReasoningEffort::High);
+    model_info
+        .supported_reasoning_levels
+        .push(ReasoningEffortPreset {
+            effort: ReasoningEffort::High,
+            description: "high".to_string(),
+        });
+
+    let actual = [SessionSource::Cli, spawned_session_source()].map(|session_source| {
+        reasoning_effort_in_request(&model_info, session_source, ReasoningEffort::Ultra)
+    });
+
+    assert_eq!(actual, [ReasoningEffort::High, ReasoningEffort::High]);
+}
+
+#[test]
+fn reasoning_effort_for_requests_falls_back_for_missing_or_invalid_override() {
+    let mut model_info = test_model_info();
+    model_info.supported_reasoning_levels = vec![
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::Low,
+            description: "low".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::XHigh,
+            description: "xhigh".to_string(),
+        },
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::Ultra,
+            description: "ultra".to_string(),
+        },
+    ];
+
+    let actual = [
+        None,
+        Some(ReasoningEffort::Ultra),
+        Some(ReasoningEffort::High),
+    ]
+    .map(|multi_agent_reasoning_effort| {
+        model_info.multi_agent_reasoning_effort = multi_agent_reasoning_effort;
+        reasoning_effort_in_request(&model_info, SessionSource::Cli, ReasoningEffort::Ultra)
+    });
+
+    assert_eq!(
+        actual,
+        [
+            ReasoningEffort::XHigh,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::XHigh,
+        ]
+    );
+
+    model_info.multi_agent_reasoning_effort = None;
+    model_info.supported_reasoning_levels.insert(
+        1,
+        ReasoningEffortPreset {
+            effort: ReasoningEffort::Max,
+            description: "max".to_string(),
+        },
+    );
+    assert_eq!(
+        reasoning_effort_in_request(&model_info, SessionSource::Cli, ReasoningEffort::Ultra),
+        ReasoningEffort::Max
+    );
+
+    model_info.supported_reasoning_levels.clear();
+    assert_eq!(
+        reasoning_effort_in_request(&model_info, SessionSource::Cli, ReasoningEffort::Ultra),
+        ReasoningEffort::Medium
+    );
+}
+
+#[test]
+fn reasoning_effort_for_requests_preserves_non_ultra_and_persistent_behavior() {
+    let mut model_info = test_model_info();
+    model_info.multi_agent_reasoning_effort = Some(ReasoningEffort::Low);
+
     assert_eq!(
         (
-            super::reasoning_effort_for_request(ReasoningEffort::Ultra),
-            super::reasoning_effort_for_request(ReasoningEffort::High),
+            reasoning_effort_in_request(&model_info, SessionSource::Cli, ReasoningEffort::High,),
+            reasoning_effort_in_request(
+                &model_info,
+                SessionSource::Cli,
+                ReasoningEffort::Persistent,
+            ),
         ),
-        (ReasoningEffort::Max, ReasoningEffort::High,)
+        (
+            ReasoningEffort::High,
+            ReasoningEffort::Custom("disabled".to_string()),
+        )
     );
 }
 
@@ -657,6 +847,7 @@ async fn response_stream_records_last_model_feedback_ids() {
         Ok(ResponseEvent::Completed {
             response_id: "resp-123".to_string(),
             token_usage: None,
+            usage_metadata: None,
             end_turn: Some(true),
         }),
     ]);
@@ -968,6 +1159,80 @@ fn model_client_with_counting_attestation(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     );
     (model_client, attestation_calls)
+}
+
+#[test]
+fn guardian_reviewer_uses_dedicated_endpoint_only_with_codex_backend_auth() {
+    let (mut model_client, _) =
+        model_client_with_counting_attestation(/*include_attestation*/ true);
+    Arc::get_mut(&mut model_client.state)
+        .expect("test client should have unique session state")
+        .session_source = SessionSource::SubAgent(SubAgentSource::Other("guardian".to_owned()));
+
+    assert_eq!(
+        model_client.responses_endpoint(
+            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+            "codex-auto-review",
+        ),
+        ResponsesEndpoint::Responses
+    );
+
+    model_client = model_client.with_free_guardian_enabled(/*free_guardian_enabled*/ true);
+    assert_eq!(
+        model_client.responses_endpoint(
+            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+            "codex-auto-review",
+        ),
+        ResponsesEndpoint::Guardian
+    );
+    assert_eq!(
+        model_client.responses_endpoint(
+            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+            "required-reviewer-model",
+        ),
+        ResponsesEndpoint::Responses
+    );
+    assert_eq!(
+        model_client.responses_endpoint(
+            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+            "parent-fallback-model",
+        ),
+        ResponsesEndpoint::Responses
+    );
+    assert_eq!(
+        model_client.responses_endpoint(
+            Some(&CodexAuth::from_api_key("test-api-key")),
+            "codex-auto-review",
+        ),
+        ResponsesEndpoint::Responses
+    );
+
+    Arc::get_mut(&mut model_client.state)
+        .expect("test client should have unique session state")
+        .provider = create_model_provider(
+        ModelProviderInfo::create_openai_provider(Some("https://proxy.example.com/v1".to_owned())),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+    );
+    assert_eq!(
+        model_client.responses_endpoint(
+            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+            "codex-auto-review",
+        ),
+        ResponsesEndpoint::Responses
+    );
+
+    Arc::get_mut(&mut model_client.state)
+        .expect("test client should have unique session state")
+        .session_source = SessionSource::Exec;
+    assert_eq!(
+        model_client.responses_endpoint(
+            Some(&CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+            "codex-auto-review",
+        ),
+        ResponsesEndpoint::Responses
+    );
 }
 
 #[tokio::test]

@@ -587,14 +587,17 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
         match wait_for_event(&test.codex, |_| true).await {
             EventMsg::Error(error) => {
                 error_events += 1;
-                assert_eq!(error.codex_error_info, Some(CodexErrorInfo::Other));
+                assert_eq!(
+                    error.codex_error_info,
+                    Some(CodexErrorInfo::RateLimitExceeded)
+                );
                 assert!(error.message.contains("Rate limit exceeded."));
             }
             EventMsg::StreamError(_) => stream_error_events += 1,
             EventMsg::TurnComplete(event) => {
                 assert_eq!(
                     event.error.and_then(|error| error.codex_error_info),
-                    Some(CodexErrorInfo::Other)
+                    Some(CodexErrorInfo::RateLimitExceeded)
                 );
                 break;
             }
@@ -1001,14 +1004,17 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries() -> Result<()>
         match wait_for_event(&test.codex, |_| true).await {
             EventMsg::Error(error) => {
                 error_events += 1;
-                assert_eq!(error.codex_error_info, Some(CodexErrorInfo::Other));
+                assert_eq!(
+                    error.codex_error_info,
+                    Some(CodexErrorInfo::RateLimitExceeded)
+                );
                 assert!(error.message.contains("Rate limit exceeded."));
             }
             EventMsg::StreamError(_) => stream_error_events += 1,
             EventMsg::TurnComplete(event) => {
                 assert_eq!(
                     event.error.and_then(|error| error.codex_error_info),
-                    Some(CodexErrorInfo::Other)
+                    Some(CodexErrorInfo::RateLimitExceeded)
                 );
                 break;
             }

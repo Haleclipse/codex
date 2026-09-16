@@ -30,6 +30,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::binding::call_tool_result_from_rmcp;
+use crate::catalog::McpServerSource;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -37,6 +38,7 @@ use crate::mcp::ToolPluginProvenance;
 use crate::pagination::MAX_CODEX_APPS_TOOL_CATALOG_ITEMS;
 use crate::pagination::MAX_MCP_CATALOG_ITEMS;
 use crate::rmcp_client::AsyncManagedClient;
+use crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT;
 use crate::rmcp_client::DEFAULT_TOOL_TIMEOUT;
 use crate::rmcp_client::ManagedClient;
 use crate::rmcp_client::StartupOutcomeError;
@@ -51,6 +53,8 @@ use crate::tool_catalog_cache::McpToolCatalogCacheContext;
 use crate::tools::ToolFilter;
 use crate::tools::ToolInfo;
 use crate::tools::filter_tools;
+use crate::trusted_access::ENTITLEMENT_CONTEXT_KEY;
+use crate::trusted_access::TrustedAccessContext;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -60,8 +64,6 @@ use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::mcp::McpServerInfo;
-use codex_protocol::models::PermissionProfile;
-use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpStartupCompleteEvent;
@@ -81,6 +83,8 @@ static LIVE_CONNECTIONS: Gauge = Gauge::new("mcp.connections.live");
 pub(crate) struct McpServerConnection {
     identity: Option<McpServerConnectionIdentity>,
     client: AsyncManagedClient,
+    // Startup-only budget; changing it must not replace a ready connection.
+    startup_timeout: Duration,
     startup_trigger: Option<watch::Sender<bool>>,
     _diagnostics_guard: GaugeGuard,
 }
@@ -191,6 +195,7 @@ pub(crate) struct McpConnectionSet {
     prefix_mcp_tool_names: bool,
     non_prefixed_mcp_tool_servers: Vec<String>,
     elicitation_requests: ElicitationRequestManager,
+    pub(crate) trusted_access: Option<TrustedAccessContext>,
 }
 
 impl McpConnectionSet {
@@ -202,6 +207,7 @@ impl McpConnectionSet {
         input: McpRuntimeInput,
         elicitation_router: ElicitationRequestRouter,
     ) -> Self {
+        let trusted_access = TrustedAccessContext::from_runtime(&input);
         let McpRuntimeInput {
             startup_policy,
             config,
@@ -217,14 +223,12 @@ impl McpConnectionSet {
             codex_apps_tools_cache_key,
             client_mcp_extensions,
             auth,
-            codex_apps_auth_manager,
+            auth_manager,
             elicitation_reviewer,
             elicitation_lifecycle,
         } = input;
         let store_mode = config.mcp_oauth_credentials_store_mode;
         let keyring_backend_kind = config.auth_keyring_backend_kind;
-        let approval_policy = &config.approval_policy;
-        let initial_permission_profile = config.permission_profile.clone();
         let codex_home = config.codex_home.clone();
         let prefix_mcp_tool_names = config.prefix_mcp_tool_names;
         let non_prefixed_mcp_tool_servers = config.non_prefixed_mcp_tool_servers.clone();
@@ -252,8 +256,7 @@ impl McpConnectionSet {
         let reusable_previous = previous.filter(|previous| {
             !previous.servers.is_empty()
                 && previous.elicitation_requests.update(
-                    approval_policy.value(),
-                    initial_permission_profile.clone(),
+                    Arc::clone(&config),
                     elicitation_reviewer.clone(),
                     elicitation_lifecycle.clone(),
                 )
@@ -262,8 +265,7 @@ impl McpConnectionSet {
             previous.elicitation_requests.clone()
         } else {
             ElicitationRequestManager::new(
-                approval_policy.value(),
-                initial_permission_profile,
+                Arc::clone(&config),
                 elicitation_reviewer,
                 elicitation_lifecycle,
                 elicitation_router,
@@ -274,7 +276,7 @@ impl McpConnectionSet {
         let static_chatgpt_auth_provider = auth
             .filter(|auth| auth.uses_codex_backend())
             .map(codex_model_provider::auth_provider_from_auth);
-        let codex_apps_auth_provider = codex_apps_auth_manager.and_then(|auth_manager| {
+        let codex_apps_auth_provider = auth_manager.and_then(|auth_manager| {
             auth.filter(|auth| auth.uses_codex_backend()).map(|auth| {
                 codex_model_provider::auth_provider_from_auth_manager(auth_manager, auth)
             })
@@ -283,14 +285,19 @@ impl McpConnectionSet {
             .into_iter()
             .filter(|(_, server)| server.enabled())
         {
-            let is_host_owned_codex_apps = config
-                .mcp_server_catalog
-                .server(&server_name)
-                .is_some_and(|server| {
-                    server
-                        .source()
-                        .is_host_owned_apps(&server_name, server.config())
-                });
+            let registration = config.mcp_server_catalog.server(&server_name);
+            let is_host_owned_codex_apps = registration.is_some_and(|server| {
+                server
+                    .source()
+                    .is_host_owned_apps(&server_name, server.config())
+            });
+            let host_plugin_root = registration.and_then(|server| match server.source() {
+                McpServerSource::Plugin(plugin) => plugin.host_root(),
+                McpServerSource::SelectedPlugin(_)
+                | McpServerSource::Config
+                | McpServerSource::Compatibility { .. }
+                | McpServerSource::Extension { .. } => None,
+            });
             let catalog_item_limit = if is_host_owned_codex_apps {
                 MAX_CODEX_APPS_TOOL_CATALOG_ITEMS
             } else {
@@ -299,6 +306,9 @@ impl McpConnectionSet {
             let metadata = McpServerMetadata::from(&server);
             let configured_config = server.config().clone();
             let configured_tool_filter = ToolFilter::from_config(&configured_config);
+            let startup_timeout = configured_config
+                .startup_timeout_sec
+                .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
             let configured_tool_timeout = Some(
                 configured_config
                     .tool_timeout_sec
@@ -344,6 +354,7 @@ impl McpConnectionSet {
             let connection_identity = McpServerConnectionIdentity::new(
                 &server_name,
                 &server,
+                host_plugin_root,
                 store_mode,
                 keyring_backend_kind,
                 &resolved_environment,
@@ -385,6 +396,7 @@ impl McpConnectionSet {
                 let reusable_pending_startup = connection.identity.as_ref()
                     == Some(&connection_identity)
                     && !connection.client.startup_complete.load(Ordering::Acquire)
+                    && connection.startup_timeout == startup_timeout
                     && !connection.startup_is_dormant()
                     && !connection.client.cancel_token.is_cancelled()
                     && previous_view.catalog_item_limit == catalog_item_limit
@@ -544,6 +556,7 @@ impl McpConnectionSet {
                     connection: Arc::new(McpServerConnection {
                         identity: Some(connection_identity),
                         client: async_managed_client.clone(),
+                        startup_timeout,
                         startup_trigger,
                         _diagnostics_guard: LIVE_CONNECTIONS.track(),
                     }),
@@ -680,6 +693,7 @@ impl McpConnectionSet {
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers,
             elicitation_requests: elicitation_requests.clone(),
+            trusted_access,
         };
         let summary_publication_gate = publication_gate;
         tokio::spawn(async move {
@@ -739,13 +753,8 @@ impl McpConnectionSet {
             tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers: Vec::new(),
-            elicitation_requests: ElicitationRequestManager::new(
-                AskForApproval::Never,
-                PermissionProfile::default(),
-                /*reviewer*/ None,
-                /*lifecycle*/ None,
-                ElicitationRequestRouter::default(),
-            ),
+            elicitation_requests: ElicitationRequestManager::default(),
+            trusted_access: None,
         }
     }
 
@@ -871,7 +880,7 @@ impl McpConnectionSet {
         tool: &str,
         environment_id: Option<&str>,
         arguments: Option<serde_json::Value>,
-        meta: Option<serde_json::Value>,
+        mut meta: Option<serde_json::Value>,
         requested_timeout: Option<Duration>,
         wait_for_server: bool,
     ) -> Result<CallToolResult> {
@@ -915,6 +924,10 @@ impl McpConnectionSet {
             }
             (server_timeout, requested_timeout) => server_timeout.or(requested_timeout),
         };
+        // Direct callers cannot supply host-owned entitlement metadata, even for unlisted tools.
+        if let Some(serde_json::Value::Object(meta)) = meta.as_mut() {
+            meta.remove(ENTITLEMENT_CONTEXT_KEY);
+        }
         let result: rmcp::model::CallToolResult = client
             .client
             .call_tool(tool.to_string(), arguments, meta, effective_timeout)

@@ -896,6 +896,7 @@ pub(crate) struct CodexImageGenerationEventParams {
     pub(crate) revised_prompt_present: bool,
     pub(crate) saved_path_present: bool,
     pub(crate) transparent_background: Option<bool>,
+    pub(crate) imagegen_request_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1449,8 +1450,8 @@ pub(crate) fn subagent_thread_started_event_request(
         session_id: input.session_id,
         app_server_client: CodexAppServerClientMetadata {
             product_client_id: input.product_client_id,
-            client_name: Some(input.client_name),
-            client_version: Some(input.client_version),
+            client_name: input.client_name,
+            client_version: input.client_version,
             rpc_transport: AppServerRpcTransport::InProcess,
             experimental_api_enabled: None,
         },

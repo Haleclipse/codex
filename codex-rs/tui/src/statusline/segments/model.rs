@@ -49,6 +49,7 @@ fn reasoning_effort_suffix(effort: &ReasoningEffort) -> &str {
         ReasoningEffort::XHigh => "·xhigh",
         ReasoningEffort::Max => "·max",
         ReasoningEffort::Ultra => "·ultra",
+        ReasoningEffort::Persistent => "·persist",
         ReasoningEffort::Custom(val) => val.as_str(),
     }
 }

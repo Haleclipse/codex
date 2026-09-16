@@ -5,11 +5,15 @@ use codex_client::HttpTransport;
 use codex_client::RequestBody;
 use codex_login::default_client::create_client;
 use codex_model_provider::SharedModelProvider;
+use codex_utils_output_truncation::TruncationPolicy;
+use http::HeaderValue;
 use http::Method;
 use serde_json::Value;
 use serde_json::json;
 
 const HISTORY_NOTES_BACKEND_TIMEOUT: Duration = Duration::from_secs(35);
+const ENCRYPTED_TOOL_ARGUMENTS_HEADER: &str = "x-openai-encrypted-tool-arguments";
+const TOOL_OUTPUT_TRUNCATION_POLICY_HEADER: &str = "x-openai-tool-output-truncation-policy";
 
 #[derive(Clone)]
 pub(crate) struct HistoryNotesBackend {
@@ -27,6 +31,7 @@ impl HistoryNotesBackend {
         session_id: &str,
         current_agent_name: &str,
         mut arguments: Value,
+        truncation_policy: TruncationPolicy,
     ) -> Result<Value, String> {
         let Some(arguments_object) = arguments.as_object_mut() else {
             return Err("History tool arguments must be a JSON object".to_string());
@@ -50,6 +55,26 @@ impl HistoryNotesBackend {
             .map_err(|error| format!("History backend auth could not be resolved: {error}"))?;
 
         let mut request = provider.build_request(Method::POST, path);
+        let encoded_truncation_policy = serde_json::to_string(&truncation_policy)
+            .map_err(|error| format!("Could not encode tool output truncation policy: {error}"))?;
+        request.headers.insert(
+            TOOL_OUTPUT_TRUNCATION_POLICY_HEADER,
+            HeaderValue::from_str(&encoded_truncation_policy).map_err(|error| {
+                format!("Invalid tool output truncation policy header: {error}")
+            })?,
+        );
+        if matches!(
+            path,
+            "alpha/history/v2/search_contents"
+                | "alpha/notes/v2/search_contents"
+                | "alpha/notes/v2/append_to_file"
+                | "alpha/notes/v2/write_file"
+        ) {
+            request.headers.insert(
+                ENCRYPTED_TOOL_ARGUMENTS_HEADER,
+                HeaderValue::from_static("true"),
+            );
+        }
         request.body = Some(RequestBody::Json(arguments));
         request.timeout = Some(HISTORY_NOTES_BACKEND_TIMEOUT);
         let request = auth

@@ -619,7 +619,9 @@ impl ToolRegistry {
             }
         }
 
-        notify_tool_start(&invocation).await;
+        if tool.mcp_server_name().is_none() {
+            notify_tool_start(&invocation, /*mcp_tool*/ None).await;
+        }
         let mut control_tool_analytics = tool
             .is_builtin_control_tool()
             .then(|| ControlToolCallGuard::new(&invocation));

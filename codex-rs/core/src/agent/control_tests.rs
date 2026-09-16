@@ -111,9 +111,11 @@ fn captured_op_matches(actual: &(ThreadId, Op), expected: &(ThreadId, Op)) -> bo
         (
             Op::InterAgentCommunication {
                 communication: actual,
+                ..
             },
             Op::InterAgentCommunication {
                 communication: expected,
+                ..
             },
         ) => actual == expected,
         _ => false,
@@ -450,8 +452,7 @@ async fn send_input_errors_when_manager_dropped() {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
             }],
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await
         .expect_err("send_input should fail without a manager");
@@ -486,6 +487,7 @@ async fn on_event_updates_status_from_task_complete() {
         (None, AgentStatus::Completed(Some("done".to_string()))),
         (
             Some(ErrorEvent {
+                misalignment: None,
                 message: "denied".to_string(),
                 codex_error_info: None,
             }),
@@ -508,6 +510,7 @@ async fn on_event_updates_status_from_task_complete() {
 #[tokio::test]
 async fn on_event_updates_status_from_error() {
     let status = agent_status_from_event(&EventMsg::Error(ErrorEvent {
+        misalignment: None,
         message: "boom".to_string(),
         codex_error_info: None,
     }));
@@ -576,8 +579,7 @@ async fn send_input_errors_when_thread_missing() {
                 text: "hello".to_string(),
                 text_elements: Vec::new(),
             }],
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await
         .expect_err("send_input should fail for missing thread");
@@ -650,8 +652,7 @@ async fn send_input_submits_user_message() {
                 text: "hello from tests".to_string(),
                 text_elements: Vec::new(),
             }],
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await
         .expect("send_input should succeed");
@@ -677,8 +678,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
             thread_id,
             communication.clone(),
             AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await
         .expect("send_inter_agent_communication should succeed");
@@ -688,6 +688,7 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
         thread_id,
         Op::InterAgentCommunication {
             communication: communication.clone(),
+            start_options: Default::default(),
         },
     );
     let captured = harness
@@ -959,14 +960,16 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
             spawned_agent.thread_id,
             communication.clone(),
             AgentCommunicationContext::new(AgentCommunicationKind::Message, ThreadId::new()),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await
         .expect("send_inter_agent_communication should succeed after reload");
     let expected = (
         spawned_agent.thread_id,
-        Op::InterAgentCommunication { communication },
+        Op::InterAgentCommunication {
+            communication,
+            start_options: Default::default(),
+        },
     );
     let captured = harness
         .manager
@@ -1458,6 +1461,8 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
 #[tokio::test]
 async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     let managed_fragment = "<managed_developer_instructions>\nParent developer instructions.\n</managed_developer_instructions>";
+    let persistent_fragment =
+        "<persistent_mode>\nParent developer instructions.\n</persistent_mode>";
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
@@ -1555,6 +1560,9 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                         ContentItem::InputText {
                             text: managed_fragment.to_string(),
                         },
+                        ContentItem::InputText {
+                            text: persistent_fragment.to_string(),
+                        },
                     ],
                     phase: None,
                     internal_chat_message_metadata_passthrough: Some(
@@ -1564,6 +1572,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                                 ContentItemKind("multi_agent.mode_instructions".to_string()),
                                 ContentItemKind("generic.developer_policy".to_string()),
                                 ContentItemKind("managed_config.developer_instructions".to_string()),
+                                ContentItemKind("persistent_mode.instructions".to_string()),
                             ]),
                             ..Default::default()
                         },
@@ -1674,6 +1683,9 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
             ContentItem::InputText {
                 text: managed_fragment.to_string(),
             },
+            ContentItem::InputText {
+                text: persistent_fragment.to_string(),
+            },
         ],
         phase: None,
         internal_chat_message_metadata_passthrough: Some(
@@ -1682,6 +1694,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                     ContentItemKind("generic.developer_instructions".to_string()),
                     ContentItemKind("generic.developer_policy".to_string()),
                     ContentItemKind("managed_config.developer_instructions".to_string()),
+                    ContentItemKind("persistent_mode.instructions".to_string()),
                 ]),
                 ..Default::default()
             },
@@ -1766,8 +1779,9 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         "empty child developer instructions should remove parent developer instructions"
     );
     assert!(
-        history_contains_text(no_hint_history.raw_items(), managed_fragment),
-        "clearing child instructions must preserve an overlapping managed policy"
+        history_contains_text(no_hint_history.raw_items(), managed_fragment)
+            && history_contains_text(no_hint_history.raw_items(), persistent_fragment),
+        "clearing child instructions must preserve overlapping managed and persistent instructions"
     );
     assert!(
         history_contains_text(
@@ -2657,6 +2671,8 @@ async fn spawn_agent_fork_last_n_turns_drops_parent_startup_prefix_when_under_li
 
 #[tokio::test]
 async fn spawn_agent_fork_last_n_turns_strips_parent_usage_hints() {
+    let persistent_fragment =
+        "<persistent_mode>\nParent persistent instructions.\n</persistent_mode>";
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
@@ -2706,6 +2722,9 @@ async fn spawn_agent_fork_last_n_turns_strips_parent_usage_hints() {
                         },
                         ContentItem::InputText {
                             text: "Preserved bounded developer context.".to_string(),
+                        },
+                        ContentItem::InputText {
+                            text: persistent_fragment.to_string(),
                         },
                     ],
                     phase: None,
@@ -2768,6 +2787,10 @@ async fn spawn_agent_fork_last_n_turns_strips_parent_usage_hints() {
     assert!(
         !history_contains_text(history.raw_items(), "Child developer instructions."),
         "bounded fork should not inject child instructions before its canonical context rebuild"
+    );
+    assert!(
+        !history_contains_text(history.raw_items(), persistent_fragment),
+        "bounded fork should remove persistent instructions before rebuilding context for the child's effort"
     );
     assert!(
         history_contains_text(history.raw_items(), "Preserved bounded developer context."),
@@ -3129,7 +3152,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
                 thread_id == worker_thread_id
                     && matches!(
                         op,
-                        Op::InterAgentCommunication { communication }
+                        Op::InterAgentCommunication { communication, .. }
                             if communication.author == tester_path
                                 && communication.recipient == worker_path
                                 && communication.content == "done"
@@ -3216,6 +3239,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
                 expected_message.clone(),
                 /*trigger_turn*/ false,
             ),
+            start_options: Default::default(),
         },
     );
 

@@ -12,11 +12,13 @@ use codex_api::Reasoning;
 use codex_api::ReasoningContext;
 use codex_api::ResponseEvent;
 use codex_api::ResponsesApiRequest;
+use codex_api::ResponsesEndpoint;
 use codex_api::ResponsesWebsocketClient;
 use codex_api::ResponsesWebsocketConnection;
 use codex_api::ResponsesWsRequest;
 use codex_api::TransportError;
 use codex_api::build_session_headers;
+use codex_extension_api::ContextualUserFragment;
 use codex_extension_api::ExtensionMetrics;
 use codex_http_client::HttpClientFactory;
 use codex_login::AgentIdentityAuthPolicy;
@@ -42,11 +44,14 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
 
+use super::trusted_skills::GuardianTrustedSkillsFragment;
+use super::trusted_tools::GuardianTrustedToolFragment;
+
 pub(crate) const MODEL: &str = "gpt-5.6-luna";
 pub(crate) const CLASSIFICATION_TOKEN_USAGE_METRIC: &str =
     "codex.guardian_v2.classification.token_usage";
 const MAX_OUTPUT_BYTES: usize = 8 * 1024;
-pub(super) const INITIAL_WEBSOCKET_CONNECTIONS: usize = 8;
+pub(super) const INITIAL_WEBSOCKET_CONNECTIONS: usize = if cfg!(test) { 2 } else { 8 };
 const MAX_WEBSOCKET_CONNECTIONS: usize = 16;
 const MAX_SAMPLING_RETRIES: usize = 2;
 const MAX_WEBSOCKET_AGE: Duration = Duration::from_secs(55 * 60);
@@ -71,6 +76,8 @@ pub struct LunaSamplerConfig {
     pub thread_id: String,
     /// Optional host-resolved request originator.
     pub originator: Option<String>,
+    /// Whether this thread may use the unmetered Guardian classifier endpoint.
+    pub free_guardian: bool,
     /// Optional inference service tier.
     pub service_tier: Option<String>,
     /// Luna model's host-resolved encrypted-compaction compatibility hash.
@@ -85,6 +92,10 @@ pub struct LunaSamplingRequest {
     pub instructions: String,
     /// Host-supplied Guardian reviews isolated from untrusted transcript entries.
     pub trusted_review_evidence: Vec<String>,
+    /// Host-attested metadata for the current home-owned MCP tool or connector.
+    pub trusted_tool_context: Option<GuardianTrustedToolFragment>,
+    /// Host-verified paths of user-owned skills invoked during this turn.
+    pub trusted_skill_paths: Vec<String>,
     /// Ordered untrusted input entries that the model should classify.
     pub input: Vec<String>,
     /// Optional bounded screenshots accompanying the transcript.
@@ -124,6 +135,7 @@ pub enum LunaSamplerError {
 
 struct PooledConnection {
     connection: ResponsesWebsocketConnection,
+    endpoint: ResponsesEndpoint,
     // The bridge routes by thread ID, so each socket needs its own identity.
     thread_id: String,
     expires_at: Instant,
@@ -187,26 +199,57 @@ pub struct LunaSampler {
 }
 
 impl LunaSampler {
-    /// Opens the initial WebSockets before any sample is requested.
-    pub async fn connect(config: LunaSamplerConfig) -> Result<Self, LunaSamplerError> {
-        let sampler = Self {
+    pub(super) fn new(config: LunaSamplerConfig) -> Self {
+        Self {
             config,
             idle_connections: Arc::new(Mutex::new(Vec::with_capacity(MAX_WEBSOCKET_CONNECTIONS))),
             capacity: Arc::new(Semaphore::new(MAX_WEBSOCKET_CONNECTIONS)),
             active_requests: Mutex::new(VecDeque::with_capacity(MAX_WEBSOCKET_CONNECTIONS)),
-        };
+        }
+    }
+
+    pub(super) async fn prewarm(&self) {
         for _ in 0..INITIAL_WEBSOCKET_CONNECTIONS {
-            let connection = match sampler.open_connection().await {
+            let idle_connections = self
+                .idle_connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            if idle_connections >= self.capacity.available_permits() {
+                break;
+            }
+            let connection = match self.open_connection().await {
                 Ok(connection) => connection,
                 Err(_) => break,
             };
-            sampler
-                .idle_connections
+            self.idle_connections
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(connection);
         }
-        Ok(sampler)
+    }
+
+    async fn responses_endpoint(&self) -> ResponsesEndpoint {
+        let provider = self.config.provider.info();
+        if self.config.free_guardian
+            && self
+                .config
+                .provider
+                .auth()
+                .await
+                .as_ref()
+                .is_some_and(CodexAuth::uses_codex_backend)
+            && provider.supports_codex_backend_routes()
+            && provider.requires_openai_auth
+            && provider.env_key.is_none()
+            && provider.experimental_bearer_token.is_none()
+            && provider.auth.is_none()
+            && provider.aws.is_none()
+        {
+            ResponsesEndpoint::GuardianClassifier
+        } else {
+            ResponsesEndpoint::Responses
+        }
     }
 
     async fn open_connection(&self) -> Result<PooledConnection, LunaSamplerError> {
@@ -259,30 +302,8 @@ impl LunaSampler {
         }
 
         let provider_info = self.config.provider.info();
-        if self
-            .config
-            .provider
-            .auth()
-            .await
-            .as_ref()
-            .is_some_and(CodexAuth::uses_codex_backend)
-            && provider_info.is_openai()
-            && provider_info.requires_openai_auth
-            && provider_info.env_key.is_none()
-            && provider_info.experimental_bearer_token.is_none()
-            && provider_info.auth.is_none()
-            && provider_info.aws.is_none()
-        {
-            let routing_hint = match self.config.service_tier.as_deref() {
-                Some(tier) => format!("model={MODEL};tier={tier}"),
-                None => format!("model={MODEL}"),
-            };
-            if let Ok(value) = HeaderValue::from_str(&routing_hint) {
-                headers.insert("x-codex-routing-hint", value);
-            }
-        }
-
-        let client = ResponsesWebsocketClient::new(provider, auth);
+        let endpoint = self.responses_endpoint().await;
+        let client = ResponsesWebsocketClient::new(provider, auth).with_endpoint(endpoint);
         let connect = client.connect(
             &self.config.http_client_factory,
             headers,
@@ -305,6 +326,7 @@ impl LunaSampler {
 
         Ok(PooledConnection {
             connection,
+            endpoint,
             thread_id,
             expires_at: Instant::now() + MAX_WEBSOCKET_AGE,
             auth_changes,
@@ -353,7 +375,10 @@ impl LunaSampler {
         let retryable = match error {
             LunaSamplerError::ConnectionTimeout
             | LunaSamplerError::Api(
-                ApiError::Retryable { .. } | ApiError::Stream(_) | ApiError::ServerOverloaded,
+                ApiError::Retryable { .. }
+                | ApiError::RateLimitExceeded { .. }
+                | ApiError::Stream(_)
+                | ApiError::ServerOverloaded,
             )
             | LunaSamplerError::Api(ApiError::Transport(
                 TransportError::RetryLimit
@@ -452,6 +477,16 @@ impl LunaSampler {
                 internal_chat_message_metadata_passthrough: None,
             });
         }
+        if let Some(fragment) = request.trusted_tool_context {
+            input.push(ContextualUserFragment::into(fragment));
+        }
+        if !request.trusted_skill_paths.is_empty() {
+            input.push(ContextualUserFragment::into(
+                GuardianTrustedSkillsFragment {
+                    paths: request.trusted_skill_paths,
+                },
+            ));
+        }
         input.push(ResponseItem::Message {
             id: None,
             role: "user".to_owned(),
@@ -485,10 +520,11 @@ impl LunaSampler {
             stream: true,
             stream_options: None,
             include: Vec::new(),
-            service_tier: self.config.service_tier.clone(),
+            service_tier: None,
             prompt_cache_key: Some(format!("guardian-v2:{}", self.config.thread_id)),
             text: None,
             client_metadata: None,
+            access_programs: None,
         };
         let (supersede, mut superseded) = oneshot::channel();
         let scored = Arc::new(AtomicBool::new(false));
@@ -535,6 +571,12 @@ impl LunaSampler {
                     return Err(error);
                 }
             };
+            request.service_tier =
+                if lease.connection.endpoint == ResponsesEndpoint::GuardianClassifier {
+                    None
+                } else {
+                    self.config.service_tier.clone()
+                };
             let thread_id = &lease.connection.thread_id;
             let turn_metadata = json!({
                 "session_id": self.config.session_id,

@@ -31,7 +31,7 @@ pub(crate) async fn context_window_token_status(
         match turn_context.config.model_auto_compact_token_limit_scope {
             AutoCompactTokenLimitScope::Total => (
                 active_context_tokens,
-                turn_context.model_info.auto_compact_token_limit(),
+                turn_context.model_info().auto_compact_token_limit(),
                 None,
             ),
             AutoCompactTokenLimitScope::BodyAfterPrefix => {
@@ -41,7 +41,7 @@ pub(crate) async fn context_window_token_status(
                 let scope_limit = turn_context
                     .config
                     .model_auto_compact_token_limit
-                    .or_else(|| turn_context.model_info.auto_compact_token_limit());
+                    .or_else(|| turn_context.model_info().auto_compact_token_limit());
                 (
                     active_context_tokens.saturating_sub(baseline),
                     scope_limit,

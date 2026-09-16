@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_git_utils::GitSha;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -309,7 +310,7 @@ fn parse_legacy_sandbox_policy(value: &str) -> serde_json::Result<SandboxPolicy>
 pub(super) fn git_info_from_parts(
     sha: Option<String>,
     branch: Option<String>,
-    origin_url: Option<String>,
+    origin_url: Option<SanitizedGitUrl>,
 ) -> Option<GitInfo> {
     if sha.is_none() && branch.is_none() && origin_url.is_none() {
         return None;

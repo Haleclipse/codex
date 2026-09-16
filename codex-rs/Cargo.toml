@@ -98,6 +98,7 @@ members = [
     "tools",
     "v8-poc",
     "websocket-client",
+    "worktree",
     "workload-identity",
     "utils/absolute-path",
     "utils/audio",
@@ -140,7 +141,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.150.0"
+version = "0.151.0"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
@@ -338,6 +339,7 @@ flate2 = "1.1.8"
 futures = { version = "0.3", default-features = false }
 gethostname = "1.1.0"
 gix = { version = "0.81.0", default-features = false, features = ["sha1"] }
+gix-url = "0.35.2"
 glob = "0.3"
 globset = "0.4"
 hmac = "0.12.1"

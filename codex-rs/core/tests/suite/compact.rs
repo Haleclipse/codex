@@ -14,10 +14,13 @@ use codex_models_manager::bundled_models_response;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -2281,6 +2284,97 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn previous_model_compaction_resolves_selected_settings() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", "before switch"),
+                ev_completed("r1"),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", "COMPACTION_SUMMARY"),
+                ev_completed("r2"),
+            ]),
+            responses::sse_completed("r3"),
+        ],
+    )
+    .await;
+    let model_provider = non_openai_model_provider(&server);
+    let test = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.comp_hash = Some("hash-a".to_string());
+            model.default_reasoning_summary = ReasoningSummary::Detailed;
+            model.service_tiers = vec![ModelServiceTier {
+                id: ServiceTier::Fast.request_value().to_string(),
+                name: "Fast".to_string(),
+                description: "Priority processing".to_string(),
+            }];
+        })
+        .with_model_info_override("gpt-5.2", |model| {
+            model.comp_hash = Some("hash-b".to_string());
+            model.default_reasoning_summary = ReasoningSummary::Auto;
+            model.service_tiers.clear();
+        })
+        .with_model("gpt-5.4")
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            config.model_reasoning_summary = None;
+            config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+            config
+                .features
+                .enable(Feature::FastMode)
+                .expect("enable FastMode");
+            set_test_compact_prompt(config);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.submit_text_turn("before switch").await?;
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "after switch".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                model: Some("gpt-5.2".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    // The retained priority selection is filtered out for B, restored for
+    // compaction on A, and still omitted from the following B request.
+    let actual = request_log
+        .requests()
+        .iter()
+        .map(|request| {
+            let body = request.body_json();
+            json!([
+                body["model"],
+                body["reasoning"]["summary"],
+                body["service_tier"]
+            ])
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            json!(["gpt-5.4", "detailed", "priority"]),
+            json!(["gpt-5.4", "detailed", "priority"]),
+            json!(["gpt-5.2", "auto", null]),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_rename() {
     skip_if_no_network!();
 
@@ -2572,9 +2666,11 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
     let mut previous_model_info =
         model_info_with_context_window("gpt-5.4", /*context_window*/ 273_000);
     previous_model_info.slug = previous_model_family.to_string();
+    previous_model_info.use_responses_lite = true;
     let mut next_model_info =
         model_info_with_context_window("gpt-5.4", /*context_window*/ 125_000);
     next_model_info.slug = next_model.to_string();
+    next_model_info.use_responses_lite = false;
 
     let models_mock = mount_models_once(
         &server,
@@ -2616,6 +2712,7 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
         .with_model(retired_model)
         .with_config(move |config| {
             config.model_provider = model_provider;
+            config.tool_registry.turn_metadata_includes_tool_info = true;
             set_test_compact_prompt(config);
             let _ = config.features.enable(Feature::RemoteCompactionV2);
         });
@@ -2661,6 +2758,25 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
     );
     assert_eq!(requests[2].body_json()["model"].as_str(), Some(next_model));
     assert_eq!(requests[3].body_json()["model"].as_str(), Some(next_model));
+
+    // Preparing the non-Lite fallback must not clear the previous model's inventory
+    // before its compaction attempt is sent.
+    let [first_metadata, compact_metadata] = [&requests[0], &requests[1]].map(|request| {
+        serde_json::from_str::<Value>(
+            request.body_json()["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("request should include turn metadata"),
+        )
+        .expect("turn metadata should be valid JSON")
+    });
+    let inventory = first_metadata["tool_namespaces_info"]
+        .as_object()
+        .expect("Responses Lite request should include tool inventory");
+    assert!(!inventory.is_empty());
+    assert_eq!(
+        compact_metadata["tool_namespaces_info"],
+        first_metadata["tool_namespaces_info"],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

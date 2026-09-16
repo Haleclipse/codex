@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
+use codex_extension_api::McpToolContext;
+use codex_extension_api::McpToolResultInput;
 use codex_extension_api::ToolCallOutcome;
 use codex_extension_api::ToolCallSource as ExtensionToolCallSource;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolStartInput;
+use codex_protocol::mcp::CallToolResult;
 use codex_tools::ToolName;
 
 use crate::session::session::Session;
@@ -11,7 +14,10 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 
-pub(crate) async fn notify_tool_start(invocation: &ToolInvocation) {
+pub(crate) async fn notify_tool_start(
+    invocation: &ToolInvocation,
+    mcp_tool: Option<&McpToolContext>,
+) {
     let contributors = invocation
         .session
         .services
@@ -32,9 +38,34 @@ pub(crate) async fn notify_tool_start(invocation: &ToolInvocation) {
                 turn_id: invocation.turn.sub_id.as_str(),
                 call_id: invocation.call_id.as_str(),
                 tool_name: &invocation.tool_name,
+                mcp_tool,
                 payload: &invocation.payload,
                 conversation_history: Arc::clone(&conversation_history),
                 source: extension_tool_call_source(invocation.source.clone()),
+            })
+            .await;
+    }
+}
+
+pub(crate) async fn process_mcp_tool_result(
+    session: &Session,
+    turn: &TurnContext,
+    call_id: &str,
+    mcp_tool: &McpToolContext,
+    arguments: &serde_json::Value,
+    result: &mut CallToolResult,
+) {
+    for contributor in session.services.extensions.tool_lifecycle_contributors() {
+        contributor
+            .on_mcp_tool_result(McpToolResultInput {
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: turn.extension_data.as_ref(),
+                turn_id: &turn.sub_id,
+                call_id,
+                mcp_tool,
+                arguments,
+                result,
             })
             .await;
     }

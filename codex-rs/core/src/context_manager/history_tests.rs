@@ -336,6 +336,7 @@ fn reference_context_item() -> TurnContextItem {
         multi_agent_version: None,
         multi_agent_mode: None,
         realtime_active: Some(false),
+        cyber_access_program: None,
         effort: None,
         summary: codex_protocol::config_types::ReasoningSummary::Auto,
     }
@@ -1265,6 +1266,10 @@ fn drop_last_n_user_turns_preserves_annotations_for_surviving_developer_fragment
             },
             ContentItem::InputText { text: model_switch },
             ContentItem::InputText {
+                text: "<persistent_mode>\nFollow up on the completed task.\n</persistent_mode>"
+                    .to_string(),
+            },
+            ContentItem::InputText {
                 text: "persistent environment instructions".to_string(),
             },
         ],
@@ -1274,6 +1279,7 @@ fn drop_last_n_user_turns_preserves_annotations_for_surviving_developer_fragment
             content_item_kinds: Some(vec![
                 ContentItemKind("generic.developer_instructions".to_string()),
                 ContentItemKind("model_switch.instructions".to_string()),
+                ContentItemKind("persistent_mode.instructions".to_string()),
                 ContentItemKind("environments.instructions".to_string()),
             ]),
             ..Default::default()
@@ -2724,7 +2730,7 @@ fn text_only_items_unchanged() {
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
-            text: "Hello world, this is a response.".to_string(),
+            text: "Hello, \"world\"!\nこんにちは".to_string(),
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,

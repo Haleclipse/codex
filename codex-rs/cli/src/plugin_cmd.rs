@@ -483,10 +483,8 @@ pub(crate) fn configured_marketplace_sources(
     plugins_input: &PluginsConfigInput,
     codex_home: &Path,
 ) -> HashMap<String, JsonMarketplaceSource> {
-    let Some(user_config) = plugins_input.config_layer_stack.effective_user_config() else {
-        return HashMap::new();
-    };
-    let Some(marketplaces) = user_config
+    let effective_config = plugins_input.config_layer_stack.effective_config();
+    let Some(marketplaces) = effective_config
         .get("marketplaces")
         .and_then(toml::Value::as_table)
     else {
@@ -726,10 +724,8 @@ pub(crate) fn configured_marketplace_snapshot_issues(
     load_errors: &[MarketplaceListError],
     marketplace_name: Option<&str>,
 ) -> Vec<ConfiguredMarketplaceSnapshotIssue> {
-    let Some(user_config) = plugins_input.config_layer_stack.effective_user_config() else {
-        return Vec::new();
-    };
-    let Some(configured_marketplaces) = user_config
+    let effective_config = plugins_input.config_layer_stack.effective_config();
+    let Some(configured_marketplaces) = effective_config
         .get("marketplaces")
         .and_then(toml::Value::as_table)
     else {

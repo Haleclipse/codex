@@ -2505,6 +2505,7 @@ async fn send_conversation_error(
     sess.send_event_raw(Event {
         id: sub_id,
         msg: EventMsg::Error(ErrorEvent {
+            misalignment: None,
             message,
             codex_error_info: Some(codex_error_info),
         }),

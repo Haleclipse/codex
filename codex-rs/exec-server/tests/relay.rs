@@ -1,9 +1,5 @@
 mod common;
 
-#[cfg(unix)]
-#[path = "relay/version_skew.rs"]
-mod version_skew;
-
 #[path = "common/relay.rs"]
 mod relay_support;
 

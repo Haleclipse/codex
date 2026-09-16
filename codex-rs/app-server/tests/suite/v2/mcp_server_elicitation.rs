@@ -907,20 +907,19 @@ impl ElicitationRoundTripFixture {
             function_call_output.get("call_id"),
             Some(&Value::String(call_id.to_string()))
         );
-        let output = function_call_output
-            .get("output")
-            .and_then(Value::as_str)
-            .expect("function_call_output output should be a JSON string");
-        let payload = assert_regex_match(
-            r#"(?s)^Wall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n(.*)$"#,
-            output,
-        )
-        .get(1)
-        .expect("wall-time wrapped output should include payload")
-        .as_str();
+        let header = function_call_output["output"][0]["text"]
+            .as_str()
+            .expect("first content item should contain the wall-time header");
+        assert_regex_match(
+            r#"^Wall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:$"#,
+            header,
+        );
         assert_eq!(
-            serde_json::from_str::<Value>(payload)?,
-            json!([{ "type": "text", "text": expected_text }])
+            function_call_output["output"],
+            json!([
+                { "type": "input_text", "text": header },
+                { "type": "input_text", "text": expected_text },
+            ])
         );
 
         if matches!(self.scenario, ElicitationScenario::Strict(Review::Approved)) && !self.next_turn

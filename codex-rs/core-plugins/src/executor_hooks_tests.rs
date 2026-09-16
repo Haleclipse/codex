@@ -186,8 +186,23 @@ fn ignores_unallowlisted_executor_plugin_hooks() {
     wrong_matcher["hooks"]["hooks"]["Stop"][0]["matcher"] = json!("unexpected");
     for (name, plugin_id, manifest) in [
         (
-            "wrong plugin id",
+            "unallowlisted bundled plugin",
+            "another-plugin@openai-bundled",
+            cleanup_hook_manifest(),
+        ),
+        (
+            "wrong marketplace",
             "computer-use@other",
+            cleanup_hook_manifest(),
+        ),
+        (
+            "bundled alpha marketplace",
+            "computer-use@openai-bundled-alpha",
+            cleanup_hook_manifest(),
+        ),
+        (
+            "bundled marketplace suffix",
+            "computer-use@fake-openai-bundled",
             cleanup_hook_manifest(),
         ),
         ("wrong event", "computer-use@openai-bundled", wrong_event),

@@ -96,9 +96,22 @@ pub(super) async fn revert(
     )
     .await?;
 
+    let forked_from_ordinal_exclusive =
+        codex_rollout::forked_from_ordinal_exclusive(&source_meta, Some(source_path.as_path()))
+            .map(|cutoff| {
+                // Reverting into inherited history can shrink, but never grow, the parent prefix.
+                cutoff.min(history_base.map_or(0, |base| base.end_ordinal_exclusive))
+            });
+
     let rollout_id = ThreadId::new();
-    let recorder =
-        create_replacement_recorder(store, source_meta, rollout_id, history_base).await?;
+    let recorder = create_replacement_recorder(
+        store,
+        source_meta,
+        rollout_id,
+        history_base,
+        forked_from_ordinal_exclusive,
+    )
+    .await?;
     let replacement_path = recorder.rollout_path().to_path_buf();
     recorder.persist().await.map_err(thread_store_io_error)?;
     recorder.shutdown().await.map_err(thread_store_io_error)?;
@@ -127,6 +140,7 @@ async fn create_replacement_recorder(
     source_meta: codex_rollout::SessionMeta,
     rollout_id: ThreadId,
     history_base: Option<codex_protocol::protocol::HistoryPosition>,
+    forked_from_ordinal_exclusive: Option<u64>,
 ) -> ThreadStoreResult<RolloutRecorder> {
     let config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
@@ -154,6 +168,7 @@ async fn create_replacement_recorder(
     .with_multi_agent_version(source_meta.multi_agent_version)
     .with_history_mode(ThreadHistoryMode::Paginated)
     .with_history_base(history_base)
+    .with_forked_from_ordinal_exclusive(forked_from_ordinal_exclusive)
     .with_subagent_history_start_ordinal(source_meta.subagent_history_start_ordinal);
     if let Some(context_window) = source_meta.context_window {
         params = params.with_initial_window_id(context_window.window_id);

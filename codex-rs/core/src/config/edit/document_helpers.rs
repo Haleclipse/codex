@@ -155,6 +155,9 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
         {
             oauth_table["client_id"] = value(client_id.clone());
         }
+        if let Some(callback_url) = &oauth.callback_url {
+            oauth_table["callback_url"] = value(callback_url.clone());
+        }
         if let Some(callback_port) = oauth.callback_port {
             oauth_table["callback_port"] = value(i64::from(callback_port));
         }

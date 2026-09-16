@@ -14,6 +14,7 @@ fn only_workspace_listed_materializations_are_eligible() {
                 scope,
                 discoverability,
                 authenticated_account_id: Some("account-123".to_string()),
+                capabilities: Default::default(),
             }
         };
 

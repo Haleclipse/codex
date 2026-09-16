@@ -205,6 +205,13 @@ pub(crate) enum ThreadTitleDestination {
     RenameSuggestion { request_id: Uuid },
 }
 
+/// Identifies the policy that initiated a recap request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecapTrigger {
+    Automatic,
+    Manual,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
@@ -946,7 +953,6 @@ pub(crate) enum AppEvent {
 
     StartCommitAnimation,
     StopCommitAnimation,
-    CommitTick,
 
     /// Update the current reasoning effort in the running app and widget.
     UpdateReasoningEffort(Option<ReasoningEffort>),
@@ -1036,6 +1042,10 @@ pub(crate) enum AppEvent {
         /// True when the scan failed (e.g. ACL query error) and protections could not be verified.
         failed_scan: bool,
     },
+
+    /// The startup world-writable scan finished and queued any protected warning it requires.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    StartupWorldWritableScanCompleted,
 
     /// Prompt to enable the Windows sandbox feature before using Agent mode.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1333,6 +1343,38 @@ pub(crate) enum AppEvent {
         context: String,
         action: String,
     },
+
+    /// Generate a recap for the displayed idle thread at the user's request.
+    GenerateRecap {
+        thread_id: ThreadId,
+    },
+
+    /// Recheck whether an unfocused thread is ready for an automatic recap.
+    CheckRecap {
+        thread_id: ThreadId,
+    },
+
+    /// Deliver the result of starting a recap's temporary thread.
+    RecapStarted {
+        thread_id: ThreadId,
+        request_id: Uuid,
+        trigger: RecapTrigger,
+        completed_turn_count: usize,
+        turn_revision: usize,
+        history: String,
+        result: Result<String, String>,
+    },
+
+    /// Deliver the generated recap from a temporary structured turn.
+    RecapGenerated {
+        thread_id: ThreadId,
+        request_id: Uuid,
+        trigger: RecapTrigger,
+        temporary_thread_id: ThreadId,
+        completed_turn_count: usize,
+        turn_revision: usize,
+        result: Result<String, String>,
+    },
 }
 
 /// Named profile selection to apply after any required UI guardrails complete.
@@ -1353,6 +1395,8 @@ pub(crate) struct PermissionProfileSelection {
 pub(crate) enum ExitMode {
     /// Shutdown core and exit after completion.
     ShutdownFirst,
+    /// Unsubscribe and exit after the current turn was successfully interrupted.
+    ShutdownAfterInterrupt,
     /// Exit the UI loop immediately without waiting for shutdown.
     ///
     /// This skips `Op::Shutdown`, so any in-flight work may be dropped and

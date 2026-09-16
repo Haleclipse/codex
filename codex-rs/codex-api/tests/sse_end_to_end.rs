@@ -113,6 +113,7 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
         "type": "response.completed",
         "response": {
             "id": "resp1",
+            "usage_metadata": { "amount": "0.12345678901234567890" },
             "usage": {
                 "input_tokens": 10,
                 "output_tokens": 5,
@@ -165,9 +166,16 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
         ResponseEvent::Completed {
             response_id,
             token_usage,
+            usage_metadata,
             end_turn,
         } => {
             assert_eq!(response_id, "resp1");
+            assert_eq!(
+                usage_metadata,
+                &Some(codex_protocol::ResponseUsageMetadata {
+                    amount: Some("0.12345678901234567890".to_string()),
+                })
+            );
             assert_eq!(
                 token_usage.as_ref().map(|usage| usage.total_tokens),
                 Some(15)

@@ -102,6 +102,10 @@ pub fn truncate_function_output_items_with_policy(
     for item in items {
         match item {
             FunctionCallOutputContentItem::InputText { text } => {
+                // Empty text contributes no model content but still consumes an API array slot.
+                if text.is_empty() {
+                    continue;
+                }
                 if remaining_budget == 0 {
                     omitted_text_items += 1;
                     continue;

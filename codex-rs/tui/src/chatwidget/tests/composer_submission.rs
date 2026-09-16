@@ -1,5 +1,6 @@
 use super::*;
 use crate::app_event::ConnectorsSnapshot;
+use crate::history_cell::ThreadRecapLoadingCell;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -30,6 +31,25 @@ fn assert_hidden_shell_payload_is_literal(op: Result<Op, TryRecvError>, payload:
         ),
         other => panic!("expected hidden shell payload as literal input, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn user_submission_does_not_commit_recap_loading_to_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.show_recap_loading();
+    while rx.try_recv().is_ok() {}
+
+    chat.submit_user_message(UserMessage::from("Continue with the task"));
+
+    let mut saw_user_message = false;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            assert!(!cell.as_any().is::<ThreadRecapLoadingCell>());
+            saw_user_message |= cell.as_any().is::<UserHistoryCell>();
+        }
+    }
+    assert!(saw_user_message);
 }
 
 #[tokio::test]

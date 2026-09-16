@@ -187,6 +187,79 @@ async fn installed_extension_exposes_and_invokes_history_notes_tools() -> TestRe
         })
     );
 
+    for (namespace, name, mut arguments) in [
+        ("history", "list_windows", json!({"limit": 101})),
+        ("history", "list_items", json!({})),
+        (
+            "history",
+            "list_items",
+            json!({"limit": 21, "max_chars_per_item": 4_000}),
+        ),
+        (
+            "history",
+            "read_item",
+            json!({"window_id": "window", "item_id": "item", "limit_chars": 20_001}),
+        ),
+        (
+            "history",
+            "search_contents",
+            json!({"query": "x".repeat(1_001), "limit": 21}),
+        ),
+        ("history", "search_contents", json!({"query": ""})),
+        ("notes", "list_files_by_prefix", json!({"max_results": 101})),
+        (
+            "notes",
+            "search_contents",
+            json!({"query": "x".repeat(1_001), "max_files": 21, "max_matches_per_file": 11}),
+        ),
+        ("notes", "search_contents", json!({"query": ""})),
+        (
+            "notes",
+            "read_file",
+            json!({"path": "notes.md", "start_line": -2}),
+        ),
+        (
+            "notes",
+            "append_to_file",
+            json!({"path": "notes.md", "text": "append"}),
+        ),
+        (
+            "notes",
+            "write_file",
+            json!({"path": "notes.md", "text": "replace"}),
+        ),
+    ] {
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/backend-api/codex/alpha/{namespace}/v2/{name}"
+            )))
+            .and(header("x-openai-actor-authorization", "actor-biscuit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "encrypted_output": "enc_history"
+            })))
+            .mount(&server)
+            .await;
+        let tool_name = ToolName::namespaced(namespace, name);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.tool_name() == tool_name)
+            .expect("exposed tool");
+        tool.handle(tool_call(tool_name, arguments.clone())).await?;
+        arguments["context"] = json!({
+            "session_id": "session-123",
+            "current_agent_name": "/root/worker",
+        });
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body))
+                .collect::<Result<Vec<_>, _>>()?,
+            vec![arguments]
+        );
+    }
+
     for result in [
         json!({"text": ""}),
         json!({"text": "x".repeat(4_001)}),
@@ -277,7 +350,7 @@ fn exposed_tools(
     registry: &ExtensionRegistry<Config>,
     session_store: &ExtensionData,
     thread_store: &ExtensionData,
-) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
     registry
         .tool_contributors()
         .iter()
@@ -285,7 +358,7 @@ fn exposed_tools(
         .collect()
 }
 
-fn tool_call(tool_name: ToolName, arguments: serde_json::Value) -> ToolCall {
+fn tool_call(tool_name: ToolName, arguments: serde_json::Value) -> ToolCall<'static> {
     ToolCall {
         turn_id: "turn-1".to_string(),
         call_id: "call-read-file".to_string(),

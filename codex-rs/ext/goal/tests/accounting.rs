@@ -3,9 +3,11 @@
 #[path = "../src/accounting.rs"]
 mod accounting;
 
+use accounting::BudgetLimitedGoalDisposition;
 use accounting::GoalAccountingState;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::protocol::TokenUsage;
+use codex_state::ThreadGoalStatus;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -49,6 +51,46 @@ fn goal_accounting_ignores_plan_mode_turns() {
     );
 
     assert_eq!(None, recorded);
+}
+
+#[test]
+fn goal_accounting_preserves_concurrent_descendant_usage_across_checkpoints() {
+    let state = GoalAccountingState::default();
+    state.start_turn("turn-1", ModeKind::Default, &TokenUsage::default());
+    state.mark_current_turn_goal_active("goal-1");
+    let first_usage = token_usage(
+        /*input_tokens*/ 20, /*cached_input_tokens*/ 5, /*output_tokens*/ 8,
+        /*reasoning_output_tokens*/ 0, /*total_tokens*/ 28,
+    );
+    let second_usage = token_usage(
+        /*input_tokens*/ 8, /*cached_input_tokens*/ 2, /*output_tokens*/ 4,
+        /*reasoning_output_tokens*/ 0, /*total_tokens*/ 12,
+    );
+    std::thread::scope(|scope| {
+        scope.spawn(|| state.record_descendant_token_usage(&first_usage));
+        scope.spawn(|| state.record_descendant_token_usage(&second_usage));
+    });
+
+    let first = state
+        .progress_snapshot("turn-1")
+        .expect("descendant usage should create a progress snapshot");
+    assert_eq!(33, first.token_delta);
+
+    state.record_descendant_token_usage(&token_usage(
+        /*input_tokens*/ 6, /*cached_input_tokens*/ 1, /*output_tokens*/ 3,
+        /*reasoning_output_tokens*/ 0, /*total_tokens*/ 9,
+    ));
+    state.mark_progress_accounted_for_status(
+        "turn-1",
+        &first,
+        ThreadGoalStatus::Active,
+        BudgetLimitedGoalDisposition::KeepActive,
+    );
+
+    let second = state
+        .progress_snapshot("turn-1")
+        .expect("usage received during accounting should remain pending");
+    assert_eq!(8, second.token_delta);
 }
 
 fn token_usage(

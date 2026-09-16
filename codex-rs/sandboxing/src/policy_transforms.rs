@@ -12,6 +12,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::permissions::ReadDenyMatcher;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
+use codex_utils_path_uri::PathUri;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
@@ -327,11 +328,10 @@ fn deny_entry_constrains_accepted_grant(
             };
             match &deny_entry.path {
                 FileSystemPath::GlobPattern { pattern } => glob_static_prefix_path(pattern, cwd)
-                    .is_some_and(|prefix| paths_overlap(prefix.as_path(), grant_path.as_path())),
+                    .is_some_and(|prefix| paths_may_overlap(&prefix, &grant_path)),
                 FileSystemPath::Path { .. } | FileSystemPath::Special { .. } => {
-                    resolve_permission_path(&deny_entry.path, cwd).is_some_and(|deny_path| {
-                        paths_overlap(deny_path.as_path(), grant_path.as_path())
-                    })
+                    resolve_permission_path(&deny_entry.path, cwd)
+                        .is_some_and(|deny_path| paths_may_overlap(&deny_path, &grant_path))
                 }
             }
         })
@@ -358,8 +358,10 @@ fn glob_static_prefix_path(pattern: &str, cwd: &Path) -> Option<AbsolutePathBuf>
     AbsolutePathBuf::from_absolute_path(prefix).ok()
 }
 
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    left.starts_with(right) || right.starts_with(left)
+fn paths_may_overlap(left: &AbsolutePathBuf, right: &AbsolutePathBuf) -> bool {
+    let left = PathUri::from_abs_path(left);
+    let right = PathUri::from_abs_path(right);
+    left.overlaps(&right).unwrap_or(true)
 }
 
 fn access_covers(requested: FileSystemAccessMode, granted: FileSystemAccessMode) -> bool {

@@ -15,6 +15,7 @@ use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::RawResponseCompletedNotification;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ResponseUsageMetadata;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
 use codex_app_server_protocol::ThreadItem;
@@ -244,9 +245,11 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
+    let mut completed = responses::ev_completed_with_tokens("r1", /*total_tokens*/ 200);
+    completed["response"]["usage_metadata"] = serde_json::json!({ "amount": "0.125" });
     let sse = responses::sse(vec![
         responses::ev_assistant_message("m1", "MANUAL_COMPACT_SUMMARY"),
-        responses::ev_completed_with_tokens("r1", /*total_tokens*/ 200),
+        completed,
     ]);
     responses::mount_sse_sequence(&server, vec![sse]).await;
 
@@ -300,6 +303,9 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
             thread_id,
             turn_id: started.turn_id,
             response_id: "r1".to_string(),
+            usage_metadata: Some(ResponseUsageMetadata {
+                amount: Some("0.125".to_string()),
+            }),
             usage: Some(TokenUsageBreakdown {
                 total_tokens: 200,
                 input_tokens: 200,

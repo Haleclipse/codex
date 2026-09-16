@@ -48,7 +48,10 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
         })
     }
 
-    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async {
             Ok(
                 Box::new(FunctionToolOutput::from_text("ok".to_string(), Some(true)))
@@ -280,6 +283,7 @@ async fn missing_code_mode_wait_traces_only_the_wait_tool_call() -> anyhow::Resu
     session.services.code_mode_service = CodeModeService::new(
         Arc::new(MissingCellCodeModeSessionProvider),
         &turn.config.code_mode,
+        session.services.executed_tool_calls.clone(),
     );
     attach_test_trace(&mut session, &turn, temp.path())?;
 

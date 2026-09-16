@@ -331,14 +331,14 @@ impl Session {
                 RolloutItem::ResponseItem(response_item) => {
                     history.record_annotated_items(
                         std::slice::from_ref(response_item),
-                        turn_context.model_info.truncation_policy.into(),
+                        turn_context.model_info().truncation_policy.into(),
                     );
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
                     let response_item = communication.to_model_input_item();
                     history.record_items(
                         std::iter::once(&response_item),
-                        turn_context.model_info.truncation_policy.into(),
+                        turn_context.model_info().truncation_policy.into(),
                     );
                 }
                 RolloutItem::InterAgentCommunicationMetadata { .. } => {}

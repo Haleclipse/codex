@@ -2640,6 +2640,7 @@ async fn status_widget_and_approval_modal_snapshot() {
 
     // Now show an approval modal (e.g. exec approval).
     let ev = ExecApprovalRequestEvent {
+        kind: Default::default(),
         call_id: "call-approve-exec".into(),
         approval_id: Some("call-approve-exec".into()),
         turn_id: "turn-approve-exec".into(),

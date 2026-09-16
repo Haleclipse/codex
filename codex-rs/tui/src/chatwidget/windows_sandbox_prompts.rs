@@ -48,13 +48,15 @@ impl ChatWidget {
         else {
             return None;
         };
-        match codex_windows_sandbox::apply_world_writable_scan_and_denies_for_permissions(
+        let result = codex_windows_sandbox::apply_world_writable_scan_and_denies_for_permissions(
             self.config.codex_home.as_path(),
             cwd.as_path(),
             &env_map,
             &permissions,
             Some(self.config.codex_home.as_path()),
-        ) {
+        );
+        crate::windows_sandbox::record_world_writable_scan_result(&self.session_telemetry, &result);
+        match result {
             Ok(_) => None,
             Err(_) => Some((Vec::new(), 0, true)),
         }
@@ -66,7 +68,7 @@ impl ChatWidget {
         None
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", test))]
     pub(crate) fn open_world_writable_warning_confirmation(
         &mut self,
         preset: Option<ApprovalPreset>,
@@ -185,6 +187,7 @@ impl ChatWidget {
                 description: Some(format!("Apply {mode_label} for this session")),
                 actions: accept_actions,
                 dismiss_on_select: true,
+                require_explicit_confirmation: true,
                 ..Default::default()
             },
             SelectionItem {
@@ -192,6 +195,7 @@ impl ChatWidget {
                 description: Some(format!("Enable {mode_label} and remember this choice")),
                 actions: accept_and_remember_actions,
                 dismiss_on_select: true,
+                require_explicit_confirmation: true,
                 ..Default::default()
             },
         ];
@@ -204,7 +208,7 @@ impl ChatWidget {
         });
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "windows"), not(test)))]
     pub(crate) fn open_world_writable_warning_confirmation(
         &mut self,
         _preset: Option<ApprovalPreset>,
@@ -288,6 +292,7 @@ impl ChatWidget {
                     });
                 })],
                 dismiss_on_select: true,
+                require_explicit_confirmation: true,
                 ..Default::default()
             });
         }
@@ -412,6 +417,7 @@ impl ChatWidget {
                     }
                 })],
                 dismiss_on_select: true,
+                require_explicit_confirmation: true,
                 ..Default::default()
             });
         }

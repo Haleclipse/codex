@@ -441,6 +441,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
             resets_at: Some(1_786_150_800),
         }),
         saved_path: None,
+        imagegen_request_id: None,
     };
     let image_completion =
         RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
@@ -1452,6 +1453,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: ReasoningSummary::Auto,
             }),

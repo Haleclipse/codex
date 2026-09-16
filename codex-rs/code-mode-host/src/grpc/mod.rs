@@ -14,6 +14,7 @@ use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::grpc as proto;
 use codex_code_mode_protocol::grpc::code_mode_host_server::CodeModeHost;
+use codex_protocol::protocol::W3cTraceContext;
 use futures::Stream;
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -21,6 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tracing::Instrument;
 
 use self::session::GrpcHostState;
 use self::session::GrpcSession;
@@ -28,6 +30,17 @@ use self::waits::WaitRegistration;
 
 type GrpcStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 type GrpcFuture<'a, T> = Pin<Box<dyn Future<Output = Result<Response<T>, Status>> + Send + 'a>>;
+
+fn trace_context_from_request<T>(request: &Request<T>) -> Option<W3cTraceContext> {
+    request
+        .metadata()
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .map(|traceparent| W3cTraceContext {
+            traceparent: Some(traceparent.to_string()),
+            tracestate: None,
+        })
+}
 
 /// Serves transport-independent, leased code-mode sessions over gRPC.
 #[derive(Clone)]
@@ -52,6 +65,15 @@ impl GrpcCodeModeHost {
         Ok(Response::new(self.state.open_session(limits)?))
     }
 
+    #[tracing::instrument(
+        name = "code_mode_host.grpc.close_session",
+        level = "info",
+        skip_all,
+        fields(
+            otel.name = "code_mode_host.grpc.close_session",
+            session.id = %request.session_id,
+        )
+    )]
     async fn close_session_request(
         &self,
         request: proto::CloseSessionRequest,
@@ -107,6 +129,7 @@ impl GrpcCodeModeHost {
     async fn execute_request(
         &self,
         request: proto::ExecuteRequest,
+        callback_traceparent: Option<String>,
     ) -> Result<Response<GrpcStream<proto::ExecuteEvent>>, Status> {
         let session = self.state.session(&request.session_id)?;
         validation::identifier(&request.execution_id, "execution ID")?;
@@ -128,7 +151,12 @@ impl GrpcCodeModeHost {
             }
         };
         let cell_id = started.cell_id.clone();
-        session.admit_execution(execution_id.clone(), cell_id.to_string(), cell_permit)?;
+        session.admit_execution(
+            execution_id.clone(),
+            cell_id.to_string(),
+            cell_permit,
+            callback_traceparent,
+        )?;
 
         let (sender, receiver) = mpsc::channel(/*buffer*/ 2);
         sender
@@ -141,22 +169,26 @@ impl GrpcCodeModeHost {
                 )),
             }))
             .map_err(|_| Status::internal("failed to publish code-mode execution admission"))?;
-        tokio::spawn(async move {
-            let _request_permit = request_permit;
-            tokio::select! {
-                biased;
-                _ = sender.closed() => {}
-                response = started.initial_response() => {
-                    let event = response.map(|response| proto::ExecuteEvent {
-                        event: Some(proto::execute_event::Event::Outcome(
-                            conversions::execution_outcome(response),
-                        )),
-                    }).map_err(Status::internal);
-                    let _ = sender.send(event).await;
+        let outcome_span = tracing::Span::current();
+        tokio::spawn(
+            async move {
+                let _request_permit = request_permit;
+                tokio::select! {
+                    biased;
+                    _ = sender.closed() => {}
+                    response = started.initial_response() => {
+                        let event = response.map(|response| proto::ExecuteEvent {
+                            event: Some(proto::execute_event::Event::Outcome(
+                                conversions::execution_outcome(response),
+                            )),
+                        }).map_err(Status::internal);
+                        let _ = sender.send(event).await;
+                    }
+                    _ = session.closed.cancelled() => {}
                 }
-                _ = session.closed.cancelled() => {}
             }
-        });
+            .instrument(outcome_span),
+        );
 
         let stream = ReceiverStream::new(receiver).inspect(move |event| {
             if matches!(
@@ -171,6 +203,17 @@ impl GrpcCodeModeHost {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    #[tracing::instrument(
+        name = "code_mode_host.grpc.wait",
+        level = "info",
+        skip_all,
+        fields(
+            otel.name = "code_mode_host.grpc.wait",
+            session.id = %request.session_id,
+            cell.id = %request.cell_id,
+            wait.id = %request.wait_id,
+        )
+    )]
     async fn wait_request(
         &self,
         request: proto::WaitRequest,
@@ -241,7 +284,16 @@ impl CodeModeHost for GrpcCodeModeHost {
         'a: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(self.open_session_request(request.into_inner()))
+        let trace = trace_context_from_request(&request);
+        let request = request.into_inner();
+        let open_session_span = tracing::info_span!("code_mode_host.grpc.open_session");
+        if let Some(trace) = trace.as_ref() {
+            codex_otel::set_parent_from_w3c_trace_context(&open_session_span, trace);
+        }
+        Box::pin(
+            self.open_session_request(request)
+                .instrument(open_session_span),
+        )
     }
 
     fn close_session<'a, 'async_trait>(
@@ -296,7 +348,24 @@ impl CodeModeHost for GrpcCodeModeHost {
         'a: 'async_trait,
         Self: 'async_trait,
     {
-        Box::pin(self.execute_request(request.into_inner()))
+        let trace = trace_context_from_request(&request);
+        let request = request.into_inner();
+        let execute_span = tracing::info_span!(
+            "code_mode_host.grpc.execute",
+            otel.name = "code_mode_host.grpc.execute",
+            session.id = %request.session_id,
+            execution.id = %request.execution_id,
+            call_id = %request.tool_call_id,
+        );
+        if let Some(trace) = trace.as_ref() {
+            codex_otel::set_parent_from_w3c_trace_context(&execute_span, trace);
+        }
+        let callback_traceparent =
+            codex_otel::span_w3c_trace_context(&execute_span).and_then(|trace| trace.traceparent);
+        Box::pin(
+            self.execute_request(request, callback_traceparent)
+                .instrument(execute_span),
+        )
     }
 
     fn wait<'a, 'async_trait>(

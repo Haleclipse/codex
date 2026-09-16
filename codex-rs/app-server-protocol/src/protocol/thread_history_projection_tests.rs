@@ -68,6 +68,7 @@ fn projects_turn_lifecycle_without_prior_builder_state() {
 #[test]
 fn projects_failed_turn_completion_as_snapshot() {
     let error = ErrorEvent {
+        misalignment: None,
         message: "request failed".to_string(),
         codex_error_info: None,
     };
@@ -91,6 +92,7 @@ fn projects_failed_turn_completion_as_snapshot() {
                 turn_id: "turn-1".to_string(),
                 status: TurnStatus::Failed,
                 error: Some(TurnError {
+                    misalignment: None,
                     message: "request failed".to_string(),
                     codex_error_info: None,
                     additional_details: None,
@@ -206,6 +208,8 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
     }));
     let security_risk = project(RolloutItem::SecurityRiskScore(SecurityRiskScore {
         scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
+        call_id: None,
+        action: None,
         sampled_at: None,
     }));
 

@@ -126,6 +126,7 @@ use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandAction;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
+use codex_app_server_protocol::CommandExecutionApprovalKind;
 use codex_app_server_protocol::CommandExecutionSource;
 use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
@@ -148,6 +149,7 @@ use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::WebSearchAction;
+use codex_git_utils::SanitizedGitUrl;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_login::default_client::originator;
@@ -493,6 +495,7 @@ impl TurnToolCounts {
             ThreadItem::UserMessage { .. }
             | ThreadItem::HookPrompt { .. }
             | ThreadItem::AgentMessage { .. }
+            | ThreadItem::FunctionCallOutput { .. }
             | ThreadItem::Plan { .. }
             | ThreadItem::Reasoning { .. }
             | ThreadItem::ImageView { .. }
@@ -1088,9 +1091,13 @@ impl AnalyticsReducer {
         if thread_state.connection_id.is_none() {
             thread_state.connection_id = parent_connection_id;
         }
-        out.push(TrackEventRequest::ThreadInitialized(
-            subagent_thread_started_event_request(input),
-        ));
+        // Guardian prewarm can register lineage before parent client metadata is set.
+        // Keep the existing completeness requirement for the initialization event.
+        if input.client_name.is_some() && input.client_version.is_some() {
+            out.push(TrackEventRequest::ThreadInitialized(
+                subagent_thread_started_event_request(input),
+            ));
+        }
     }
 
     fn ingest_guardian_review(
@@ -1228,7 +1235,7 @@ impl AnalyticsReducer {
                         None
                     };
                     let skill_id = skill_id_for_local_skill(
-                        repo_url.as_deref(),
+                        repo_url.as_ref().map(SanitizedGitUrl::as_str),
                         repo_root.as_deref(),
                         path.as_path(),
                         invocation.skill_name.as_str(),
@@ -1270,7 +1277,7 @@ impl AnalyticsReducer {
                         invoke_type: Some(invocation.invocation_type),
                         model_slug: Some(tracking.model_slug.clone()),
                         product_client_id: Some(tracking.product_client_id.clone()),
-                        repo_url,
+                        repo_url: repo_url.map(String::from),
                         skill_scope,
                         plugin_id: invocation.plugin_id,
                         remote_plugin_id: invocation.remote_plugin_id,
@@ -1497,6 +1504,10 @@ impl AnalyticsReducer {
     fn ingest_server_request(&mut self, _connection_id: u64, request: ServerRequest) {
         match request {
             ServerRequest::CommandExecutionRequestApproval { request_id, params } => {
+                let is_stdin_review = match params.kind {
+                    CommandExecutionApprovalKind::WriteStdin => true,
+                    CommandExecutionApprovalKind::Command => false,
+                };
                 let is_network_access_review = params.network_approval_context.is_some();
                 let requested_network_access = is_network_access_review
                     || params
@@ -1510,7 +1521,9 @@ impl AnalyticsReducer {
                         .and_then(|network| network.enabled)
                         .unwrap_or(false);
                 let requested_additional_permissions = params.additional_permissions.is_some();
-                let trigger = if params.approval_id.is_some() {
+                let trigger = if is_stdin_review {
+                    ReviewTrigger::Initial
+                } else if params.approval_id.is_some() {
                     ReviewTrigger::ExecveIntercept
                 } else if requested_network_access {
                     ReviewTrigger::NetworkPolicyDenial
@@ -1529,12 +1542,16 @@ impl AnalyticsReducer {
                         turn_id: params.turn_id,
                         item_id: Some(params.item_id),
                         review_id: user_review_id(&request_id),
-                        subject_kind: if is_network_access_review {
+                        subject_kind: if is_stdin_review {
+                            ReviewSubjectKind::WriteStdin
+                        } else if is_network_access_review {
                             ReviewSubjectKind::NetworkAccess
                         } else {
                             ReviewSubjectKind::CommandExecution
                         },
-                        subject_name: if is_network_access_review {
+                        subject_name: if is_stdin_review {
+                            "write_stdin".to_string()
+                        } else if is_network_access_review {
                             "network_access".to_string()
                         } else {
                             "command_execution".to_string()
@@ -2414,7 +2431,7 @@ fn warn_missing_analytics_context(
     );
 }
 
-fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
+pub(crate) fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
     match item {
         ThreadItem::CommandExecution { id, .. }
         | ThreadItem::FileChange { id, .. }
@@ -2426,6 +2443,7 @@ fn tracked_tool_item_id(item: &ThreadItem) -> Option<&str> {
         ThreadItem::UserMessage { .. }
         | ThreadItem::HookPrompt { .. }
         | ThreadItem::AgentMessage { .. }
+        | ThreadItem::FunctionCallOutput { .. }
         | ThreadItem::Plan { .. }
         | ThreadItem::Reasoning { .. }
         | ThreadItem::SubAgentActivity { .. }
@@ -2832,6 +2850,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
                         revised_prompt_present: item.revised_prompt.is_some(),
                         saved_path_present: item.saved_path.is_some(),
                         transparent_background: item.transparent_background,
+                        imagegen_request_id: item.imagegen_request_id.clone(),
                     },
                 },
             ))

@@ -38,6 +38,7 @@ use codex_protocol::permissions::FileSystemSandboxEntry as CoreFileSystemSandbox
 use codex_protocol::permissions::FileSystemSpecialPath as CoreFileSystemSpecialPath;
 use codex_protocol::protocol::AgentStatus as CoreAgentStatus;
 use codex_protocol::protocol::AskForApproval as CoreAskForApproval;
+use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
 use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::ExecCommandSource as CoreExecCommandSource;
 use codex_protocol::protocol::GranularApprovalConfig as CoreGranularApprovalConfig;
@@ -4488,11 +4489,19 @@ fn codex_error_info_serializes_http_status_code_in_camel_case() {
 }
 
 #[test]
-fn codex_error_info_serializes_cyber_policy_in_camel_case() {
-    assert_eq!(
-        serde_json::to_value(CodexErrorInfo::CyberPolicy).unwrap(),
-        json!("cyberPolicy")
-    );
+fn core_error_info_converts_to_camel_case() {
+    for (core, expected) in [
+        (CoreCodexErrorInfo::CyberPolicy, json!("cyberPolicy")),
+        (
+            CoreCodexErrorInfo::RateLimitExceeded,
+            json!("rateLimitExceeded"),
+        ),
+    ] {
+        assert_eq!(
+            serde_json::to_value(CodexErrorInfo::from(core)).unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -4714,6 +4723,8 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
         thread_id: "thread_123".to_string(),
         client_user_message_id: None,
         input: vec![],
+        turn_trigger: None,
+        tool_output: None,
         responsesapi_client_metadata: None,
         additional_context: None,
         environments: None,
@@ -4725,16 +4736,47 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
         permissions: None,
         model: None,
         service_tier: None,
+        service_tier_for_turn: None,
         effort: None,
         summary: None,
         output_schema: None,
         collaboration_mode: None,
         multi_agent_mode: None,
         personality: None,
+        cyber_access_program: None,
     };
     let serialized_without_override =
         serde_json::to_value(&without_override).expect("params should serialize");
     assert_eq!(serialized_without_override.get("serviceTier"), None);
+}
+
+#[test]
+fn turn_start_cyber_access_program_uses_separate_wire_formats() {
+    for (app_server_value, core_value) in [
+        ("standard", "standard"),
+        ("daybreakBlue", "daybreak_blue"),
+        ("daybreakRed", "daybreak_red"),
+    ] {
+        let params: TurnStartParams = serde_json::from_value(json!({
+            "threadId": "thread_123",
+            "input": [],
+            "cyberAccessProgram": app_server_value,
+        }))
+        .expect("params should deserialize");
+        let core_program: codex_protocol::turn_input::CyberAccessProgram = params
+            .cyber_access_program
+            .expect("explicit program")
+            .into();
+
+        assert_eq!(
+            serde_json::to_value(params).expect("params should serialize")["cyberAccessProgram"],
+            app_server_value,
+        );
+        assert_eq!(
+            serde_json::to_value(core_program).expect("core program should serialize"),
+            json!(core_value),
+        );
+    }
 }
 
 #[test]

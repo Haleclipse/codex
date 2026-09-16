@@ -27,6 +27,7 @@ use codex_app_server_protocol::ProjectUpdateResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
@@ -855,6 +856,7 @@ async fn assigned_forks_inherit_projects_for_persistent_and_ephemeral_children()
     let started = server
         .start_thread(ThreadStartParams {
             project_id: Some(project.project.id.clone()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
             ..Default::default()
         })
         .await?;

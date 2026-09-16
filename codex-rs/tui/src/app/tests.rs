@@ -17,11 +17,15 @@ mod patch_approval_tests;
 mod permission_shortcuts_tests;
 mod plugin_catalog;
 mod rate_limits;
+#[path = "tests/recap_generation_tests.rs"]
+mod recap_generation;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
 mod session_summary;
 mod startup;
+#[path = "tests/stream_animation_tests.rs"]
+mod stream_animation_tests;
 #[path = "tests/thread_usage.rs"]
 mod thread_usage;
 #[path = "tests/turn_submission.rs"]
@@ -5433,7 +5437,7 @@ async fn make_test_app() -> App {
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
         key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
-        commit_anim_running: Arc::new(AtomicBool::new(false)),
+        commit_animation: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         skill_load_warnings: SkillLoadWarningState::default(),
@@ -5468,6 +5472,7 @@ async fn make_test_app() -> App {
         rate_limit_hard_stop_generation: 0,
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
+        recap: recap::RecapState::default(),
     }
 }
 
@@ -5513,7 +5518,7 @@ async fn make_test_app_with_channels() -> (
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
             key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
-            commit_anim_running: Arc::new(AtomicBool::new(false)),
+            commit_animation: None,
             status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             skill_load_warnings: SkillLoadWarningState::default(),
@@ -5548,6 +5553,7 @@ async fn make_test_app_with_channels() -> (
             rate_limit_hard_stop_generation: 0,
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
+            recap: recap::RecapState::default(),
         },
         rx,
         op_rx,
@@ -6491,6 +6497,7 @@ fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {
 #[test]
 fn active_turn_not_steerable_turn_error_extracts_structured_server_error() {
     let turn_error = AppServerTurnError {
+        misalignment: None,
         message: "cannot steer a review turn".to_string(),
         codex_error_info: Some(AppServerCodexErrorInfo::ActiveTurnNotSteerable {
             turn_kind: AppServerNonSteerableTurnKind::Review,
@@ -7709,6 +7716,13 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
     let store_snapshot = store.snapshot();
     assert_eq!(store_snapshot.session, Some(resumed_session));
     assert_eq!(store_snapshot.turns, snapshot.turns);
+    assert_eq!(
+        store.recap_progress(),
+        recap::RecapProgress {
+            completed_turns: 1,
+            last_recapped_turn_count: None,
+        }
+    );
 }
 
 #[tokio::test]

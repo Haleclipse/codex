@@ -82,16 +82,11 @@ pub async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
     communication: InterAgentCommunication,
-    parent_turn_id: Option<String>,
-    root_turn_id: Option<String>,
+    start_options: codex_protocol::turn_input::TurnStartOptions,
 ) {
     let trigger_turn = communication.trigger_turn;
     sess.input_queue
-        .enqueue_mailbox_communication(
-            communication,
-            parent_turn_id.filter(|_| trigger_turn),
-            root_turn_id.filter(|_| trigger_turn),
-        )
+        .enqueue_mailbox_communication(communication, start_options)
         .await;
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn || sess.has_outstanding_durable_sleep() {
@@ -118,13 +113,11 @@ pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command
         return;
     }
 
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
-    sess.spawn_task(
-        Arc::clone(&turn_context),
-        Vec::new(),
-        UserShellCommandTask::new(command),
-    )
-    .await;
+    let turn_context = sess
+        .new_turn_with_default_settings(sub_id, Default::default())
+        .await;
+    sess.spawn_task(turn_context, Vec::new(), UserShellCommandTask::new(command))
+        .await;
 }
 
 pub async fn resolve_elicitation(
@@ -241,10 +234,11 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
 }
 
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
-
-    sess.spawn_task(Arc::clone(&turn_context), Vec::new(), CompactTask)
+    let turn_context = sess
+        .new_turn_with_default_settings(sub_id, Default::default())
         .await;
+
+    sess.spawn_task(turn_context, Vec::new(), CompactTask).await;
 }
 
 pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32) {
@@ -252,6 +246,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         sess.send_event_raw(Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: "num_turns must be >= 1".to_string(),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
             }),
@@ -265,6 +260,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         sess.send_event_raw(Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: "Cannot rollback while a turn is in progress.".to_string(),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
             }),
@@ -273,13 +269,16 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         return;
     }
 
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id).await;
+    let turn_context = sess
+        .new_turn_with_default_settings(sub_id, Default::default())
+        .await;
     let live_thread = match sess.live_thread_for_persistence("rollback thread") {
         Ok(live_thread) => live_thread,
         Err(_) => {
             sess.send_event_raw(Event {
                 id: turn_context.sub_id.clone(),
                 msg: EventMsg::Error(ErrorEvent {
+                    misalignment: None,
                     message: "thread rollback requires persisted thread history".to_string(),
                     codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
                 }),
@@ -292,6 +291,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         sess.send_event_raw(Event {
             id: turn_context.sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: format!("failed to flush thread persistence for rollback replay: {err}"),
                 codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
             }),
@@ -306,6 +306,7 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
             sess.send_event_raw(Event {
                 id: turn_context.sub_id.clone(),
                 msg: EventMsg::Error(ErrorEvent {
+                    misalignment: None,
                     message: format!("failed to load thread history for rollback replay: {err}"),
                     codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
                 }),
@@ -385,6 +386,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
         let event = Event {
             id: sub_id,
             msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: err.to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
             }),
@@ -456,6 +458,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         let event = Event {
             id: sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: "Failed to shutdown thread persistence".to_string(),
                 codex_error_info: Some(CodexErrorInfo::Other),
             }),
@@ -483,7 +486,9 @@ pub async fn review(
     sub_id: String,
     review_request: ReviewRequest,
 ) {
-    let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
+    let turn_context = sess
+        .new_turn_with_default_settings(sub_id.clone(), Default::default())
+        .await;
     sess.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
     #[allow(deprecated)]
@@ -502,6 +507,7 @@ pub async fn review(
             let event = Event {
                 id: sub_id,
                 msg: EventMsg::Error(ErrorEvent {
+                    misalignment: None,
                     message: err.to_string(),
                     codex_error_info: Some(CodexErrorInfo::Other),
                 }),
@@ -538,6 +544,7 @@ pub(super) async fn submission_loop(
                         sess.send_event_raw(Event {
                             id: sub.id.clone(),
                             msg: EventMsg::Error(ErrorEvent {
+                                misalignment: None,
                                 message: err.to_string(),
                                 codex_error_info: Some(CodexErrorInfo::Other),
                             }),
@@ -577,10 +584,16 @@ pub(super) async fn submission_loop(
                 }
                 Op::RecoverTurn {
                     thread_settings,
+                    start_options,
                     reply,
                 } => {
-                    let result =
-                        turn_input::handle_recovery(&sess, thread_settings, sub.id.clone()).await;
+                    let result = turn_input::handle_recovery(
+                        &sess,
+                        thread_settings,
+                        start_options,
+                        sub.id.clone(),
+                    )
+                    .await;
                     let _ = reply.send(result);
                     false
                 }
@@ -601,15 +614,21 @@ pub(super) async fn submission_loop(
                     thread_settings::update(&sess, sub.id.clone(), thread_settings).await;
                     false
                 }
-                Op::InterAgentCommunication { communication } => {
-                    inter_agent_communication(
-                        &sess,
-                        sub.id.clone(),
-                        communication,
-                        sub.parent_turn_id,
-                        sub.root_turn_id,
-                    )
-                    .await;
+                Op::TurnSettings {
+                    turn_id,
+                    update,
+                    reply,
+                } => {
+                    let outcome = sess.apply_turn_settings(&turn_id, update).await;
+                    let _ = reply.send(outcome);
+                    false
+                }
+                Op::InterAgentCommunication {
+                    communication,
+                    start_options,
+                } => {
+                    inter_agent_communication(&sess, sub.id.clone(), communication, start_options)
+                        .await;
                     false
                 }
                 Op::ExecApproval {

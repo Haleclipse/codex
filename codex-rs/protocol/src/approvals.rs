@@ -6,6 +6,7 @@ use crate::protocol::FileChange;
 use crate::protocol::ReviewDecision;
 use crate::request_permissions::RequestPermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -152,6 +153,7 @@ pub enum GuardianAssessmentAction {
         approval_id: String,
         process_id: String,
         stdin: String,
+        /// Launch directory of the existing terminal, not its current working directory.
         cwd: PathUri,
     },
     ApplyPatch {
@@ -279,8 +281,8 @@ pub struct ExecApprovalRequestEvent {
     pub started_at_ms: i64,
     /// The command to be executed.
     pub command: Vec<String>,
-    /// The command's working directory.
-    pub cwd: AbsolutePathBuf,
+    /// The command's working directory, or the launch directory for terminal input.
+    pub cwd: LegacyAppPathString,
     /// Optional human-readable reason for the approval (e.g. retry without sandbox).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

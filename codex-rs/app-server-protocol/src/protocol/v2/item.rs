@@ -34,6 +34,7 @@ use codex_protocol::items::McpToolCallStatus as CoreMcpToolCallStatus;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::memory_citation::MemoryCitation as CoreMemoryCitation;
 use codex_protocol::memory_citation::MemoryCitationEntry as CoreMemoryCitationEntry;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -257,6 +258,14 @@ pub enum ThreadItem {
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
+    FunctionCallOutput {
+        id: String,
+        name: String,
+        namespace: Option<String>,
+        output: FunctionCallOutputBody,
+    },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
     /// EXPERIMENTAL - proposed plan item content. The completed plan item is
     /// authoritative and may not match the concatenation of `PlanDelta` text.
     Plan {
@@ -429,6 +438,7 @@ impl ThreadItem {
             ThreadItem::UserMessage { id, .. }
             | ThreadItem::HookPrompt { id, .. }
             | ThreadItem::AgentMessage { id, .. }
+            | ThreadItem::FunctionCallOutput { id, .. }
             | ThreadItem::Plan { id, .. }
             | ThreadItem::Reasoning { id, .. }
             | ThreadItem::CommandExecution { id, .. }
@@ -873,6 +883,12 @@ impl From<CoreTurnItem> for ThreadItem {
                     delivery: agent.delivery,
                 }
             }
+            CoreTurnItem::FunctionCallOutput(output) => ThreadItem::FunctionCallOutput {
+                id: output.id,
+                name: output.name,
+                namespace: output.namespace,
+                output: output.output,
+            },
             CoreTurnItem::Plan(plan) => ThreadItem::Plan {
                 id: plan.id,
                 text: plan.text,
@@ -973,6 +989,7 @@ impl From<CoreTurnItem> for ThreadItem {
                     transparent_background: None,
                     failure: None,
                     saved_path: image.saved_path,
+                    imagegen_request_id: None,
                 })
             }
             CoreTurnItem::EnteredReviewMode(review) => ThreadItem::EnteredReviewMode {

@@ -56,9 +56,14 @@ struct ToolCatalogCacheEntry {
 #[derive(Default)]
 struct ToolCatalogCacheState {
     snapshot: Option<ToolCatalogSnapshot>,
-    optional_startup_deadline: Option<Instant>,
+    optional_startup_deadline: Option<OptionalStartupDeadline>,
     last_accepted_generation: u64,
     disabled_by_server: bool,
+}
+
+struct OptionalStartupDeadline {
+    grace: Duration,
+    deadline: Instant,
 }
 
 struct ToolCatalogSnapshot {
@@ -114,7 +119,11 @@ impl McpToolCatalogCacheContext {
         self.current_tools().is_some_and(|tools| !tools.is_empty())
     }
 
-    pub(crate) fn optional_startup_deadline(&self, default_deadline: Instant) -> Instant {
+    pub(crate) fn optional_startup_deadline(
+        &self,
+        default_deadline: Instant,
+        startup_grace: Duration,
+    ) -> Instant {
         let mut state = lock_unpoisoned(&self.entry.state);
         if state.disabled_by_server
             || state
@@ -124,9 +133,20 @@ impl McpToolCatalogCacheContext {
         {
             return default_deadline;
         }
-        *state
-            .optional_startup_deadline
-            .get_or_insert(default_deadline)
+        let cached_deadline =
+            state
+                .optional_startup_deadline
+                .get_or_insert(OptionalStartupDeadline {
+                    grace: startup_grace,
+                    deadline: default_deadline,
+                });
+        if cached_deadline.grace != startup_grace {
+            *cached_deadline = OptionalStartupDeadline {
+                grace: startup_grace,
+                deadline: default_deadline,
+            };
+        }
+        cached_deadline.deadline
     }
 
     pub(crate) fn current_tools(&self) -> Option<Vec<ToolInfo>> {

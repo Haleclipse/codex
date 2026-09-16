@@ -9,6 +9,7 @@ use codex_app_server_protocol::GitInfo;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
@@ -30,6 +31,7 @@ use codex_app_server_protocol::ThreadStatus;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_features::Feature;
 use codex_git_utils::GitSha;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo as RolloutGitInfo;
 use codex_rollout::state_db::reconcile_rollout;
@@ -651,6 +653,90 @@ async fn thread_metadata_update_patches_git_branch_and_returns_updated_thread() 
     Ok(())
 }
 
+/// Client-provided Git credentials must not reach API responses, SQLite, or rollout files.
+#[tokio::test]
+async fn thread_metadata_update_sanitizes_git_origin_before_persisting() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(codex_home.path())?;
+    let state_db = init_state_db(codex_home.path()).await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+
+    let update_id = mcp
+        .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
+            thread_id: thread.id.clone(),
+            project_id: None,
+            git_info: Some(ThreadMetadataGitInfoUpdateParams {
+                sha: None,
+                branch: None,
+                origin_url: Some(Some(
+                    "https://alice:synthetic-git-secret@example.invalid/org/repo.git".to_string(),
+                )),
+            }),
+        })
+        .await?;
+    let update_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(update_id)),
+    )
+    .await??;
+    let ThreadMetadataUpdateResponse { thread: updated } =
+        to_response::<ThreadMetadataUpdateResponse>(update_resp)?;
+    let expected_git_info = Some(GitInfo {
+        sha: None,
+        branch: None,
+        origin_url: Some("https://example.invalid/org/repo.git".to_string()),
+    });
+    assert_eq!(updated.git_info, expected_git_info);
+
+    let persisted = state_db
+        .get_thread(ThreadId::from_string(&thread.id)?)
+        .await?
+        .expect("updated thread must be persisted");
+    assert_eq!(
+        persisted.git_origin_url.as_deref(),
+        Some("https://example.invalid/org/repo.git")
+    );
+    let rollout = fs::read_to_string(persisted.rollout_path)?;
+    assert!(!rollout.contains("synthetic-git-secret"));
+    assert!(rollout.contains("https://example.invalid/org/repo.git"));
+
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id,
+            include_turns: false,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread: read, .. } = to_response::<ThreadReadResponse>(read_resp)?;
+    assert_eq!(read.git_info, expected_git_info);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn thread_metadata_update_rejects_empty_git_info_patch() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
@@ -1004,7 +1090,10 @@ async fn thread_metadata_update_can_clear_stored_git_fields() -> Result<()> {
         Some(RolloutGitInfo {
             commit_hash: Some(GitSha::new("abc123")),
             branch: Some("feature/sidebar-pr".to_string()),
-            repository_url: Some("git@example.com:openai/codex.git".to_string()),
+            repository_url: Some(
+                SanitizedGitUrl::try_from("git@example.com:openai/codex.git")
+                    .expect("repository URL should be valid"),
+            ),
         }),
     )?;
     let _state_db = init_state_db(codex_home.path()).await?;

@@ -42,6 +42,10 @@ use codex_protocol::turn_input::TurnStartOptions;
 #[cfg(test)]
 use crate::session::completed_session_loop_termination;
 
+pub(crate) struct GuardianReadOnlyHistoryTools(
+    pub(crate) Vec<Arc<dyn for<'call> codex_tools::ToolExecutor<codex_tools::ToolCall<'call>>>>,
+);
+
 /// Start an interactive sub-Codex thread and return its runtime and IO channels.
 ///
 /// Delegates never request approvals, and the returned IO yields their public events.
@@ -81,6 +85,27 @@ pub(crate) async fn run_codex_thread_interactive(
     };
     let session_source = SessionSource::SubAgent(subagent_source.clone());
     let is_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source);
+    let mut thread_extension_init = codex_extension_api::ExtensionDataInit::default();
+    if is_guardian_reviewer {
+        let history_tools = crate::tools::spec_plan::extension_tool_executors(
+            parent_session.as_ref(),
+            parent_ctx.extension_data.as_ref(),
+        )
+        .filter(|executor| {
+            let name = executor.tool_name();
+            matches!(
+                (name.namespace.as_deref(), name.name.as_str()),
+                (
+                    Some("history"),
+                    "list_windows" | "list_items" | "read_item" | "search_contents"
+                )
+            )
+        })
+        .collect::<Vec<_>>();
+        if !history_tools.is_empty() {
+            thread_extension_init.insert(GuardianReadOnlyHistoryTools(history_tools));
+        }
+    }
     let extensions = if is_guardian_reviewer {
         codex_extension_api::empty_extension_registry()
     } else {
@@ -123,7 +148,7 @@ pub(crate) async fn run_codex_thread_interactive(
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
         environment_selections: parent_environments.to_selections(),
-        thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
+        thread_extension_init,
         client_mcp_extensions: parent_session.services.client_mcp_extensions.clone(),
         reserved_thread_id: None,
         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
@@ -214,8 +239,10 @@ pub(crate) async fn run_codex_thread_one_shot(
         .submit_turn_input(
             TurnInputRequest::user_input(input).on_start(TurnStartOptions {
                 final_output_json_schema,
+                service_tier: None,
                 parent_turn_id: Some(parent_turn_id),
                 root_turn_id,
+                ..Default::default()
             }),
             TurnInputMode::StartIfIdle,
         )

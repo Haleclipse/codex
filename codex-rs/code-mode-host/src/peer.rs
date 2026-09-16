@@ -16,7 +16,6 @@ use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
-use codex_code_mode_protocol::host::TransportLane;
 use codex_code_mode_protocol::host::WireResult;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -30,7 +29,6 @@ const CELL_MESSAGE_CAPACITY: usize = 128;
 
 pub(super) struct HostPeer {
     outgoing_tx: mpsc::Sender<EncodedFrame>,
-    bulk_tx: Option<mpsc::Sender<EncodedFrame>>,
     pending: Mutex<HashMap<DelegateRequestId, PendingDelegate>>,
     delegate_permits: Arc<Semaphore>,
     cell_routes: StdMutex<HashMap<(SessionId, CellId), CellRoute>>,
@@ -64,7 +62,6 @@ impl HostPeer {
     pub(super) fn new(outgoing_tx: mpsc::Sender<EncodedFrame>) -> Self {
         Self {
             outgoing_tx,
-            bulk_tx: None,
             pending: Mutex::new(HashMap::new()),
             delegate_permits: Arc::new(Semaphore::new(MAX_PENDING_DELEGATE_CALLS)),
             cell_routes: StdMutex::new(HashMap::new()),
@@ -75,16 +72,10 @@ impl HostPeer {
         }
     }
 
-    pub(super) fn with_bulk_sender(mut self, bulk_tx: mpsc::Sender<EncodedFrame>) -> Self {
-        self.bulk_tx = Some(bulk_tx);
-        self
-    }
-
     pub(super) fn send(&self, message: HostToClient) -> Result<(), PeerSendError> {
         let frame = EncodedFrame::encode(&message)
             .map_err(|err| PeerSendError::Payload(err.to_string()))?;
-        let lane = message.transport_lane();
-        self.send_frame(frame, lane)
+        self.send_frame(frame)
     }
 
     pub(super) fn respond(
@@ -398,12 +389,8 @@ impl HostPeer {
         });
     }
 
-    fn send_frame(&self, frame: EncodedFrame, lane: TransportLane) -> Result<(), PeerSendError> {
-        let sender = match lane {
-            TransportLane::Control => &self.outgoing_tx,
-            TransportLane::Bulk => self.bulk_tx.as_ref().unwrap_or(&self.outgoing_tx),
-        };
-        match sender.try_send(frame) {
+    fn send_frame(&self, frame: EncodedFrame) -> Result<(), PeerSendError> {
+        match self.outgoing_tx.try_send(frame) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.disconnect();

@@ -131,7 +131,7 @@ fn map_git_info(git_info: &CoreGitInfo) -> ConversationGitInfo {
     ConversationGitInfo {
         sha: git_info.commit_hash.as_ref().map(|sha| sha.0.clone()),
         branch: git_info.branch.clone(),
-        origin_url: git_info.repository_url.clone(),
+        origin_url: git_info.repository_url.clone().map(String::from),
     }
 }
 

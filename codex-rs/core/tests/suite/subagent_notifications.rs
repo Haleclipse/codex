@@ -408,6 +408,7 @@ async fn setup_turn_one_with_spawned_child(
         }),
         child_response_delay,
         /*wait_for_parent_notification*/ true,
+        INHERITED_REASONING_EFFORT,
         |builder| builder,
     )
     .await?;
@@ -419,6 +420,7 @@ async fn setup_turn_one_with_custom_spawned_child(
     spawn_args: serde_json::Value,
     child_response_delay: Option<Duration>,
     wait_for_parent_notification: bool,
+    turn_reasoning_effort: ReasoningEffort,
     configure_test: impl FnOnce(
         core_test_support::test_codex::TestCodexBuilder,
     ) -> core_test_support::test_codex::TestCodexBuilder,
@@ -481,16 +483,32 @@ async fn setup_turn_one_with_custom_spawned_child(
     )
     .await;
 
-    let mut builder = configure_test(test_codex().with_config(|config| {
+    let configured_reasoning_effort = turn_reasoning_effort.clone();
+    let mut builder = configure_test(test_codex().with_config(move |config| {
         config
             .features
             .enable(Feature::Collab)
             .expect("test config should allow feature update");
         config.model = Some(INHERITED_MODEL.to_string());
-        config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
+        config.model_reasoning_effort = Some(configured_reasoning_effort);
     }));
     let test = builder.build_with_auto_env(server).await?;
-    test.submit_turn(TURN_1_PROMPT).await?;
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: TURN_1_PROMPT.to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                effort: Some(Some(turn_reasoning_effort)),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
     if child_response_delay.is_none() && wait_for_parent_notification {
         let _ = wait_for_requests(&child_request_log).await?;
         let rollout_path = test
@@ -530,6 +548,7 @@ async fn spawn_child_and_capture_snapshot(
         spawn_args,
         /*child_response_delay*/ None,
         /*wait_for_parent_notification*/ false,
+        INHERITED_REASONING_EFFORT,
         configure_test,
     )
     .await?;
@@ -540,6 +559,47 @@ async fn spawn_child_and_capture_snapshot(
         .await?
         .config_snapshot()
         .await)
+}
+
+#[test_case(
+    ReasoningEffort::Ultra,
+    ReasoningEffort::XHigh;
+    "absent catalog override uses highest non-ultra"
+)]
+#[test_case(
+    ReasoningEffort::High,
+    ReasoningEffort::High;
+    "non-ultra selection is unchanged"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_agent_uses_multi_agent_reasoning_effort_for_requests(
+    selected_reasoning_effort: ReasoningEffort,
+    expected_request_reasoning_effort: ReasoningEffort,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let (_test, _spawned_id, child_request_log) = setup_turn_one_with_custom_spawned_child(
+        &server,
+        json!({ "message": CHILD_PROMPT }),
+        /*child_response_delay*/ None,
+        /*wait_for_parent_notification*/ false,
+        selected_reasoning_effort,
+        std::convert::identity,
+    )
+    .await?;
+
+    let child_request = wait_for_requests(&child_request_log)
+        .await?
+        .into_iter()
+        .next()
+        .expect("wait_for_requests should return a request");
+    assert_eq!(
+        child_request.body_json()["reasoning"]["effort"],
+        expected_request_reasoning_effort.to_string()
+    );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1662,6 +1722,7 @@ async fn spawned_agent_uses_summary_support_for_final_model(
         }),
         /*child_response_delay*/ Some(Duration::from_secs(1)),
         /*wait_for_parent_notification*/ false,
+        INHERITED_REASONING_EFFORT,
         move |builder| {
             builder.with_config(move |config| {
                 config.model_catalog = Some(model_catalog);
@@ -2582,6 +2643,17 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
         )
     );
 
+    // Fresh turn input is sampled before queued mail is drained. Let that first
+    // request complete successfully so the next request can include the result.
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, READ_RESULT_PROMPT)
+                && !body_contains(request, "peer follow-up finished")
+        },
+        sse(vec![ev_completed("resp-routing-root-before-mail")]),
+    )
+    .await;
     let root_result_request = mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {

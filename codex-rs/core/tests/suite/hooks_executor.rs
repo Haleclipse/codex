@@ -398,6 +398,7 @@ impl ExecutorStopHookFixture {
                 &selection,
                 EnvironmentConfig {
                     allow_login_shell: false,
+                    workspace_roots: selection.workspace_roots.clone(),
                     permission_profile: PermissionProfileSnapshot::legacy(
                         self.test.config.permissions.permission_profile().clone(),
                     ),

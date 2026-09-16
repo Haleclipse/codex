@@ -73,6 +73,7 @@ fn tool_call_decodes_structured_input_and_namespace() {
         tool_kind: grpc::ToolKind::Function as i32,
         input_json: Some(br#"{"query":"hello"}"#.to_vec()),
         sequence: 1,
+        traceparent: None,
     };
 
     assert_eq!(

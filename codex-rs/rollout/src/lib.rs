@@ -113,6 +113,7 @@ pub use list::rollout_date_parts;
 pub use maintenance::RolloutMaintenanceGuard;
 pub use maintenance::try_acquire_rollout_maintenance_lock;
 pub use metadata::builder_from_items;
+pub use metadata::forked_from_ordinal_exclusive;
 pub use metadata::rollout_id_from_path;
 pub use model_context::ModelContextScan;
 pub use model_context::ModelContextScanProgress;

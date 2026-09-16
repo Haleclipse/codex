@@ -36,7 +36,10 @@ impl ToolExecutor<ToolInvocation> for Handler {
         )
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { handle_spawn_agent(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -132,6 +135,7 @@ async fn handle_spawn_agent(
             root_turn_id: turn.turn_metadata_state.root_turn_id(),
             environments: Some(step_context.environments.to_selections()),
             multi_agent_v2_usage_hints: None,
+            cyber_access_program: turn.cyber_access_program,
         },
     ))
     .await

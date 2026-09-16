@@ -42,6 +42,19 @@ use super::LunaSamplingRequest;
 use super::MAX_SAMPLING_RETRIES;
 use super::MAX_WEBSOCKET_CONNECTIONS;
 
+impl LunaSampler {
+    /// Waits for warm sockets to enter the client pool, beyond the server handshake.
+    pub(in crate::async_scorer) async fn wait_for_prewarm(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, async {
+            while self.idle_connections.lock().unwrap().len() < INITIAL_WEBSOCKET_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+}
+
 fn assert_connection_metadata(server: &responses::WebSocketTestServer) -> Result<String> {
     let handshake = server.single_handshake();
     let thread_id = handshake.header("thread-id").expect("classifier thread ID");
@@ -112,6 +125,7 @@ async fn proxy_websocket_servers_with_prewarm_limit(
     tokio::spawn(async move {
         for (index, target) in targets.into_iter().enumerate() {
             if let ProxyPrewarmLimit::StopAfter { ready_connections } = prewarm_limit
+                && ready_connections < INITIAL_WEBSOCKET_CONNECTIONS
                 && index == ready_connections
             {
                 let Ok((connection, _)) = listener.accept().await else {
@@ -147,16 +161,25 @@ fn sampler_config(base_url: String) -> LunaSamplerConfig {
         session_id: "session-1".to_owned(),
         thread_id: "thread-1".to_owned(),
         originator: Some("guardian-v2-test".to_owned()),
+        free_guardian: false,
         service_tier: None,
         luna_compaction_hash: None,
         metrics: None,
     }
 }
 
+async fn connect_sampler(config: LunaSamplerConfig) -> Result<LunaSampler> {
+    let sampler = LunaSampler::new(config);
+    sampler.prewarm().await;
+    Ok(sampler)
+}
+
 fn sample_request(turn_id: &str) -> LunaSamplingRequest {
     LunaSamplingRequest {
         instructions: "Return high for high risk or low for low risk.".to_owned(),
         trusted_review_evidence: Vec::new(),
+        trusted_tool_context: None,
+        trusted_skill_paths: Vec::new(),
         input: vec!["The user requested a README summary.".to_owned()],
         images: Vec::new(),
         parent_compaction: None,
@@ -202,7 +225,7 @@ async fn sampler_records_token_usage_after_returning_an_early_classification() -
         server.uri().trim_start_matches("ws://")
     ));
     config.metrics = Some(metrics.clone());
-    let sampler = LunaSampler::connect(config).await?;
+    let sampler = connect_sampler(config).await?;
 
     assert_eq!(sampler.sample(sample_request("turn-1")).await?, "low");
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -245,6 +268,81 @@ impl ExternalAuth for RefreshableAuth {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn classifier_uses_free_endpoint_only_with_codex_backend_auth() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    for (auth, base_path, free_guardian, expected_path, expected_service_tier) in [
+        (
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            "/backend-api/codex",
+            false,
+            "/backend-api/codex/responses",
+            Some("priority"),
+        ),
+        (
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            "/backend-api/codex",
+            true,
+            "/backend-api/codex/guardian-classifier",
+            None,
+        ),
+        (
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            "/v1",
+            true,
+            "/v1/responses",
+            Some("priority"),
+        ),
+        (
+            CodexAuth::from_api_key("test-api-key"),
+            "/v1",
+            true,
+            "/v1/responses",
+            Some("priority"),
+        ),
+    ] {
+        let events = vec![
+            ev_assistant_message("classification", "low"),
+            ev_completed("response-1"),
+        ];
+        let mut connections = vec![Vec::new(); INITIAL_WEBSOCKET_CONNECTIONS - 1];
+        connections.push(vec![events]);
+        let server = responses::start_websocket_server(connections).await;
+        let base_url = format!(
+            "http://{}{base_path}",
+            server.uri().trim_start_matches("ws://")
+        );
+        let mut config = sampler_config(base_url.clone());
+        config.provider = create_model_provider(
+            ModelProviderInfo::create_openai_provider(Some(base_url)),
+            Some(AuthManager::from_auth_for_testing(auth)),
+        );
+        config.free_guardian = free_guardian;
+        config.service_tier = Some("priority".to_owned());
+        let sampler = connect_sampler(config).await?;
+
+        assert_eq!(sampler.sample(sample_request("turn-1")).await?, "low");
+        for handshake in server.handshakes() {
+            assert_eq!(handshake.uri(), expected_path);
+            assert_eq!(handshake.header("x-codex-routing-hint"), None);
+        }
+        let request = server
+            .wait_for_request(
+                /*connection_index*/ INITIAL_WEBSOCKET_CONNECTIONS - 1,
+                /*request_index*/ 0,
+            )
+            .await
+            .body_json();
+        assert_eq!(request["service_tier"].as_str(), expected_service_tier);
+
+        drop(sampler);
+        server.shutdown().await;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -282,7 +380,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
         Some(manager.clone()),
     );
 
-    let sampler = LunaSampler::connect(LunaSamplerConfig {
+    let sampler = connect_sampler(LunaSamplerConfig {
         provider,
         http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
@@ -290,6 +388,7 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
         session_id: "session-1".to_owned(),
         thread_id: "thread-1".to_owned(),
         originator: Some("guardian-v2-test".to_owned()),
+        free_guardian: false,
         service_tier: None,
         luna_compaction_hash: None,
         metrics: None,
@@ -326,6 +425,8 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
         .sample(LunaSamplingRequest {
             instructions: "Return high for high risk or low for low risk.".to_owned(),
             trusted_review_evidence: Vec::new(),
+            trusted_tool_context: None,
+            trusted_skill_paths: Vec::new(),
             input: vec![
                 "The user requested a README summary.".to_owned(),
                 "The assistant inspected README.md.".to_owned(),
@@ -354,6 +455,8 @@ async fn preconnected_sampler_reuses_authenticated_websocket_for_classifications
         .sample(LunaSamplingRequest {
             instructions: "Return high for high risk or low for low risk.".to_owned(),
             trusted_review_evidence: Vec::new(),
+            trusted_tool_context: None,
+            trusted_skill_paths: Vec::new(),
             input: vec!["The user requested a source review.".to_owned()],
             images: Vec::new(),
             parent_compaction: None,
@@ -429,7 +532,7 @@ async fn sampler_reuses_parent_compaction_only_for_matching_model_hashes() -> Re
             server.uri().trim_start_matches("ws://")
         ));
         config.luna_compaction_hash = luna_hash.map(str::to_owned);
-        let sampler = LunaSampler::connect(config).await?;
+        let sampler = connect_sampler(config).await?;
         let parent_compaction = ResponseItem::Compaction {
             id: Some(ResponseItemId::from_server("cmp_parent".to_owned())),
             encrypted_content: "opaque encrypted summary".to_owned(),
@@ -501,7 +604,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
             "test-api-key",
         ))),
     );
-    let sampler = LunaSampler::connect(LunaSamplerConfig {
+    let sampler = connect_sampler(LunaSamplerConfig {
         provider,
         http_client_factory: HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         agent_identity_policy: AgentIdentityAuthPolicy::JwtOnly,
@@ -509,6 +612,7 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
         session_id: "session-1".to_owned(),
         thread_id: "thread-1".to_owned(),
         originator: None,
+        free_guardian: false,
         service_tier: None,
         luna_compaction_hash: None,
         metrics: None,
@@ -520,6 +624,8 @@ async fn sampler_returns_classification_token_before_terminal_response_events() 
         sampler.sample(LunaSamplingRequest {
             instructions: "Return high for high risk or low for low risk.".to_owned(),
             trusted_review_evidence: Vec::new(),
+            trusted_tool_context: None,
+            trusted_skill_paths: Vec::new(),
             input: vec!["The user requested a README summary.".to_owned()],
             images: Vec::new(),
             parent_compaction: None,
@@ -549,7 +655,7 @@ async fn sampler_keeps_first_classification_token_when_later_output_disagrees() 
     let mut connections = vec![Vec::new(); INITIAL_WEBSOCKET_CONNECTIONS - 1];
     connections.push(vec![events]);
     let server = responses::start_websocket_server(connections).await;
-    let sampler = LunaSampler::connect(sampler_config(format!(
+    let sampler = connect_sampler(sampler_config(format!(
         "http://{}/v1",
         server.uri().trim_start_matches("ws://")
     )))
@@ -593,7 +699,7 @@ async fn sampler_recovers_after_initial_prewarm_failures() -> Result<()> {
         }
     });
 
-    let sampler = LunaSampler::connect(sampler_config(format!("http://{address}/v1"))).await?;
+    let sampler = connect_sampler(sampler_config(format!("http://{address}/v1"))).await?;
     assert_eq!(failed_connections.load(Ordering::Relaxed), 1);
 
     assert_eq!(sampler.sample(sample_request("turn-1")).await?, "low");
@@ -612,7 +718,7 @@ async fn sampler_remains_available_when_second_prewarm_fails() -> Result<()> {
     ]]])
     .await;
     let sampler =
-        LunaSampler::connect(sampler_config(proxy_websocket_servers(&[&server]).await?)).await?;
+        connect_sampler(sampler_config(proxy_websocket_servers(&[&server]).await?)).await?;
 
     assert_eq!(sampler.sample(sample_request("turn-1")).await?, "low");
     assert_eq!(server.handshakes().len(), 1);
@@ -627,7 +733,7 @@ async fn sampler_grows_its_pool_for_overlapping_requests() -> Result<()> {
     let first = responses::start_websocket_server(vec![response("response-1")]).await;
     let second = responses::start_websocket_server(vec![response("response-2")]).await;
     let third = responses::start_websocket_server(vec![response("response-3")]).await;
-    let sampler = LunaSampler::connect(sampler_config(
+    let sampler = connect_sampler(sampler_config(
         proxy_websocket_servers_with_prewarm_limit(
             &[&first, &second, &third],
             ProxyPrewarmLimit::StopAfter {
@@ -712,7 +818,7 @@ async fn sampler_replaces_scored_drains_before_unfinished_classifications() -> R
         .chain(servers[INITIAL_WEBSOCKET_CONNECTIONS..].iter())
         .collect::<Vec<_>>();
     let sampler = Arc::new(
-        LunaSampler::connect(sampler_config(proxy_websocket_servers(&server_refs).await?)).await?,
+        connect_sampler(sampler_config(proxy_websocket_servers(&server_refs).await?)).await?,
     );
 
     let oldest_sampler = Arc::clone(&sampler);
@@ -793,7 +899,7 @@ async fn sampler_retries_expired_websockets_on_another_warm_connection() -> Resu
         }
     })]]])
     .await;
-    let sampler = LunaSampler::connect(sampler_config(
+    let sampler = connect_sampler(sampler_config(
         proxy_websocket_servers(&[&healthy, &expired]).await?,
     ))
     .await?;
@@ -833,7 +939,7 @@ async fn sampler_assigns_a_fresh_identity_when_replacing_aged_connections() -> R
     let first = responses::start_websocket_server(vec![response.clone()]).await;
     let second = responses::start_websocket_server(vec![response.clone()]).await;
     let replacement = responses::start_websocket_server(vec![response]).await;
-    let sampler = LunaSampler::connect(sampler_config(
+    let sampler = connect_sampler(sampler_config(
         proxy_websocket_servers_with_prewarm_limit(
             &[&first, &second, &replacement],
             ProxyPrewarmLimit::StopAfter {
@@ -884,7 +990,7 @@ async fn sampler_reconnects_after_transient_service_failures() -> Result<()> {
         ev_completed("recovered"),
     ]]])
     .await;
-    let sampler = LunaSampler::connect(sampler_config(
+    let sampler = connect_sampler(sampler_config(
         proxy_websocket_servers_with_prewarm_limit(
             &[&first, &second, &recovered],
             ProxyPrewarmLimit::StopAfter {
@@ -925,7 +1031,7 @@ async fn sampler_limits_transient_recovery_attempts() -> Result<()> {
     let second = responses::start_websocket_server(unavailable()).await;
     let third = responses::start_websocket_server(unavailable()).await;
     let unused = responses::start_websocket_server(unavailable()).await;
-    let sampler = LunaSampler::connect(sampler_config(
+    let sampler = connect_sampler(sampler_config(
         proxy_websocket_servers_with_prewarm_limit(
             &[&first, &second, &third, &unused],
             ProxyPrewarmLimit::StopAfter {

@@ -21,6 +21,8 @@ mod connection_handling_websocket_unix;
 #[cfg(unix)]
 mod curated_mcp_sync;
 mod current_time;
+mod cyber_access_program;
+mod daybreak_access;
 mod dynamic_tools;
 mod environment_add;
 mod environment_info;
@@ -114,6 +116,7 @@ mod thread_timeline;
 mod thread_unarchive;
 mod thread_unsubscribe;
 mod turn_interrupt;
+mod turn_settings_update;
 mod turn_start;
 mod turn_start_zsh_fork;
 mod turn_steer;

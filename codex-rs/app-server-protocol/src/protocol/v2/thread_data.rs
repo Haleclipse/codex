@@ -5,6 +5,8 @@ use super::TurnStatus;
 use crate::JsonSchema;
 use crate::TS;
 use codex_experimental_api_macros::ExperimentalApi;
+use codex_protocol::protocol::MisalignmentErrorDetails as CoreMisalignmentErrorDetails;
+use codex_protocol::protocol::MisalignmentSteer as CoreMisalignmentSteer;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource as CoreSubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode as CoreThreadHistoryMode;
@@ -16,6 +18,7 @@ use schemars::r#gen::SchemaGenerator;
 use schemars::schema::Schema;
 use serde::Deserialize;
 use serde::Serialize;
+use std::fmt;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -226,7 +229,6 @@ pub struct Thread {
     )]
     pub project_id: Option<String>,
     /// Persisted thread history contract selected when this thread was created.
-    #[experimental("thread.historyMode")]
     #[serde(default)]
     pub history_mode: ThreadHistoryMode,
     /// Model provider used for this thread (for example, 'openai').
@@ -394,4 +396,67 @@ pub struct TurnError {
     pub codex_error_info: Option<CodexErrorInfo>,
     #[serde(default)]
     pub additional_details: Option<String>,
+    /// Optional public explanation and continuation instruction for a misalignment block.
+    #[serde(default)]
+    pub misalignment: Option<MisalignmentErrorDetails>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MisalignmentErrorDetails {
+    /// Open-ended classification; clients must accept categories added by Responses.
+    pub error_type: Option<String>,
+    /// A substantive localized explanation is required before offering continuation.
+    pub detailed_explanation: Option<String>,
+    /// Instruction to submit as the next turn's user input if continuation is confirmed.
+    pub steer: Option<MisalignmentSteer>,
+}
+
+impl fmt::Debug for MisalignmentErrorDetails {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MisalignmentErrorDetails")
+            .field("error_type", &self.error_type)
+            .field(
+                "has_detailed_explanation",
+                &self.detailed_explanation.is_some(),
+            )
+            .field("has_steer", &self.steer.is_some())
+            .finish()
+    }
+}
+
+impl From<CoreMisalignmentErrorDetails> for MisalignmentErrorDetails {
+    fn from(value: CoreMisalignmentErrorDetails) -> Self {
+        Self {
+            error_type: value.error_type,
+            detailed_explanation: value.detailed_explanation,
+            steer: value.steer.map(Into::into),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct MisalignmentSteer {
+    pub message: String,
+}
+
+impl fmt::Debug for MisalignmentSteer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MisalignmentSteer")
+            .field("message", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl From<CoreMisalignmentSteer> for MisalignmentSteer {
+    fn from(value: CoreMisalignmentSteer) -> Self {
+        Self {
+            message: value.message,
+        }
+    }
 }

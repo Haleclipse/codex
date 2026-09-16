@@ -26,16 +26,10 @@ pub(crate) enum GuardianApprovalRequest {
         justification: Option<String>,
         tty: bool,
     },
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Constructed by the follow-up stdin approval routing change"
-        )
-    )]
     WriteStdin {
         id: String,
         approval_id: String,
+        environment_id: String,
         process_id: i32,
         input: String,
         cwd: PathUri,
@@ -129,6 +123,7 @@ struct CommandApprovalAction<'a> {
 #[derive(Serialize)]
 struct WriteStdinApprovalAction<'a> {
     tool: &'static str,
+    environment_id: &'a str,
     session_id: i32,
     chars: &'a str,
     cwd: LegacyAppPathString,
@@ -300,6 +295,7 @@ pub(crate) fn guardian_approval_request_to_json(
             Some(*tty),
         ),
         GuardianApprovalRequest::WriteStdin {
+            environment_id,
             process_id,
             input,
             cwd,
@@ -307,6 +303,7 @@ pub(crate) fn guardian_approval_request_to_json(
             ..
         } => serialize_guardian_action(WriteStdinApprovalAction {
             tool: "write_stdin",
+            environment_id,
             session_id: *process_id,
             chars: input,
             cwd: cwd.clone().into(),

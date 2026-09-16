@@ -982,6 +982,7 @@ async fn load_plugins_loads_default_skills_and_mcp_servers() {
                     scopes: None,
                     oauth: Some(McpServerOAuthConfig {
                         client_id: Some("client-id".to_string()),
+                        callback_url: None,
                         callback_port: Some(3118),
                     }),
                     oauth_resource: None,
@@ -2902,7 +2903,7 @@ async fn load_plugins_returns_empty_when_feature_disabled() {
 }
 
 #[tokio::test]
-async fn plugin_cache_ignores_unrelated_session_overrides() {
+async fn plugin_cache_reuses_effective_configurations() {
     let codex_home = TempDir::new().unwrap();
     let plugin_root = codex_home
         .path()
@@ -2961,16 +2962,44 @@ async fn plugin_cache_ignores_unrelated_session_overrides() {
     };
     let manager = test_plugins_manager(codex_home.path().to_path_buf());
 
-    let first = manager
-        .plugins_for_config(&config(r#"model = "first""#))
-        .await;
+    let first_config = config(r#"model = "first""#);
+    let second_config = config(
+        r#"[plugins."sample@test".mcp_servers.sample]
+enabled = false"#,
+    );
+    let first = manager.plugins_for_config(&first_config).await;
+    let first_snapshots = manager
+        .plugin_skill_snapshots_for_config(&first_config)
+        .expect("first configuration snapshots");
+    let second = manager.plugins_for_config(&second_config).await;
+    let second_snapshots = manager
+        .plugin_skill_snapshots_for_config(&second_config)
+        .expect("second configuration snapshots");
     std::fs::remove_file(plugin_root.join(".mcp.json")).unwrap();
-    let second = manager
-        .plugins_for_config(&config(r#"model = "second""#))
-        .await;
 
-    assert_eq!(second, first);
-    assert_eq!(second.plugins()[0].mcp_servers.len(), 1);
+    assert_eq!(
+        manager.plugin_skill_snapshots_for_config(&first_config),
+        Some(first_snapshots),
+    );
+    assert_eq!(
+        manager
+            .plugins_for_config(&config(r#"model = "second""#))
+            .await,
+        first,
+    );
+    assert_eq!(
+        manager.plugin_skill_snapshots_for_config(&second_config),
+        Some(second_snapshots),
+    );
+    assert_eq!(manager.plugins_for_config(&second_config).await, second);
+    manager.clear_cache();
+    assert_eq!(
+        [first_config, second_config]
+            .iter()
+            .map(|config| manager.plugin_skill_snapshots_for_config(config))
+            .collect::<Vec<_>>(),
+        vec![None, None],
+    );
 }
 
 #[tokio::test]
@@ -3053,6 +3082,57 @@ enabled = true
             )],
         );
     }
+}
+
+#[test]
+fn loaded_plugins_cache_evicts_least_recently_used_configuration() {
+    let codex_home = TempDir::new().unwrap();
+    let manager = test_plugins_manager(codex_home.path().to_path_buf());
+    let keys = (0..=LOADED_PLUGINS_CACHE_CAPACITY)
+        .map(|index| PluginLoadCacheKey {
+            configured_plugins: HashMap::from([(
+                format!("plugin-{index}@test"),
+                PluginConfig {
+                    enabled: true,
+                    mcp_servers: HashMap::new(),
+                },
+            )]),
+            skill_config_rules: SkillConfigRules::default(),
+            remote_global_catalog_active: false,
+            auth_identity: None,
+        })
+        .collect::<Vec<_>>();
+    let generation = manager.loaded_plugins_cache_generation();
+    for key in keys.iter().take(LOADED_PLUGINS_CACHE_CAPACITY) {
+        manager.cache_loaded_plugins_if_current(
+            generation,
+            key.clone(),
+            Vec::new(),
+            crate::skill_snapshots::new_plugin_skill_snapshots(),
+        );
+    }
+    manager.cache_loaded_plugins_if_current(
+        generation,
+        keys[LOADED_PLUGINS_CACHE_CAPACITY - 1].clone(),
+        Vec::new(),
+        crate::skill_snapshots::new_plugin_skill_snapshots(),
+    );
+    assert_eq!(manager.cached_loaded_plugins(&keys[0]), Some(Vec::new()));
+    manager.cache_loaded_plugins_if_current(
+        generation,
+        keys[LOADED_PLUGINS_CACHE_CAPACITY].clone(),
+        Vec::new(),
+        crate::skill_snapshots::new_plugin_skill_snapshots(),
+    );
+
+    assert_eq!(
+        keys.iter()
+            .map(|key| manager.cached_loaded_plugins(key).is_some())
+            .collect::<Vec<_>>(),
+        (0..=LOADED_PLUGINS_CACHE_CAPACITY)
+            .map(|index| index != 1)
+            .collect::<Vec<_>>(),
+    );
 }
 
 #[test]
@@ -6284,25 +6364,39 @@ enabled = true
 "#,
     );
     let config = load_plugins_config_input(codex_home.path(), &marketplace_root).await;
-    let roots = [AbsolutePathBuf::try_from(marketplace_root.clone()).unwrap()];
+    let context = PluginMarketplaceContext {
+        global_config: config.clone(),
+        scopes: vec![PluginMarketplaceScope {
+            cwd: Some(AbsolutePathBuf::try_from(marketplace_root.clone()).unwrap()),
+            config,
+        }],
+        load_errors: Vec::new(),
+    };
     let manager = Arc::new(test_plugins_manager(codex_home.path().to_path_buf()));
     manager
         .non_curated_cache_refresh_state
         .write()
         .expect("refresh state lock")
         .in_flight = true;
+    let marketplaces = manager
+        .list_marketplaces_for_context(&context, /*include_openai_curated*/ false)
+        .unwrap()
+        .marketplaces;
 
     for git_mode in [
         PluginGitMode::Automatic,
         PluginGitMode::Manual,
         PluginGitMode::Automatic,
     ] {
-        manager.schedule_non_curated_plugin_cache_refresh(
-            &config,
-            &roots,
-            NonCuratedCacheRefreshMode::IfVersionChanged,
-            git_mode,
-        );
+        let request = context
+            .non_curated_cache_refresh_request(
+                &manager,
+                &marketplaces,
+                NonCuratedCacheRefreshMode::IfVersionChanged,
+                git_mode,
+            )
+            .expect("refresh request");
+        manager.schedule_non_curated_plugin_cache_refresh(request);
     }
 
     {
@@ -6318,7 +6412,7 @@ enabled = true
         state.in_flight = false;
     }
 
-    manager.maybe_start_non_curated_plugin_cache_refresh(&config, &roots);
+    manager.maybe_start_non_curated_plugin_cache_refresh(&context, &marketplaces);
 
     {
         let mut state = manager
@@ -6337,7 +6431,11 @@ enabled = true
         "sample-plugin",
         Some("2.0.0"),
     );
-    manager.maybe_start_non_curated_plugin_cache_refresh(&config, &roots);
+    let marketplaces = manager
+        .list_marketplaces_for_context(&context, /*include_openai_curated*/ false)
+        .unwrap()
+        .marketplaces;
+    manager.maybe_start_non_curated_plugin_cache_refresh(&context, &marketplaces);
 
     let state = manager
         .non_curated_cache_refresh_state
@@ -6670,7 +6768,7 @@ fn refresh_non_curated_plugin_cache_continues_after_plugin_error() {
 }
 
 #[tokio::test]
-async fn load_plugins_ignores_project_config_files() {
+async fn load_plugins_uses_project_config_files() {
     let codex_home = TempDir::new().unwrap();
     let project_root = codex_home.path().join("project");
     let plugin_root = codex_home
@@ -6713,7 +6811,13 @@ async fn load_plugins_ignores_project_config_files() {
     )
     .await;
 
-    assert_eq!(plugins, Vec::new());
+    assert_eq!(
+        plugins
+            .iter()
+            .map(|plugin| (plugin.config_name.as_str(), plugin.enabled))
+            .collect::<Vec<_>>(),
+        vec![("sample@test", true)]
+    );
 }
 
 #[tokio::test]
@@ -6876,6 +6980,7 @@ fn remote_installed_plugins_cache_refresh_coalesces_materializations() {
         scope: crate::remote::RemotePluginScope::Workspace,
         discoverability: Some(crate::remote::RemotePluginShareDiscoverability::Listed),
         authenticated_account_id: Some("account-123".to_string()),
+        capabilities: Default::default(),
     };
     let change = |name: &str| EffectivePluginsChange {
         materialized_remote_plugins: vec![materialization(name)],

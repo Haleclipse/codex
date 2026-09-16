@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -32,8 +31,6 @@ use crate::tools::normalize_tools_for_model_with_prefix;
 const MCP_UI_META_KEY: &str = "ui";
 const MCP_UI_VISIBILITY_META_KEY: &str = "visibility";
 const MCP_UI_MODEL_VISIBILITY: &str = "model";
-const OPTIONAL_MCP_STARTUP_GRACE: Duration = Duration::from_secs(1);
-
 /// Returns whether a tool may be included in model-facing tool declarations.
 ///
 /// Tools without visibility metadata remain visible. Tools with visibility
@@ -177,6 +174,7 @@ impl McpConnectionSet {
         let revision = self.tool_catalog_revision.read().await;
         let mut listed_tools = Vec::new();
         let mut clients = std::collections::HashMap::new();
+        let optional_mcp_startup_grace = config.optional_mcp_startup_grace;
         join_all(self.servers.iter().map(|(server_name, view)| async move {
             if !view
                 .connection
@@ -196,12 +194,21 @@ impl McpConnectionSet {
                 if !must_wait_for_startup && has_cached_tools {
                     return;
                 }
-                if !must_wait_for_startup {
+                if !must_wait_for_startup && optional_mcp_startup_grace.is_zero() {
+                    if let Some(cache) = view.connection.client.tool_catalog_cache_context.as_ref()
+                    {
+                        cache.optional_startup_deadline(
+                            tokio::time::Instant::now(),
+                            optional_mcp_startup_grace,
+                        );
+                    }
+                    let _ = view.connection.client().await;
+                } else if !must_wait_for_startup {
                     let optional_startup_deadline = if view.connection.startup_is_dormant() {
-                        tokio::time::Instant::now() + OPTIONAL_MCP_STARTUP_GRACE
+                        tokio::time::Instant::now() + optional_mcp_startup_grace
                     } else {
                         *self.optional_startup_deadline.get_or_init(|| {
-                            tokio::time::Instant::now() + OPTIONAL_MCP_STARTUP_GRACE
+                            tokio::time::Instant::now() + optional_mcp_startup_grace
                         })
                     };
                     let startup_deadline = view
@@ -209,7 +216,12 @@ impl McpConnectionSet {
                         .client
                         .tool_catalog_cache_context
                         .as_ref()
-                        .map(|cache| cache.optional_startup_deadline(optional_startup_deadline))
+                        .map(|cache| {
+                            cache.optional_startup_deadline(
+                                optional_startup_deadline,
+                                optional_mcp_startup_grace,
+                            )
+                        })
                         .unwrap_or(optional_startup_deadline);
                     if tokio::time::timeout_at(startup_deadline, view.connection.client())
                         .await
@@ -334,7 +346,7 @@ impl McpConnectionSet {
     ) -> Option<PreparedMcpCall> {
         let server_name = &tool_info.server_name;
         let view = self.servers.get(server_name)?;
-        Some(PreparedMcpCall::new(
+        PreparedMcpCall::new(
             Arc::clone(self),
             client,
             config,
@@ -345,7 +357,7 @@ impl McpConnectionSet {
             self.plugin_id_for_mcp_server_name(server_name)
                 .map(str::to_string),
             self.is_selected_plugin_mcp_server(server_name),
-        ))
+        )
     }
 
     /// Force-refresh Codex Apps tools and publish one new exact catalog revision.

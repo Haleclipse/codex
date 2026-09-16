@@ -110,6 +110,30 @@ where
             let Ok(thread_id) = ThreadId::from_string(input.thread_store.level_id()) else {
                 return;
             };
+            let root_accounting_state = input
+                .session_source
+                .parent_thread_id()
+                .or_else(|| {
+                    ThreadId::from_string(input.session_store.level_id())
+                        .ok()
+                        .filter(|_| input.session_source.is_non_root_agent())
+                })
+                .and_then(|parent_thread_id| {
+                    self.goal_service
+                        .runtime_for_thread(parent_thread_id)
+                        .or_else(|| {
+                            ThreadId::from_string(input.session_store.level_id())
+                                .ok()
+                                .and_then(|root_thread_id| {
+                                    self.goal_service.runtime_for_thread(root_thread_id)
+                                })
+                        })
+                })
+                .map(|parent| {
+                    parent
+                        .root_accounting_state()
+                        .unwrap_or_else(|| parent.accounting_state())
+                });
             let runtime = input.thread_store.get_or_init::<GoalRuntimeHandle>(|| {
                 GoalRuntimeHandle::new(
                     thread_id,
@@ -122,6 +146,7 @@ where
                         analytics: self.analytics.clone(),
                         enabled,
                         tools_available_for_thread,
+                        root_accounting_state,
                     },
                 )
             });
@@ -346,12 +371,12 @@ where
                 return;
             }
 
-            let Some(_recorded) = runtime
+            if let Some(root_accounting_state) = runtime.root_accounting_state() {
+                root_accounting_state.record_descendant_token_usage(&token_usage.last_token_usage);
+            }
+            let _ = runtime
                 .accounting_state()
-                .record_token_usage(turn_store.level_id(), &token_usage.total_token_usage)
-            else {
-                return;
-            };
+                .record_token_usage(turn_store.level_id(), &token_usage.total_token_usage);
         })
     }
 }
@@ -415,7 +440,9 @@ where
         &self,
         _session_store: &ExtensionData,
         thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>> {
+    ) -> Vec<
+        Arc<dyn for<'call> codex_extension_api::ToolExecutor<codex_extension_api::ToolCall<'call>>>,
+    > {
         let Some(runtime) = goal_runtime_handle(thread_store) else {
             return Vec::new();
         };

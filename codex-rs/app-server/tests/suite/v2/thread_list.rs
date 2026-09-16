@@ -37,6 +37,7 @@ use codex_app_server_protocol::UserInput;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
 use codex_features::Feature;
 use codex_git_utils::GitSha;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -1886,7 +1887,10 @@ async fn thread_list_includes_git_info() -> Result<()> {
     let git_info = CoreGitInfo {
         commit_hash: Some(GitSha::new("abc123")),
         branch: Some("main".to_string()),
-        repository_url: Some("https://example.com/repo.git".to_string()),
+        repository_url: Some(
+            SanitizedGitUrl::try_from("https://example.com/repo.git")
+                .expect("repository URL should be valid"),
+        ),
     };
     let conversation_id = create_fake_rollout(
         codex_home.path(),
@@ -1922,6 +1926,65 @@ async fn thread_list_includes_git_info() -> Result<()> {
     assert_eq!(thread.source, SessionSource::Cli);
     assert_eq!(thread.cwd, test_absolute_path("/"));
     assert_eq!(thread.cli_version, "0.0.0");
+
+    Ok(())
+}
+
+/// Legacy rollout credentials must be sanitized before thread/list returns Git metadata.
+#[tokio::test]
+async fn thread_list_sanitizes_git_info_from_existing_rollouts() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_minimal_config(codex_home.path())?;
+
+    let git_info = CoreGitInfo {
+        commit_hash: Some(GitSha::new("abc123")),
+        branch: Some("main".to_string()),
+        repository_url: Some(
+            SanitizedGitUrl::try_from("https://example.com/repo.git")
+                .expect("repository URL should be valid"),
+        ),
+    };
+    let conversation_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-02-01T09-00-00",
+        "2025-02-01T09:00:00Z",
+        "Git info preview",
+        Some("mock_provider"),
+        Some(git_info),
+    )?;
+    let path = rollout_path(codex_home.path(), "2025-02-01T09-00-00", &conversation_id);
+    let rollout = fs::read_to_string(&path)?;
+    fs::write(
+        path,
+        rollout.replace(
+            "https://example.com/repo.git",
+            "https://alice:synthetic-rollout-secret@example.com/repo.git",
+        ),
+    )?;
+
+    let mut mcp = init_mcp(codex_home.path()).await?;
+    let ThreadListResponse { data, .. } = list_threads(
+        &mut mcp,
+        /*cursor*/ None,
+        Some(10),
+        Some(vec!["mock_provider".to_string()]),
+        /*source_kinds*/ None,
+        /*archived*/ None,
+    )
+    .await?;
+    let thread = data
+        .iter()
+        .find(|thread| thread.id == conversation_id)
+        .expect("expected thread for created rollout");
+
+    assert_eq!(
+        thread.git_info,
+        Some(ApiGitInfo {
+            sha: Some("abc123".to_string()),
+            branch: Some("main".to_string()),
+            origin_url: Some("https://example.com/repo.git".to_string()),
+        })
+    );
 
     Ok(())
 }

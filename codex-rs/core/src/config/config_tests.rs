@@ -229,6 +229,25 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+async fn load_config_applies_optional_mcp_startup_grace() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config_toml: ConfigToml = toml::from_str("mcp_optional_startup_grace_ms = 2500")
+        .expect("optional MCP startup grace should parse from config.toml");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.mcp_optional_startup_grace,
+        Duration::from_millis(2500)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_toml_parsing() {
     let history_with_persistence = r#"
 [history]
@@ -5533,7 +5552,8 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
             .plugin_attributions_by_server_name(),
         HashMap::from([(
             "sample".to_string(),
-            McpPluginAttribution::new("sample@test".to_string(), "sample".to_string()),
+            McpPluginAttribution::new("sample@test".to_string(), "sample".to_string())
+                .with_host_root(PathUri::from_host_native_path(&plugin_root)?),
         )])
     );
 
@@ -7830,6 +7850,7 @@ async fn replace_mcp_servers_streamable_http_serializes_oauth_resource() -> anyh
             scopes: None,
             oauth: Some(McpServerOAuthConfig {
                 client_id: Some("eci-prd-pub-codex-123".to_string()),
+                callback_url: None,
                 callback_port: None,
             }),
             oauth_resource: Some("https://resource.example.com".to_string()),

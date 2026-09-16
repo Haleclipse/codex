@@ -4184,6 +4184,13 @@ async fn inbound_handoff_request_starts_turn() -> Result<()> {
     .await;
 
     let request = response_mock.single_request();
+    let turn_metadata: Value = serde_json::from_str(
+        request
+            .header("x-codex-turn-metadata")
+            .as_deref()
+            .context("realtime-routed turn should include turn metadata")?,
+    )?;
+    assert_eq!(turn_metadata["turn_trigger"].as_str(), Some("realtime"));
     let user_texts = request.message_input_texts("user");
     assert!(user_texts.iter().any(|text| text
         == "<realtime_delegation>\n  <input>text from realtime</input>\n  <transcript_delta>user: text from realtime</transcript_delta>\n</realtime_delegation>"));

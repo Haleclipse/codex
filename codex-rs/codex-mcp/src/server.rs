@@ -17,6 +17,7 @@ use codex_login::CodexAuth;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_rmcp_client::StoredOAuthCredentialSnapshot;
 use codex_rmcp_client::StoredOAuthTokens;
+use codex_utils_path_uri::PathUri;
 use rmcp::model::ElicitationCapability;
 use tracing::warn;
 
@@ -93,8 +94,10 @@ pub(crate) fn has_explicit_http_authorization(config: &McpServerConfig) -> bool 
 /// those belong to a publication and can change without reconnecting.
 #[derive(Clone)]
 pub(crate) struct McpServerConnectionIdentity {
+    auth: McpServerAuth,
     transport: McpServerTransportConfig,
     environment_id: String,
+    host_plugin_root: Option<PathUri>,
     oauth_store: Option<(OAuthCredentialsStoreMode, AuthKeyringBackendKind)>,
     oauth_credentials: Result<Option<StoredOAuthCredentialSnapshot>, String>,
     pub(crate) oauth_store_was_contended: bool,
@@ -114,6 +117,7 @@ impl McpServerConnectionIdentity {
     pub(crate) fn new(
         server_name: &str,
         server: &EffectiveMcpServer,
+        host_plugin_root: Option<&PathUri>,
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
         resolved_environment: &Result<Option<Arc<Environment>>, String>,
@@ -206,8 +210,10 @@ impl McpServerConnectionIdentity {
             .is_some_and(StoredOAuthCredentialSnapshot::store_was_contended);
 
         Self {
+            auth: config.auth.clone(),
             transport: config.transport.clone(),
             environment_id: config.environment_id.clone(),
+            host_plugin_root: host_plugin_root.cloned(),
             oauth_store: stored_oauth_url
                 .is_some()
                 .then_some((store_mode, keyring_backend_kind)),
@@ -239,8 +245,10 @@ impl McpServerConnectionIdentity {
             (None, None) => true,
             (Some(_), None) | (None, Some(_)) => false,
         };
-        self.transport == other.transport
+        self.auth == other.auth
+            && self.transport == other.transport
             && self.environment_id == other.environment_id
+            && self.host_plugin_root == other.host_plugin_root
             && self.oauth_store == other.oauth_store
             && same_resolved_environment(&self.resolved_environment, &other.resolved_environment)
             && self.local_stdio_fallback_cwd == other.local_stdio_fallback_cwd

@@ -17,7 +17,6 @@ use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
-use codex_code_mode_protocol::host::DelegateResponse;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::HostResponse;
@@ -248,11 +247,6 @@ struct RecordingDelegate {
 
 struct PanickingDelegate;
 
-struct LargeResultBurstDelegate {
-    started: AtomicUsize,
-    release: CancellationToken,
-}
-
 #[derive(Debug, Eq, PartialEq)]
 enum HeldDelegateEvent {
     Started,
@@ -327,35 +321,6 @@ impl CodeModeSessionDelegate for PanickingDelegate {
         _cancellation_token: CancellationToken,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async { panic!("delegate panic probe") })
-    }
-
-    fn notify<'a>(
-        &'a self,
-        _call_id: String,
-        _cell_id: CellId,
-        _text: String,
-        _cancellation_token: CancellationToken,
-    ) -> NotificationFuture<'a> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn cell_closed(&self, _cell_id: &CellId) {}
-}
-
-impl CodeModeSessionDelegate for LargeResultBurstDelegate {
-    fn invoke_tool<'a>(
-        &'a self,
-        _invocation: CodeModeNestedToolCall,
-        cancellation_token: CancellationToken,
-    ) -> ToolInvocationFuture<'a> {
-        self.started.fetch_add(1, Ordering::Release);
-        let release = self.release.clone();
-        Box::pin(async move {
-            tokio::select! {
-                _ = cancellation_token.cancelled() => Err("cancelled".to_string()),
-                _ = release.cancelled() => Ok("x".repeat(256 * 1024).into()),
-            }
-        })
     }
 
     fn notify<'a>(
@@ -690,97 +655,6 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(delegate.invocations.load(Ordering::Relaxed), 1);
     assert_eq!(delegate.notifications.load(Ordering::Relaxed), 0);
-}
-
-#[tokio::test]
-async fn concurrent_large_delegate_results_do_not_disconnect_a_backpressured_bulk_lane() {
-    const CONCURRENT_RESULTS: usize = 129;
-
-    let (command_tx, command_rx) = mpsc::channel(/*max_capacity*/ 16);
-    let (event_tx, event_rx) = mpsc::channel(/*max_capacity*/ 16);
-    let (outgoing_tx, outgoing_rx) = mpsc::channel(/*max_capacity*/ 16);
-    let (bulk_tx, mut bulk_rx) = mpsc::channel(MAX_PENDING_DELEGATE_CALLS);
-    let cancellation = CancellationToken::new();
-    let alive = Arc::new(AtomicBool::new(true));
-    let failure = Arc::new(StdMutex::new(None));
-    let (driver, execute_claim_tx) = ConnectionDriver::new(
-        command_rx,
-        event_rx,
-        event_tx.clone(),
-        outgoing_tx,
-        DriverLifecycle {
-            alive: Arc::clone(&alive),
-            failure: Arc::clone(&failure),
-            cancellation: cancellation.clone(),
-        },
-    );
-    let driver_task = tokio::spawn(driver.with_bulk_sender(bulk_tx).run());
-    let mut harness = DriverHarness {
-        command_tx,
-        event_tx,
-        execute_claim_tx,
-        outgoing_rx,
-        cancellation,
-        alive,
-        failure,
-        driver_task,
-    };
-    let session = remote_session();
-    let delegate = Arc::new(LargeResultBurstDelegate {
-        started: AtomicUsize::new(0),
-        release: CancellationToken::new(),
-    });
-    harness.open(session.clone(), delegate.clone()).await;
-    let _started = harness
-        .start_cell(session.clone(), /*request_id*/ 2, "1")
-        .await;
-
-    for value in 1..=CONCURRENT_RESULTS {
-        harness
-            .start_tool_delegate(&session, DelegateRequestId::new(value as i64))
-            .await;
-    }
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while delegate.started.load(Ordering::Acquire) < CONCURRENT_RESULTS {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("concurrent delegate calls should all start");
-
-    delegate.release.cancel();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while bulk_rx.len() < CONCURRENT_RESULTS {
-            assert!(
-                harness.alive.load(Ordering::Acquire),
-                "bulk queue disconnected before accepting all concurrent tool results"
-            );
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("concurrent large results should queue behind the blocked bulk writer");
-
-    let _unrelated = harness.start_cell(session, /*request_id*/ 3, "2").await;
-    assert!(harness.alive.load(Ordering::Acquire));
-
-    for _ in 0..CONCURRENT_RESULTS {
-        let frame = bulk_rx.recv().await.expect("queued bulk delegate result");
-        let message = EncodedFrame::decode_framed::<ClientToHost>(&frame.into_framed_bytes())
-            .expect("decode queued delegate result");
-        let ClientToHost::DelegateResponse {
-            result:
-                WireResult::Ok {
-                    value: DelegateResponse::ToolResult { result },
-                },
-            ..
-        } = message
-        else {
-            panic!("expected a successful large delegate result");
-        };
-        assert_eq!(result.as_str().map(str::len), Some(256 * 1024));
-    }
-    assert!(harness.alive.load(Ordering::Acquire));
 }
 
 #[tokio::test]

@@ -677,9 +677,11 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
         &format!("Use the tools from {second_process}."),
         &format!("Echo from {second_process}."),
     );
-    let output = cached_done_response
+    let output_item = cached_done_response
         .single_request()
-        .function_call_output_text(app_only_call_id)
+        .function_call_output(app_only_call_id);
+    let output = output_item["output"][1]["text"]
+        .as_str()
         .expect("app-only tool error should be returned to the model");
     assert!(
         output.contains(&expected_error),

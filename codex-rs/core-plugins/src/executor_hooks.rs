@@ -18,21 +18,47 @@ struct AllowlistedExecutorPluginHook {
 }
 
 // Executor plugin manifests are unsigned, so temporarily hardcode the expected
-// bundled cleanup hook identity and MCP target until plugin signing lands.
-const ALLOWLISTED_EXECUTOR_PLUGIN_HOOKS: &[AllowlistedExecutorPluginHook] =
-    &[AllowlistedExecutorPluginHook {
+// bundled plugin identities and cleanup MCP target until plugin signing lands.
+const ALLOWLISTED_EXECUTOR_PLUGIN_HOOKS: &[AllowlistedExecutorPluginHook] = &[
+    AllowlistedExecutorPluginHook {
+        plugin_id: "browser@openai-bundled",
+        event: HookEventName::Stop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome@openai-bundled",
+        event: HookEventName::Stop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome-dev@openai-bundled",
+        event: HookEventName::Stop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
+        plugin_id: "chrome-internal@openai-bundled",
+        event: HookEventName::Stop,
+        server: "node_repl",
+        tool: "turn_ended",
+    },
+    AllowlistedExecutorPluginHook {
         plugin_id: "computer-use@openai-bundled",
         event: HookEventName::Stop,
         server: "node_repl",
         tool: "turn_ended",
-    }];
+    },
+];
 
 /// Returns accepted inline hook sources from executor-discovered plugin manifests.
 ///
 /// Executor scoped hooks are best-effort because executor capabilities can become available
 /// after earlier lifecycle events have passed.
 ///
-/// Note: Executor manifests are not signed yet, so temporarily we only admit the known Computer Use cleanup hook.
+/// Note: Executor manifests are not signed yet, so temporarily we only admit the known cleanup
+/// hook from the bundled Browser, Chrome, Chrome Dev, Chrome Internal, and Computer Use plugins.
 pub fn executor_plugin_hook_sources(
     snapshot: &ExecutorCapabilityDiscoverySnapshot,
 ) -> Vec<ExecutorPluginHookSource> {

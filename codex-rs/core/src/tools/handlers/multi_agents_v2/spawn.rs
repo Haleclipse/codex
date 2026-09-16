@@ -37,7 +37,10 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_spawn_agent_tool_v2(self.options.clone())
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let analytics = invocation.session.services.analytics_events_client.clone();
             let sender_thread_id = invocation.session.thread_id;
@@ -186,7 +189,7 @@ async fn handle_spawn_agent(
     let multi_agent_v2_usage_hints =
         if is_full_history_fork && turn.multi_agent_version == MultiAgentVersion::V2 {
             let child_model_info = match config.model.as_deref() {
-                Some(model) if model != turn.model_info.slug => Some(
+                Some(model) if model != turn.model_info().slug => Some(
                     session
                         .services
                         .models_manager
@@ -197,7 +200,7 @@ async fn handle_spawn_agent(
             };
             let child_catalog = child_model_info
                 .as_ref()
-                .unwrap_or(&turn.model_info)
+                .unwrap_or(turn.model_info())
                 .model_messages
                 .as_ref()
                 .and_then(|messages| messages.multi_agent.as_ref())
@@ -223,6 +226,7 @@ async fn handle_spawn_agent(
                     root_turn_id: turn.turn_metadata_state.root_turn_id(),
                     environments: Some(step_context.environments.to_selections()),
                     multi_agent_v2_usage_hints,
+                    cyber_access_program: turn.cyber_access_program,
                 },
             ),
     )

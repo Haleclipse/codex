@@ -728,6 +728,8 @@ mod tests {
             RolloutItem::ResponseItem(skill_message.into()),
             RolloutItem::SecurityRiskScore(SecurityRiskScore {
                 scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
+                call_id: None,
+                action: None,
                 sampled_at: None,
             }),
             RolloutItem::ResponseItem(subagent_message.clone().into()),

@@ -3352,6 +3352,12 @@ async fn model_reasoning_selection_popup_snapshot() {
             effort: ReasoningEffortConfig::Ultra,
             description: "Ultra reasoning".to_string(),
         });
+    preset
+        .supported_reasoning_efforts
+        .push(ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Persistent,
+            description: "Continue working until put to sleep".to_string(),
+        });
     chat.open_reasoning_popup(preset);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
