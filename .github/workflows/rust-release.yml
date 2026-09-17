@@ -70,6 +70,8 @@ jobs:
     env:
       CARGO_PROFILE_RELEASE_LTO: ${{ (contains(github.ref_name, '-alpha') || contains(github.ref_name, '-cometix')) && 'thin' || 'fat' }}
       CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ contains(github.ref_name, '-cometix') && 's' || '3' }}
+      # macOS release packages archive packed dSYM bundles before stripping.
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: ${{ contains(matrix.target, 'apple-darwin') && 'packed' || 'off' }}
 
     strategy:
       fail-fast: false
@@ -214,6 +216,47 @@ jobs:
           name: cargo-timings-rust-release-${{ matrix.target }}
           path: codex-rs/target/**/cargo-timings/cargo-timing.html
           if-no-files-found: warn
+
+      # @cometix: `profile.release` keeps `strip = false` because upstream packaging
+      # archives sidecar symbols and strips afterwards. This fork never ran that
+      # step, so release binaries shipped with debug info embedded and the musl
+      # `codex` grew to ~700 MB, pushing the linux npm tarballs past the registry
+      # upload limit. Reuse the upstream script so symbol handling stays identical
+      # per platform (dSYM copy on macOS, objcopy + debuglink on Linux, .pdb copy
+      # on Windows). The archived symbols are published as release assets so
+      # stripped builds stay symbolicatable.
+      #
+      # bwrap is excluded on purpose: its sha256 is baked into the codex binary as
+      # CODEX_BWRAP_SHA256, so stripping would break the runtime integrity check in
+      # linux-sandbox/src/bundled_bwrap.rs.
+      #
+      # Windows is skipped: MSVC already keeps debug info in separate .pdb files, so
+      # there is nothing to strip, and the shared script's Windows branch expects the
+      # pdb naming that only upstream's dedicated rust-release-windows.yml resolves
+      # (codex-code-mode-host builds codex_code_mode_host.pdb).
+      - if: ${{ !contains(matrix.target, 'windows') }}
+        name: Archive symbols and strip release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/archive-release-symbols-and-strip-binaries.sh" \
+            --target "${{ matrix.target }}" \
+            --artifact-name "${{ matrix.target }}" \
+            --release-dir "target/${{ matrix.target }}/release" \
+            --archive-dir "symbols-dist/${{ matrix.target }}" \
+            --binaries "codex codex-code-mode-host"
+
+      # @cometix: the artifact name must not collide with a target name.
+      # install_native_deps.py resolves native binaries as `artifacts_dir/<target>`,
+      # so naming this `${{ matrix.target }}` would make npm staging look for
+      # binaries inside the symbol bundle.
+      - if: ${{ !contains(matrix.target, 'windows') }}
+        name: Upload symbols archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-symbols-${{ matrix.target }}
+          path: codex-rs/symbols-dist/${{ matrix.target }}/*
+          if-no-files-found: error
 
 
       - name: Stage artifacts
