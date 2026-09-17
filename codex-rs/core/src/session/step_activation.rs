@@ -48,17 +48,12 @@ fn check_legacy_turn_safety(
             || ignored_models.is_some_and(|models| models.contains(&model.slug))
     };
 
-    // tools::approvals and guardian::review still route approvals using the
-    // originating turn's policy, reviewer, and required-model classification.
+    // Approval policy and required-model classification still have consumers
+    // using the originating turn. The reviewer is captured separately.
     if destination.constrained_approval_policy() != current.constrained_approval_policy()
         || destination.approval_policy() != turn_context.approval_policy()
     {
         return Err("the destination changes the admitted approval policy".to_string());
-    }
-    if destination.approvals_reviewer() != current.approvals_reviewer()
-        || destination.approvals_reviewer() != turn_context.config.approvals_reviewer
-    {
-        return Err("the destination changes the admitted approvals reviewer".to_string());
     }
     if required_review
         != requirements
@@ -237,7 +232,12 @@ impl Session {
         turn_id: &str,
         update: TurnSettingsUpdate,
     ) -> TurnSettingsUpdateOutcome {
-        if !self.features.enabled(Feature::StepModelSwitching) {
+        let reviewer_only = update.approvals_reviewer.is_some()
+            && update.model.is_none()
+            && update.effort.is_none()
+            && update.summary.is_none()
+            && update.service_tier.is_none();
+        if !reviewer_only && !self.features.enabled(Feature::StepModelSwitching) {
             return TurnSettingsUpdateOutcome::Rejected {
                 reason: "turn settings updates require the step_model_switching feature"
                     .to_string(),
@@ -265,12 +265,14 @@ impl Session {
             return TurnSettingsUpdateOutcome::TargetUnavailable;
         };
         let TurnSettingsUpdate {
+            approvals_reviewer,
             model,
             effort,
             summary,
             service_tier,
         } = update;
         let update = StepSettingsUpdate {
+            approvals_reviewer,
             model,
             effort,
             reasoning_summary: summary,
@@ -313,6 +315,11 @@ impl Session {
             )
             .map_err(|error| error.to_string())
             .and_then(|()| {
+                // A reviewer-only patch cannot change any model-owned authority.
+                // Managed reviewer restrictions were checked above.
+                if reviewer_only {
+                    return Ok(());
+                }
                 check_legacy_turn_safety(
                     &turn_context,
                     &current,

@@ -23,6 +23,7 @@ clap = { workspace = true, features = ["derive"] }
 codex-code-mode-protocol = { workspace = true }
 codex-code-mode-runtime = { workspace = true }
 codex-otel = { workspace = true }
+codex-otel-trace-websocket = { workspace = true }
 codex-protocol = { workspace = true }
 futures = { workspace = true }
 prost = "0.14.3"

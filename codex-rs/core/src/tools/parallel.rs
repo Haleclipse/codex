@@ -114,7 +114,7 @@ impl ToolCallRuntime {
         }
         let router = &self.step_context.tool_router;
         let supports_parallel = router.tool_supports_parallel(&call);
-        let tool_runtime = router.tool_runtime(&call);
+        let tool_runtime = router.tool_runtime(&call.tool_name);
         let router = Arc::clone(router);
         let session = Arc::clone(&self.session);
         let step_context = Arc::clone(&self.step_context);

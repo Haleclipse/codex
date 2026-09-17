@@ -625,6 +625,7 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         phase: Some(MessagePhase::FinalAnswer),
         memory_citation: None,
         delivery: None,
+        questions: None,
     };
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -1302,6 +1303,7 @@ async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
         phase: Some(MessagePhase::FinalAnswer),
         memory_citation: None,
         delivery: None,
+        questions: None,
     }];
     chat.handle_server_notification(
         ServerNotification::TurnCompleted(TurnCompletedNotification {

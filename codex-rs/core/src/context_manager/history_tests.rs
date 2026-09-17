@@ -314,6 +314,7 @@ fn developer_msg_with_fragments(texts: &[&str]) -> ResponseItem {
 fn reference_context_item() -> TurnContextItem {
     TurnContextItem {
         turn_id: Some("reference-turn".to_string()),
+        root_turn_id: None,
         cwd: AbsolutePathBuf::try_from(
             std::env::current_dir()
                 .expect("current directory")
@@ -1657,46 +1658,6 @@ fn format_exec_output_prefers_line_marker_when_both_limits_exceeded() {
     let truncated = truncate_exec_output(&content);
 
     assert_truncated_message_matches(&truncated, "line-0-", /*expected_removed*/ 17_423);
-}
-
-#[cfg(not(debug_assertions))]
-#[test]
-fn normalize_adds_missing_output_for_function_call() {
-    let items = vec![ResponseItem::FunctionCall {
-        id: None,
-        name: "do_it".to_string(),
-        namespace: None,
-        arguments: "{}".to_string(),
-        call_id: "call-x".to_string(),
-        encrypted_function_args: None,
-        internal_chat_message_metadata_passthrough: None,
-    }];
-    let mut h = create_history_with_items(items);
-
-    h.normalize_history(&default_input_modalities());
-
-    assert_eq!(
-        raw_items(&h),
-        vec![
-            ResponseItem::FunctionCall {
-                id: None,
-                name: "do_it".to_string(),
-                namespace: None,
-                arguments: "{}".to_string(),
-                call_id: "call-x".to_string(),
-                encrypted_function_args: None,
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: Some("call-x".to_string()),
-                name: None,
-                namespace: None,
-                output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ]
-    );
 }
 
 #[cfg(not(debug_assertions))]

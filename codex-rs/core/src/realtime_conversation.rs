@@ -1191,7 +1191,16 @@ async fn prepare_realtime_start(
         .clone()
         .unwrap_or(ConversationStartTransport::Websocket);
     let mut api_provider = provider.to_api_provider(Some(AuthMode::ApiKey))?;
-    let realtime_sideband_base_url = config.experimental_realtime_ws_base_url.clone();
+    let realtime_sideband_base_url = match &transport {
+        ConversationStartTransport::ExistingCall {
+            sideband_base_url, ..
+        } => sideband_base_url
+            .clone()
+            .or_else(|| config.experimental_realtime_ws_base_url.clone()),
+        ConversationStartTransport::Websocket | ConversationStartTransport::Webrtc { .. } => {
+            config.experimental_realtime_ws_base_url.clone()
+        }
+    };
     if let Some(realtime_ws_base_url) = &realtime_sideband_base_url {
         api_provider.base_url = realtime_ws_base_url.clone();
     }
@@ -1525,7 +1534,7 @@ async fn handle_start_inner(
     let (sdp, existing_call_id) = match transport {
         ConversationStartTransport::Websocket => (None, None),
         ConversationStartTransport::Webrtc { sdp } => (Some(sdp), None),
-        ConversationStartTransport::ExistingCall { call_id } => (None, Some(call_id)),
+        ConversationStartTransport::ExistingCall { call_id, .. } => (None, Some(call_id)),
     };
     let mode_instructions = RealtimeModeInstructions {
         start: realtime_start_instructions,
@@ -2440,7 +2449,10 @@ async fn handle_realtime_server_event(
         | RealtimeEvent::OutputTranscriptDelta(_)
         | RealtimeEvent::OutputTranscriptDone(_)
         | RealtimeEvent::ConversationItemAdded(_)
-        | RealtimeEvent::ConversationItemDone { .. } => false,
+        | RealtimeEvent::ConversationItemDone { .. }
+        | RealtimeEvent::HistoryItemStarted(_)
+        | RealtimeEvent::HistoryTranscriptDelta { .. }
+        | RealtimeEvent::HistoryItemCompleted(_) => false,
     };
 
     if events_tx.send(event).await.is_err() {

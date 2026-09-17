@@ -904,19 +904,24 @@ async fn turn_start_sends_service_tier_id_to_model_request() -> Result<()> {
     Ok(())
 }
 
-#[test_case(None, json!(null); "without_usage_metadata")]
-#[test_case(Some(json!({})), json!({ "amount": null }); "without_amount")]
-#[test_case(Some(json!({ "amount": null })), json!({ "amount": null }); "null_amount")]
-#[test_case(Some(json!({ "amount": "0" })), json!({ "amount": "0" }); "zero_amount")]
+#[test_case(None, None, None; "without_usage_metadata")]
+#[test_case(Some(json!({})), None, None; "without_amount")]
+#[test_case(Some(json!({ "amount": null })), None, None; "null_amount")]
+#[test_case(Some(json!({ "amount": "0" })), Some("0"), None; "zero_amount")]
 #[test_case(
     Some(json!({ "amount": "0.12345678901234567890" })),
-    json!({ "amount": "0.12345678901234567890" });
+    Some("0.12345678901234567890"),
+    Some(json!({ "label": "example", "items": [0, null, true] }));
     "exact_amount"
 )]
+#[test_case(None, None, Some(json!(null)); "null_extra")]
+#[test_case(None, None, Some(json!(0)); "zero_extra")]
+#[test_case(None, None, Some(json!({ "label": "example" })); "nested_extra")]
 #[tokio::test]
 async fn turn_start_emits_raw_response_completed_with_upstream_usage(
     upstream_metadata: Option<Value>,
-    expected_metadata: Value,
+    expected_amount: Option<&str>,
+    extra: Option<Value>,
 ) -> Result<()> {
     let server = responses::start_mock_server().await;
     let mut completed = json!({
@@ -935,6 +940,13 @@ async fn turn_start_emits_raw_response_completed_with_upstream_usage(
     if let Some(metadata) = upstream_metadata {
         completed["response"]["usage_metadata"] = metadata;
     }
+    if let Some(extra) = extra {
+        completed["response"]["usage"]["extra"] = extra;
+    }
+    let expected_metadata = json!({
+        "amount": expected_amount,
+        "metadata": completed["response"]["usage"],
+    });
     let body = responses::sse(vec![
         responses::ev_response_created("resp-1"),
         responses::ev_assistant_message("msg-1", "Done"),
@@ -1147,10 +1159,11 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
                     url: TINY_PNG_DATA_URL.to_string(),
                     detail: None,
                 }],
-                responsesapi_client_metadata: Some(HashMap::from([(
-                    "workspace_kind".to_string(),
-                    "projectless".to_string(),
-                )])),
+                turn_trigger: Some("user".to_string()),
+                responsesapi_client_metadata: Some(HashMap::from([
+                    ("workspace_kind".to_string(), "projectless".to_string()),
+                    ("source".to_string(), "composer".to_string()),
+                ])),
                 ..Default::default()
             },
         })
@@ -1167,6 +1180,26 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
     assert_eq!(event["event_params"]["session_id"], thread.session_id);
     assert_eq!(event["event_params"]["turn_id"], turn.id);
     assert_eq!(event["event_params"]["root_turn_id"], turn.id);
+    let request = response_mock.requests()[0].body_json();
+    let request_metadata: Value = serde_json::from_str(
+        request["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .context("expected turn metadata")?,
+    )?;
+    assert_eq!(
+        json!({
+            "eventTrigger": event["event_params"]["turn_trigger"],
+            "eventSource": event["event_params"]["codex_turn_source"],
+            "requestTrigger": request_metadata["turn_trigger"],
+            "requestSource": request_metadata["source"],
+        }),
+        json!({
+            "eventTrigger": "user",
+            "eventSource": "composer",
+            "requestTrigger": "user",
+            "requestSource": "composer",
+        })
+    );
     assert_eq!(
         event["event_params"]["app_server_client"]["product_client_id"],
         "codex_work_desktop"

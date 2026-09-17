@@ -35,7 +35,7 @@ impl Session {
         }
     }
 
-    /// Injects hook context while classifying its actual receiving turn atomically.
+    /// Injects hook context into the running turn atomically.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn provenance and turn state updates must remain atomic"
@@ -43,19 +43,13 @@ impl Session {
     pub(crate) async fn inject_hook_context_if_running(
         &self,
         input: Vec<ResponseItem>,
-        source_turn_id: Option<&str>,
     ) -> Result<(), Vec<ResponseItem>> {
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
             return Err(input);
         };
-        let Some(task) = active_turn.task.as_ref() else {
+        if active_turn.task.is_none() {
             return Err(input);
-        };
-        if source_turn_id != Some(task.turn_context.sub_id.as_str()) {
-            task.turn_context
-                .turn_metadata_state
-                .mark_root_turn_ambiguous();
         }
         self.input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
@@ -86,11 +80,6 @@ impl Session {
             .collect::<Vec<_>>();
         let mut active = self.active_turn.lock().await;
         if let Some(active_turn) = active.as_mut() {
-            if let Some(task) = active_turn.task.as_ref() {
-                task.turn_context
-                    .turn_metadata_state
-                    .mark_root_turn_ambiguous();
-            }
             self.input_queue
                 .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                     active_turn.turn_state.as_ref(),

@@ -81,6 +81,7 @@ use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_protocol::shell_environment::is_non_inheritable_env_var;
 use codex_sandboxing::SandboxCommand;
+use codex_shell_command::is_dangerous_command::DangerousCommandPlatform;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::approx_tokens_from_byte_count;
 use codex_utils_path_uri::PathUri;
@@ -120,14 +121,14 @@ fn should_use_deterministic_process_ids() -> bool {
     cfg!(test) || deterministic_process_ids_forced_for_tests()
 }
 
-fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
+pub(super) fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
     for (key, value) in UNIFIED_EXEC_ENV {
         env.insert(key.to_string(), value.to_string());
     }
     env
 }
 
-fn exec_env_policy_from_shell_policy(
+pub(super) fn exec_env_policy_from_shell_policy(
     policy: &ShellEnvironmentPolicy,
 ) -> codex_exec_server::ExecEnvPolicy {
     let mut exclude = policy
@@ -462,7 +463,11 @@ impl UnifiedExecProcessManager {
     pub(crate) async fn release_process_id(&self, process_id: i32) {
         let removed = {
             let mut store = self.process_store.lock().await;
-            store.remove(process_id)
+            let entry = store.processes.remove(&process_id);
+            if !should_use_deterministic_process_ids() {
+                store.reserved_process_ids.remove(&process_id);
+            }
+            entry
         };
         if let Some(entry) = removed {
             unregister_network_approval_for_entry(&entry).await;
@@ -1369,6 +1374,13 @@ impl UnifiedExecProcessManager {
             .shell
             .as_ref()
             .unwrap_or(session_shell.as_ref());
+        // Legacy executors omit the platform. Unknown reported platforms use the
+        // more conservative Windows rules rather than silently weakening checks.
+        let command_platform = match request.turn_environment.executor_platform_os.as_deref() {
+            Some("linux" | "macos") => DangerousCommandPlatform::Posix,
+            Some("windows") | Some(_) => DangerousCommandPlatform::Windows,
+            None => DangerousCommandPlatform::host(),
+        };
         let exec_approval_requirement = context
             .session
             .services
@@ -1390,6 +1402,7 @@ impl UnifiedExecProcessManager {
                 },
                 configured_shell,
                 &request.shell_mode,
+                command_platform,
             )
             .await;
         let req = UnifiedExecToolRequest {

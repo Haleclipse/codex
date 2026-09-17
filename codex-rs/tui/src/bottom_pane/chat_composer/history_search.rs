@@ -1,9 +1,9 @@
 //! Composer-side Ctrl+R reverse history search state and rendering helpers.
 //!
 //! The persistent and local history stores live in `chat_composer_history`, but the composer owns
-//! the active search session because it has to snapshot/restore the editable draft, preview matches
-//! in the textarea, and render the footer prompt while the footer line is acting as the search
-//! input.
+//! the active search session because it has to snapshot/restore the editable draft and Vim edit
+//! state, preview matches in the textarea, and render the footer prompt while the footer line is
+//! acting as the search input.
 //!
 //! This module is responsible for the UI-facing lifecycle of a search session: recognizing the
 //! keys that enter and drive search mode, keeping the footer query separate from the textarea
@@ -35,10 +35,12 @@ use super::super::chat_composer_history::HistorySearchDirection;
 use super::super::chat_composer_history::HistorySearchResult;
 use super::super::footer::footer_height;
 use super::super::footer::reset_mode_after_activity;
+use super::super::textarea::VimPersistentState;
 use super::ActivePopup;
 use super::ChatComposer;
 use super::ComposerDraft;
 use super::InputResult;
+use super::vim_history::VimHistory;
 use crate::app_event::AppEvent;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
@@ -49,12 +51,16 @@ use crate::ui_consts::FOOTER_INDENT_COLS;
 /// Active composer-owned state for one Ctrl+R search interaction.
 ///
 /// The session is created only by [`ChatComposer::begin_history_search`] and is cleared only by
-/// accepting, canceling, or replacing the search mode. It stores the original draft separately from
-/// the footer query so transient previews never destroy the user's in-progress composer content.
-#[derive(Clone, Debug)]
+/// accepting, canceling, or replacing the search mode. It stores the original draft and Vim edit
+/// state separately from the footer query so transient previews never destroy in-progress content.
+#[derive(Debug)]
 pub(super) struct HistorySearchSession {
     /// Draft to restore when search is canceled or a query has no match.
     original_draft: ComposerDraft,
+    /// Same-draft Vim edits to restore when a temporary preview is canceled.
+    original_vim_history: VimHistory,
+    /// Active and completed Vim commands suspended during temporary draft replacement.
+    original_vim_state: VimPersistentState,
     /// Footer-owned query text typed while Ctrl+R search is active.
     query: String,
     /// User-visible search status used to choose footer hints and composer preview behavior.
@@ -114,8 +120,16 @@ impl ChatComposer {
         }
         self.popups.active = ActivePopup::None;
         self.attachments.clear_remote_image_selection();
+        let original_draft = self.snapshot_draft();
+        let original_vim_history = std::mem::take(&mut self.vim_history);
+        let mut original_vim_state = VimPersistentState::default();
+        self.draft
+            .textarea
+            .swap_vim_persistent_state(&mut original_vim_state);
         self.history_search = Some(HistorySearchSession {
-            original_draft: self.snapshot_draft(),
+            original_draft,
+            original_vim_history,
+            original_vim_state,
             query: String::new(),
             status: HistorySearchStatus::Idle,
         });
@@ -292,12 +306,16 @@ impl ChatComposer {
     /// as Ctrl+C, should use the boolean result to consume the key without also clearing the
     /// restored draft or triggering quit/interrupt behavior.
     pub(crate) fn cancel_history_search(&mut self) -> bool {
-        let Some(search) = self.history_search.take() else {
+        let Some(mut search) = self.history_search.take() else {
             return false;
         };
         self.history.reset_navigation();
         self.footer.mode = reset_mode_after_activity(self.footer.mode);
         self.restore_draft(search.original_draft);
+        self.vim_history = search.original_vim_history;
+        self.draft
+            .textarea
+            .swap_vim_persistent_state(&mut search.original_vim_state);
         true
     }
 
@@ -783,6 +801,9 @@ mod tests {
             .history
             .record_local_submission(HistoryEntry::new("git status".to_string()));
         composer.set_vim_enabled(/*enabled*/ true);
+        let mut keymap = crate::keymap::RuntimeKeymap::defaults();
+        keymap.vim_normal.redo.clear();
+        composer.set_keymap_bindings(&keymap);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         for ch in ['g', 'i', 't'] {

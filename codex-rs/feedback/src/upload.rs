@@ -46,24 +46,21 @@ pub(super) fn gzip_envelope_request(
         .timeout(timeout)
 }
 
-/// Send an already-serialized envelope, charging requests and backoff to the shared budget.
+/// Send an already-serialized envelope within the report's shared deadline.
 pub(super) async fn send_gzip_envelope(
     client_pool: &RouteAwareClientPool,
     dsn: &Dsn,
     body: Vec<u8>,
     kind: EnvelopeKind,
-    remaining_upload_time: &mut Duration,
+    deadline: Instant,
+    rate_limited: &mut bool,
 ) -> Result<StatusCode> {
-    let request_started_at = Instant::now();
     let body = Bytes::from(body);
     // Retain the exact gzip bytes for at most two diagnostic retries. Never replay the core.
     let mut retry_delays = [250, 500].map(Duration::from_millis).into_iter();
     let response = loop {
-        let timeout = remaining_upload_time.saturating_sub(request_started_at.elapsed());
-        if timeout.is_zero() {
-            *remaining_upload_time = Duration::ZERO;
-            anyhow::bail!("feedback upload network wait budget exhausted");
-        }
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(!timeout.is_zero(), "feedback upload deadline exceeded");
         let response = gzip_envelope_request(client_pool, dsn, body.clone(), timeout)
             .send()
             .await;
@@ -77,7 +74,7 @@ pub(super) async fn send_gzip_envelope(
         }) {
             // Even accepted requests can impose a quota on events or attachments.
             // https://develop.sentry.dev/sdk/foundations/transport/rate-limiting/
-            *remaining_upload_time = Duration::ZERO;
+            *rate_limited = true;
             break response;
         }
         let retryable = match &response {
@@ -96,9 +93,8 @@ pub(super) async fn send_gzip_envelope(
             response.status() == StatusCode::TOO_MANY_REQUESTS
                 && (retry_delay.is_none() || !response.headers().contains_key("Retry-After"))
         }) {
-            // Bare 429s default to a cooldown longer than this upload budget.
             // Never let later files bypass an exhausted rate limit.
-            *remaining_upload_time = Duration::ZERO;
+            *rate_limited = true;
             break response;
         }
         let Some(retry_delay) = retry_delay else {
@@ -111,20 +107,16 @@ pub(super) async fn send_gzip_envelope(
             .map(|value| {
                 // An invalid cooldown is not permission to send immediately.
                 parse_retry_after(value.to_str().unwrap_or_default())
-                    .unwrap_or(*remaining_upload_time)
+                    .unwrap_or_else(|| deadline.saturating_duration_since(Instant::now()))
             });
         let delay = retry_delay.max(retry_after.unwrap_or_default());
-        if delay >= remaining_upload_time.saturating_sub(request_started_at.elapsed()) {
-            // The cooldown applies to later files too, not just this retry.
-            *remaining_upload_time = Duration::ZERO;
+        if delay >= deadline.saturating_duration_since(Instant::now()) {
+            // Leave long cooldowns for a later submission, including its remaining files.
+            *rate_limited = true;
             break response;
         }
         tokio::time::sleep(delay).await;
-        if request_started_at.elapsed() >= *remaining_upload_time {
-            break response;
-        }
     };
-    *remaining_upload_time = remaining_upload_time.saturating_sub(request_started_at.elapsed());
     response
         .map(|response| response.status())
         .context("failed to upload feedback to Sentry")

@@ -100,7 +100,9 @@ COMPONENT_DEST_DIR: dict[str, str] = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build or stage the Codex CLI npm package.")
+    parser = argparse.ArgumentParser(
+        description="Build or stage the Codex CLI npm package."
+    )
     parser.add_argument(
         "--package",
         choices=PACKAGE_CHOICES,
@@ -113,9 +115,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--release-version",
-        help=(
-            "Version to stage for npm release."
-        ),
+        help=("Version to stage for npm release."),
     )
     parser.add_argument(
         "--staging-dir",
@@ -162,7 +162,9 @@ def main() -> int:
     release_version = args.release_version
     if release_version:
         if version and version != release_version:
-            raise RuntimeError("--version and --release-version must match when both are provided.")
+            raise RuntimeError(
+                "--version and --release-version must match when both are provided."
+            )
         version = release_version
 
     if not version:
@@ -297,7 +299,9 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
     elif package == "codex-responses-api-proxy":
         bin_dir = staging_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
-        launcher_src = RESPONSES_API_PROXY_NPM_ROOT / "bin" / "codex-responses-api-proxy.js"
+        launcher_src = (
+            RESPONSES_API_PROXY_NPM_ROOT / "bin" / "codex-responses-api-proxy.js"
+        )
         shutil.copy2(launcher_src, bin_dir / "codex-responses-api-proxy.js")
 
         readme_src = RESPONSES_API_PROXY_NPM_ROOT / "README.md"
@@ -431,7 +435,10 @@ def copy_native_binaries(
         missing_targets = sorted(target_filter - copied_targets)
         if missing_targets:
             missing_list = ", ".join(missing_targets)
-            raise RuntimeError(f"Missing target directories in vendor source: {missing_list}")
+            raise RuntimeError(
+                f"Missing target directories in vendor source: {missing_list}"
+            )
+
 
 
 def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:

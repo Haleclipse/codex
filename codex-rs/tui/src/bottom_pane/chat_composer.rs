@@ -17,6 +17,8 @@
 //!
 //! # Key Event Routing
 //!
+//! Plain Left opens agents when the local-daemon composer is empty and available for input.
+//! Explicit editor remaps take precedence.
 //! Most key handling goes through [`ChatComposer::handle_key_event`], which dispatches to a
 //! popup-specific handler if a popup is visible and otherwise to
 //! [`ChatComposer::handle_key_event_without_popup`]. After every handled key, we call
@@ -61,6 +63,11 @@
 //! `Ctrl+R` opens a reverse incremental search mode. The footer becomes the search input; once the
 //! query is non-empty, the composer body previews the current match. `Enter` accepts the preview as
 //! an editable draft and `Esc` restores the draft that was active when search started.
+//! Vim undo/redo snapshots complete drafts and groups direct edits with active Vim transactions.
+//! An active edit keeps one separately capped snapshot; canceling does not evict committed history.
+//! Canceled history previews restore history and active commands; accepting another prompt resets them.
+//! Normal-mode Ctrl+R redoes an edit, or does nothing when redo is empty. Insert-mode Ctrl+R
+//! keeps prompt-history search; explicitly configured keybindings retain precedence.
 //! Vim queries stay draft-local.
 //!
 //! Slash commands are staged for local history instead of being recorded immediately. Command
@@ -108,6 +115,10 @@
 //! shell commands return `ParentOwnedInputBlocked` without clearing the draft. Bare local and
 //! navigation slash commands remain available so users can leave or manage the view. Transcript
 //! exports also remain available, including an explicit destination filename.
+//!
+//! During reconnection, `handle_disconnected_key` edits the draft directly without
+//! popup dispatch or submission. Enter and Tab leave the draft intact until reconnection succeeds.
+//! Collapsed pastes expand into editable text so the full draft can be copied before quitting.
 //!
 //! # Reasoning Effort Animations
 //!
@@ -287,13 +298,16 @@ use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_protocol::user_input::TextElement;
 
+mod agents_navigation;
 mod attachment_state;
 mod completion_target;
 mod draft_state;
 mod footer_state;
 mod history_search;
 mod popup_state;
+mod reconnect;
 mod slash_input;
+mod vim_history;
 mod vim_search;
 
 use self::attachment_state::AttachmentState;
@@ -307,6 +321,7 @@ use self::popup_state::PopupState;
 use self::slash_input::SlashInput;
 use self::slash_input::SlashValidation;
 use self::slash_input::SubmissionValidation;
+use self::vim_history::VimHistory;
 use crate::app_event::AppEvent;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
@@ -490,6 +505,7 @@ pub(crate) struct ChatComposer {
     popups: PopupState,
     app_event_tx: AppEventSender,
     history: ChatComposerHistory,
+    agents_navigation_enabled: bool,
     footer: FooterState,
     has_focus: bool,
     frame_requester: Option<FrameRequester>,
@@ -525,6 +541,7 @@ pub(crate) struct ChatComposer {
     windows_degraded_sandbox_active: bool,
     side_conversation_active: bool,
     history_search: Option<HistorySearchSession>,
+    vim_history: VimHistory,
     submit_keys: Vec<KeyBinding>,
     queue_keys: Vec<KeyBinding>,
     toggle_shortcuts_keys: Vec<KeyBinding>,
@@ -643,6 +660,7 @@ impl ChatComposer {
             popups: PopupState::default(),
             app_event_tx,
             history: ChatComposerHistory::new(),
+            agents_navigation_enabled: false,
             footer: FooterState {
                 quit_shortcut_expires_at: None,
                 quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
@@ -711,6 +729,7 @@ impl ChatComposer {
             windows_degraded_sandbox_active: false,
             side_conversation_active: false,
             history_search: None,
+            vim_history: VimHistory::default(),
             submit_keys: vec![key_hint::plain(KeyCode::Enter)],
             queue_keys: vec![key_hint::plain(KeyCode::Tab)],
             toggle_shortcuts_keys: vec![
@@ -1227,6 +1246,7 @@ impl ChatComposer {
             query.editor.insert_str(&pasted);
             return true;
         }
+        let started_vim_edit = self.begin_direct_vim_edit();
         let char_count = pasted.chars().count();
         if char_count > LARGE_PASTE_CHAR_THRESHOLD {
             let placeholder = self.next_large_paste_placeholder(char_count);
@@ -1244,6 +1264,9 @@ impl ChatComposer {
         }
         self.draft.paste_burst.clear_after_explicit_paste();
         self.sync_popups();
+        if started_vim_edit {
+            self.finish_vim_edit();
+        }
         true
     }
 
@@ -1305,6 +1328,7 @@ impl ChatComposer {
     /// are renumbered to `[Image #M+1]..[Image #N]` (where `M` is the number of
     /// remote images). Cursor is placed at the end after rebuilding elements.
     pub(crate) fn apply_external_edit(&mut self, text: String) {
+        self.vim_history = VimHistory::default();
         self.draft.pending_pastes.clear();
         let (text, _) = self.imported_text_for_textarea(text, Vec::new());
 
@@ -1390,6 +1414,7 @@ impl ChatComposer {
     pub(crate) fn set_vim_enabled(&mut self, enabled: bool) {
         self.draft.textarea.enable_vim_search();
         self.draft.textarea.set_vim_enabled(enabled);
+        self.vim_history = VimHistory::default();
         self.draft.paste_burst.clear_after_explicit_paste();
         self.footer.mode = reset_mode_after_activity(self.footer.mode);
     }
@@ -1580,6 +1605,7 @@ impl ChatComposer {
         mention_bindings: Vec<MentionBinding>,
     ) {
         // Clear any existing content, placeholders, and attachments first.
+        self.vim_history = VimHistory::default();
         self.draft.textarea.set_text_clearing_elements("");
         self.draft.is_bash_mode = false;
         self.draft.pending_pastes.clear();
@@ -1848,8 +1874,12 @@ impl ChatComposer {
 
     /// Insert an attachment placeholder and track it for the next submission.
     pub fn attach_image(&mut self, path: PathBuf) {
+        let started_vim_edit = self.begin_direct_vim_edit();
         self.attachments
             .attach_image(&mut self.draft.textarea, path);
+        if started_vim_edit {
+            self.finish_vim_edit();
+        }
     }
 
     #[cfg(test)]
@@ -1975,9 +2005,13 @@ impl ChatComposer {
     }
 
     pub(crate) fn insert_str(&mut self, text: &str) {
+        let started_vim_edit = self.begin_direct_vim_edit();
         self.draft.textarea.insert_str(text);
         self.sync_bash_mode_from_text();
         self.sync_popups();
+        if started_vim_edit {
+            self.finish_vim_edit();
+        }
     }
 
     /// Handle a key event coming from the main UI.
@@ -1999,6 +2033,10 @@ impl ChatComposer {
 
         if self.history_search.is_some() {
             return self.handle_history_search_key(key_event);
+        }
+
+        if self.handle_vim_history_key(key_event) {
+            return (InputResult::None, true);
         }
 
         if Self::is_history_search_key(&key_event, &self.history_search_previous_keys) {
@@ -2130,7 +2168,7 @@ impl ChatComposer {
 
     /// Handle key events when file search popup is visible.
     fn handle_key_event_with_file_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
-        if self.handle_shortcut_overlay_key(&key_event) {
+        if self.handle_empty_prompt_shortcut(&key_event) {
             return (InputResult::None, true);
         }
         if key_event.code == KeyCode::Esc {
@@ -2216,7 +2254,7 @@ impl ChatComposer {
 
     /// Handle key events when the legacy skill mention popup is visible.
     fn handle_key_event_with_skill_popup(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
-        if self.handle_shortcut_overlay_key(&key_event) {
+        if self.handle_empty_prompt_shortcut(&key_event) {
             return (InputResult::None, true);
         }
         self.footer.mode = reset_mode_after_activity(self.footer.mode);
@@ -2298,7 +2336,7 @@ impl ChatComposer {
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
-        if self.handle_shortcut_overlay_key(&key_event) {
+        if self.handle_empty_prompt_shortcut(&key_event) {
             return (InputResult::None, true);
         }
         self.footer.mode = reset_mode_after_activity(self.footer.mode);
@@ -2506,6 +2544,7 @@ impl ChatComposer {
     }
 
     fn insert_selected_file_path(&mut self, token_range: Range<usize>, selected_path: &str) {
+        let started_vim_edit = self.begin_direct_vim_edit();
         let token_range = self.separate_completion_from_adjacent_element(token_range);
         if Self::is_image_path(selected_path) {
             let path_buf = PathBuf::from(selected_path);
@@ -2525,6 +2564,9 @@ impl ChatComposer {
             }
         } else {
             self.insert_selected_path(token_range, selected_path);
+        }
+        if started_vim_edit {
+            self.finish_vim_edit();
         }
     }
 
@@ -3151,6 +3193,7 @@ impl ChatComposer {
                 | InputResult::ServiceTierCommand(_)
                 | InputResult::CommandWithArgs(_, _, _)
         ) {
+            self.vim_history = VimHistory::default();
             self.draft.textarea.enter_vim_insert_mode();
         }
     }
@@ -3472,8 +3515,16 @@ impl ChatComposer {
         &mut self,
         key_event: &KeyEvent,
     ) -> Option<(InputResult, bool)> {
-        self.attachments
-            .handle_remote_image_selection_key(key_event, &mut self.draft.textarea)
+        let removes_remote_image = matches!(key_event.code, KeyCode::Delete | KeyCode::Backspace)
+            && self.attachments.selected_remote_image_index.is_some();
+        let started_vim_edit = removes_remote_image && self.begin_direct_vim_edit();
+        let result = self
+            .attachments
+            .handle_remote_image_selection_key(key_event, &mut self.draft.textarea);
+        if started_vim_edit {
+            self.finish_vim_edit();
+        }
+        result
     }
 
     /// Handle key event when no popup is visible.
@@ -3484,7 +3535,7 @@ impl ChatComposer {
         if self.attachments.selected_remote_image_index.is_some() {
             self.attachments.clear_remote_image_selection();
         }
-        if self.handle_shortcut_overlay_key(&key_event) {
+        if self.handle_empty_prompt_shortcut(&key_event) {
             return (InputResult::None, true);
         }
         if self.draft.is_bash_mode && key_event.code == KeyCode::Esc {
@@ -3650,6 +3701,9 @@ impl ChatComposer {
         input: KeyEvent,
         now: Instant,
     ) -> (InputResult, bool) {
+        if !self.draft.textarea.is_vim_normal_mode() {
+            self.begin_vim_edit(input);
+        }
         // If we have a buffered non-bracketed paste burst and enough time has
         // elapsed since the last char, flush it before handling a new input.
         self.handle_paste_burst_flush(now);
@@ -3759,16 +3813,22 @@ impl ChatComposer {
             && matches!(input.code, KeyCode::Backspace)
             && self.draft.textarea.cursor() == 0
         {
+            let started_vim_edit = self.begin_direct_vim_edit();
             self.draft.is_bash_mode = false;
+            if started_vim_edit {
+                self.finish_vim_edit();
+            }
             return (InputResult::None, true);
         }
 
+        self.begin_vim_edit(input);
         self.draft.textarea.input(input);
         self.sync_bash_mode_from_text();
 
         if let Some(elements_before) = elements_before {
             self.reconcile_deleted_elements(elements_before);
         }
+        self.finish_vim_edit();
 
         // Update the paste-burst heuristic for text, shortcut, and non-char events.
         match input.code {
@@ -3811,15 +3871,21 @@ impl ChatComposer {
             .remove_deleted_local_placeholders(&removed_payloads, &mut self.draft.textarea);
     }
 
-    /// Handle the dedicated shortcut-overlay toggle key(s).
+    /// Handle empty-prompt agents navigation and the shortcut-overlay toggle.
     ///
     /// This only toggles when the composer is empty and no paste burst is in
     /// progress, so typing/pasting `?` still inserts text instead of opening
     /// help. The bound key list intentionally supports terminal-variant
     /// modifier reporting (for example `?` vs `shift-?`).
-    fn handle_shortcut_overlay_key(&mut self, key_event: &KeyEvent) -> bool {
+    fn handle_empty_prompt_shortcut(&mut self, key_event: &KeyEvent) -> bool {
         if key_event.kind != KeyEventKind::Press {
             return false;
+        }
+
+        if key_hint::plain(KeyCode::Left).is_press(*key_event) && self.agents_navigation_available()
+        {
+            self.app_event_tx.send(AppEvent::OpenAgentsOverview);
+            return true;
         }
 
         let toggles = self.toggle_shortcuts_keys.is_pressed(*key_event)
@@ -3870,6 +3936,9 @@ impl ChatComposer {
             },
             status_line_enabled: self.statusline_config.enabled || self.footer.status_line_enabled,
             key_hints: FooterKeyHints {
+                agents: self
+                    .agents_navigation_available()
+                    .then_some(key_hint::plain(KeyCode::Left).into()),
                 toggle_shortcuts: self.footer.toggle_shortcuts_key,
                 queue: self.footer.queue_key,
                 insert_newline: self.footer.insert_newline_key,
@@ -5083,6 +5152,10 @@ impl ChatComposer {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "chat_composer/agents_navigation_tests.rs"]
+mod agents_navigation_tests;
 
 #[cfg(test)]
 #[path = "chat_composer_effort_tests.rs"]
@@ -10752,6 +10825,8 @@ mod tests {
 
         let (mut composer, _rx) = new_test_composer();
         configure_bound_plugin_left_of_unbound_plugin(&mut composer);
+        composer.set_vim_enabled(/*enabled*/ true);
+        let before = composer.draft_snapshot();
         composer.insert_selected_file_path(
             "@sample".len().."@sample@other".len(),
             image_path.to_str().expect("UTF-8 path"),
@@ -10759,6 +10834,9 @@ mod tests {
 
         assert_eq!(composer.current_text(), "@sample [Image #1] ");
         assert_eq!(composer.local_image_paths(), vec![image_path]);
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(composer.draft_snapshot(), before);
     }
 
     #[test]

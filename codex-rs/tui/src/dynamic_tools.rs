@@ -616,6 +616,7 @@ async fn execute_inner(
                 thread_start_params.sandbox = None;
                 None
             } else {
+                thread_start_params.permissions = None;
                 thread_start_params.sandbox = Some(match &source.sandbox {
                     SandboxPolicy::DangerFullAccess => SandboxMode::DangerFullAccess,
                     SandboxPolicy::ReadOnly { .. } => SandboxMode::ReadOnly,

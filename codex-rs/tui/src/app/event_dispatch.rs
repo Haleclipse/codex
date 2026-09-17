@@ -30,6 +30,19 @@ impl App {
         app_server: &mut AppServerSession,
         event: AppEvent,
     ) -> Result<AppRunControl> {
+        if self.reconnect.offline
+            && !matches!(
+                &event,
+                AppEvent::InsertHistoryCell(_)
+                    | AppEvent::AppendMessageHistoryEntry { .. }
+                    | AppEvent::BeginInitialHistoryReplayBuffer
+                    | AppEvent::BeginThreadSwitchHistoryReplayBuffer
+                    | AppEvent::EndInitialHistoryReplayBuffer
+                    | AppEvent::FatalExitRequest(_)
+            )
+        {
+            return Ok(AppRunControl::Continue);
+        }
         if self.chat_widget.has_misalignment_policy_violation()
             && matches!(
                 event,
@@ -722,6 +735,10 @@ impl App {
                 }
                 self.chat_widget.prepare_local_op_submission(&op);
                 if let Err(err) = self.submit_active_thread_op(app_server, op).await {
+                    if self.recover_transport_error(&err)
+                    {
+                        return Ok(AppRunControl::Continue);
+                    }
                     let unsupported_permissions = err
                         .downcast_ref::<UnsupportedLegacyPermissionProfile>()
                         .is_some();
@@ -2276,7 +2293,8 @@ impl App {
                 self.config = config;
                 let approval_policy =
                     AskForApproval::from(self.config.permissions.approval_policy.value());
-                self.runtime_approval_policy_override = Some(approval_policy);
+                self.runtime_approval_policy_override =
+                    Some(RuntimeApprovalPolicyOverride::Explicit(approval_policy));
                 self.chat_widget.set_approval_policy(approval_policy);
                 self.sync_active_thread_permission_settings_to_cached_session()
                     .await;

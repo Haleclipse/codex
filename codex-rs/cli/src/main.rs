@@ -3735,7 +3735,10 @@ mod tests {
         AppExitInfo {
             token_usage,
             thread_id,
-            resume_hint: codex_utils_cli::resume_hint(thread_name, thread_id),
+            resume_hint: thread_id.map(|thread_id| codex_tui::ResumableThread {
+                thread_id,
+                thread_name: thread_name.map(str::to_string),
+            }),
             disconnect_info: None,
             update_action: None,
             exit_reason: ExitReason::UserRequested,
@@ -3844,27 +3847,26 @@ mod tests {
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000"
-                    .to_string(),
+                "To continue this session, run:".to_string(),
+                "  codex resume 123e4567-e89b-12d3-a456-426614174000".to_string(),
             ]
         );
     }
 
     #[test]
     fn format_exit_messages_includes_resume_hint_without_color() {
-        let exit_info = sample_exit_info(
-            Some("123e4567-e89b-12d3-a456-426614174000"),
-            /*thread_name*/ None,
-        );
-        let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
-        assert_eq!(
-            lines,
-            vec![
-                "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000"
-                    .to_string(),
-            ]
-        );
+        insta::allow_duplicates! {
+            for thread_name in [None, Some("")] {
+                let exit_info =
+                    sample_exit_info(Some("123e4567-e89b-12d3-a456-426614174000"), thread_name);
+                let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+                insta::assert_snapshot!(lines.join("\n"), @"
+                Token usage: total=2 input=0 output=2
+                To continue this session, run:
+                  codex resume 123e4567-e89b-12d3-a456-426614174000
+                ");
+            }
+        }
     }
 
     #[test]
@@ -3874,8 +3876,14 @@ mod tests {
             /*thread_name*/ None,
         );
         let lines = exit_info.format_exit_messages(/*color_enabled*/ true);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[1].contains("\u{1b}[36m"));
+        assert_eq!(
+            lines,
+            vec![
+                "Token usage: total=2 input=0 output=2",
+                "To continue this session, run:",
+                "  \u{1b}[36mcodex resume 123e4567-e89b-12d3-a456-426614174000\u{1b}[39m",
+            ]
+        );
     }
 
     #[test]
@@ -3885,11 +3893,28 @@ mod tests {
             Some("my-thread"),
         );
         let lines = exit_info.format_exit_messages(/*color_enabled*/ false);
+        insta::assert_snapshot!(lines.join("\n"), @"
+        Token usage: total=2 input=0 output=2
+        To continue this session, run:
+          codex resume 123e4567-e89b-12d3-a456-426614174000
+        Or run codex resume and select my-thread.
+        ");
+    }
+
+    #[test]
+    fn format_exit_messages_colors_commands_and_thread_name() {
+        let exit_info = sample_exit_info(
+            Some("123e4567-e89b-12d3-a456-426614174000"),
+            Some("my-thread"),
+        );
+        let lines = exit_info.format_exit_messages(/*color_enabled*/ true);
         assert_eq!(
             lines,
             vec![
-                "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codex resume, then select my-thread (123e4567-e89b-12d3-a456-426614174000)".to_string(),
+                "Token usage: total=2 input=0 output=2",
+                "To continue this session, run:",
+                "  \u{1b}[36mcodex resume 123e4567-e89b-12d3-a456-426614174000\u{1b}[39m",
+                "Or run \u{1b}[36mcodex resume\u{1b}[39m and select \u{1b}[36mmy-thread\u{1b}[39m.",
             ]
         );
     }

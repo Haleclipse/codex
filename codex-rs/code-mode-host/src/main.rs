@@ -9,6 +9,7 @@ use codex_otel::OtelExporter;
 use codex_otel::OtelHttpProtocol;
 use codex_otel::OtelProvider;
 use codex_otel::OtelSettings;
+use codex_otel_trace_websocket::TraceWebSocket;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -38,22 +39,14 @@ struct Cli {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let trace_transport = if let Some(trace_listen) = cli.otel_trace_listen.as_deref() {
-        let sender = codex_code_mode_host::trace_batch_channel();
-        let (receiver, exporter_endpoint) =
-            codex_code_mode_host::bind_otlp_trace_receiver().await?;
-        Some((
-            trace_listen.to_string(),
-            receiver,
-            sender,
-            exporter_endpoint,
-        ))
+    let mut trace_transport = if let Some(trace_listen) = cli.otel_trace_listen.as_deref() {
+        Some(TraceWebSocket::start(trace_listen).await?)
     } else {
         None
     };
     let trace_exporter_endpoint = trace_transport
         .as_ref()
-        .map(|(_, _, _, endpoint)| endpoint.as_str())
+        .map(TraceWebSocket::exporter_endpoint)
         .or(cli.otel_trace_exporter.as_deref());
     let otel = trace_exporter_endpoint
         .map(build_trace_provider)
@@ -68,6 +61,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .with(otel_layer)
         .init();
+    if let Some(trace_transport) = trace_transport.as_ref() {
+        let listen_addr = trace_transport.listen_addr();
+        tracing::info!("codex-code-mode-host OTEL trace websocket listening on ws://{listen_addr}");
+    }
     tracing::info_span!(
         "code_mode_host.startup",
         otel.name = "code_mode_host.startup"
@@ -75,33 +72,19 @@ async fn main() -> anyhow::Result<()> {
     .in_scope(|| {});
 
     let main_transport = codex_code_mode_host::run_main(&cli.listen);
-    let (result, trace_tasks) = match trace_transport {
-        Some((trace_listen, receiver, sender, _)) => {
-            let mut trace_listener_task = tokio::spawn({
-                let sender = sender.clone();
-                async move { codex_code_mode_host::run_otel_trace_listener(&trace_listen, sender).await }
-            });
-            let mut trace_receiver_task = tokio::spawn(
-                codex_code_mode_host::run_otlp_trace_receiver(receiver, sender),
-            );
-            let result = tokio::select! {
-                result = main_transport => result,
-                result = &mut trace_listener_task => result.context("OTEL trace websocket task failed").flatten(),
-                result = &mut trace_receiver_task => result.context("OTLP trace receiver task failed").flatten(),
-            };
-            (result, Some((trace_listener_task, trace_receiver_task)))
-        }
-        None => (main_transport.await, None),
+    let result = match trace_transport.as_mut() {
+        Some(trace_transport) => tokio::select! {
+            result = main_transport => result,
+            result = trace_transport.wait_for_failure() => result,
+        },
+        None => main_transport.await,
     };
     if let Some(otel) = otel
         && let Err(error) = otel.shutdown_with_timeout(OTEL_SHUTDOWN_TIMEOUT).await
     {
         tracing::warn!(%error, "failed to finish code-mode host telemetry shutdown");
     }
-    if let Some((trace_listener_task, trace_receiver_task)) = trace_tasks {
-        trace_listener_task.abort();
-        trace_receiver_task.abort();
-    }
+    drop(trace_transport);
     result
 }
 

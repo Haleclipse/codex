@@ -235,6 +235,7 @@ fn rollout_item_type(item: &RolloutItem) -> String {
         }
         RolloutItem::Compacted(_) => "compacted".to_string(),
         RolloutItem::TurnContext(_) => "turn_context".to_string(),
+        RolloutItem::TokenUsageRecord(_) => "token_usage_record".to_string(),
         RolloutItem::WorldState(_) => "world_state".to_string(),
         RolloutItem::SecurityRiskScore(_) => "security_risk_score".to_string(),
         RolloutItem::RealtimeItem(item) => match &item.content {

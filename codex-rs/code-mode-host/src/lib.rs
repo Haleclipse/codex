@@ -49,13 +49,7 @@ mod delegate;
 mod grpc;
 mod grpc_transport;
 mod peer;
-mod trace_transport;
 mod transport;
-
-pub use self::trace_transport::bind_otlp_trace_receiver;
-pub use self::trace_transport::run_otel_trace_listener;
-pub use self::trace_transport::run_otlp_trace_receiver;
-pub use self::trace_transport::trace_batch_channel;
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const MAX_ACTIVE_CELLS: usize = 128;

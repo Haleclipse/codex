@@ -11,6 +11,9 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+#[path = "marketplace_policy/curated_tests.rs"]
+mod curated;
+
 fn config_layer_stack(requirements_toml: &str) -> ConfigLayerStack {
     config_layer_stack_with_user_config(requirements_toml, /*user_config*/ None)
 }
@@ -361,6 +364,9 @@ fn curated_marketplace_requires_its_expected_name() {
         r#"
 [marketplaces]
 restrict_to_allowed_sources = true
+[marketplaces.allowed_sources.curated]
+source = "git"
+url = "https://github.com/openai/plugins.git"
 "#,
     );
     let marketplace_path = AbsolutePathBuf::try_from(
@@ -684,6 +690,8 @@ enabled = true
 
 #[test]
 fn blocked_or_reserved_upgrade_is_rejected_before_marketplace_installation() {
+    let reload_config: crate::ConfigLayerReload =
+        std::sync::Arc::new(|| panic!("blocked or reserved marketplace must not reload config"));
     let codex_home = TempDir::new().expect("create Codex home");
     let config_file = AbsolutePathBuf::try_from(codex_home.path().join("config.toml"))
         .expect("absolute config path");
@@ -702,7 +710,12 @@ source = "https://github.com/example/blocked.git"
         )),
     );
 
-    let outcome = upgrade_configured_git_marketplaces(codex_home.path(), &stack, Some("debug"));
+    let outcome = upgrade_configured_git_marketplaces(
+        codex_home.path(),
+        &stack,
+        Some("debug"),
+        &reload_config,
+    );
 
     assert_eq!(outcome.selected_marketplaces, vec!["debug".to_string()]);
     assert_eq!(outcome.upgraded_roots, Vec::new());
@@ -725,6 +738,7 @@ source = "https://github.com/example/blocked.git"
         codex_home.path(),
         &stack,
         Some(crate::OPENAI_BUNDLED_MARKETPLACE_NAME),
+        &reload_config,
     );
     assert!(outcome.errors[0].message.contains("is reserved"));
     assert!(!marketplace_install_root(codex_home.path()).exists());

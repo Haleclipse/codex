@@ -33,6 +33,7 @@ use crate::facts::TurnCodexErrorFact;
 use crate::facts::TurnProfileFact;
 use crate::facts::TurnResolvedConfigFact;
 use crate::facts::TurnTokenUsageFact;
+use crate::guardian_v2::GuardianV2Event;
 use crate::now_unix_millis;
 use crate::reducer::AnalyticsReducer;
 use crate::reducer::MAX_PLUGIN_MEASUREMENTS_PER_BATCH;
@@ -488,6 +489,12 @@ impl AnalyticsEventsClient {
 
     pub fn track_compaction(&self, event: crate::facts::CodexCompactionEvent) {
         self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::Compaction(
+            Box::new(event),
+        )));
+    }
+
+    pub fn track_guardian_v2_event(&self, event: GuardianV2Event) {
+        self.record_fact(AnalyticsFact::Custom(CustomAnalyticsFact::GuardianV2(
             Box::new(event),
         )));
     }

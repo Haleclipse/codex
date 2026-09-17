@@ -140,6 +140,42 @@ fn executed_tool_call_prompt_budget_includes_metadata_fields() -> Result<()> {
         assert_eq!(oversized_items, bounded_items);
     }
 
+    let mut items = ["exec", "wait"].map(|call_id| {
+        let mut item = ResponseItem::from(ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.to_string(),
+            output: FunctionCallOutputPayload::from_text(String::new()),
+        });
+        item.set_tool_call_cell_id("cell-\"\\");
+        item
+    });
+    items[0].append_executed_tool_calls(vec![
+        ExecutedToolCall::new(
+            "test_tool".to_string(),
+            serde_json::json!({ "payload": "x".repeat(MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES - 256) }),
+        );
+        4
+    ]);
+    items[1].mark_tool_calls_complete();
+    let expected = items.clone();
+    assert!(
+        first_executed_tool_call(&mut items[0])
+            .expect("recorded call should exist")
+            .set_tool_result_sources(ToolResultSources::new(
+                (0..MAX_TOOL_RESULT_SOURCES)
+                    .map(|index| ToolResultSource {
+                        r#type: "document".to_string(),
+                        id: format!(
+                            "R{index:0width$}",
+                            width = MAX_TOOL_RESULT_SOURCE_FIELD_BYTES - 1
+                        ),
+                    })
+                    .collect(),
+            ))
+    );
+    assert!(metadata_bytes(&items)? > MAX_EXECUTED_TOOL_CALL_METADATA_BYTES);
+    bound_executed_tool_calls_for_prompt(&mut items);
+    assert_eq!(items, expected);
+
     // Empty waits can carry only the marker; its bytes still count toward the budget.
     for metadata in [None, Some(passthrough_metadata("turn-1"))] {
         let mut item = ResponseItem::from(ResponseInputItem::FunctionCallOutput {
@@ -229,6 +265,17 @@ fn tool_call_completeness_is_host_only_and_fail_closed() -> Result<()> {
             "tool_calls_complete": true,
         }))?;
     assert_eq!(untrusted, passthrough_metadata("turn-1"));
+    for sources in [
+        serde_json::json!([{ "type": "test_resource", "id": "ATTACKER" }]),
+        serde_json::json!("parse_failed"),
+    ] {
+        let untrusted_call = serde_json::from_value::<ExecutedToolCall>(serde_json::json!({
+            "name": "test_tool",
+            "arguments": {},
+            "tool_result_sources": sources,
+        }))?;
+        assert_eq!(untrusted_call, call);
+    }
 
     let mut item = ResponseItem::from(ResponseInputItem::FunctionCallOutput {
         call_id: "call-1".to_string(),
@@ -270,5 +317,74 @@ fn tool_call_completeness_is_host_only_and_fail_closed() -> Result<()> {
             [None; 2],
         );
     }
+    Ok(())
+}
+
+#[test]
+fn tool_result_source_snapshots_replace_atomically() -> Result<()> {
+    let source = |kind: &str, id: &str| ToolResultSource {
+        r#type: kind.to_string(),
+        id: id.to_string(),
+    };
+    let mut call = ExecutedToolCall::new("test_tool".to_string(), serde_json::json!({}));
+    let mut sources = (0..MAX_TOOL_RESULT_SOURCES - 1)
+        .map(|index| source("test_resource", &format!("R{index}")))
+        .collect::<Vec<_>>();
+    sources.push(source("other_resource", "R0"));
+    sources.push(sources[0].clone());
+    let capture = ToolResultSources::new(sources.clone());
+    sources.truncate(MAX_TOOL_RESULT_SOURCES);
+    assert_eq!(
+        capture,
+        ToolResultSources(Some(ToolResultSourcesValue::Sources(sources.clone())))
+    );
+    assert!(call.set_tool_result_sources(capture));
+    sources.push(source("test_resource", "OVERFLOW"));
+    let capture = ToolResultSources::new(sources);
+    assert_eq!(capture, ToolResultSources(None));
+    assert!(!call.set_tool_result_sources(capture));
+    assert!(
+        serde_json::to_value(&call)?
+            .get("tool_result_sources")
+            .is_none()
+    );
+
+    // Measure UTF-8 bytes, and clear old evidence instead of keeping a partial replacement.
+    let field = format!(
+        "é{}",
+        "x".repeat(MAX_TOOL_RESULT_SOURCE_FIELD_BYTES - "é".len())
+    );
+    let bounded = source(&field, &field);
+    let oversized = format!("{field}x");
+    for invalid in [
+        source(&oversized, "R1"),
+        source("test_resource", &oversized),
+    ] {
+        assert!(call.set_tool_result_sources(ToolResultSources::new(vec![bounded.clone()])));
+        assert_eq!(
+            call.tool_result_sources,
+            Some(ToolResultSourcesValue::Sources(vec![bounded.clone()]))
+        );
+        let capture = ToolResultSources::new(vec![source("test_resource", "R1"), invalid]);
+        assert_eq!(capture, ToolResultSources(None));
+        assert!(!call.set_tool_result_sources(capture));
+        assert_eq!(call.tool_result_sources, None);
+    }
+
+    assert!(call.set_tool_result_sources(ToolResultSources::new(vec![bounded])));
+    assert!(call.set_tool_result_sources(ToolResultSources::parse_failed()));
+    assert_eq!(
+        serde_json::to_value(&call)?,
+        serde_json::json!({
+            "name": "test_tool",
+            "arguments": {},
+            "tool_result_sources": "parse_failed",
+        })
+    );
+    assert!(call.set_tool_result_sources(ToolResultSources::new(Vec::new())));
+    assert_eq!(
+        serde_json::to_value(&call)?["tool_result_sources"],
+        serde_json::json!([])
+    );
     Ok(())
 }

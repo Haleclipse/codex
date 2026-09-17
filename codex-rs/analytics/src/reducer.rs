@@ -113,6 +113,9 @@ use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
 use crate::facts::TurnTokenUsageFact;
+use crate::guardian_v2::GuardianV2EventKind;
+use crate::guardian_v2::GuardianV2EventParams;
+use crate::guardian_v2::GuardianV2EventRequest;
 use crate::now_unix_millis;
 use crate::now_unix_seconds;
 use crate::option_i64_to_u64;
@@ -617,6 +620,40 @@ impl AnalyticsReducer {
                 }
                 CustomAnalyticsFact::Goal(input) => {
                     self.ingest_goal(*input, out);
+                }
+                CustomAnalyticsFact::GuardianV2(input) => {
+                    let event_type = match &input.kind {
+                        GuardianV2EventKind::Classification { .. } => {
+                            "codex_guardian_v2_classification"
+                        }
+                        GuardianV2EventKind::FastDecision { .. } => {
+                            "codex_guardian_v2_fast_decision"
+                        }
+                    };
+                    if let Some((connection, thread, metadata)) =
+                        self.thread_context_or_warn(AnalyticsDropSite {
+                            event_name: event_type,
+                            thread_id: &input.thread_id,
+                            turn_id: Some(&input.turn_id),
+                            review_id: None,
+                            item_id: input.item_id.as_deref(),
+                        })
+                    {
+                        out.push(TrackEventRequest::GuardianV2(Box::new(
+                            GuardianV2EventRequest {
+                                event_type,
+                                event_params: GuardianV2EventParams {
+                                    session_id: metadata.session_id.clone(),
+                                    app_server_client: thread.app_server_client(connection),
+                                    runtime: connection.runtime.clone(),
+                                    thread_source: metadata.thread_source.clone(),
+                                    subagent_source: metadata.subagent_source.clone(),
+                                    parent_thread_id: metadata.parent_thread_id.clone(),
+                                    guardian_v2: *input,
+                                },
+                            },
+                        )));
+                    }
                 }
                 CustomAnalyticsFact::GuardianReview(input) => {
                     self.ingest_guardian_review(*input, out);
@@ -3403,6 +3440,7 @@ fn codex_turn_event_params(
         service_tier,
         approval_policy,
         approvals_reviewer,
+        guardian_v2_enabled,
         sandbox_network_access,
         collaboration_mode,
         personality,
@@ -3426,6 +3464,8 @@ fn codex_turn_event_params(
         session_id: thread_metadata.session_id.clone(),
         turn_id,
         root_turn_id: turn_metadata.root_turn_id(),
+        turn_trigger: turn_metadata.turn_trigger(),
+        codex_turn_source: turn_metadata.codex_turn_source(),
         app_server_client,
         runtime,
         submission_type,
@@ -3447,6 +3487,7 @@ fn codex_turn_event_params(
             .unwrap_or_else(|| "default".to_string()),
         approval_policy: approval_policy.to_string(),
         approvals_reviewer: approvals_reviewer.to_string(),
+        guardian_v2_enabled,
         sandbox_network_access,
         collaboration_mode: Some(collaboration_mode_mode(collaboration_mode)),
         personality: personality_mode(personality),

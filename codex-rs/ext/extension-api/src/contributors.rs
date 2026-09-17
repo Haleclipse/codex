@@ -26,6 +26,7 @@ mod world_state;
 pub use approval_review::ApprovalAssessment;
 pub use approval_review::ApprovalReviewError;
 pub use approval_review::ApprovalReviewInput;
+pub use approval_review::GuardianV2Enabled;
 pub use context::TurnContextContributionInput;
 pub use mcp::McpServerContribution;
 pub use mcp::McpServerContributionContext;

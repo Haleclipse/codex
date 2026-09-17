@@ -55,6 +55,11 @@ pub trait ToolOutput: Send {
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
         response_input_to_code_mode_result(self.to_response_item("", payload))
     }
+
+    /// Reports configured source capture only after acceptance; `None` means no capture attempt.
+    fn tool_result_sources(&self) -> Option<codex_protocol::models::ToolResultSources> {
+        None
+    }
 }
 
 impl<T> ToolOutput for Box<T>
@@ -95,6 +100,10 @@ where
 
     fn code_mode_result(&self, payload: &ToolPayload) -> JsonValue {
         (**self).code_mode_result(payload)
+    }
+
+    fn tool_result_sources(&self) -> Option<codex_protocol::models::ToolResultSources> {
+        (**self).tool_result_sources()
     }
 }
 

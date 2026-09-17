@@ -395,6 +395,72 @@ enabled = true
 }
 
 #[tokio::test]
+async fn plugin_installed_hides_bundled_sites_when_remote_sites_is_effective() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    write_curated_marketplace(
+        codex_home.path(),
+        "bundled_marketplace.json",
+        "openai-bundled",
+        Some("OpenAI Bundled"),
+        &["sites"],
+    )?;
+    write_installed_plugin(&codex_home, "openai-bundled", "sites")?;
+    write_installed_plugin(&codex_home, "openai-curated-remote", "sites")?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            r#"chatgpt_base_url = "{}/backend-api/"
+
+[features]
+plugins = true
+plugin_sharing = false
+
+[plugins."sites@openai-bundled"]
+enabled = false
+"#,
+            server.uri()
+        ),
+    )?;
+    write_remote_plugin_test_auth(codex_home.path())?;
+
+    let mut remote_sites: serde_json::Value = serde_json::from_str(&remote_installed_plugin_body(
+        "", "1.2.3", /*enabled*/ false,
+    ))?;
+    remote_sites["plugins"][0]["id"] =
+        serde_json::json!("plugins~plugin_connector_1p_689987207de08191979cf68eca2941c6");
+    remote_sites["plugins"][0]["name"] = serde_json::json!("sites");
+    remote_sites["plugins"][0]["release"]["display_name"] = serde_json::json!("Sites");
+    mount_remote_installed_plugins(&server, "GLOBAL", &serde_json::to_string(&remote_sites)?).await;
+    mount_remote_installed_plugins(&server, "WORKSPACE", empty_remote_installed_plugins_body())
+        .await;
+    mount_empty_user_installed_plugins(&server).await;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let request_id = app_server
+        .send_plugin_installed_request(PluginInstalledParams {
+            cwds: None,
+            install_suggestion_plugin_names: None,
+        })
+        .await?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, app_server.read_response(request_id)).await??;
+
+    assert_eq!(
+        response
+            .marketplaces
+            .iter()
+            .flat_map(|marketplace| &marketplace.plugins)
+            .map(|plugin| (plugin.id.as_str(), plugin.enabled))
+            .collect::<Vec<_>>(),
+        vec![("sites@openai-curated-remote", false)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn plugin_installed_prefers_api_curated_conflicts_after_switching_to_api_auth() -> Result<()>
 {
     let codex_home = TempDir::new()?;
@@ -1263,8 +1329,13 @@ async fn plugin_catalogs_skip_invalid_project_config_and_report_cwd_error() -> R
     )?;
     write_installed_plugin(&codex_home, "valid-marketplace", "sample")?;
 
+    let home = codex_home.path().to_string_lossy().into_owned();
     let mut server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
+            ("HOME", Some(home.as_str())),
+            ("USERPROFILE", Some(home.as_str())),
+        ])
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
     let invalid_cwd = AbsolutePathBuf::try_from(invalid_repo.as_path())?;
@@ -4964,8 +5035,13 @@ remote_plugin = true
     let repo_cwd = AbsolutePathBuf::try_from(repo.path())?;
     let cwds = project_enables_plugins.then(|| vec![repo_cwd]);
 
+    let home = codex_home.path().to_string_lossy().into_owned();
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
+            ("HOME", Some(home.as_str())),
+            ("USERPROFILE", Some(home.as_str())),
+        ])
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
@@ -5049,8 +5125,13 @@ async fn plugin_list_omits_featured_plugin_ids_without_chatgpt_auth() -> Result<
         .mount(&server)
         .await;
 
+    let home = codex_home.path().to_string_lossy().into_owned();
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
+            ("HOME", Some(home.as_str())),
+            ("USERPROFILE", Some(home.as_str())),
+        ])
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
@@ -5236,6 +5317,9 @@ fn cached_remote_catalog_plugin_ids(codex_home: &std::path::Path) -> Result<Vec<
     let mut plugin_ids = Vec::new();
     for entry in std::fs::read_dir(cache_dir)? {
         let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
         let cached_catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
         let Some(plugins) = cached_catalog["plugins"].as_array() else {
             continue;
@@ -5258,6 +5342,9 @@ fn rewrite_cached_remote_catalog_fetched_at(
     let cache_dir = codex_home.join("cache/remote_plugin_catalog");
     for entry in std::fs::read_dir(cache_dir)? {
         let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
         let mut cached_catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         cached_catalog["fetched_at"] = serde_json::json!(fetched_at);
         std::fs::write(path, serde_json::to_vec_pretty(&cached_catalog)?)?;

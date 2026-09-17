@@ -2,13 +2,15 @@
 //!
 //! The background scan sums regular-file lengths, without reading file contents or
 //! following symlinks. Incomplete scans emit no samples, and shutdown cancels the scan.
+//! The compression tag reflects the effective startup config, not compression completion.
 
+use codex_core::config::Config;
+use codex_features::Feature;
 use codex_otel::MetricsClient;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::SESSIONS_SUBDIR;
 use std::io;
 use std::path::Path;
-use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -25,10 +27,15 @@ const SIZE_BYTES_BOUNDARIES: &[f64] = &[
 ];
 
 pub(crate) fn spawn(
-    codex_home: PathBuf,
+    config: &Config,
     metrics: MetricsClient,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
+    let codex_home = config.codex_home.to_path_buf();
+    let compression_enabled = config
+        .features
+        .enabled(Feature::LocalThreadStoreCompression)
+        .to_string();
     tokio::task::spawn_blocking(move || {
         let sizes = match directory_sizes(&codex_home, &shutdown) {
             Ok(sizes) => sizes,
@@ -46,7 +53,10 @@ pub(crate) fn spawn(
                 SIZE_BYTES_METRIC,
                 i64::try_from(bytes).unwrap_or(i64::MAX),
                 SIZE_BYTES_BOUNDARIES,
-                &[("directory", directory)],
+                &[
+                    ("directory", directory),
+                    ("compression_enabled", compression_enabled.as_str()),
+                ],
             );
         }
     })

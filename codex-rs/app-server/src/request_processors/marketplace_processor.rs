@@ -1,4 +1,5 @@
 use super::*;
+use crate::plugin_config_reload;
 
 #[derive(Clone)]
 pub(crate) struct MarketplaceRequestProcessor {
@@ -78,11 +79,14 @@ impl MarketplaceRequestProcessor {
         let plugins_manager = self.thread_manager.plugins_manager();
         let MarketplaceUpgradeParams { marketplace_name } = params;
         let plugins_input = config.plugins_config_input();
+        let reload_config =
+            plugin_config_reload::for_cwd(self.config_manager.clone(), config.cwd.clone());
 
         let outcome = tokio::task::spawn_blocking(move || {
             plugins_manager.upgrade_configured_marketplaces_for_config(
                 &plugins_input,
                 marketplace_name.as_deref(),
+                &reload_config,
             )
         })
         .await

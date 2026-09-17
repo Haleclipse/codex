@@ -334,6 +334,7 @@ fn executor_hook_sources_for_step(step_context: &StepContext) -> Vec<ExecutorPlu
                         app_tool_policy
                             .policy(AppToolPolicyInput {
                                 connector_id: tool_info.connector_id.as_deref(),
+                                link_id: None,
                                 tool_name: &tool_info.tool.name,
                                 tool_title: tool_info.tool.title.as_deref(),
                                 destructive_hint: annotations
@@ -769,21 +770,10 @@ pub(crate) async fn drain_async_hook_results(
             .collect::<Vec<_>>();
 
         if before_user_prompt {
-            // A fresh user turn owns its root; automatic turns only inherit one.
-            let current_turn_id = Some(turn_context.sub_id.as_str());
-            if !additional_contexts.is_empty()
-                && result.turn_id.as_deref() != current_turn_id
-                && turn_context.turn_metadata_state.root_turn_id().as_deref() != current_turn_id
-            {
-                turn_context.turn_metadata_state.mark_root_turn_ambiguous();
-            }
             record_additional_contexts(sess, turn_context, additional_contexts).await;
         } else if !additional_contexts.is_empty() {
             let _ = sess
-                .inject_hook_context_if_running(
-                    additional_context_messages(additional_contexts),
-                    result.turn_id.as_deref(),
-                )
+                .inject_hook_context_if_running(additional_context_messages(additional_contexts))
                 .await;
         }
 
@@ -854,6 +844,10 @@ fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<Response
         .collect()
 }
 
+fn should_emit_hook_notification(run: &HookRunSummary) -> bool {
+    !run.builtin && run.execution_mode == HookExecutionMode::Sync
+}
+
 async fn emit_hook_started_events(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -861,7 +855,7 @@ async fn emit_hook_started_events(
 ) {
     for run in preview_runs
         .into_iter()
-        .filter(|run| run.execution_mode == HookExecutionMode::Sync)
+        .filter(should_emit_hook_notification)
     {
         sess.send_event(
             turn_context,
@@ -899,7 +893,7 @@ pub(crate) async fn emit_hook_completed_events(
     for completed in completed_events {
         emit_hook_completed_metrics(turn_context, &completed);
         track_hook_completed_analytics(sess, turn_context, &completed);
-        if completed.run.execution_mode == HookExecutionMode::Sync {
+        if should_emit_hook_notification(&completed.run) {
             sess.send_event(turn_context, EventMsg::HookCompleted(completed))
                 .await;
         }
@@ -1046,6 +1040,12 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use codex_otel::HOOK_RUN_DURATION_METRIC;
+    use codex_otel::HOOK_RUN_METRIC;
+    use codex_otel::MetricsClient;
+    use codex_otel::MetricsConfig;
     use codex_protocol::models::ContentItem;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;
@@ -1053,6 +1053,11 @@ mod tests {
     use codex_protocol::protocol::HookRunStatus;
     use codex_protocol::protocol::HookScope;
     use codex_protocol::protocol::HookSource;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::HistogramDataPoint;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    use opentelemetry_sdk::metrics::data::SumDataPoint;
     use pretty_assertions::assert_eq;
 
     use super::additional_context_messages;
@@ -1104,18 +1109,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_lifecycle_notifications_only_report_synchronous_runs() {
-        let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    async fn hook_lifecycle_notifications_hide_builtin_and_async_runs_but_preserve_metrics() {
+        let metrics = MetricsClient::new(
+            MetricsConfig::in_memory(
+                "test",
+                "codex-core",
+                env!("CARGO_PKG_VERSION"),
+                InMemoryMetricExporter::default(),
+            )
+            .with_runtime_reader(),
+        )
+        .expect("in-memory metrics client");
+        let (session, mut turn_context, events) = make_session_and_context_with_rx().await;
+        let turn_context_mut = Arc::get_mut(&mut turn_context).expect("single turn context ref");
+        turn_context_mut.session_telemetry = turn_context_mut
+            .session_telemetry
+            .clone()
+            .with_metrics(metrics.clone());
         let mut synchronous_run = sample_hook_run(HookRunStatus::Running, HookSource::User);
         synchronous_run.id = "synchronous-hook".to_string();
         let mut asynchronous_run = synchronous_run.clone();
         asynchronous_run.id = "asynchronous-hook".to_string();
         asynchronous_run.execution_mode = HookExecutionMode::Async;
+        let mut builtin_run = synchronous_run.clone();
+        builtin_run.id = "builtin-hook".to_string();
+        builtin_run.builtin = true;
+        builtin_run.source = HookSource::Plugin;
+        builtin_run.handler_type = HookHandlerType::McpTool;
 
         emit_hook_started_events(
             &session,
             &turn_context,
-            vec![asynchronous_run.clone(), synchronous_run.clone()],
+            vec![
+                builtin_run.clone(),
+                asynchronous_run.clone(),
+                synchronous_run.clone(),
+            ],
         )
         .await;
 
@@ -1127,12 +1156,17 @@ mod tests {
         ));
         assert!(events.try_recv().is_err());
 
+        builtin_run.status = HookRunStatus::Completed;
         asynchronous_run.status = HookRunStatus::Completed;
         synchronous_run.status = HookRunStatus::Completed;
         emit_hook_completed_events(
             &session,
             &turn_context,
             vec![
+                HookCompletedEvent {
+                    turn_id: Some(turn_context.sub_id.clone()),
+                    run: builtin_run,
+                },
                 HookCompletedEvent {
                     turn_id: Some(turn_context.sub_id.clone()),
                     run: asynchronous_run,
@@ -1152,6 +1186,33 @@ mod tests {
                 if event.run.id == synchronous_run.id
         ));
         assert!(events.try_recv().is_err());
+
+        let snapshot = metrics.snapshot().expect("metrics snapshot");
+        let counter = snapshot
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == HOOK_RUN_METRIC)
+            .expect("hook run counter");
+        let AggregatedMetrics::U64(MetricData::Sum(sum)) = counter.data() else {
+            panic!("expected hook run counter");
+        };
+        assert_eq!(sum.data_points().map(SumDataPoint::value).sum::<u64>(), 3);
+
+        let duration = snapshot
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == HOOK_RUN_DURATION_METRIC)
+            .expect("hook run duration histogram");
+        let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = duration.data() else {
+            panic!("expected hook run duration histogram");
+        };
+        assert_eq!(
+            histogram
+                .data_points()
+                .map(HistogramDataPoint::sum)
+                .sum::<f64>(),
+            81.0,
+        );
     }
 
     #[tokio::test]
@@ -1247,6 +1308,7 @@ mod tests {
             event_name: HookEventName::Stop,
             handler_type: HookHandlerType::Command,
             execution_mode: HookExecutionMode::Sync,
+            builtin: false,
             scope: HookScope::Turn,
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source,

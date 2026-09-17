@@ -73,7 +73,7 @@ impl App {
         {
             return self.working_directory_error("Permission profile cannot be preserved by /cd.");
         }
-        self.apply_runtime_policy_overrides(&mut config);
+        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All);
         if self.runtime_permission_profile_override.is_some() {
             let reviewer = self.config.approvals_reviewer;
             let reviewers = &config.config_layer_stack.requirements().approvals_reviewer;
@@ -83,7 +83,9 @@ impl App {
             config.approvals_reviewer = reviewer;
         }
         let actual = config.permissions.approval_policy.value();
-        let approval = self.runtime_approval_policy_override;
+        let approval = self
+            .runtime_approval_policy_override
+            .map(RuntimeApprovalPolicyOverride::policy);
         let profile = self.runtime_permission_profile_override.as_ref();
         if approval.is_some_and(|p| actual != p.to_core())
             || profile.is_some_and(|profile| !profile.matches_config(&config))

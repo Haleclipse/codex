@@ -95,6 +95,7 @@ pub(super) fn completed_item(
                 phase: event.phase.clone(),
                 memory_citation: event.memory_citation.clone(),
                 delivery: event.delivery,
+                questions: event.questions.clone(),
             }),
             None,
         )),

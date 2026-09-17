@@ -24,6 +24,7 @@ pub(crate) fn test_mcp_config(codex_home: PathBuf) -> McpConfig {
         apps_mcp_product_sku: None,
         codex_home,
         mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode::default(),
+        oauth_refresh_mode: McpOAuthRefreshMode::Legacy,
         auth_keyring_backend_kind: AuthKeyringBackendKind::default(),
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,

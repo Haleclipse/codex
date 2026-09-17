@@ -221,7 +221,7 @@ Example with notification opt-out:
 - `thread/revert` — replace a loaded paginated thread's durable history with the prefix strictly before `beforeTurnId` while preserving its thread id. The operation interrupts an active turn if needed, leaves older rollout files immutable, reloads the thread, returns updated thread metadata with empty `turns` plus pagination cursors, and emits `thread/reverted`. It does not revert local file changes. Parent-owned Multi-Agent V2 subagents reject direct revert requests.
 - `turn/start` — add user input or a named standalone function-call output to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. For standalone outputs, provide `toolOutput` with an empty `input` array. Optional `turnTrigger` classifies who or what started a new turn and is sent as `turn_trigger` in Responses request metadata; it is ignored if the request steers an active turn. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Experimental `runtimeWorkspaceRoots` supplies the default roots for newly resolved environment selections. Explicit `environments[].runtimeWorkspaceRoots` override that fallback with environment-native absolute paths. Prefer experimental `permissions` profile selection by id for permission overrides; the legacy `sandboxPolicy` field is still accepted but cannot be combined with `permissions`. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode". Deprecated experimental `multiAgentMode` is ignored; Ultra reasoning effort selects proactive behavior. Parent-owned Multi-Agent V2 subagents reject direct turns.
 - `thread/inject_items` — append raw Responses API items to a loaded thread’s model-visible history without starting a turn; returns `{}` on success. Parent-owned Multi-Agent V2 subagents reject direct item injection.
-- `turn/settings/update` — experimental; publish a narrow model-settings patch to the exact live task identified by `threadId` and `turnId`, regardless of task kind. Requires `step_model_switching`; returns `status: "applied"` or `status: "targetUnavailable"`, or a request error if rejected. Future-thread settings and already captured steps are unchanged. Parent-owned Multi-Agent V2 subagents reject direct settings updates.
+- `turn/settings/update` — experimental; publish a reviewer or model-settings patch to the exact live task identified by `threadId` and `turnId`, regardless of task kind. Model-settings updates require `step_model_switching`; reviewer-only updates do not. Returns `status: "applied"` or `status: "targetUnavailable"`, or a request error if rejected. Future-thread settings and already captured steps are unchanged. Parent-owned Multi-Agent V2 subagents reject direct settings updates.
 - `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. `clientUserMessageId` is optional; when supplied, the corresponding `userMessage` item echoes it as `clientId`. Review and manual compaction turns reject `turn/steer`. Parent-owned Multi-Agent V2 subagents reject direct steering.
 - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`. Also available for parent-owned Multi-Agent V2 subagents.
 - `thread/realtime/start` — start a thread-scoped realtime session (experimental); pass `outputModality: "text"` or `outputModality: "audio"` to choose model output, optionally pass `model` and `version` to override configured realtime selection for this session only, pass `includeStartupContext: false` to omit Codex's generated startup context, and optionally pass `initialItems` to seed V3 with complete role-bearing text messages at session creation. Pass `realtimeStartInstructions` and `realtimeEndInstructions` to control the developer instructions given to the backing Codex model when this session starts and ends. Version `"v1"` uses legacy Bidi `conversation.handoff.*`, `"v2"` uses the Realtime Voice API, and `"v3"` preserves V1 Codex Voice behavior while using Frameless Bidi `delegation.*`. For V3 automatic Codex text, `codexResponseHandoffMode` accepts `"thinking"` (the default; all output uses channel-less thinking appends), `"commentary"` (all output uses the commentary channel), or `"bemTags"` (the raw BEM envelope selects the API channel: BEM `analysis` and `commentary` use `commentary`, while BEM `final` and unparsable output use `speakable`). The BEM envelope remains in the appended text for the frontend model to interpret. V1 and V2 ignore this setting. For V3, pass `delegationAckFiller: false` to suppress the Realtime API's delegation acknowledgement filler or `true` to restore it; omitting the field preserves the Realtime API's default. V1 and V2 ignore `delegationAckFiller`. V3 handoffs do not prepend the legacy `"Agent Final Message"` label. Pass `clientManagedHandoffs: true` to disable automatic Codex response delivery so only the client's explicit append calls produce handoffs. Pass `codexResponsesAsItems: true` to send automatic Codex responses as realtime conversation items instead, and optionally pass `codexResponseItemPrefix` to prepend experiment instructions to those items. Returns `{}` and streams `thread/realtime/*` notifications. Omit `transport` for the websocket transport, or pass `{ "type": "webrtc", "sdp": "..." }` to create a Bidi WebRTC session from a browser-generated SDP offer; the remote answer SDP is emitted as `thread/realtime/sdp`. Conversation `version: "v2"` requests remain unsupported for WebRTC. Parent-owned Multi-Agent V2 subagents reject this request.
@@ -271,6 +271,7 @@ Example with notification opt-out:
 - `plugin/list` — list discovered plugin marketplaces and plugin state, including effective marketplace install/auth policy metadata, nullable remote install-policy provenance in `installPolicySource` (`WORKSPACE_SETTING` or `IMPLICIT_CANONICAL_APP`), the remote marketplace `version` and locally materialized `localVersion` when available, plugin `availability` (`AVAILABLE` by default or `DISABLED_BY_ADMIN` for remote plugins blocked upstream), fail-open `marketplaceLoadErrors` entries for marketplace files that could not be parsed or loaded, and best-effort `featuredPluginIds` for the official curated marketplace. Every `PluginSummary` returned by plugin list, installed, read, and share-list methods includes nullable `disabledReason` and `eligiblePlanTypes`, preserving plugin-service availability metadata and raw plan identifiers for remote plugins while returning `null` for local plugins or older remote responses. The same summaries include `mustShowInstallationInterstitial`: remote service values preserve `true` or `false`, while local plugins and remote responses that omit the policy return `null`. Clients should fail closed when the value is `null`. Clients can explicitly request the remote `workspace-directory`, `shared-with-me`, or `created-by-me-remote` marketplace kinds. Set `forceRefetch: true` to bypass TTL-backed remote catalog caches for the requested marketplaces and wait for fresh data; cache entries are replaced only after a successful fetch. When local marketplaces are included, the request also waits for configured plugin caches to reconcile before marketplace summaries are returned. At app-server startup, existing cached catalogs remain available to `plugin/list` while they refresh in the background. `interface.category` uses the marketplace category when present; otherwise it falls back to the plugin manifest category (**under development; do not call from production clients yet**).
 - `plugin/search` — search the remote plugin service directly and combine matching local marketplace plugins into the first result page. Accepts a `searchTerm`, optional `global`, `workspace`, or `personal` scope, optional `cwds` for discovering repo marketplaces, and optional `cursor` and `limit`; `personal` searches user-owned plugins. Local matching uses plugin names, display names, and keywords, with case- and punctuation-insensitive relevance ordering. Global searches include applicable built-in local plugins, personal searches include other local plugins, workspace searches remain remote-only, and an omitted scope includes all local plugins. When the remote global catalog is active, it is authoritative and replaces the local curated marketplace. Local results remain available with API-key authentication and when `remote_plugin` is disabled; in the latter case, omitted-scope and explicit workspace searches can still query the remote workspace catalog, while explicit global and personal searches do not query plugin-service. The first page includes at most 100 local matches and can exceed `limit`; subsequent pages contain remote results only, and the upstream pagination token is passed through unchanged as `nextCursor`. Local and remote copies are deduplicated by shared remote identity, with the remote summary retaining local installed state. Every result always explicitly returns `plugin.enabled: false`, including enabled local plugins, deduplicated plugins, and later remote-only pages; search reports discovery metadata rather than effective activation. Use `plugin/list` or `plugin/read` to determine whether a plugin is actually enabled. When `plugin_sharing` is disabled, shared/private workspace results are omitted after the remote page is fetched (**under development; do not call from production clients yet**).
 - `plugin/installed` — list installed plugin rows plus any explicitly requested local install-suggestion plugin names, without fetching the broader remote catalog. Remote rows include nullable `installPolicySource` and `installedAt`, the backend installation timestamp in Unix seconds. `installedAt` is also returned by `plugin/list`, `plugin/read`, and `plugin/share/list`; it is `null` for local plugins, uninstalled plugins, plugins installed by default, and older backend responses that do not include an installation timestamp. Mention surfaces can use this narrower view when they need plugin mention payloads rather than plugin-page discovery data (**under development; do not call from production clients yet**).
+- `plugin/reconcile` — sync installed remote plugin bundles to match the latest plugin-service state. Blocks until synchronization and required hook updates finish, then returns `changedPlugins` with `hasMcps`, `hasApps`, `hasHooks`, and `hasSkills` refresh hints, including removals. Callers refresh MCP and Apps runtimes; plugin skills are picked up automatically on subsequent turns.
 - `plugin/read` — read one plugin by `marketplacePath` plus `pluginName`, returning marketplace info, a list-style `summary`, manifest descriptions/interface metadata, and bundled skills/hooks/apps/MCP server names. Remote plugin details can include scheduled task summaries from the catalog; `scheduledTasks: null` means the metadata is unavailable, while an empty array means the catalog found no scheduled tasks. Remote plugin details expose the canonical `shareUrl` supplied by the remote catalog when available; it is `null` for local plugins or when the catalog omits it. This field is separate from `summary.shareContext`, which continues to describe user and workspace sharing state. For owned workspace plugins, `summary.shareContext.canPublishToWorkspace` reports whether the current user may add the plugin to the workspace directory; `plugin/share/save` returns the same capability after creating or updating a share, and clients should fail closed when either value is `null`. Remote skill interfaces expose `iconSmallUrl` and `iconLargeUrl` when the catalog supplies icon URLs. Returned plugin skills include their current `enabled` state after local config filtering; bundled hooks are returned as lightweight declaration summaries keyed for correlation with `hooks/list`. Use `plugin/install`'s `appsNeedingAuth` to drive post-install authentication and `app/list`'s `isAccessible` to determine current connector accessibility (**under development; do not call from production clients yet**).
 - `plugin/skill/read` — read remote plugin skill markdown on demand by `remoteMarketplaceName`, `remotePluginId`, and `skillName`. This lets clients preview uninstalled remote plugin skills without downloading the plugin bundle.
 - `skills/changed` — notification emitted when watched local skill files change.
@@ -296,7 +297,7 @@ Example with notification opt-out:
 - `mcpServer/event/stream/stop` (experimental) — stop the caller's event subscription by `subscriptionId`.
 - `mcpServer/tool/call` — call a tool on a thread's configured MCP server by `threadId`, `server`, `tool`, optional `arguments`, and optional `_meta`, returning the MCP tool result. Parent-owned Multi-Agent V2 subagents reject direct tool calls.
 - `windowsSandbox/setupStart` — start Windows sandbox setup for the selected mode (`elevated` or `unelevated`); accepts an optional absolute `cwd` to target setup for a specific workspace, returns `{ started: true }` immediately, and later emits `windowsSandbox/setupCompleted`.
-- `feedback/upload` — submit a feedback report (classification + optional reason/logs, conversation_id, and optional `extraLogFiles` attachments array); returns the tracking thread id.
+- `feedback/upload` — submit a feedback report (classification + optional reason/logs, conversation_id, and optional `extraLogFiles` attachments array); returns the tracking thread id. With logs enabled, includes bounded recent failed Guardian review actions, decisions, and reviewer history from the reported thread and its descendants, linked to the reviewed turn and target item where available. Rollout selection preserves the reported thread and prioritizes children with retained failed reviews before newer children, including each selected thread's available Guardian trunk rollout. `feedback-thread-index.json` lists selected filenames and bounded omission details; it describes selection, not successful delivery. Failed-review captures are process-local, so missing evidence does not establish that no denial occurred.
 - `config/read` — fetch the runtime-effective config after resolving config layering and managed requirements, including opaque `desktop` values stored in `config.toml`. When configured, the `packagedDefaults` layer has the lowest precedence.
 - `externalAgentConfig/detect` — detect migratable external-agent artifacts with `includeHome`, optional `cwds`, and an optional `migrationSource` selector. Omitted, `null`, or unrecognized migration-source values retain the default behavior. The deprecated optional `source` field remains accepted for compatibility but does not select the migration source. Each detected item includes `cwd` (`null` for home), and multi-item migrations may additionally include structured `details` with plugin ids, skill names, memory, session metadata, or other artifact names. The response also includes connector candidates inferred from detected source sessions, with a normalized display `name`, the number of detected sessions that used the connector, and the source metadata field used for detection.
 - `externalAgentConfig/import` — apply selected external-agent migration items by passing explicit `migrationItems` with `cwd` (`null` for home) and any `details` returned by detect. Pass the same optional `migrationSource` used for detection so the server reads from the matching source; omitted, `null`, or unrecognized values retain the default behavior. The optional `source` identifies the product that initiated the import, while the optional opaque `providerId` attributes analytics to the provider selected by that product without affecting migration-source selection. The response acknowledges the synchronous import phase with an `importId`. Expected migration failures are reported as per-item failures rather than JSON-RPC errors, so the server still returns that `importId` and emits `externalAgentConfig/import/completed` with the same ID once all synchronous and background work finishes. The completion notification contains type-level `itemTypeResults` with successes and failures, including raw failure messages for the client to report separately.
@@ -317,6 +318,17 @@ Plugin activation and MCP settings use the existing merged configuration, includ
 system settings and trusted project overrides. `skills/list` resolves plugin skills
 independently for each requested working directory.
 
+Sites migration persists an account/backend-scoped list of excluded bundled plugin IDs, not
+remote installed metadata. Once remote Sites is installed and locally loadable, the shared
+marketplace and runtime loaders exclude `sites@openai-bundled`. The exclusion survives restarts;
+normal remote refresh remains authoritative and clears it when remote Sites is unavailable.
+The bundled files and preference remain available for account changes or a missing replacement.
+Direct local reads and installs of excluded bundled Sites return the existing plugin-not-found error.
+Plugin Service implicitly installs eligible Sites; migration does not call install, ensure, enable,
+or disable. Remote enablement stays authoritative, including when bundled preferences differ.
+A successful check that remote Sites is unavailable is throttled for 60 seconds. Catalog requests
+then skip blocking bundle synchronization; normal background synchronization continues unchanged.
+
 For local `plugin/list` and `plugin/installed` results, each requested cwd supplies
 its effective plugin state and plugin feature flag. When a plugin appears in multiple
 contexts, the first source wins and installed/enabled state is merged across contexts.
@@ -327,14 +339,28 @@ sources before returning; ordinary listing schedules the same work in the backgr
 Remote catalog settings and feature gating remain request-wide rather than being
 selected from the requested repos. Search continues to report `enabled: false`.
 
-Marketplace definitions can come from system configuration, but configured Git
-marketplaces currently require an existing downloaded snapshot.
+Marketplace definitions can come from system configuration. Startup synchronization
+and `marketplace/upgrade` download or update configured Git marketplaces using the
+merged source, ref, and sparse-path settings. Snapshot metadata stays with the
+downloaded files; configuration is not copied into the user layer. Pure catalog
+listing does not wait for missing snapshots to download.
+Activation reloads configuration with the operation's original load settings and
+rolls back if the marketplace definition changed or the reload fails. User files
+ignored at startup remain ignored during this check.
 
 `marketplace/remove` rejects removal when the marketplace name is defined in another
 enabled layer of the operation's loaded config stack. Otherwise it removes the
 snapshot and any base-user entry; a base-user entry is not required for cleanup.
 
 ### Example: Start or resume a thread
+
+The shared `Thread` object includes nullable `model` and `reasoningEffort` fields,
+including in `thread/read`, `thread/list`, and `thread/started`. Loaded threads report
+their current configured settings; unloaded threads report the latest persisted
+values. Unavailable legacy or filesystem-only values remain `null`, and an unset
+reasoning effort is also `null`. These fields are not per-turn execution telemetry.
+Use `thread/read` or `thread/list` to inspect them without resuming a thread,
+subscribing to it, or dispatching queued work or goal continuations.
 
 Start a fresh thread when you need a new Codex conversation.
 
@@ -1339,8 +1365,8 @@ Use `thread/backgroundTerminals/terminate` to terminate one running background t
 
 ### Example: Update a running turn's settings (experimental)
 
-Enable `capabilities.experimentalApi` and the disabled-by-default `step_model_switching`
-feature. Supply the exact turn ID from `turn/start`, `turn/started`, `thread/read` with
+Enable `capabilities.experimentalApi`; model-settings updates also require the
+disabled-by-default `step_model_switching` feature. Supply the exact turn ID from `turn/start`, `turn/started`, `thread/read` with
 `includeTurns: true`, or `thread/turns/list`:
 
 ```json
@@ -1350,9 +1376,20 @@ feature. Supply the exact turn ID from `turn/start`, `turn/started`, `thread/rea
 { "id": 42, "result": { "status": "applied" } }
 ```
 
-Only `model`, `effort`, `summary`, and `serviceTier` may change. Unknown fields are
+Only `approvalsReviewer`, `model`, `effort`, `summary`, and `serviceTier` may change. Unknown fields are
 rejected. Omitted fields leave settings unchanged; `serviceTier: null` clears the
 requested tier, while `null` for model, effort, or summary leaves it unchanged.
+
+A reviewer-only update does not require `step_model_switching`. Set
+`approvalsReviewer` to `"auto_review"` or `"user"` to change review routing for
+subsequently captured steps and newly initiated background approval requests.
+Omission or `null` leaves the reviewer unchanged. Managed reviewer restrictions
+and model-required auto review still apply. Existing captured steps and pending
+approvals keep their original reviewer; this does not approve a pending request,
+change sandbox permissions, or update child sessions. App/account-specific
+reviewer overrides still take precedence. Future-thread defaults remain separate.
+For compatibility, MCP keeps following refreshed thread defaults until an explicit
+live reviewer update overrides them for that turn.
 
 The response waits for core: `status: "applied"` means a settings snapshot was published
 for subsequent captures, even if its values were unchanged. Normal defaults and tier
@@ -1709,6 +1746,8 @@ Event notifications are the server-initiated event stream for thread lifecycles,
 
 Thread realtime publishes thread-scoped timeline item lifecycle notifications for paginated threads alongside its existing realtime notifications. Completed timeline items are durably interleaved with ordinary turn items by `thread/timeline/list`. Neither surface changes `ThreadItem`, `thread/read`, `thread/resume`, or `thread/fork`; clients ignore notification methods they do not recognize.
 
+Core records transcript segments, session boundaries, and backing-agent artifact promotions through its injected thread store, even without an app-server event listener. Presentation selection uses the same rules for every Core host. App-server translates Core's history events into the notifications below; it does not append those items again. Recording remains limited to paginated threads. A completed notification follows acceptance by the thread store, not an additional flush or power-loss durability barrier.
+
 Each realtime item has an `id`, a `realtimeSessionId`, and one of four types: `realtimeSessionStarted`, `transcriptSegment`, `bemItemPromoted`, or `realtimeSessionClosed`. A `bemItemPromoted` item references an existing backing-agent item by `turnId` and `itemId`; its `presentation` is `wholeItem`, `inlineMarkdown`, or `inlineVisualization` with an `index`.
 
 Recoverable configuration and initialization warnings use the existing `configWarning` notification: `{ summary, details?, path?, range? }`. App-server may emit it during initialization for config parsing and related setup diagnostics, or to the requesting connection during `thread/start` when that thread's exec-policy rules fail to parse.
@@ -1785,7 +1824,7 @@ The app-server streams JSON-RPC notifications while a turn is running. Each turn
 
 - `userMessage` — `{id, clientId, content}` where `clientId` is the optional `clientUserMessageId` supplied to `turn/start` or `turn/steer`, and `content` is a list of user inputs (`text`, `image`, `localImage`, `audio`, or `localAudio`).
 - `functionCallOutput` — `{id, name, namespace, output}` for a standalone function-call output without a `call_id`. `namespace` is nullable, and `output` is either a string or structured content items. Clients decide whether to render these tool-authority items; ordinary paired function-call outputs are not emitted separately.
-- `agentMessage` — `{id, text, phase, memoryCitation, delivery}` containing the accumulated agent reply. `delivery: "async"` identifies a user-visible message sent without ending the current turn; ordinary agent messages have `delivery: null`.
+- `agentMessage` — `{id, text, phase, memoryCitation, delivery, questions}` containing the accumulated agent reply. `delivery: "async"` identifies a user-visible message sent without ending the current turn. Async user-input requests also provide `questions`, an ordered array of `{title, options}`; `options: null` means free text only. `text` remains a readable fallback. Replies arrive as ordinary user messages. Ordinary agent messages have `delivery: null` and `questions: null`.
 - `plan` — `{id, text}` emitted for plan-mode turns; plan text can stream via `item/plan/delta` (experimental).
 - `reasoning` — `{id, summary, content}` where `summary` holds streamed reasoning summaries (applicable for most OpenAI models) and `content` holds raw reasoning blocks (applicable for e.g. open source models).
 - `commandExecution` — `{id, pluginId?, scriptPath?, command, cwd, status, commandActions, aggregatedOutput?, exitCode?, durationMs?}` for sandboxed commands; `pluginId` is present only for commands attributed to a trusted first-party plugin, newly attributed items also include `scriptPath` as a safe `/`-separated path relative to the trusted plugin root, older history may omit `scriptPath`, and `status` is `inProgress`, `completed`, `failed`, or `declined`. Ordinary execution items and their replay expose `command` and `commandActions` as redacted display values, not executable commands.
@@ -1883,6 +1922,18 @@ explanation. Misalignment explanation and steering details are delivered live bu
 persisted rollout errors, so unavailable details after a restart remain a terminal block.
 
 ## Approvals
+
+In User approval mode (`approvalsReviewer: "user"`), async Guardian scoring and
+prewarming are skipped, and ordinary `node_repl.js` execution confirmations are
+accepted automatically. Separate sensitive-action checks and requests for user
+input keep their existing behavior. Approve for me and Full Access are unchanged.
+
+Full Access (`approvalPolicy: "never"` with unrestricted selected environments)
+skips Guardian, including background scoring. Confirmation-only MCP approvals,
+including strict or sensitive CUA requests, are accepted. Strict responses retain
+`approvals_reviewer: "auto_review"` for client compatibility, without a model review.
+Restricted or unresolved environments, explicit client denials, and forms requiring
+user input keep their existing behavior. Cancellation still stops the request.
 
 Certain actions (shell commands or modifying files) may require explicit user approval depending on the user's config. When `turn/start` is used, the app-server drives an approval flow by sending a server-initiated JSON-RPC request to the client. The client must respond to tell Codex whether to proceed. UIs should present these requests inline with the active turn so users can review the proposed command or diff before choosing.
 
@@ -2412,6 +2463,11 @@ default_tools_approval_mode = "approve"
 Setting the app value to `"user"` routes its approval prompts to the user
 instead of Guardian; setting it to `"auto_review"` opts that app into Guardian
 review when allowed by configuration requirements.
+
+Per-account approval configuration uses `apps.<app_id>.links.<link_id>` with
+`approvals_reviewer` and `default_tools_approval_mode`. Like `tools`, `links` is
+an optional section: `config/read` returns `null` when it is absent, `{}` when
+it is explicitly empty, and a map keyed by link ID when accounts are configured.
 
 Use `apps._default.default_tools_approval_mode` to set the approval mode for
 tools without a per-app or per-tool override. Supported values are `"auto"`,

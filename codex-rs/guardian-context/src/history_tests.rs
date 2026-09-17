@@ -19,6 +19,19 @@ fn tool(text: &str) -> ResponseItem {
 }
 
 #[test]
+fn rollback_keeps_the_earlier_prefix_or_clears_an_evicted_boundary() {
+    let items = [message("keep"), message("roll back"), tool("later")];
+    let mut history = TranscriptHistory::default();
+    history.reset(items.iter());
+    let generation = history.generation();
+    history.truncate_before(&items[1]);
+    assert_eq!(history.items().collect::<Vec<_>>(), vec![&items[0]]);
+    assert!(history.generation() > generation);
+    history.truncate_before(&items[1]);
+    assert_eq!(history.items().count(), 0);
+}
+
+#[test]
 fn each_kind_evicts_its_own_oldest_entries_without_reordering() {
     let users = [message("first"), message("second"), message("third")];
     let tools: Vec<_> = (0..MAX_ITEMS_PER_KIND)

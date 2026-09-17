@@ -26,6 +26,7 @@ use codex_protocol::approvals::GuardianAssessmentDecisionSource as CoreGuardianA
 use codex_protocol::approvals::GuardianCommandSource as CoreGuardianCommandSource;
 use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
 pub use codex_protocol::items::AgentMessageDelivery;
+pub use codex_protocol::items::AsyncUserInputQuestion;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::CollabAgentToolCallStatus as CoreCollabAgentToolCallStatus;
 use codex_protocol::items::CommandExecutionStatus as CoreCommandExecutionStatus;
@@ -255,6 +256,8 @@ pub enum ThreadItem {
         memory_citation: Option<MemoryCitation>,
         #[serde(default)]
         delivery: Option<AgentMessageDelivery>,
+        #[serde(default)]
+        questions: Option<Vec<AsyncUserInputQuestion>>,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -881,6 +884,7 @@ impl From<CoreTurnItem> for ThreadItem {
                     phase: agent.phase,
                     memory_citation: agent.memory_citation.map(Into::into),
                     delivery: agent.delivery,
+                    questions: agent.questions,
                 }
             }
             CoreTurnItem::FunctionCallOutput(output) => ThreadItem::FunctionCallOutput {

@@ -16,6 +16,7 @@ use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EnvironmentConnectionEvent;
@@ -701,6 +702,7 @@ impl ThreadEnvironments {
                 environment.selection.config,
                 EnvironmentConfigState::Failed(_)
             ) {
+                environments.push(TurnEnvironmentState::Failed);
                 continue;
             }
             let pending = matches!(
@@ -720,9 +722,7 @@ impl ThreadEnvironments {
                     Err(error) => Err(error),
                 })
             };
-            if let Some(environment) = TurnEnvironmentState::from_resolution(starting, resolved) {
-                environments.push(environment);
-            }
+            environments.push(TurnEnvironmentState::from_resolution(starting, resolved));
         }
         TurnEnvironmentSnapshot { environments }
     }
@@ -736,18 +736,23 @@ impl ThreadEnvironments {
 pub(crate) enum TurnEnvironmentState {
     Ready(TurnEnvironment),
     Starting(StartingTurnEnvironment),
+    /// Unavailable for execution, but still selected when evaluating permissions.
+    Failed,
 }
 
 impl TurnEnvironmentState {
     fn from_resolution(
         starting: StartingTurnEnvironment,
         resolved: Option<TurnEnvironmentResult>,
-    ) -> Option<Self> {
+    ) -> Self {
         match resolved {
             Some(Ok(environment)) => {
                 let mut selection = starting.selection;
                 if matches!(selection.config, EnvironmentConfigState::Pending) {
-                    selection.config = EnvironmentConfigState::Ready(environment.installed_config?);
+                    let Some(config) = environment.installed_config else {
+                        return Self::Failed;
+                    };
+                    selection.config = EnvironmentConfigState::Ready(config);
                 }
                 let mut turn_environment = TurnEnvironment::new(
                     selection,
@@ -761,35 +766,55 @@ impl TurnEnvironmentState {
                     environment.shell_snapshot_v2_supported;
                 turn_environment.user_home_dir = environment.user_home_dir;
                 turn_environment.temporary_directories = environment.temporary_directories;
-                Some(Self::Ready(turn_environment))
+                Self::Ready(turn_environment)
             }
             Some(Err(err)) => {
                 tracing::debug!(
                     environment_id = %starting.selection.environment_id,
                     "skipping failed turn environment: {err}"
                 );
-                None
+                Self::Failed
             }
-            None => Some(Self::Starting(starting)),
+            None => Self::Starting(starting),
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TurnEnvironmentSnapshot {
-    // Keep ready and starting environments in their original selection order.
+    // Keep every selected environment, including failures, in its original order.
     pub(crate) environments: Vec<TurnEnvironmentState>,
 }
 
 impl TurnEnvironmentSnapshot {
+    pub(crate) fn has_full_access(
+        &self,
+        approval_policy: AskForApproval,
+        thread_profile: &PermissionProfile,
+    ) -> bool {
+        codex_protocol::protocol::has_full_access(
+            approval_policy,
+            thread_profile,
+            self.refresh_readiness()
+                .environments
+                .iter()
+                .map(|environment| match environment {
+                    TurnEnvironmentState::Ready(environment) => &environment.selection.config,
+                    TurnEnvironmentState::Starting(_) | TurnEnvironmentState::Failed => {
+                        &EnvironmentConfigState::Pending
+                    }
+                }),
+        )
+    }
+
     /// Promotes completed startup work without adopting newer thread selections.
     pub(crate) fn refresh_readiness(&self) -> Self {
         let environments = self
             .environments
             .iter()
-            .filter_map(|environment| match environment {
+            .map(|environment| match environment {
                 TurnEnvironmentState::Ready(environment) => {
-                    Some(TurnEnvironmentState::Ready(environment.clone()))
+                    TurnEnvironmentState::Ready(environment.clone())
                 }
                 TurnEnvironmentState::Starting(environment) => {
                     TurnEnvironmentState::from_resolution(
@@ -797,6 +822,7 @@ impl TurnEnvironmentSnapshot {
                         environment.resolution.clone().now_or_never(),
                     )
                 }
+                TurnEnvironmentState::Failed => TurnEnvironmentState::Failed,
             })
             .collect();
         Self { environments }
@@ -871,7 +897,7 @@ impl TurnEnvironmentSnapshot {
                 {
                     environment.selection.cwd.to_abs_path().ok()
                 }
-                TurnEnvironmentState::Starting(_) => None,
+                TurnEnvironmentState::Starting(_) | TurnEnvironmentState::Failed => None,
             })
     }
 
@@ -1458,9 +1484,15 @@ url = "ws://127.0.0.1:8765"
         assert_eq!(starting.to_selections(), vec![local.clone()]);
         assert!(starting.single_local_environment().is_none());
 
-        let next_config = test_environment_config();
+        let next_config = EnvironmentConfig {
+            permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
+            ..test_environment_config()
+        };
         turn_environments.update_thread_config(&next_config);
         let next_starting = turn_environments.snapshot().await;
+        assert!(
+            !next_starting.has_full_access(AskForApproval::Never, &PermissionProfile::Disabled)
+        );
 
         let server = tokio::spawn(serve_environment_info(listener));
         timeout(
@@ -1475,6 +1507,8 @@ url = "ws://127.0.0.1:8765"
         .await
         .expect("environment resolution should finish")
         .expect("environment resolution should succeed");
+        assert!(next_starting.has_full_access(AskForApproval::Never, &PermissionProfile::Disabled));
+        assert!(!starting.has_full_access(AskForApproval::Never, &PermissionProfile::Disabled));
         let attached = starting.refresh_readiness();
 
         assert!(attached.starting().next().is_none());
@@ -1552,12 +1586,17 @@ url = "ws://127.0.0.1:8765"
         );
         environments
             .update_selections(std::slice::from_ref(&selection), &test_environment_config());
+        let starting = environments.snapshot().await;
         let failed_resolution = environments.environments.load()[0].resolution.clone();
         let error = failed_resolution
             .clone()
             .await
             .err()
             .expect("environment should fail to start");
+        // Failed selections must not turn an empty executable snapshot into Full Access.
+        for snapshot in [starting.refresh_readiness(), environments.snapshot().await] {
+            assert!(!snapshot.has_full_access(AskForApproval::Never, &PermissionProfile::Disabled));
+        }
         let selected_root = SelectedCapabilityRoot {
             id: "failed-root".to_string(),
             location: CapabilityRootLocation::Environment {

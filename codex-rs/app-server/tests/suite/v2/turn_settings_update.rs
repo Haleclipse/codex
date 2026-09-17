@@ -2,6 +2,8 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use codex_app_server_protocol::ApprovalsReviewer;
+use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
@@ -25,6 +27,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use core_test_support::responses;
+use core_test_support::skip_if_wine_exec;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -132,6 +135,7 @@ async fn settings_updates_report_results_and_preserve_the_target_on_saved_thread
         effort: Some(ReasoningEffort::High),
         summary: Some(ReasoningSummary::Detailed),
         service_tier: Some(Some("priority".to_string())),
+        ..Default::default()
     };
     match scenario {
         UpdateScenario::Future => {
@@ -415,6 +419,121 @@ async fn disabled_turn_settings_update_reports_rejection_without_changing_future
         requests.single_request().body_json()["model"],
         Value::String(MODEL_A.to_string())
     );
+    Ok(())
+}
+
+#[test_case(ApprovalsReviewer::User, ApprovalsReviewer::AutoReview; "enable auto review")]
+#[test_case(ApprovalsReviewer::AutoReview, ApprovalsReviewer::User; "disable auto review")]
+#[tokio::test]
+async fn live_reviewer_updates_route_approvals_without_changing_future_turns(
+    initial: ApprovalsReviewer,
+    updated: ApprovalsReviewer,
+) -> Result<()> {
+    skip_if_wine_exec!(Ok(()), "command approval requires host-native paths");
+
+    let server = responses::start_mock_server().await;
+    let mut replies = vec![responses::sse(vec![
+        responses::ev_function_call(
+            "pause-turn",
+            "request_user_input",
+            &json!({"questions": [{
+                "id": "continue", "header": "Continue", "question": "Continue?",
+                "options": [
+                    {"label": "Yes", "description": "Continue"},
+                    {"label": "No", "description": "Stop"}
+                ]
+            }]})
+            .to_string(),
+        ),
+        responses::ev_completed("paused"),
+    ])];
+    for (index, reviewer) in [&updated, &initial].into_iter().enumerate() {
+        replies.push(responses::sse(vec![
+            responses::ev_function_call(
+                &format!("command-{index}"),
+                "exec_command",
+                r#"{"cmd":"echo reviewer-test","sandbox_permissions":"require_escalated","justification":"test approval routing"}"#,
+            ),
+            responses::ev_completed(&format!("command-response-{index}")),
+        ]));
+        if *reviewer == ApprovalsReviewer::AutoReview {
+            replies.push(responses::sse(vec![
+                responses::ev_assistant_message("review", r#"{"outcome":"deny"}"#),
+                responses::ev_completed("review-response"),
+            ]));
+        }
+        replies.push(responses::sse_completed(&format!("done-{index}")));
+    }
+    let requests = responses::mount_sse_sequence(&server, replies).await;
+    let codex_home = TempDir::new()?;
+    // Reviewer-only updates do not require the experimental model-switching feature.
+    mock_config(codex_home.path(), &server.uri())?
+        .enable_feature(Feature::GuardianApproval)
+        .write(codex_home.path())?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let id = app
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            approval_policy: Some(AskForApproval::OnRequest),
+            approvals_reviewer: Some(initial),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_TIMEOUT, app.read_response(id)).await??;
+    let turn_id = start_turn(&mut app, &thread.id).await?;
+    let request = timeout(DEFAULT_TIMEOUT, app.read_stream_until_request_message()).await??;
+    let ServerRequest::ToolRequestUserInput { request_id, .. } = request else {
+        anyhow::bail!("expected paused turn, received {request:?}");
+    };
+    let result: TurnSettingsUpdateResponse = app
+        .request(|request_id| ClientRequest::TurnSettingsUpdate {
+            request_id,
+            params: TurnSettingsUpdateParams {
+                thread_id: thread.id.clone(),
+                turn_id,
+                approvals_reviewer: Some(updated),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(
+        result,
+        TurnSettingsUpdateResponse {
+            status: TurnSettingsUpdateStatus::Applied,
+        }
+    );
+    app.send_response(
+        request_id,
+        json!({"answers": {"continue": {"answers": ["Yes"]}}}),
+    )
+    .await?;
+
+    for (index, reviewer) in [updated, initial].into_iter().enumerate() {
+        if index != 0 {
+            start_turn(&mut app, &thread.id).await?;
+        }
+        if reviewer == ApprovalsReviewer::User {
+            let request =
+                timeout(DEFAULT_TIMEOUT, app.read_stream_until_request_message()).await??;
+            let ServerRequest::CommandExecutionRequestApproval { request_id, .. } = request else {
+                anyhow::bail!("expected manual approval, received {request:?}");
+            };
+            app.send_response(request_id, json!({"decision": "decline"}))
+                .await?;
+        }
+        let completed: TurnCompletedNotification =
+            timeout(DEFAULT_TIMEOUT, app.read_notification("turn/completed")).await??;
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+    }
+    let guardian_requests = requests
+        .requests()
+        .into_iter()
+        .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
+        .count();
+    assert_eq!(guardian_requests, 1);
     Ok(())
 }
 

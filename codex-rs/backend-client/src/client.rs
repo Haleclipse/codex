@@ -34,10 +34,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
 
+mod chatgpt_turn_cost;
 mod rate_limit_resets;
 mod thread_usage;
 pub(crate) mod turn_usage;
 
+pub use chatgpt_turn_cost::ChatgptThreadTurnCosts;
+pub use chatgpt_turn_cost::ChatgptTurnCost;
 pub use thread_usage::ThreadUsage;
 pub use thread_usage::ThreadUsageBreakdownGroup;
 

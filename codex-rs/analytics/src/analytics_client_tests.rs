@@ -209,6 +209,14 @@ impl TurnAnalyticsMetadata for TestTurnMetadata {
     fn root_turn_id(&self) -> Option<String> {
         self.root_turn_id.lock().expect("root turn ID").clone()
     }
+
+    fn turn_trigger(&self) -> Option<String> {
+        None
+    }
+
+    fn codex_turn_source(&self) -> Option<String> {
+        None
+    }
 }
 
 fn test_turn_metadata(root_turn_id: Option<&str>) -> Arc<TestTurnMetadata> {
@@ -246,6 +254,8 @@ fn sample_thread_with_metadata(
         project_id: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
+        model: None,
+        reasoning_effort: None,
         created_at: 1,
         updated_at: 2,
         recency_at: Some(2),
@@ -472,6 +482,7 @@ fn sample_turn_resolved_config(thread_id: &str, turn_id: &str) -> TurnResolvedCo
         service_tier: None,
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
+        guardian_v2_enabled: false,
         sandbox_network_access: true,
         collaboration_mode: ModeKind::Plan,
         personality: None,
@@ -4648,6 +4659,8 @@ fn turn_event_serializes_expected_shape() {
             session_id: "session-thread-2".to_string(),
             turn_id: "turn-2".to_string(),
             root_turn_id: Some("turn-2".to_string()),
+            turn_trigger: Some("user".to_string()),
+            codex_turn_source: Some("composer".to_string()),
             app_server_client: sample_app_server_client_metadata(),
             runtime: sample_runtime_metadata(),
             submission_type: None,
@@ -4664,6 +4677,7 @@ fn turn_event_serializes_expected_shape() {
             service_tier: "flex".to_string(),
             approval_policy: "on-request".to_string(),
             approvals_reviewer: "auto_review".to_string(),
+            guardian_v2_enabled: true,
             sandbox_network_access: true,
             collaboration_mode: Some("plan"),
             personality: Some("pragmatic".to_string()),
@@ -4722,6 +4736,8 @@ fn turn_event_serializes_expected_shape() {
                 "session_id": "session-thread-2",
                 "turn_id": "turn-2",
                 "root_turn_id": "turn-2",
+                "turn_trigger": "user",
+                "codex_turn_source": "composer",
                 "submission_type": null,
                 "app_server_client": {
                     "product_client_id": "codex_cli_rs",
@@ -4749,6 +4765,7 @@ fn turn_event_serializes_expected_shape() {
                 "service_tier": "flex",
                 "approval_policy": "on-request",
                 "approvals_reviewer": "auto_review",
+                "guardian_v2_enabled": true,
                 "sandbox_network_access": true,
                 "collaboration_mode": "plan",
                 "personality": "pragmatic",
@@ -5073,6 +5090,16 @@ async fn turn_lifecycle_emits_turn_event() {
     );
     assert_eq!(payload["event_params"]["turn_id"], json!("turn-2"));
     assert_eq!(
+        (
+            payload["event_params"].get("turn_trigger"),
+            payload["event_params"].get("codex_turn_source"),
+        ),
+        (
+            Some(&serde_json::Value::Null),
+            Some(&serde_json::Value::Null)
+        )
+    );
+    assert_eq!(
         payload["event_params"]["app_server_client"],
         json!({
             "product_client_id": "codex-tui",
@@ -5092,6 +5119,7 @@ async fn turn_lifecycle_emits_turn_event() {
         })
     );
     assert!(payload["event_params"].get("product_client_id").is_none());
+    assert_eq!(payload["event_params"]["guardian_v2_enabled"], json!(false));
     assert_eq!(payload["event_params"]["ephemeral"], json!(false));
     assert_eq!(payload["event_params"]["workspace_kind"], json!(null));
     assert_eq!(payload["event_params"]["num_input_images"], json!(1));

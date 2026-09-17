@@ -254,6 +254,8 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
     ]);
     let mut completed = responses::ev_completed_with_tokens("r1", /*total_tokens*/ 200);
     completed["response"]["usage_metadata"] = serde_json::json!({ "amount": "0.125" });
+    completed["response"]["usage"]["extra"] = serde_json::json!({ "label": "example" });
+    let expected_metadata = completed["response"]["usage"].clone();
     let sse = responses::sse(vec![
         responses::ev_assistant_message("m1", "MANUAL_COMPACT_SUMMARY"),
         completed,
@@ -338,6 +340,7 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
             response_id: "r1".to_string(),
             usage_metadata: Some(ResponseUsageMetadata {
                 amount: Some("0.125".to_string()),
+                metadata: Some(expected_metadata),
             }),
             usage: Some(TokenUsageBreakdown {
                 total_tokens: 200,

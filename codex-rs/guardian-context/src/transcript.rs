@@ -97,7 +97,7 @@ impl SectionContributor for ConversationTranscriptSection {
     }
 
     fn contribute(&self, input: &SectionInput<'_>) -> Result<Option<ContextSection>, SectionError> {
-        Ok(Some(ContextSection {
+        Ok(Some(ContextSection::ConversationTranscript {
             items: collect_transcript(input.history, input.transcript),
         }))
     }

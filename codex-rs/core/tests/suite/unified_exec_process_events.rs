@@ -66,6 +66,7 @@ enum PushedExecScenario {
     Complete,
     DirectDenied,
     ElevatedPowerShell,
+    RejectedLongWindowsDangerousCommand,
     SandboxedInterceptedPatch,
     SandboxedDirectPatch,
     SandboxedDirectPatchDenied,
@@ -153,17 +154,27 @@ async fn respond_environment_info(
     id: &Value,
     scenario: PushedExecScenario,
 ) {
-    let shell = if matches!(scenario, PushedExecScenario::ElevatedPowerShell) {
+    let shell = if matches!(
+        scenario,
+        PushedExecScenario::ElevatedPowerShell
+            | PushedExecScenario::RejectedLongWindowsDangerousCommand
+    ) {
         json!({ "name": "powershell", "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" })
     } else {
         json!({ "name": "zsh", "path": "/bin/zsh" })
     };
+    let platform_os = matches!(
+        scenario,
+        PushedExecScenario::RejectedLongWindowsDangerousCommand
+    )
+    .then_some("windows");
     send_exec_server_json(
         websocket,
         json!({
             "id": id,
             "result": {
                 "shell": shell,
+                "platformOs": platform_os,
                 "capabilities": { "networkProxyLaunch": true }
             }
         }),
@@ -390,6 +401,9 @@ async fn serve_exec_with_pushed_events(
                 send_exec_server_json(&mut websocket, message).await;
             }
         }
+        PushedExecScenario::RejectedLongWindowsDangerousCommand => {
+            panic!("dangerous command must not reach the executor")
+        }
         PushedExecScenario::DirectDenied => {
             send_exec_server_json(
                 &mut websocket,
@@ -463,6 +477,9 @@ async fn serve_exec_with_pushed_events(
                     }),
                     PushedExecScenario::ElevatedPowerShell => {
                         panic!("elevated remote PowerShell must not read a remote process")
+                    }
+                    PushedExecScenario::RejectedLongWindowsDangerousCommand => {
+                        panic!("dangerous command must not read a remote process")
                     }
                     PushedExecScenario::SandboxedInterceptedPatch
                     | PushedExecScenario::SandboxedDirectPatch
@@ -555,6 +572,7 @@ async fn serve_exec_with_pushed_events(
 #[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, ManagedNetworkScenario::Enabled { policy_callbacks: true }, true ; "foreign_windows_managed_network_preserves_approval_registration"))]
 #[cfg_attr(not(windows), test_case(PushedExecScenario::Complete, ManagedNetworkScenario::None, true ; "foreign_windows_workspace_sandbox"))]
 #[test_case(PushedExecScenario::ElevatedPowerShell, ManagedNetworkScenario::None, true ; "windows_elevated_powershell_disables_profile")]
+#[cfg_attr(not(windows), test_case(PushedExecScenario::RejectedLongWindowsDangerousCommand, ManagedNetworkScenario::None, true ; "remote_windows_dangerous_command_rejection_is_bounded"))]
 #[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedInterceptedPatch, ManagedNetworkScenario::None, true ; "foreign_windows_intercepted_patch_is_sandboxed"))]
 #[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatch, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_is_sandboxed"))]
 #[cfg_attr(not(windows), test_case(PushedExecScenario::SandboxedDirectPatchDenied, ManagedNetworkScenario::None, true ; "foreign_windows_direct_patch_denial_requests_approval"))]
@@ -590,13 +608,17 @@ async fn exec_command_consumes_pushed_remote_process_events(
             &json!({
                 "cmd": match scenario {
                     PushedExecScenario::SandboxedInterceptedPatch => {
-                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: secret.txt\n@@\n-old\n+new\n*** End Patch\nPATCH"
+                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: secret.txt\n@@\n-old\n+new\n*** End Patch\nPATCH".to_string()
                     }
                     PushedExecScenario::UnsandboxedInterceptedPatch
                     | PushedExecScenario::FullDiskInterceptedPatch => {
-                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: allowed.txt\n+allowed\n*** End Patch\nPATCH"
+                        "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: allowed.txt\n+allowed\n*** End Patch\nPATCH".to_string()
                     }
-                    _ => "pwd",
+                    PushedExecScenario::RejectedLongWindowsDangerousCommand => format!(
+                        "Remove-Item test -Force; {}",
+                        "Write-Output filler; ".repeat(2_000)
+                    ),
+                    _ => "pwd".to_string(),
                 },
                 "yield_time_ms": 1_000,
             })
@@ -807,6 +829,23 @@ timeout = 900
     }
     if matches!(
         scenario,
+        PushedExecScenario::RejectedLongWindowsDangerousCommand
+    ) {
+        let request = response_mock
+            .last_request()
+            .context("model should receive the dangerous-command rejection")?;
+        let (output, success) = request
+            .function_call_output_content_and_success(CALL_ID)
+            .context("dangerous-command rejection should be model visible")?;
+        assert_ne!(success, Some(true));
+        let output = output.context("dangerous-command rejection should contain text")?;
+        assert!(output.len() < 1_000);
+        assert!(output.contains("chars truncated"));
+        exec_server.abort();
+        return Ok(());
+    }
+    if matches!(
+        scenario,
         PushedExecScenario::SandboxedDirectPatchDenied
             | PushedExecScenario::SandboxedDirectPatchRetry
     ) {
@@ -994,6 +1033,9 @@ timeout = 900
             assert!(output.contains("Process exited with code 0"));
             assert!(output.contains(COMPLETE_OUTPUT));
             assert_eq!(process_read_requests, 0, "unexpected compatibility read");
+        }
+        PushedExecScenario::RejectedLongWindowsDangerousCommand => {
+            unreachable!("dangerous command returned early")
         }
         PushedExecScenario::DirectDenied => {
             assert!(!saw_exec_command_begin);

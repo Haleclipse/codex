@@ -23,20 +23,30 @@ use axum::routing::get;
 use axum::routing::post;
 use codex_app_server_protocol::ApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval;
+use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemGuardianApprovalReviewStartedNotification;
+use codex_app_server_protocol::McpServerElicitationRequest;
+use codex_app_server_protocol::McpToolCallStatus;
+use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::StrictReviewRequiredNotification;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::TurnCompletedNotification;
+use codex_app_server_protocol::TurnSettingsUpdateParams;
+use codex_app_server_protocol::TurnSettingsUpdateResponse;
+use codex_app_server_protocol::TurnSettingsUpdateStatus;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_features::Feature;
 use codex_state::StateRuntime;
@@ -56,10 +66,16 @@ use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
+use super::analytics::captured_analytics_events;
+use super::analytics::mount_analytics_capture;
+use super::analytics::wait_for_matching_analytics_event;
 use super::mcp_tool::TEST_SERVER_NAME;
 use super::mcp_tool::TEST_TOOL_NAME;
 use super::mcp_tool::start_mcp_server;
 use super::mcp_tool::start_mcp_server_with_tools;
+
+#[path = "guardian_v2_history_tests.rs"]
+mod history;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL: &str = "mock-model";
@@ -138,6 +154,7 @@ struct MockResponsesState {
     guardian_reviews: AtomicUsize,
     guardian_requests: Mutex<Vec<Value>>,
     luna_requests: Mutex<Vec<Value>>,
+    luna_connections: AtomicUsize,
     root_thread_id: Mutex<Option<String>>,
     allow_luna: Notify,
     allow_guardian_review: Notify,
@@ -149,6 +166,7 @@ struct MockResponsesState {
     transcript_content: TranscriptContent,
     mcp_server_name: Option<&'static str>,
     mcp_tool_sequence: Option<&'static [&'static str]>,
+    mcp_messages: Mutex<Vec<&'static str>>,
     root_worker: bool,
     root_user_restriction: bool,
     root_user_input_restriction: bool,
@@ -436,7 +454,13 @@ async fn parent_response(
             || (state.root_worker || state.root_user_restriction) && request_number == 3
         {
             let call_id = format!("guardian-action-{request_number}");
-            let mut message = format!("guardian-{request_number}");
+            let mut message = state
+                .mcp_messages
+                .lock()
+                .expect("MCP messages lock")
+                .get(request_number)
+                .map(|message| (*message).to_string())
+                .unwrap_or_else(|| format!("guardian-{request_number}"));
             if request_number == 0 && matches!(state.review_outcome, ReviewOutcome::Deny) {
                 message.push_str(&"x".repeat(2_000));
             }
@@ -480,6 +504,7 @@ async fn luna_websocket(
     State(state): State<Arc<MockResponsesState>>,
     websocket: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    state.luna_connections.fetch_add(1, Ordering::SeqCst);
     websocket.on_upgrade(move |mut socket| async move {
         while let Some(Ok(message)) = socket.recv().await {
             let Message::Text(text) = message else {
@@ -630,6 +655,8 @@ async fn guardian_v2_routes_scoped_tool_approvals(
     let (mcp_server_url, mcp_server_handle) = start_mcp_server(sensitive_action).await?;
 
     let codex_home = TempDir::new()?;
+    let analytics_server = responses::start_mock_server().await;
+    mount_analytics_capture(&analytics_server, codex_home.path()).await?;
     let root_skill = if matches!(lifecycle, ThreadLifecycle::RootTrustedSkill) {
         let path = codex_home.path().join("skills/root-trusted/SKILL.md");
         std::fs::create_dir_all(path.parent().expect("root skill parent"))?;
@@ -697,7 +724,10 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         .with_model(MODEL)
         .with_provider_config("supports_websockets = false")
         .with_approval_policy("on-request")
-        .with_root_config(reviewer_config)
+        .with_root_config(&format!(
+            "{reviewer_config}\nchatgpt_base_url = \"{}\"",
+            analytics_server.uri(),
+        ))
         .with_extra_config(&format!(
             "[mcp_servers.{server_name}]\nurl = \"{mcp_server_url}/mcp\"\ndefault_tools_approval_mode = \"{tool_approval_mode}\"\n\n[analytics]\nenabled = true\n\n[otel]\nmetrics_exporter = {{ otlp-http = {{ endpoint = \"{responses_url}/metrics\", protocol = \"json\" }} }}{guardian_scope_config}"
         ))
@@ -973,6 +1003,24 @@ async fn guardian_v2_routes_scoped_tool_approvals(
         let second_sample = wait_for_luna_request(responses_state.as_ref(), /*index*/ 1).await?;
         let reviews = sync_review_fragments(&second_sample);
         if lifecycle.has_user_answer() {
+            let answer_items = second_sample["input"]
+                .as_array()
+                .expect("Luna input messages")
+                .iter()
+                .filter(|item| {
+                    item["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|part| {
+                            part["text"]
+                                .as_str()
+                                .is_some_and(|text| text.contains(">>> TRUSTED USER ANSWERS START"))
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(answer_items.len(), 1);
+            assert_eq!(answer_items[0]["role"], "user");
             assert!(
                 reviews.is_empty(),
                 "a user input answer must invalidate earlier synchronous Guardian decisions"
@@ -1335,6 +1383,77 @@ async fn guardian_v2_routes_scoped_tool_approvals(
 
     if matches!(review_outcome, ReviewOutcome::Deny) && !lifecycle.has_user_answer() {
         timeout(TIMEOUT, responses_state.truncation_recorded.notified()).await?;
+    }
+
+    if matches!(lifecycle, ThreadLifecycle::New)
+        && matches!(scope, GuardianToolScope::AllTools)
+        && sensitive_action.is_none()
+    {
+        if classifier_in_scope {
+            wait_for_matching_analytics_event(&analytics_server, TIMEOUT, |event| {
+                event["event_type"] == "codex_guardian_v2_classification"
+                    && event["event_params"]["item_id"] == "guardian-action-0"
+            })
+            .await?;
+        }
+        timeout(TIMEOUT, app_server.shutdown_gracefully()).await??;
+        let events = captured_analytics_events(&analytics_server).await;
+        let turn = &events
+            .iter()
+            .find(|event| {
+                event["event_type"] == "codex_turn_event"
+                    && event["event_params"]["thread_id"] == reviewed_thread_id
+            })
+            .expect("parent turn analytics")["event_params"];
+        assert_eq!(turn["guardian_v2_enabled"], classifier_in_scope);
+        let classification = events.iter().find(|event| {
+            event["event_type"] == "codex_guardian_v2_classification"
+                && event["event_params"]["item_id"] == "guardian-action-0"
+        });
+        assert_eq!(classification.is_some(), classifier_in_scope);
+        if let Some(event) = classification {
+            assert_eq!(
+                json!([
+                    event["event_params"]["outcome"],
+                    event["event_params"]["risk_level"]
+                ]),
+                match risk {
+                    GuardianRisk::Low => json!(["success", "low"]),
+                    GuardianRisk::Threshold | GuardianRisk::High => json!(["success", "high"]),
+                    GuardianRisk::InvalidResponse => json!(["failure", null]),
+                }
+            );
+        }
+        let approvals = events
+            .iter()
+            .filter(|event| event["event_type"] == "codex_guardian_v2_fast_decision")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            approvals.len(),
+            usize::from(classifier_in_scope && matches!(risk, GuardianRisk::Low))
+        );
+        for event in classification.into_iter().chain(approvals) {
+            let params = &event["event_params"];
+            for key in [
+                "session_id",
+                "thread_id",
+                "turn_id",
+                "model",
+                "app_server_client",
+                "runtime",
+                "thread_source",
+                "subagent_source",
+                "parent_thread_id",
+            ] {
+                assert_eq!(params[key], turn[key], "{key}");
+            }
+            if event["event_type"] == "codex_guardian_v2_fast_decision" {
+                assert_eq!(
+                    json!([params["item_id"], params["decision"]]),
+                    json!(["guardian-action-1", "approved"])
+                );
+            }
+        }
     }
 
     mcp_server_handle.abort();
@@ -1703,6 +1822,176 @@ async fn first_cua_review_does_not_wait_for_initial_score(
         timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
     assert_eq!(completed.thread_id, thread.id);
     assert_eq!(state.guardian_reviews.load(Ordering::SeqCst), 1);
+    app_server.shutdown_gracefully().await?;
+    mcp_server.abort();
+    responses_server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_approval_skips_async_guardian_without_changing_other_modes() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let state = Arc::new(MockResponsesState {
+        mcp_server_name: Some("node_repl"),
+        mcp_tool_sequence: Some(&["js", "js", "js"]),
+        ..Default::default()
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let responses_url = format!("http://{}", listener.local_addr()?);
+    let router = Router::new()
+        .route("/v1/responses", get(luna_websocket).post(parent_response))
+        .with_state(Arc::clone(&state));
+    let responses_server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    // Mix ordinary execution, a user-input form, and a sensitive check.
+    let (mcp_url, mcp_server) =
+        start_mcp_server_with_tools(&["js"], /*sensitive_action*/ None).await?;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&responses_url)
+        .with_model(MODEL)
+        .with_provider_config("supports_websockets = false")
+        .with_approval_policy("on-request")
+        .with_root_config("approvals_reviewer = \"user\"")
+        .with_extra_config(&format!(
+            "[mcp_servers.node_repl]\nurl = \"{mcp_url}/mcp\"\ndefault_tools_approval_mode = \"auto\"\n\n[features.guardianv2]\nenabled = true"
+        ))
+        .enable_feature(Feature::GuardianApproval)
+        .write(codex_home.path())?;
+    let config = load_default_config_for_test(&codex_home).await;
+    let mut model_info = codex_core::test_support::construct_model_info_offline(MODEL, &config);
+    model_info.node_repl_auto_review_required = true;
+    write_models_cache_with_models(codex_home.path(), vec![model_info])?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized_with_timeout(TIMEOUT)
+        .await?;
+    let thread = app_server
+        .start_thread(ThreadStartParams {
+            approval_policy: Some(AskForApproval::OnRequest),
+            approvals_reviewer: Some(ApprovalsReviewer::User),
+            sandbox: Some(SandboxMode::DangerFullAccess),
+            ..Default::default()
+        })
+        .await?
+        .thread;
+
+    // Leave async scoring pending so reviewed mode must use synchronous Guardian.
+    state.allow_guardian_review.notify_one();
+    use ApprovalsReviewer::AutoReview;
+    use ApprovalsReviewer::User;
+    use AskForApproval::Never;
+    use AskForApproval::OnRequest;
+    for (approval_policy, reviewer, live_reviewer, expected_reviews) in [
+        (OnRequest, User, None, 1),
+        (Never, User, None, 0),
+        (Never, AutoReview, None, 0),
+        (OnRequest, User, Some(AutoReview), 2),
+        (OnRequest, AutoReview, Some(User), 2),
+        (OnRequest, AutoReview, None, 3),
+        (OnRequest, User, None, 1),
+    ] {
+        let reviews_before = state.guardian_reviews.load(Ordering::SeqCst);
+        *state.mcp_messages.lock().expect("MCP messages lock") = vec![
+            if approval_policy == OnRequest {
+                "confirm"
+            } else {
+                "guardian-0"
+            },
+            "guardian-1",
+            "sensitive",
+        ];
+        state.parent_requests.store(0, Ordering::SeqCst);
+        app_server.clear_message_buffer();
+        let request_id = app_server
+            .send_turn_start_request(TurnStartParams {
+                thread_id: thread.id.clone(),
+                input: vec![UserInput::Text {
+                    text: USER_CONTEXT.to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                approval_policy: Some(approval_policy),
+                approvals_reviewer: Some(reviewer),
+                ..Default::default()
+            })
+            .await?;
+        let started: TurnStartResponse =
+            timeout(TIMEOUT, app_server.read_response(request_id)).await??;
+        if approval_policy == OnRequest {
+            let request =
+                timeout(TIMEOUT, app_server.read_stream_until_request_message()).await??;
+            let ServerRequest::McpServerElicitationRequest { request_id, params } = request else {
+                panic!("expected user input, got {request:?}");
+            };
+            assert!(
+                matches!(params.request, McpServerElicitationRequest::Form { message, .. }
+                if message == "Allow this request?")
+            );
+            if let Some(reviewer) = live_reviewer {
+                let updated: TurnSettingsUpdateResponse = app_server
+                    .request(|request_id| ClientRequest::TurnSettingsUpdate {
+                        request_id,
+                        params: TurnSettingsUpdateParams {
+                            thread_id: thread.id.clone(),
+                            turn_id: started.turn.id.clone(),
+                            approvals_reviewer: Some(reviewer),
+                            ..Default::default()
+                        },
+                    })
+                    .await?;
+                assert_eq!(updated.status, TurnSettingsUpdateStatus::Applied);
+            }
+            app_server
+                .send_response(
+                    request_id,
+                    json!({ "action": "accept", "content": { "confirmed": true } }),
+                )
+                .await?;
+        }
+        let completed: TurnCompletedNotification =
+            timeout(TIMEOUT, app_server.read_notification("turn/completed")).await??;
+        assert_eq!(completed.turn.status, TurnStatus::Completed);
+
+        let mut tool_results = Vec::new();
+        while tool_results.len() < 3 {
+            let completed: ItemCompletedNotification =
+                timeout(TIMEOUT, app_server.read_notification("item/completed")).await??;
+            if let ThreadItem::McpToolCall {
+                status,
+                result,
+                error,
+                ..
+            } = completed.item
+            {
+                tool_results.push((status, result.map(|result| result.content), error));
+            }
+        }
+        assert_eq!(
+            tool_results,
+            (0..3)
+                .map(|index| (
+                    McpToolCallStatus::Completed,
+                    Some(vec![json!({ "type": "text", "text": match index {
+                            0 if approval_policy == OnRequest => "accepted".to_string(),
+                            2 => "echo: sensitive".to_string(),
+                            _ => format!("echo: guardian-{index}"),
+                        } })]),
+                    None,
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state.guardian_reviews.load(Ordering::SeqCst),
+            reviews_before + expected_reviews
+        );
+        if approval_policy == OnRequest
+            && (reviewer == AutoReview || live_reviewer == Some(AutoReview))
+        {
+            wait_for_luna_request(&state, /*index*/ 0).await?;
+        } else if reviews_before <= 1 {
+            assert_eq!(state.luna_connections.load(Ordering::SeqCst), 0);
+        }
+    }
     app_server.shutdown_gracefully().await?;
     mcp_server.abort();
     responses_server.abort();

@@ -300,6 +300,7 @@ async fn run_remote_compact_task_inner_impl(
             message: String::new(),
             window_number: new_window_number,
             window_ids: new_window_ids,
+            compaction_response_id: None,
         },
     )
     .await;

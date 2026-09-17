@@ -255,6 +255,17 @@ async fn wait_until_cell_ready_for_dispatch(
 }
 
 impl CodeModeSessionDelegate for CodeModeDispatchBroker {
+    #[tracing::instrument(
+        name = "code_mode.broker.invoke_tool",
+        level = "info",
+        skip_all,
+        fields(
+            cell.id = %invocation.cell_id,
+            runtime_tool_call_id = invocation.runtime_tool_call_id.as_str(),
+            tool_name = invocation.tool_name.name.as_str(),
+            tool_namespace = invocation.tool_name.namespace.as_deref(),
+        )
+    )]
     fn invoke_tool<'a>(
         &'a self,
         invocation: CodeModeNestedToolCall,

@@ -28,6 +28,7 @@ use codex_protocol::RolloutId;
 use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -82,6 +83,10 @@ pub struct ThreadItem {
     pub agent_role: Option<String>,
     /// Model provider from session metadata.
     pub model_provider: Option<String>,
+    /// Latest persisted model in SQLite-owned metadata, when available.
+    pub model: Option<String>,
+    /// Latest persisted reasoning effort in SQLite-owned metadata, when available.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// CLI version from session metadata.
     pub cli_version: Option<String>,
     /// RFC3339 timestamp string for when the session was created, if available.
@@ -849,6 +854,8 @@ async fn build_thread_item(
             agent_nickname,
             agent_role,
             model_provider,
+            model: None,
+            reasoning_effort: None,
             cli_version,
             created_at,
             recency_at: summary_updated_at.clone(),
@@ -1174,6 +1181,9 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             RolloutItem::TurnContext(_) => {
                 // Not included in `head`; skip.
             }
+            RolloutItem::TokenUsageRecord(_) => {
+                // Not included in `head`; skip.
+            }
             RolloutItem::WorldState(_) | RolloutItem::SecurityRiskScore(_) => {
                 // Not included in `head`; skip.
             }
@@ -1249,6 +1259,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::TokenUsageRecord(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::RealtimeItem(_)
                 | RolloutItem::SecurityRiskScore(_)
@@ -1303,6 +1314,7 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::SecurityRiskScore(_)

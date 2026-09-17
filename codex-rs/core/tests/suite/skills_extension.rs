@@ -26,9 +26,17 @@ use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::TruncationPolicyConfig;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_skills_extension::ExecutorSkillProvider;
 use codex_skills_extension::HostSkillProvider;
@@ -65,14 +73,19 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
+use core_test_support::skip_if_target_windows;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::test_env;
+use core_test_support::test_codex::turn_permission_fields;
+use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use sha1::Digest;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use toml::toml;
@@ -1825,6 +1838,428 @@ async fn executor_only_provider_preserves_structured_repo_skill_without_discover
         "desktop's structured absolute-path skill selection must remain available: {user_text}"
     );
 
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ExecutorReferenceRead {
+    Allowed,
+    Denied,
+    Continuation,
+    EditedContinuation,
+    DeniedContinuation,
+}
+
+/// Live references and continuation pages use current permissions, including after discovery
+/// materialized the main prompt. Continuations preserve the cached snapshot across file edits.
+#[test_case(ExecutorReferenceRead::Allowed; "full disk read")]
+#[test_case(ExecutorReferenceRead::Denied; "denied reference")]
+#[test_case(ExecutorReferenceRead::Continuation; "unchanged continuation")]
+#[test_case(ExecutorReferenceRead::EditedContinuation; "edited continuation")]
+#[test_case(ExecutorReferenceRead::DeniedContinuation; "denied continuation")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_skill_tool_reads_references_under_current_permissions(
+    read: ExecutorReferenceRead,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    if matches!(
+        read,
+        ExecutorReferenceRead::Denied | ExecutorReferenceRead::DeniedContinuation
+    ) {
+        skip_if_target_windows!(
+            Ok(()),
+            "restricted reads require the elevated Windows sandbox backend, unavailable in this fixture"
+        );
+    }
+
+    const REFERENCE_CONTENTS: &str = "Live executor reference instructions.";
+    let contents = match read {
+        ExecutorReferenceRead::Allowed | ExecutorReferenceRead::Denied => {
+            REFERENCE_CONTENTS.to_string()
+        }
+        ExecutorReferenceRead::Continuation
+        | ExecutorReferenceRead::EditedContinuation
+        | ExecutorReferenceRead::DeniedContinuation => "reference line\n".repeat(800),
+    };
+    let reference_access = match read {
+        ExecutorReferenceRead::Denied => FileSystemAccessMode::Deny,
+        ExecutorReferenceRead::Allowed
+        | ExecutorReferenceRead::Continuation
+        | ExecutorReferenceRead::EditedContinuation
+        | ExecutorReferenceRead::DeniedContinuation => FileSystemAccessMode::Read,
+    };
+    let server = responses::start_mock_server().await;
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    install_with_providers(
+        &mut extensions,
+        SkillProviders::new().with_executor_provider(Arc::new(
+            ExecutorSkillProvider::new_with_restriction_product(
+                Arc::new(EnvironmentManager::default_for_tests()),
+                /*restriction_product*/ None,
+            ),
+        )),
+        |config: &Config| SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
+            bundled_skills_enabled: false,
+            orchestrator_skills_enabled: false,
+            shadow_selection_enabled: false,
+        },
+    );
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_model_info_override("gpt-5.4", |model_info| {
+            model_info.truncation_policy = TruncationPolicyConfig::bytes(/*limit*/ 8192);
+        })
+        .with_config(configure_catalog_test);
+    let test = builder.build_with_auto_env(&server).await?;
+    let selection = test
+        .codex
+        .environment_selections()
+        .await
+        .into_iter()
+        .next()
+        .expect("thread should select an executor environment");
+    let file_system = test.fs();
+    let skill_dir = selection.cwd.join("skill")?;
+    file_system
+        .create_directory(
+            &skill_dir,
+            CreateDirectoryOptions {
+                recursive: true,
+                follow_symlinks: true,
+            },
+            /*sandbox*/ None,
+        )
+        .await?;
+    // Discovery retains the selected root's spelling, including macOS /var aliases.
+    // Only permission entries should use the canonical path.
+    let policy_skill_dir = file_system
+        .canonicalize(&skill_dir, /*sandbox*/ None)
+        .await?;
+    for (name, contents) in [
+        (
+            "SKILL.md",
+            "---\nname: skill\ndescription: Read executor references.\n---\n\nRead reference.md.\n",
+        ),
+        ("reference.md", contents.as_str()),
+    ] {
+        file_system
+            .write_file(
+                &skill_dir.join(name)?,
+                contents.as_bytes().to_vec(),
+                Default::default(),
+                /*sandbox*/ None,
+            )
+            .await?;
+    }
+    let package = format!(
+        "skill://reference-root/{}",
+        skill_dir
+            .inferred_native_path_string()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
+    let resource = format!("{package}/reference.md");
+    let mut thread_extension_init = ExtensionDataInit::new();
+    thread_extension_init.insert(vec![SelectedCapabilityRoot {
+        id: "reference-root".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: selection.environment_id.clone(),
+            path: selection.cwd.clone(),
+        },
+    }]);
+    let mut config = test.config.clone();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::restricted(vec![
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    },
+                    FileSystemAccessMode::Read,
+                ),
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Path {
+                        path: policy_skill_dir.join("reference.md")?,
+                    },
+                    reference_access,
+                ),
+            ]),
+            NetworkSandboxPolicy::Restricted,
+        ))?;
+    let thread = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            environments: Some(vec![selection]),
+            thread_extension_init,
+            ..StartThreadOptions::new(config)
+        })
+        .await?;
+    let response = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                responses::ev_function_call_with_namespace(
+                    "read-reference",
+                    "skills",
+                    "read",
+                    &json!({ "package": package, "resource": resource }).to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        ],
+    )
+    .await;
+    thread
+        .thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Read the executor skill reference.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&thread.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let output = response.requests()[1]
+        .function_call_output_text("read-reference")
+        .expect("skills.read should return a tool result");
+    if matches!(read, ExecutorReferenceRead::Denied) {
+        assert_eq!(output, "failed to read skill resource");
+    } else if matches!(read, ExecutorReferenceRead::Allowed) {
+        assert_eq!(
+            serde_json::from_str::<Value>(&output)?,
+            json!({
+                "resource": resource,
+                "contents": contents,
+                "skill_root": skill_dir.inferred_native_path_string(),
+                "next_cursor": null,
+            })
+        );
+    } else {
+        let page: Value = serde_json::from_str(&output)?;
+        let cursor = page["next_cursor"]
+            .as_str()
+            .expect("reference needs another page");
+        let first_contents = page["contents"].as_str().expect("first page contents");
+        assert_eq!(
+            page,
+            json!({
+                "resource": resource,
+                "contents": &contents[..first_contents.len()],
+                "skill_root": skill_dir.inferred_native_path_string(),
+                "next_cursor": cursor,
+            })
+        );
+        if matches!(read, ExecutorReferenceRead::EditedContinuation) {
+            file_system
+                .write_file(
+                    &skill_dir.join("reference.md")?,
+                    b"edited reference".to_vec(),
+                    Default::default(),
+                    /*sandbox*/ None,
+                )
+                .await?;
+        }
+        let response = responses::mount_sse_sequence(
+            &server,
+            vec![
+                sse(vec![
+                    ev_response_created("resp-3"),
+                    responses::ev_function_call_with_namespace(
+                        "continue-reference",
+                        "skills",
+                        "read",
+                        &json!({"package": package, "resource": resource, "cursor": cursor})
+                            .to_string(),
+                    ),
+                    ev_completed("resp-3"),
+                ]),
+                sse(vec![ev_response_created("resp-4"), ev_completed("resp-4")]),
+            ],
+        )
+        .await;
+        let mut input = TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Read the next page of the executor reference.".to_string(),
+            text_elements: Vec::new(),
+        }]);
+        if matches!(read, ExecutorReferenceRead::DeniedContinuation) {
+            let permissions = PermissionProfile::from_runtime_permissions(
+                &FileSystemSandboxPolicy::restricted(vec![
+                    FileSystemSandboxEntry::new(
+                        FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        FileSystemAccessMode::Read,
+                    ),
+                    FileSystemSandboxEntry::new(
+                        FileSystemPath::Path {
+                            path: policy_skill_dir.join("reference.md")?,
+                        },
+                        FileSystemAccessMode::Deny,
+                    ),
+                ]),
+                NetworkSandboxPolicy::Restricted,
+            );
+            let (sandbox_policy, permission_profile) =
+                turn_permission_fields(permissions, test.config.cwd.as_path());
+            input = input.with_thread_settings(ThreadSettingsOverrides {
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                ..Default::default()
+            });
+        }
+        thread.thread.start_or_steer_turn(input).await?;
+        wait_for_event(&thread.thread, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        let output = response.requests()[1]
+            .function_call_output_text("continue-reference")
+            .expect("skills.read continuation should return a tool result");
+        match read {
+            ExecutorReferenceRead::Continuation | ExecutorReferenceRead::EditedContinuation => {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&output)?,
+                    json!({
+                        "resource": resource,
+                        "contents": &contents[first_contents.len()..],
+                        "skill_root": skill_dir.inferred_native_path_string(),
+                        "next_cursor": null,
+                    })
+                )
+            }
+            ExecutorReferenceRead::DeniedContinuation => {
+                assert_eq!(output, "failed to read skill resource")
+            }
+            ExecutorReferenceRead::Allowed | ExecutorReferenceRead::Denied => {
+                unreachable!("single-page cases handled above")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Live executor prompts reject oversized resources without rewriting earlier injected content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_executor_skill_prompt_rejects_oversized_resource() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const FIRST_BODY: &str = "Instructions from the allowed live read.";
+    let server = responses::start_mock_server().await;
+    let environment = test_env().await?;
+    let environment_id = environment.selection().environment_id.clone();
+    let skill_path = environment.selection().cwd.join("SKILL.md")?;
+    let file_system = environment.environment().get_filesystem();
+    file_system
+        .write_file(
+            &skill_path,
+            FIRST_BODY.as_bytes().to_vec(),
+            Default::default(),
+            /*sandbox*/ None,
+        )
+        .await?;
+    let catalog = SkillCatalog {
+        entries: vec![SkillCatalogEntry::new(
+            SkillPackageId("skill://prompt-limit/live".to_string()),
+            SkillAuthority::new(SkillSourceKind::Executor, "prompt-limit"),
+            "live",
+            "Read executor instructions.",
+            SkillResourceId::environment(
+                "skill://prompt-limit/live/SKILL.md",
+                &environment_id,
+                skill_path.clone(),
+            ),
+        )],
+        warnings: Vec::new(),
+    };
+    let environment_manager = match environment.exec_server_url() {
+        Some(url) => {
+            EnvironmentManager::create_for_tests(
+                Some(url.to_string()),
+                /*local_runtime_paths*/ None,
+            )
+            .await
+        }
+        None => EnvironmentManager::default_for_tests(),
+    };
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut extensions =
+        ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::new(ChannelEventSink(event_tx)));
+    install_with_providers(
+        &mut extensions,
+        SkillProviders::new()
+            .with_executor_provider(Arc::new(CatalogSkillProvider { catalog }))
+            .with_executor_provider(Arc::new(
+                ExecutorSkillProvider::new_with_restriction_product(
+                    Arc::new(environment_manager),
+                    /*restriction_product*/ None,
+                ),
+            )),
+        |config: &Config| SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
+            bundled_skills_enabled: false,
+            orchestrator_skills_enabled: false,
+            shadow_selection_enabled: false,
+        },
+    );
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(configure_catalog_test);
+    let test = builder.build_with_environment(&server, environment).await?;
+    let first_response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    test.submit_turn("$live").await?;
+    let expected_prompts = vec![format!(
+        "<skill>\n<name>live</name>\n<path>skill://prompt-limit/live/SKILL.md</path>\n{FIRST_BODY}\n</skill>"
+    )];
+    let first_prompts = first_response
+        .single_request()
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| text.starts_with("<skill>"))
+        .collect::<Vec<_>>();
+    assert_eq!(first_prompts, expected_prompts);
+
+    file_system
+        .write_file(
+            &skill_path,
+            vec![b'x'; 1024 * 1024 + 1],
+            Default::default(),
+            /*sandbox*/ None,
+        )
+        .await?;
+    let second_response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+    test.submit_turn("$live").await?;
+    let prompts = second_response
+        .single_request()
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| text.starts_with("<skill>"))
+        .collect::<Vec<_>>();
+    assert_eq!(prompts, expected_prompts);
+    let warnings = event_rx
+        .try_iter()
+        .filter_map(|event| match event {
+            CapturedExtensionEvent::Warning(warning) => Some(warning.message),
+            CapturedExtensionEvent::Event(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(warnings, vec![
+        "Failed to load skill `live`: executor skill resource skill://prompt-limit/live/SKILL.md exceeds 1048576 bytes".to_string()
+    ]);
     Ok(())
 }
 

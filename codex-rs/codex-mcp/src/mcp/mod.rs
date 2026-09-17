@@ -41,6 +41,7 @@ use codex_protocol::mcp::Tool;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::McpAuthStatus;
+use codex_rmcp_client::McpOAuthRefreshMode;
 use codex_utils_path_uri::PathUri;
 use rmcp::model::ElicitationCapability;
 use rmcp::model::ReadResourceRequestParams;
@@ -128,6 +129,8 @@ pub struct McpConfig {
     pub codex_home: PathBuf,
     /// Preferred credential store for MCP OAuth tokens.
     pub mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode,
+    /// OAuth refresh ownership selected for new MCP connections.
+    pub oauth_refresh_mode: McpOAuthRefreshMode,
     /// Backend used when MCP OAuth storage is configured for keyring-backed persistence.
     pub auth_keyring_backend_kind: AuthKeyringBackendKind,
     /// Optional fixed localhost callback port for MCP OAuth login.

@@ -1,8 +1,11 @@
 use super::effective_file_system_sandbox_policy;
 use super::intersect_permission_profiles;
+use super::intersect_permission_profiles_with_context;
 use super::materialize_additional_permissions;
+use super::materialize_additional_permissions_with_context;
 use super::merge_file_system_policy_with_additional_permissions;
 use super::normalize_additional_permissions;
+use super::normalize_additional_permissions_with_context;
 use super::should_require_platform_sandbox;
 use codex_protocol::models::AdditionalPermissionProfile as PermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
@@ -11,9 +14,13 @@ use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathConvention;
+use codex_utils_path_uri::PathUri;
 use dunce::canonicalize;
 use pretty_assertions::assert_eq;
 #[cfg(unix)]
@@ -126,6 +133,59 @@ fn normalize_additional_permissions_preserves_network() {
             Some(vec![path.clone()]),
             Some(vec![path]),
         ))
+    );
+}
+
+#[test]
+fn normalize_additional_permissions_only_checks_convention_with_context() {
+    let windows_path = PathUri::parse("file:///C:/workspace/out").expect("Windows path URI");
+    let permissions = PermissionProfile {
+        file_system: Some(FileSystemPermissions {
+            entries: vec![FileSystemSandboxEntry::new(
+                FileSystemPath::Path { path: windows_path },
+                FileSystemAccessMode::Write,
+            )],
+            glob_scan_max_depth: None,
+        }),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        normalize_additional_permissions(permissions.clone()).expect("context-free permissions"),
+        permissions
+    );
+
+    let cwd = PathUri::parse("file:///workspace").expect("POSIX cwd URI");
+    let workspace_roots = [cwd.clone()];
+    let context = FileSystemSandboxPolicyContext {
+        cwd: &cwd,
+        workspace_roots: &workspace_roots,
+        user_home_dir: None,
+        temporary_directories: None,
+    };
+    assert!(
+        normalize_additional_permissions_with_context(permissions.clone(), &context).is_err(),
+        "context-aware normalization should reject mismatched conventions"
+    );
+
+    let cwd = LegacyAppPathString::from_string(
+        r"\\?\Volume{00000000-0000-0000-0000-000000000000}\workspace",
+    )
+    .to_path_uri(PathConvention::Windows)
+    .expect("opaque Windows cwd");
+    assert!(cwd.is_opaque(), "volume GUID cwd should stay opaque");
+    let workspace_roots = [cwd.clone()];
+    let context = FileSystemSandboxPolicyContext {
+        cwd: &cwd,
+        workspace_roots: &workspace_roots,
+        user_home_dir: None,
+        temporary_directories: None,
+    };
+
+    assert_eq!(
+        normalize_additional_permissions_with_context(permissions.clone(), &context)
+            .expect("absolute path with opaque cwd"),
+        permissions
     );
 }
 
@@ -242,6 +302,7 @@ fn materialize_additional_permissions_preserves_authority_and_constraints() {
         canonicalize(temp_dir.path()).expect("canonicalize temp dir"),
     )
     .expect("absolute temp dir");
+    let home = PathUri::from_host_native_path("~").expect("host home");
     let project_path = |subpath: &str| FileSystemPath::Special {
         value: FileSystemSpecialPath::project_roots(Some(subpath.to_owned())),
     };
@@ -263,6 +324,8 @@ fn materialize_additional_permissions_preserves_authority_and_constraints() {
         FileSystemSandboxEntry::new(project_path("private/reopened"), Write),
         reopened.clone(),
         deny_glob("**/*.env".to_owned()),
+        deny_glob("~".to_owned()),
+        deny_glob("~/private/*.env".to_owned()),
     ]);
     let expected = profile(vec![
         FileSystemSandboxEntry::new(cwd.clone().into(), Write),
@@ -270,12 +333,62 @@ fn materialize_additional_permissions_preserves_authority_and_constraints() {
         FileSystemSandboxEntry::skip_missing_path(cwd.join("readonly").into(), Read),
         reopened,
         deny_glob(cwd.join("**/*.env").to_string_lossy().into_owned()),
+        deny_glob(home.inferred_native_path_string()),
+        deny_glob(
+            home.join("private/*.env")
+                .expect("home-relative deny glob")
+                .inferred_native_path_string(),
+        ),
     ]);
 
     assert_eq!(
         materialize_additional_permissions(requested, cwd.as_path())
             .expect("materialized permissions"),
         expected
+    );
+}
+
+#[test]
+fn materialize_additional_permissions_ignores_empty_tmpdir_deny() {
+    let cwd = PathUri::parse("file:///workspace").expect("cwd URI");
+    let workspace_roots = [cwd.clone()];
+    let temporary_directories = [];
+    let context = FileSystemSandboxPolicyContext {
+        cwd: &cwd,
+        workspace_roots: &workspace_roots,
+        user_home_dir: None,
+        temporary_directories: Some(&temporary_directories),
+    };
+    let write = FileSystemSandboxEntry::new(
+        FileSystemPath::Path { path: cwd.clone() },
+        FileSystemAccessMode::Write,
+    );
+    let permissions = PermissionProfile {
+        file_system: Some(FileSystemPermissions {
+            entries: vec![
+                write.clone(),
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Tmpdir,
+                    },
+                    FileSystemAccessMode::Deny,
+                ),
+            ],
+            glob_scan_max_depth: None,
+        }),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        materialize_additional_permissions_with_context(permissions, &context)
+            .expect("permissions"),
+        PermissionProfile {
+            file_system: Some(FileSystemPermissions {
+                entries: vec![write],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        }
     );
 }
 
@@ -447,6 +560,99 @@ fn intersect_permission_profiles_preserves_deny_across_case_variant_grant() {
         ),
         profile(vec![granted_write, requested_deny])
     );
+}
+
+#[test]
+fn intersect_permission_profiles_preserves_denies_for_unresolved_tmpdir() {
+    let cwd = PathUri::parse("file:///workspace").expect("cwd URI");
+    let context = FileSystemSandboxPolicyContext {
+        cwd: &cwd,
+        workspace_roots: std::slice::from_ref(&cwd),
+        user_home_dir: None,
+        temporary_directories: None,
+    };
+    let write = FileSystemSandboxEntry::new(
+        FileSystemPath::Special {
+            value: FileSystemSpecialPath::Tmpdir,
+        },
+        FileSystemAccessMode::Write,
+    );
+    let deny = FileSystemSandboxEntry::new(
+        PathUri::parse("file:///tmp/private").expect("deny").into(),
+        FileSystemAccessMode::Deny,
+    );
+    let profile = |entries| PermissionProfile {
+        file_system: Some(FileSystemPermissions {
+            entries,
+            glob_scan_max_depth: None,
+        }),
+        ..Default::default()
+    };
+    let grant = profile(vec![write.clone()]);
+    let grant_with_deny = profile(vec![write, deny]);
+
+    for (requested, granted) in [
+        (grant_with_deny.clone(), grant.clone()),
+        (grant, grant_with_deny.clone()),
+        (grant_with_deny.clone(), grant_with_deny.clone()),
+    ] {
+        assert_eq!(
+            intersect_permission_profiles_with_context(requested, granted, &context),
+            grant_with_deny
+        );
+    }
+}
+
+#[test]
+fn intersect_permission_profiles_preserves_rooted_first_segment_glob_deny() {
+    use FileSystemAccessMode::Deny;
+    use FileSystemAccessMode::Write;
+
+    for (cwd_uri, grant_uri, pattern) in [
+        ("file:///workspace", "file:///fooX", "/foo*/*"),
+        ("file:///workspace", "file:///foo%5Cbar", r"/foo\\*/*"),
+        ("file:///C:/workspace", "file:///C:/fooX", r"C:\foo*\*"),
+        (
+            "file://server/share/workspace",
+            "file://server/share/fooX",
+            r"\\server\share\foo*\*",
+        ),
+    ] {
+        let cwd = PathUri::parse(cwd_uri).expect("cwd URI");
+        let grant_path = PathUri::parse(grant_uri).expect("grant URI");
+        let workspace_roots = [cwd.clone()];
+        let context = FileSystemSandboxPolicyContext {
+            cwd: &cwd,
+            workspace_roots: &workspace_roots,
+            user_home_dir: None,
+            temporary_directories: None,
+        };
+        let grant_entry =
+            FileSystemSandboxEntry::new(FileSystemPath::Path { path: grant_path }, Write);
+        let deny_entry = FileSystemSandboxEntry::new(
+            FileSystemPath::GlobPattern {
+                pattern: pattern.to_string(),
+            },
+            Deny,
+        );
+        let profile = |entries| PermissionProfile {
+            file_system: Some(FileSystemPermissions {
+                entries,
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            intersect_permission_profiles_with_context(
+                profile(vec![grant_entry.clone(), deny_entry.clone()]),
+                profile(vec![grant_entry.clone()]),
+                &context,
+            ),
+            profile(vec![grant_entry, deny_entry]),
+            "deny glob should survive for {pattern}",
+        );
+    }
 }
 
 #[test]

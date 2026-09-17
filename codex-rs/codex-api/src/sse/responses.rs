@@ -478,8 +478,15 @@ pub fn process_responses_event(
         }
         "response.completed" => {
             if let Some(resp_val) = event.response {
+                let metadata = resp_val
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                    .cloned();
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {
-                    Ok(resp) => {
+                    Ok(mut resp) => {
+                        if let Some(metadata) = metadata {
+                            resp.usage_metadata.get_or_insert_default().metadata = Some(metadata);
+                        }
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
                             token_usage: resp.usage.map(Into::into),

@@ -9,7 +9,6 @@ use tokio_util::task::AbortOnDropHandle;
 
 use codex_diagnostics::GaugeGuard;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
-use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
@@ -23,6 +22,7 @@ use crate::mcp_tool_call::McpToolApprovalMetadata;
 use crate::session::TurnInputQueue;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tasks::AnySessionTask;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::McpInvocation;
@@ -109,7 +109,7 @@ pub(crate) struct TurnState {
 pub(crate) struct PendingRequestPermissions {
     pub(crate) tx_response: oneshot::Sender<RequestPermissionsResponse>,
     pub(crate) requested_permissions: RequestPermissionProfile,
-    pub(crate) environment: TurnEnvironmentSelection,
+    pub(crate) environment: TurnEnvironment,
 }
 
 impl TurnState {

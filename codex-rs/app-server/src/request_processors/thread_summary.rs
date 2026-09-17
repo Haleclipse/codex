@@ -272,6 +272,8 @@ pub(crate) fn summary_to_thread(
         history_mode: ThreadHistoryMode::Legacy,
         model_provider,
         created_at: created_at.map(|dt| dt.timestamp()).unwrap_or(0),
+        model: None,
+        reasoning_effort: None,
         updated_at: updated_at.map(|dt| dt.timestamp()).unwrap_or(0),
         recency_at: updated_at.map(|dt| dt.timestamp()),
         status: ThreadStatus::NotLoaded,

@@ -47,6 +47,10 @@ pub enum TurnStatus {
 pub struct TurnSettingsUpdateParams {
     pub thread_id: String,
     pub turn_id: String,
+    /// Changes the active turn's reviewer without changing future thread settings.
+    /// Already captured steps and pending approvals retain their original reviewer.
+    #[ts(optional = nullable)]
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
     /// Omission or `null` leaves the model unchanged.
     #[ts(optional = nullable)]
     pub model: Option<String>,

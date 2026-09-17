@@ -1102,8 +1102,8 @@ async fn injected_response_item_reopens_turn_after_final_answer() {
     responses::assert_root_turn(&first, Some(first_turn_id))
         .expect("initial root should be trusted");
     let second: Value = from_slice(&requests[1]).expect("parse second request");
-    responses::assert_root_turn(&second, /*expected*/ None)
-        .expect("external injection should invalidate the active turn root");
+    responses::assert_root_turn(&second, Some(first_turn_id))
+        .expect("external injection should preserve the active turn root");
     let relevant_user_input = message_input_texts(&second, "user")
         .into_iter()
         .filter(|text| {

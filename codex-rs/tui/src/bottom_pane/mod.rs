@@ -61,6 +61,7 @@ mod actionable_banner;
 mod app_link_view;
 mod apply_patch_header;
 mod approval_overlay;
+mod hook_status;
 mod mcp_server_elicitation;
 mod multi_select_picker;
 mod request_user_input;
@@ -248,7 +249,11 @@ pub(crate) struct BottomPane {
 
     /// Inline status indicator shown above the composer while a task is running.
     status: Option<StatusIndicatorWidget>,
+    /// Running-hook summary supplied by the lifecycle owner after its reveal delay.
+    hook_status_message: Option<String>,
     inline_banner: Option<actionable_banner::InlineBanner>,
+    /// Streaming may drop the row without losing its elapsed time or modal pause.
+    status_timer: crate::status_indicator_widget::StatusTimer,
     /// Unified exec session summary source.
     ///
     /// When a status row exists, this summary is mirrored inline in that row;
@@ -321,7 +326,9 @@ impl BottomPane {
             disable_paste_burst,
             is_task_running: false,
             status: None,
+            hook_status_message: None,
             inline_banner: None,
+            status_timer: crate::status_indicator_widget::StatusTimer::default(),
             unified_exec_footer: UnifiedExecFooter::new(),
             pending_input_preview: PendingInputPreview::new(),
             pending_thread_approvals: PendingThreadApprovals::new(),
@@ -376,6 +383,11 @@ impl BottomPane {
 
     pub fn set_plugin_mentions(&mut self, plugins: Option<Vec<PluginCapabilitySummary>>) {
         self.composer.set_plugin_mentions(plugins);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_agents_navigation_enabled(&mut self, enabled: bool) {
+        self.composer.set_agents_navigation_enabled(enabled);
         self.request_redraw();
     }
 
@@ -548,6 +560,15 @@ impl BottomPane {
         self.status.as_ref()
     }
 
+    pub(crate) fn status_elapsed(&self) -> Option<Duration> {
+        self.is_task_running
+            .then(|| self.status_timer.elapsed_at(Instant::now()))
+    }
+
+    pub(crate) fn reset_status_timer(&mut self, elapsed: Duration) {
+        self.status_timer.reset(elapsed);
+    }
+
     pub fn skills(&self) -> Option<&Vec<SkillMetadata>> {
         self.composer.skills()
     }
@@ -650,6 +671,16 @@ impl BottomPane {
         }
         self.pause_status_timer_for_modal();
         self.push_view(Box::new(modal));
+    }
+
+    /// Edit the draft without invoking popups, submissions, or remote actions.
+    pub(crate) fn handle_disconnected_key(&mut self, key: KeyEvent) {
+        self.view_stack.clear();
+        self.delayed_approval_requests.clear();
+        self.composer
+            .set_input_enabled(/*enabled*/ true, /*placeholder*/ None);
+        self.composer.handle_disconnected_key(key);
+        self.request_redraw();
     }
 
     /// Forward a key event to the active view or the composer.
@@ -1046,7 +1077,7 @@ impl BottomPane {
 
     #[cfg(test)]
     pub(crate) fn status_indicator_visible(&self) -> bool {
-        self.status.is_some()
+        self.status_widget().is_some()
     }
 
     #[cfg(test)]
@@ -1077,6 +1108,7 @@ impl BottomPane {
 
         if running {
             if !was_running {
+                self.status_timer.reset(Duration::ZERO);
                 if self.status.is_none() {
                     self.status = Some(StatusIndicatorWidget::new(
                         self.app_event_tx.clone(),
@@ -1113,11 +1145,13 @@ impl BottomPane {
 
     pub(crate) fn ensure_status_indicator(&mut self) {
         if self.status.is_none() {
-            self.status = Some(StatusIndicatorWidget::new(
-                self.app_event_tx.clone(),
-                self.frame_requester.clone(),
-                self.animations_enabled,
-            ));
+            self.status.get_or_insert_with(|| {
+                StatusIndicatorWidget::new(
+                    self.app_event_tx.clone(),
+                    self.frame_requester.clone(),
+                    self.animations_enabled,
+                )
+            });
             if let Some(status) = self.status.as_mut() {
                 status.set_interrupt_binding(
                     self.keymap
@@ -1453,13 +1487,29 @@ impl BottomPane {
         }
     }
 
-    /// Copy unified-exec summary text into the active status row, if any.
+    /// Update hook activity after the lifecycle reveal delay, even outside a turn.
+    pub(crate) fn set_hook_status_message(&mut self, message: Option<String>) {
+        if self.hook_status_message == message {
+            return;
+        }
+
+        self.hook_status_message = message;
+        if self.hook_status_message.is_some() && self.status.is_none() && self.is_task_running() {
+            self.ensure_status_indicator();
+        } else {
+            self.sync_status_inline_message();
+            self.request_redraw();
+        }
+    }
+
+    /// Copy background activity and hook text into the active status row, if any.
     ///
     /// This keeps status-line inline text synchronized without forcing the
     /// standalone unified-exec footer row to be visible.
     fn sync_status_inline_message(&mut self) {
         if let Some(status) = self.status.as_mut() {
             status.update_inline_message(self.unified_exec_footer.summary_text());
+            status.update_hook_status_message(self.hook_status_message.clone());
         }
     }
 
@@ -1492,7 +1542,7 @@ impl BottomPane {
             && !(is_agent_command && key_event.code == KeyCode::Esc)
             && self.no_modal_or_popup_active()
             && !self.composer_should_handle_vim_insert_escape(key_event)
-            && self.status.is_some()
+            && self.status_widget().is_some()
     }
 
     pub(crate) fn terminal_title_requires_action(&self) -> bool {
@@ -1753,15 +1803,12 @@ impl BottomPane {
     }
 
     fn pause_status_timer_for_modal(&mut self) {
-        if let Some(status) = self.status.as_mut() {
-            status.pause_timer();
-        }
+        self.status_timer.pause_at(Instant::now());
     }
 
     fn resume_status_timer_after_modal(&mut self) {
-        if let Some(status) = self.status.as_mut() {
-            status.resume_timer();
-        }
+        self.status_timer.resume_at(Instant::now());
+        self.request_redraw();
     }
 
     /// Height (terminal rows) required by the current bottom pane.
@@ -1893,12 +1940,26 @@ impl BottomPane {
             {
                 flex.push(/*flex*/ 0, RenderableItem::Borrowed(banner));
             }
-            if let Some(status) = &self.status {
-                flex.push(/*flex*/ 0, RenderableItem::Borrowed(status));
+            if let Some(status) = self.status_widget() {
+                flex.push(
+                    /*flex*/ 0,
+                    RenderableItem::Owned(Box::new(status.with_timer(&self.status_timer))),
+                );
+            }
+            if self.status.is_none()
+                && let Some(message) = &self.hook_status_message
+            {
+                flex.push(
+                    /*flex*/ 0,
+                    RenderableItem::Owned(Box::new(hook_status::HookStatus {
+                        message,
+                        animations_enabled: self.animations_enabled,
+                    })),
+                );
             }
             // Avoid double-surfacing the same summary and avoid adding an extra
             // row while the status line is already visible.
-            if self.status.is_none() && !self.unified_exec_footer.is_empty() {
+            if self.status_widget().is_none() && !self.unified_exec_footer.is_empty() {
                 flex.push(
                     /*flex*/ 0,
                     RenderableItem::Borrowed(&self.unified_exec_footer),
@@ -1908,8 +1969,9 @@ impl BottomPane {
             let has_pending_input = !self.pending_input_preview.queued_messages.is_empty()
                 || !self.pending_input_preview.pending_steers.is_empty()
                 || !self.pending_input_preview.rejected_steers.is_empty();
-            let has_status_or_footer =
-                self.status.is_some() || !self.unified_exec_footer.is_empty();
+            let has_status_or_footer = self.status_widget().is_some()
+                || self.hook_status_message.is_some()
+                || !self.unified_exec_footer.is_empty();
             let has_inline_previews = has_pending_thread_approvals || has_pending_input;
             if has_inline_previews && has_status_or_footer {
                 flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
@@ -2423,6 +2485,11 @@ mod tests {
         assert_eq!(pane.composer_text(), "ya");
         assert!(pane.view_stack.is_empty());
         assert_eq!(pane.delayed_approval_requests.len(), 1);
+        pane.handle_disconnected_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+        pane.pre_draw_tick_at(Instant::now() + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
+        pane.handle_paste(" kept".into());
+        assert_eq!(pane.composer_text(), "ya kept");
+        assert!(pane.view_stack.is_empty());
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(event, AppEvent::SubmitThreadOp { .. }),
@@ -2697,6 +2764,53 @@ mod tests {
 
         let bufs = snapshot_buffer(&buf);
         assert!(bufs.contains("• Working"), "expected Working header");
+
+        pane.reset_status_timer(Duration::from_secs(/*secs*/ 42));
+        pane.hide_status_indicator();
+        pane.pause_status_timer_for_modal();
+        let paused = pane.status_timer.elapsed_at(Instant::now());
+        pane.ensure_status_indicator();
+        assert_snapshot!(
+            "status_timer_survives_hidden_row",
+            render_snapshot(&pane, area)
+        );
+        assert_eq!(
+            pane.status_timer
+                .elapsed_at(Instant::now() + Duration::from_secs(/*secs*/ 10)),
+            paused
+        );
+        pane.resume_status_timer_after_modal();
+        assert!(
+            pane.status_timer
+                .elapsed_at(Instant::now() + Duration::from_secs(/*secs*/ 10))
+                >= paused + Duration::from_secs(/*secs*/ 10)
+        );
+        pane.set_task_running(/*running*/ false);
+        pane.set_task_running(/*running*/ true);
+        assert!(pane.status_timer.elapsed_at(Instant::now()) < paused);
+    }
+
+    #[test]
+    fn turn_start_keeps_an_outstanding_approval_paused() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let mut pane = test_pane(AppEventSender::new(tx));
+        // MCP startup can already own the running row when an agent turn starts.
+        pane.set_task_running(/*running*/ true);
+        pane.push_approval_request(exec_request(), &Features::default());
+        pane.hide_status_indicator();
+        pane.set_task_running(/*running*/ true);
+        pane.reset_status_timer(Duration::ZERO);
+        pane.ensure_status_indicator();
+        let later = Instant::now() + Duration::from_secs(/*secs*/ 120);
+        assert_eq!(pane.status_timer.elapsed_at(later), Duration::ZERO);
+
+        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(pane.no_modal_or_popup_active());
+        assert!(
+            pane.status_timer
+                .elapsed_at(Instant::now() + Duration::from_secs(/*secs*/ 10))
+                >= Duration::from_secs(/*secs*/ 10)
+        );
     }
 
     #[test]

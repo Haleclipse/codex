@@ -128,13 +128,14 @@ impl MarketplaceCli {
             subcommand,
         } = self;
 
-        let config =
-            cloud_config::load_config(&config_overrides, LoaderOverrides::default()).await?;
+        let builder =
+            cloud_config::config_builder(&config_overrides, LoaderOverrides::default()).await?;
+        let config = builder.clone().build().await?;
 
         match subcommand {
             MarketplaceSubcommand::Add(args) => run_add(config, args).await?,
             MarketplaceSubcommand::List(args) => run_list(config, args).await?,
-            MarketplaceSubcommand::Upgrade(args) => run_upgrade(config, args).await?,
+            MarketplaceSubcommand::Upgrade(args) => run_upgrade(config, args, builder).await?,
             MarketplaceSubcommand::Remove(args) => run_remove(config, args).await?,
         }
 
@@ -358,16 +359,33 @@ fn configured_marketplace_sources_by_root(
         .collect()
 }
 
-async fn run_upgrade(config: Config, args: UpgradeMarketplaceArgs) -> Result<()> {
+async fn run_upgrade(
+    config: Config,
+    args: UpgradeMarketplaceArgs,
+    builder: codex_core::config::ConfigBuilder,
+) -> Result<()> {
     let UpgradeMarketplaceArgs {
         marketplace_name,
         json,
     } = args;
     let manager = plugins_manager_for_config(&config, load_cli_auth_manager(&config).await?);
     let plugins_input = config.plugins_config_input();
-    let outcome = manager
-        .upgrade_configured_marketplaces_for_config(&plugins_input, marketplace_name.as_deref())
-        .map_err(anyhow::Error::msg)?;
+    let runtime = tokio::runtime::Handle::current();
+    let reload_config: codex_core_plugins::ConfigLayerReload = std::sync::Arc::new(move || {
+        runtime
+            .block_on(builder.clone().build())
+            .map(|config| config.config_layer_stack)
+    });
+    let requested_name = marketplace_name.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        manager.upgrade_configured_marketplaces_for_config(
+            &plugins_input,
+            requested_name.as_deref(),
+            &reload_config,
+        )
+    })
+    .await?
+    .map_err(anyhow::Error::msg)?;
     if json {
         print_upgrade_outcome_json(&outcome)
     } else {

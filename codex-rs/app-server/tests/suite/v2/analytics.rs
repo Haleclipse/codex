@@ -198,6 +198,7 @@ async fn guardian_review_turns_and_tools_reach_analytics() -> Result<()> {
                 .expect("turn completion time");
             assert!(started_at > 0 && completed_at >= started_at);
             assert!(params["duration_ms"].is_u64());
+            assert_eq!(params["guardian_v2_enabled"], false);
             json!([
                 params["turn_id"],
                 params["status"],

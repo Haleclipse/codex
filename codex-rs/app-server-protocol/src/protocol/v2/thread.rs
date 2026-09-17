@@ -1856,12 +1856,14 @@ pub struct RawResponseCompletedNotification {
 #[ts(export_to = "v2/")]
 pub struct ResponseUsageMetadata {
     pub amount: Option<String>,
+    pub metadata: Option<JsonValue>,
 }
 
 impl From<codex_protocol::ResponseUsageMetadata> for ResponseUsageMetadata {
     fn from(value: codex_protocol::ResponseUsageMetadata) -> Self {
         Self {
             amount: value.amount,
+            metadata: value.metadata,
         }
     }
 }

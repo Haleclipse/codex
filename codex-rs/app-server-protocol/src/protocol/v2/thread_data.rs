@@ -5,6 +5,7 @@ use super::TurnStatus;
 use crate::JsonSchema;
 use crate::TS;
 use codex_experimental_api_macros::ExperimentalApi;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::MisalignmentErrorDetails as CoreMisalignmentErrorDetails;
 use codex_protocol::protocol::MisalignmentSteer as CoreMisalignmentSteer;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
@@ -233,6 +234,12 @@ pub struct Thread {
     pub history_mode: ThreadHistoryMode,
     /// Model provider used for this thread (for example, 'openai').
     pub model_provider: String,
+    /// Current configured model when loaded, otherwise the latest persisted model.
+    /// Null when unavailable. This is not per-turn execution telemetry.
+    pub model: Option<String>,
+    /// Current configured reasoning effort when loaded, otherwise the latest persisted effort.
+    /// Null when unset or unavailable. This is not per-turn execution telemetry.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Unix timestamp (in seconds) when the thread was created.
     #[ts(type = "number")]
     pub created_at: i64,
@@ -294,6 +301,8 @@ struct ThreadCompatibility {
     #[serde(default)]
     history_mode: ThreadHistoryMode,
     model_provider: String,
+    model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
     created_at: i64,
     updated_at: i64,
     recency_at: Option<i64>,
@@ -330,6 +339,8 @@ impl<'de> Deserialize<'de> for Thread {
             project_id: thread.project_id,
             history_mode: thread.history_mode,
             model_provider: thread.model_provider,
+            model: thread.model,
+            reasoning_effort: thread.reasoning_effort,
             created_at: thread.created_at,
             updated_at: thread.updated_at,
             recency_at: thread.recency_at,

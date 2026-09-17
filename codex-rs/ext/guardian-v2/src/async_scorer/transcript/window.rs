@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
-use super::TranscriptConfig;
+use codex_guardian_context::TranscriptRetentionConfig;
+
 use super::TranscriptEntry;
 use super::TranscriptEntryKind;
 
@@ -44,7 +45,7 @@ pub(super) struct TranscriptWindow<'a> {
 impl<'a> TranscriptWindow<'a> {
     pub(super) fn new(
         entries: &'a [TranscriptEntry],
-        config: &TranscriptConfig,
+        config: &TranscriptRetentionConfig,
         message_token_budget: usize,
     ) -> Self {
         Self {

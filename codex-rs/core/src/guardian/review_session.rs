@@ -79,6 +79,7 @@ use super::ApprovalRequestReasons;
 use super::GUARDIAN_REVIEWER_NAME;
 use super::GuardianApprovalRequest;
 use super::GuardianReviewContext;
+use super::feedback::record_failed_review;
 #[cfg(test)]
 use super::prompt::BUNDLED_GUARDIAN_POLICY;
 use super::prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
@@ -652,6 +653,7 @@ impl GuardianReviewSessionManager {
             deadline,
         ))
         .await;
+        record_failed_review(&trunk.session, &params, &outcome).await;
         if keep_review_session && matches!(outcome, GuardianReviewSessionOutcome::Completed(_)) {
             trunk.refresh_last_committed_fork_snapshot().await;
         }
@@ -826,6 +828,7 @@ impl GuardianReviewSessionManager {
             deadline,
         ))
         .await;
+        record_failed_review(&review_session.session, &params, &outcome).await;
         if let Some(review_session) = self.take_active_ephemeral(&review_session).await {
             cleanup.disarm();
             review_session.shutdown_in_background();

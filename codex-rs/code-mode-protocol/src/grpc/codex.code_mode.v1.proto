@@ -83,7 +83,7 @@ message ToolCall {
   // Starts at one and increases independently for each execution.
   uint64 sequence = 9;
 
-  // The host execution span's W3C parent context for this streamed callback.
+  // The host tool invocation span's W3C parent context for this streamed callback.
   // gRPC metadata is fixed when the subscription stream opens, so each call
   // carries its own context in the message.
   optional string traceparent = 10;

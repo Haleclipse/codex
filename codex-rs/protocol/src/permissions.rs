@@ -288,15 +288,43 @@ struct FileSystemSemanticSignature {
 
 /// Runtime matcher for read-deny entries in a filesystem sandbox policy.
 pub struct ReadDenyMatcher {
-    cwd: AbsolutePathBuf,
+    native_cwd: Option<AbsolutePathBuf>,
     user_home_dir: Option<PathUri>,
     temporary_directories: Vec<PathUri>,
+    prepared: PreparedReadDenyMatcher,
+}
+
+/// Prepared PathUri deny roots and globs for repeated executor-owned read checks.
+struct PreparedReadDenyMatcher {
     denied_roots: Vec<PathUri>,
     deny_read_matchers: Vec<GlobMatcher>,
     invalid_pattern: bool,
 }
 
 impl ReadDenyMatcher {
+    /// Builds a matcher for executor-owned URI paths without host projection.
+    pub fn from_context(
+        file_system_sandbox_policy: &FileSystemSandboxPolicy,
+        context: &FileSystemSandboxPolicyContext<'_>,
+    ) -> Option<Self> {
+        file_system_sandbox_policy
+            .entries
+            .iter()
+            .any(|entry| entry.access == FileSystemAccessMode::Deny)
+            .then(|| {
+                file_system_sandbox_policy
+                    .prepare_deny_read_matcher(context, InvalidDenyReadGlobBehavior::FailClosed)
+                    .map(|prepared| Self {
+                        native_cwd: None,
+                        user_home_dir: None,
+                        temporary_directories: Vec::new(),
+                        prepared,
+                    })
+                    .ok()
+            })
+            .flatten()
+    }
+
     /// Builds a matcher from exact deny-read roots and deny-read glob entries.
     ///
     /// Returns `None` when the policy has no deny-read restrictions, so callers
@@ -348,38 +376,42 @@ impl ReadDenyMatcher {
             user_home_dir: user_home_dir.as_ref(),
             temporary_directories: Some(&temporary_directories),
         };
-        let (denied_roots, deny_read_matchers, invalid_pattern) = file_system_sandbox_policy
+        let prepared = file_system_sandbox_policy
             .prepare_deny_read_matcher(&context, invalid_glob_behavior)?;
         Ok(Some(Self {
-            cwd,
+            native_cwd: Some(cwd),
             user_home_dir,
             temporary_directories,
-            denied_roots,
-            deny_read_matchers,
-            invalid_pattern,
+            prepared,
         }))
     }
 
     /// Returns whether `path` is denied by the policy used to build this matcher.
     pub fn is_read_denied(&self, path: &Path) -> bool {
-        let Some(path) = resolve_candidate_path(path, self.cwd.as_path()) else {
+        let Some(cwd) = self.native_cwd.as_ref() else {
+            return true;
+        };
+        let Some(path) = resolve_candidate_path(path, cwd.as_path()) else {
             return true;
         };
         let path = PathUri::from(path);
-        let cwd = PathUri::from_abs_path(&self.cwd);
+        let cwd = PathUri::from_abs_path(cwd);
         let context = FileSystemSandboxPolicyContext {
             cwd: &cwd,
             workspace_roots: std::slice::from_ref(&cwd),
             user_home_dir: self.user_home_dir.as_ref(),
             temporary_directories: Some(&self.temporary_directories),
         };
-        FileSystemSandboxPolicy::matches_prepared_read_deny(
-            &path,
-            &context,
-            &self.denied_roots,
-            &self.deny_read_matchers,
-            self.invalid_pattern,
-        )
+        self.is_read_denied_uri(&path, &context)
+    }
+
+    /// Returns whether an executor-owned URI is denied under its matching path context.
+    pub fn is_read_denied_uri(
+        &self,
+        path: &PathUri,
+        context: &FileSystemSandboxPolicyContext<'_>,
+    ) -> bool {
+        FileSystemSandboxPolicy::matches_prepared_read_deny(path, context, &self.prepared)
     }
 
     /// Checks an enumerated path using a canonical location already resolved by
@@ -891,7 +923,7 @@ impl FileSystemSandboxPolicy {
         .unwrap_or(false)
     }
 
-    fn resolve_access(
+    pub fn resolve_access(
         &self,
         path: &PathUri,
         context: &FileSystemSandboxPolicyContext<'_>,
@@ -973,7 +1005,7 @@ impl FileSystemSandboxPolicy {
         &self,
         context: &FileSystemSandboxPolicyContext<'_>,
         invalid_glob_behavior: InvalidDenyReadGlobBehavior,
-    ) -> Result<(Vec<PathUri>, Vec<GlobMatcher>, bool), String> {
+    ) -> Result<PreparedReadDenyMatcher, String> {
         let file_system_root = file_system_root(context);
         let denied_roots = self
             .resolved_entries(context)
@@ -987,7 +1019,11 @@ impl FileSystemSandboxPolicy {
             .map(|(root, _)| root)
             .collect();
         let Some(convention) = context.cwd.infer_path_convention() else {
-            return Ok((denied_roots, Vec::new(), true));
+            return Ok(PreparedReadDenyMatcher {
+                denied_roots,
+                deny_read_matchers: Vec::new(),
+                invalid_pattern: true,
+            });
         };
         let mut deny_read_matchers = Vec::new();
         let mut invalid_pattern = false;
@@ -995,7 +1031,11 @@ impl FileSystemSandboxPolicy {
             Ok(patterns) => patterns,
             Err(err) => match invalid_glob_behavior {
                 InvalidDenyReadGlobBehavior::FailClosed => {
-                    return Ok((denied_roots, Vec::new(), true));
+                    return Ok(PreparedReadDenyMatcher {
+                        denied_roots,
+                        deny_read_matchers: Vec::new(),
+                        invalid_pattern: true,
+                    });
                 }
                 InvalidDenyReadGlobBehavior::ReturnError => return Err(err),
             },
@@ -1011,15 +1051,17 @@ impl FileSystemSandboxPolicy {
                 },
             }
         }
-        Ok((denied_roots, deny_read_matchers, invalid_pattern))
+        Ok(PreparedReadDenyMatcher {
+            denied_roots,
+            deny_read_matchers,
+            invalid_pattern,
+        })
     }
 
     fn matches_prepared_read_deny(
         path: &PathUri,
         context: &FileSystemSandboxPolicyContext<'_>,
-        denied_roots: &[PathUri],
-        deny_read_matchers: &[GlobMatcher],
-        invalid_pattern: bool,
+        prepared: &PreparedReadDenyMatcher,
     ) -> bool {
         let Some(convention) = context.cwd.infer_path_convention() else {
             return true;
@@ -1030,11 +1072,14 @@ impl FileSystemSandboxPolicy {
         {
             return true;
         }
-        if invalid_pattern {
+        if prepared.invalid_pattern {
             return true;
         }
-        denied_roots.iter().any(|root| path.starts_with(root))
-            || deny_read_matchers.iter().any(|matcher| {
+        prepared
+            .denied_roots
+            .iter()
+            .any(|root| path.starts_with(root))
+            || prepared.deny_read_matchers.iter().any(|matcher| {
                 let path = match convention {
                     PathConvention::Posix => path.decoded_path_bytes(),
                     PathConvention::Windows => Cow::Owned(
@@ -1400,6 +1445,21 @@ impl FileSystemSandboxPolicy {
                     entry.access.can_write()
                         && self.can_write_path_with_cwd(entry.path.as_path(), cwd)
                 })
+    }
+
+    /// Reports configured writable roots for diagnostics without inspecting the filesystem.
+    ///
+    /// Unlike runtime root resolution, this includes configured roots even if they
+    /// do not currently exist (including `/tmp`). Do not use this result to authorize
+    /// filesystem access or replace the resolution needed for sandbox enforcement.
+    pub fn has_configured_writable_roots_with_cwd(&self, cwd: &Path) -> bool {
+        !self.has_full_disk_write_access()
+            && with_local_policy_context(cwd, cwd, |_, context| {
+                self.resolved_entries(context)
+                    .into_iter()
+                    .any(|(path, access)| access.can_write() && self.can_write_path(&path, context))
+            })
+            .unwrap_or(false)
     }
 
     /// Returns writable roots without following attacker-mutable path components.
@@ -1897,7 +1957,7 @@ fn with_local_policy_context<T>(
     Some(evaluate(&path, &context))
 }
 
-fn file_system_root(context: &FileSystemSandboxPolicyContext<'_>) -> Option<PathUri> {
+pub fn file_system_root(context: &FileSystemSandboxPolicyContext<'_>) -> Option<PathUri> {
     context.cwd.lexical_depth()?;
     context.cwd.ancestors().last()
 }
@@ -2476,6 +2536,10 @@ mod tests {
                 policy.has_writable_roots_with_cwd(cwd.path()),
                 !policy.get_writable_roots_with_cwd(cwd.path()).is_empty()
             );
+            assert_eq!(
+                policy.has_configured_writable_roots_with_cwd(cwd.path()),
+                !policy.get_writable_roots_with_cwd(cwd.path()).is_empty()
+            );
         }
     }
 
@@ -2725,25 +2789,21 @@ mod tests {
             ),
             unreadable_glob_entry(r"C:\workspace\**\*.env".to_string()),
         ]);
-        let (roots, globs, invalid) = policy
+        let prepared = policy
             .prepare_deny_read_matcher(&context, InvalidDenyReadGlobBehavior::ReturnError)
             .expect("remote deny matcher");
 
-        assert!(roots.is_empty());
+        assert!(prepared.denied_roots.is_empty());
         assert!(FileSystemSandboxPolicy::matches_prepared_read_deny(
             &path("file:///c:/WORKSPACE/app/.ENV"),
             &context,
-            &roots,
-            &globs,
-            invalid,
+            &prepared,
         ));
         for candidate in ["file:///%00/bad/path/YQ", "file:///C:/workspace/%2Fsecret"] {
             assert!(FileSystemSandboxPolicy::matches_prepared_read_deny(
                 &path(candidate),
                 &context,
-                &roots,
-                &globs,
-                invalid,
+                &prepared,
             ));
         }
         assert!(!policy.can_write_path(&path("file:///C:/workspace/.codex/config"), &context));
@@ -2793,12 +2853,12 @@ mod tests {
             let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(
                 pattern.to_string(),
             )]);
-            let (roots, globs, invalid) = policy
+            let prepared = policy
                 .prepare_deny_read_matcher(&context, InvalidDenyReadGlobBehavior::ReturnError)
                 .expect("home-relative deny glob");
 
             assert!(FileSystemSandboxPolicy::matches_prepared_read_deny(
-                &candidate, &context, &roots, &globs, invalid,
+                &candidate, &context, &prepared,
             ));
 
             let without_home = FileSystemSandboxPolicyContext {
@@ -2813,10 +2873,10 @@ mod tests {
                     )
                     .is_err()
             );
-            let (_, _, invalid) = policy
+            let prepared = policy
                 .prepare_deny_read_matcher(&without_home, InvalidDenyReadGlobBehavior::FailClosed)
                 .expect("missing executor home fails closed");
-            assert!(invalid);
+            assert!(prepared.invalid_pattern);
         }
     }
 

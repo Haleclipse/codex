@@ -15,7 +15,7 @@ pub(super) const NUDGE_MODEL_SLUG: &str = "gpt-5.6-luna";
 pub(super) const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
 pub(super) const RATE_LIMIT_SWITCH_PROMPT_VIEW_ID: &str = "rate-limit-switch-prompt";
 
-const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
+const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 4] = [50.0, 75.0, 90.0, 95.0];
 const PRIMARY_LIMIT_FALLBACK_LABEL: &str = "usage";
 const SECONDARY_LIMIT_FALLBACK_LABEL: &str = "secondary usage";
 
@@ -28,6 +28,7 @@ pub(super) struct RateLimitWarningState {
 impl RateLimitWarningState {
     pub(super) fn take_warnings(
         &mut self,
+        plan_type: Option<PlanType>,
         secondary_used_percent: Option<f64>,
         secondary_window_minutes: Option<i64>,
         primary_used_percent: Option<f64>,
@@ -47,7 +48,14 @@ impl RateLimitWarningState {
             while self.secondary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
                 && secondary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]
             {
-                highest_secondary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index]);
+                let threshold = RATE_LIMIT_WARNING_THRESHOLDS[self.secondary_index];
+                if threshold != 50.0
+                    || (matches!(plan_type, Some(PlanType::Plus | PlanType::Team))
+                        && secondary_window_minutes
+                            .is_some_and(|minutes| is_approximate_window(minutes, 5 * 60)))
+                {
+                    highest_secondary = Some(threshold);
+                }
                 self.secondary_index += 1;
             }
             if let Some(threshold) = highest_secondary {
@@ -65,7 +73,14 @@ impl RateLimitWarningState {
             while self.primary_index < RATE_LIMIT_WARNING_THRESHOLDS.len()
                 && primary_used_percent >= RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]
             {
-                highest_primary = Some(RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index]);
+                let threshold = RATE_LIMIT_WARNING_THRESHOLDS[self.primary_index];
+                if threshold != 50.0
+                    || (matches!(plan_type, Some(PlanType::Plus | PlanType::Team))
+                        && primary_window_minutes
+                            .is_some_and(|minutes| is_approximate_window(minutes, 5 * 60)))
+                {
+                    highest_primary = Some(threshold);
+                }
                 self.primary_index += 1;
             }
             if let Some(threshold) = highest_primary {
@@ -287,6 +302,7 @@ impl ChatWidget {
             let should_warn_about_rate_limit_usage = is_codex_limit && !has_workspace_credits;
             let warnings = if should_warn_about_rate_limit_usage {
                 self.rate_limit_warnings.take_warnings(
+                    self.plan_type,
                     snapshot
                         .secondary
                         .as_ref()

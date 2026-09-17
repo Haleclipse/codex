@@ -135,7 +135,7 @@ impl GoalRuntimeHandle {
         self.inner.root_accounting_state.clone()
     }
 
-    pub(crate) async fn invalidate_turn_lineage(&self) {
+    pub(crate) async fn clear_pending_turn_start_options(&self) {
         let Some(thread_manager) = self.inner.thread_manager.upgrade() else {
             return;
         };
@@ -143,9 +143,6 @@ impl GoalRuntimeHandle {
             return;
         };
         thread.thread_extension_data().remove::<TurnStartOptions>();
-        if let Some(turn_id) = self.inner.accounting_state.current_turn_id() {
-            thread.invalidate_turn_lineage(turn_id.as_str()).await;
-        }
     }
 
     pub(crate) async fn goal_state_permit(&self) -> Result<SemaphorePermit<'_>, String> {

@@ -11,6 +11,7 @@ mod client;
 mod client_common;
 mod realtime_context;
 mod realtime_conversation;
+mod realtime_history;
 mod realtime_prompt;
 mod responses_metadata;
 mod responses_retry;

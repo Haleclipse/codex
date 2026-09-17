@@ -94,11 +94,32 @@ impl LocalThreadStore {
             }
             let rollout_path = match representation {
                 LineageRepresentation::Existing => rollout_path,
-                LineageRepresentation::PlainForReference => super::helpers::scoped_rollout_path(
-                    self.config.codex_home.clone(),
-                    rollout_path.as_path(),
-                    "Codex home",
-                )?,
+                LineageRepresentation::PlainForReference => {
+                    let outside_codex_home = || ThreadStoreError::InvalidRequest {
+                        message: format!(
+                            "rollout path `{}` must be in Codex home directory",
+                            rollout_path.display()
+                        ),
+                    };
+                    let canonical_rollout_path = std::fs::canonicalize(rollout_path.as_path())
+                        .map_err(|_| outside_codex_home())?;
+                    // Resume can retain either the logical Codex home path or its canonical
+                    // target. Keep references inside canonical managed roots so nested symlinks
+                    // cannot escape them.
+                    let is_managed_rollout = [
+                        self.config.codex_home.join(codex_rollout::SESSIONS_SUBDIR),
+                        self.config
+                            .codex_home
+                            .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
+                    ]
+                    .into_iter()
+                    .filter_map(|root| std::fs::canonicalize(root).ok())
+                    .any(|root| canonical_rollout_path.starts_with(root));
+                    if !is_managed_rollout {
+                        return Err(outside_codex_home());
+                    }
+                    canonical_rollout_path
+                }
             };
             let meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
                 .await

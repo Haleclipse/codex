@@ -318,14 +318,15 @@ fn regaining_focus_preserves_only_manual_in_flight_request() {
 async fn scheduled_check_fires_at_recap_deadline() {
     let thread_id = ThreadId::new();
     let now = Instant::now();
-    let mut state = RecapState::default();
+    let mut app = make_test_app().await;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.app_event_tx = AppEventSender::new(event_tx);
 
-    state.note_focus_lost(now);
+    app.recap.note_focus_lost(now);
     for _ in 0..3 {
-        state.note_turn_finished(&TurnStatus::Completed, now);
+        app.recap.note_turn_finished(&TurnStatus::Completed, now);
     }
-    state.schedule_check(thread_id, AppEventSender::new(event_tx), now);
+    app.schedule_recap_check(thread_id, now);
     tokio::task::yield_now().await;
 
     tokio::time::advance(RECAP_DELAY - Duration::from_secs(/*secs*/ 1)).await;
@@ -346,22 +347,24 @@ async fn scheduled_check_fires_at_recap_deadline() {
 async fn rescheduling_check_cancels_the_earlier_timer() {
     let thread_id = ThreadId::new();
     let first_turn = Instant::now();
-    let mut state = RecapState::default();
+    let mut app = make_test_app().await;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let app_event_tx = AppEventSender::new(event_tx);
+    app.app_event_tx = AppEventSender::new(event_tx);
 
-    state.note_focus_lost(first_turn);
+    app.recap.note_focus_lost(first_turn);
     for _ in 0..3 {
-        state.note_turn_finished(&TurnStatus::Completed, first_turn);
+        app.recap
+            .note_turn_finished(&TurnStatus::Completed, first_turn);
     }
-    state.schedule_check(thread_id, app_event_tx.clone(), first_turn);
+    app.schedule_recap_check(thread_id, first_turn);
     tokio::task::yield_now().await;
 
     let elapsed = Duration::from_secs(/*secs*/ 1);
     tokio::time::advance(elapsed).await;
     let later_turn = first_turn + elapsed;
-    state.note_turn_finished(&TurnStatus::Completed, later_turn);
-    state.schedule_check(thread_id, app_event_tx, later_turn);
+    app.recap
+        .note_turn_finished(&TurnStatus::Completed, later_turn);
+    app.schedule_recap_check(thread_id, later_turn);
     tokio::task::yield_now().await;
 
     tokio::time::advance(RECAP_DELAY - elapsed).await;
@@ -376,6 +379,32 @@ async fn rescheduling_check_cancels_the_earlier_timer() {
             thread_id: event_thread_id,
         }) if event_thread_id == thread_id
     ));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn auto_recap_opt_out_cancels_scheduling_after_restored_progress() {
+    let thread_id = ThreadId::new();
+    let now = Instant::now();
+    let mut app = make_test_app().await;
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.app_event_tx = AppEventSender::new(event_tx);
+    app.recap.note_focus_lost(now);
+    let progress = RecapProgress {
+        completed_turns: 3,
+        last_recapped_turn_count: None,
+    };
+    app.recap.seed_from_progress(progress, now);
+    app.schedule_recap_check(thread_id, now);
+    tokio::task::yield_now().await;
+
+    app.config.tui_auto_recap = false;
+    app.schedule_recap_check(thread_id, now);
+    tokio::time::advance(RECAP_DELAY).await;
+    tokio::task::yield_now().await;
+
+    assert!(app.recap.scheduled_check.is_none());
+    assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(app.recap.progress(), progress);
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -618,6 +647,27 @@ async fn generated_recap_is_returned_for_synchronous_insertion() {
             .collect::<Vec<_>>(),
         vec!["Conversation recap", "Continue with focused tests."]
     );
+}
+
+#[tokio::test]
+async fn auto_recap_opt_out_discards_results_without_retrying() {
+    let thread_id = ThreadId::new();
+    let mut app = app_with_visible_thread(thread_id).await;
+    for result in [
+        Ok(serde_json::json!({ "recap": "obsolete" }).to_string()),
+        Err("temporary failure".to_string()),
+    ] {
+        let (request, temporary_thread_id) = track_in_flight_recap(&mut app, thread_id);
+        app.config.tui_auto_recap = false;
+
+        assert!(
+            app.handle_generated_recap(request, temporary_thread_id, result)
+                .is_none()
+        );
+        assert!(app.recap.in_flight_request.is_none());
+        assert!(app.recap.scheduled_check.is_none());
+        assert_eq!(app.recap.last_recapped_turn_count, None);
+    }
 }
 
 #[tokio::test]

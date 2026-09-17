@@ -78,6 +78,9 @@ impl App {
                     .await;
             }
             AppServerEvent::Disconnected { message } => {
+                if self.begin_reconnect() {
+                    return;
+                }
                 tracing::warn!("app-server event stream disconnected: {message}");
                 self.chat_widget.add_error_message(message.clone());
                 self.app_event_tx.send(AppEvent::FatalExitRequest(message));
@@ -134,6 +137,7 @@ impl App {
                 .entry(thread_id)
                 .or_default();
         }
+        self.track_agents_overview_notification(&notification);
         if matches!(
             &notification,
             ServerNotification::ThreadStarted(_)
@@ -144,7 +148,8 @@ impl App {
                 | ServerNotification::ThreadDeleted(_)
                 | ServerNotification::ThreadClosed(_)
         ) {
-            self.refresh_agents_overview_threads(app_server_client);
+            self.repaint_agents_overview();
+            self.refresh_changed_agents_overview_threads(app_server_client);
         }
         match &notification {
             ServerNotification::ServerRequestResolved(notification) => {

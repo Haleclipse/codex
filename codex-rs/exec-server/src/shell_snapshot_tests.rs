@@ -10,6 +10,7 @@ use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
 use test_case::test_case;
 
+use super::CapturePurpose;
 use super::MAX_SNAPSHOT_ATTEMPTS;
 use super::SNAPSHOT_RETRY_BACKOFF;
 use super::ShellSnapshotCache;
@@ -22,14 +23,19 @@ use crate::protocol::ShellInfo;
 use crate::protocol::ShellSnapshotRequest;
 use crate::telemetry::ExecServerTelemetry;
 
-#[test_case(1; "succeeds_on_first_attempt")]
-#[test_case(2; "recovers_on_second_attempt")]
-#[test_case(3; "recovers_on_last_attempt")]
-#[test_case(4; "stops_after_three_failures")]
+#[test_case(1, CapturePurpose::Execution; "succeeds_on_first_attempt")]
+#[test_case(2, CapturePurpose::Execution; "recovers_on_second_attempt")]
+#[test_case(3, CapturePurpose::Execution; "recovers_on_last_attempt")]
+#[test_case(4, CapturePurpose::Execution; "stops_after_three_failures")]
+#[test_case(2, CapturePurpose::Prewarm; "failed_prewarm_releases_waiting_command")]
+#[test_case(3, CapturePurpose::Prewarm; "failed_prewarm_preserves_last_attempt")]
+#[test_case(4, CapturePurpose::Prewarm; "failed_prewarm_preserves_retry_limit")]
 #[tokio::test]
 async fn snapshot_failure_retries_are_bounded_and_single_flight(
     recovery_attempt: usize,
+    initial_purpose: CapturePurpose,
 ) -> anyhow::Result<()> {
+    let prewarm_fails_first = initial_purpose == CapturePurpose::Prewarm;
     let home = tempfile::TempDir::new()?;
     let profile = home.path().join(".bashrc");
     std::fs::write(&profile, "printf x >> \"$HOME/captures\"\nexit 7\n")?;
@@ -101,12 +107,23 @@ async fn snapshot_failure_retries_are_bounded_and_single_flight(
         )
         .await
         .expect("prepare concurrent capture");
+        let prewarming = prewarm_fails_first && attempt == 1;
+        let purpose = if prewarming {
+            CapturePurpose::Prewarm
+        } else {
+            CapturePurpose::Execution
+        };
         let (first, second) = tokio::join!(
-            cache.prepare(&params, &mut prepared, &telemetry),
-            cache.prepare(&params, &mut concurrent, &telemetry),
+            biased;
+            cache.prepare(&params, &mut prepared, &telemetry, purpose),
+            cache.prepare(&params, &mut concurrent, &telemetry, CapturePurpose::Execution),
         );
-        first.expect("capture failure must preserve command fallback");
-        second.expect("concurrent request must share the capture attempt");
+        if prewarming {
+            first.expect_err("prewarm must report failure without caching it");
+        } else {
+            first.expect("capture failure must preserve command fallback");
+        }
+        second.expect("waiting command must complete even when prewarm fails");
         assert_eq!(
             (&prepared.command, &prepared.env),
             (&concurrent.command, &concurrent.env)
@@ -115,7 +132,12 @@ async fn snapshot_failure_retries_are_bounded_and_single_flight(
         tokio::time::pause();
         if attempt < recovery_attempt || recovery_attempt > MAX_SNAPSHOT_ATTEMPTS {
             cache
-                .prepare(&params, &mut prepared, &telemetry)
+                .prepare(
+                    &params,
+                    &mut prepared,
+                    &telemetry,
+                    CapturePurpose::Execution,
+                )
                 .await
                 .expect("capture must stay cached during backoff");
             assert_eq!(
@@ -127,7 +149,10 @@ async fn snapshot_failure_retries_are_bounded_and_single_flight(
         }
         assert_eq!(
             std::fs::read_to_string(home.path().join("captures"))?,
-            "x".repeat(attempt.min(recovery_attempt).min(MAX_SNAPSHOT_ATTEMPTS))
+            "x".repeat(
+                attempt.min(recovery_attempt).min(MAX_SNAPSHOT_ATTEMPTS)
+                    + usize::from(prewarm_fails_first)
+            )
         );
         tokio::time::advance(SNAPSHOT_RETRY_BACKOFF).await;
         tokio::time::resume();
@@ -170,7 +195,8 @@ async fn snapshot_failure_retries_are_bounded_and_single_flight(
     }
     let mut expected_counters = BTreeMap::new();
     let mut expected_durations = BTreeMap::new();
-    let failures = (recovery_attempt - 1).min(MAX_SNAPSHOT_ATTEMPTS) as u64;
+    let failures =
+        (recovery_attempt - 1).min(MAX_SNAPSHOT_ATTEMPTS) as u64 + u64::from(prewarm_fails_first);
     for (success, count) in [
         ("false", failures),
         ("true", u64::from(recovery_attempt <= MAX_SNAPSHOT_ATTEMPTS)),

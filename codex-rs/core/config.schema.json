@@ -147,6 +147,14 @@
           "description": "When `false`, Codex does not surface this app.",
           "type": "boolean"
         },
+        "links": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AppLinksConfig"
+            }
+          ],
+          "description": "Per-account approval settings keyed by link ID."
+        },
         "open_world_enabled": {
           "description": "Whether tools with `open_world_hint = true` are allowed for this app.",
           "type": "boolean"
@@ -160,6 +168,36 @@
           "description": "Per-tool settings for this app."
         }
       },
+      "type": "object"
+    },
+    "AppLinkConfig": {
+      "additionalProperties": false,
+      "description": "Approval settings for a connected account within an app.",
+      "properties": {
+        "approvals_reviewer": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ApprovalsReviewer"
+            }
+          ],
+          "description": "Reviewer for approval prompts from this account, overriding the app default."
+        },
+        "default_tools_approval_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AppToolApproval"
+            }
+          ],
+          "description": "Approval mode for this account unless a tool override exists."
+        }
+      },
+      "type": "object"
+    },
+    "AppLinksConfig": {
+      "additionalProperties": {
+        "$ref": "#/definitions/AppLinkConfig"
+      },
+      "description": "Account settings for a single app.",
       "type": "object"
     },
     "AppToolApproval": {
@@ -661,6 +699,9 @@
             "content_item_kinds": {
               "type": "boolean"
             },
+            "context_management": {
+              "$ref": "#/definitions/FeatureToml_for_ContextManagementConfigToml"
+            },
             "current_time_reminder": {
               "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
             },
@@ -782,6 +823,9 @@
               "type": "boolean"
             },
             "mcp_2026_07_28": {
+              "type": "boolean"
+            },
+            "mcp_oauth_refresh_coordination": {
               "type": "boolean"
             },
             "memories": {
@@ -1098,6 +1142,16 @@
       },
       "type": "object"
     },
+    "ContextManagementConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "experimental_mode": {
+          "description": "Enables experimental context management.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "CurrentTimeReminderConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -1208,6 +1262,16 @@
         },
         {
           "$ref": "#/definitions/CodeModeHostConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_ContextManagementConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/ContextManagementConfigToml"
         }
       ]
     },
@@ -3772,6 +3836,15 @@
           "description": "Enable animations (welcome screen, shimmer effects, spinners). Defaults to `true`.",
           "type": "boolean"
         },
+        "auto_recap": {
+          "default": true,
+          "description": "Generate automatic conversation recaps when the terminal is unfocused. Defaults to `true`. Disabling this leaves `/recap` available on demand.",
+          "type": "boolean"
+        },
+        "disable_paste_burst": {
+          "description": "When true, disables burst-paste detection for typed input entirely. All characters are inserted as they are received, and no buffering or placeholder replacement will occur for fast keypress bursts. Overrides the legacy top-level `disable_paste_burst` setting. Defaults to `false`.",
+          "type": "boolean"
+        },
         "keymap": {
           "allOf": [
             {
@@ -3894,6 +3967,7 @@
               "open_line_above": null,
               "open_line_below": null,
               "paste_after": null,
+              "redo": null,
               "repeat_last_change": null,
               "replace_char": null,
               "start_change_operator": null,
@@ -3902,6 +3976,7 @@
               "substitute_char": null,
               "till_backward": null,
               "till_forward": null,
+              "undo": null,
               "yank_line": null
             },
             "vim_operator": {
@@ -4720,6 +4795,7 @@
             "open_line_above": null,
             "open_line_below": null,
             "paste_after": null,
+            "redo": null,
             "repeat_last_change": null,
             "replace_char": null,
             "start_change_operator": null,
@@ -4728,6 +4804,7 @@
             "substitute_char": null,
             "till_backward": null,
             "till_forward": null,
+            "undo": null,
             "yank_line": null
           }
         },
@@ -5182,6 +5259,14 @@
           ],
           "description": "Paste after cursor (`p`)."
         },
+        "redo": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Redo the last undone edit (`ctrl-r`)."
+        },
         "repeat_last_change": {
           "allOf": [
             {
@@ -5245,6 +5330,14 @@
             }
           ],
           "description": "Stop before the next character on the current line (`t`)."
+        },
+        "undo": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Undo the last complete edit (`u`)."
         },
         "yank_line": {
           "allOf": [
@@ -5788,7 +5881,7 @@
       "type": "string"
     },
     "disable_paste_burst": {
-      "description": "When true, disables burst-paste detection for typed input entirely. All characters are inserted as they are received, and no buffering or placeholder replacement will occur for fast keypress bursts.",
+      "description": "Legacy fallback for `tui.disable_paste_burst`. Prefer the setting under `[tui]`.",
       "type": "boolean"
     },
     "experimental_compact_prompt_file": {
@@ -5931,6 +6024,9 @@
         "content_item_kinds": {
           "type": "boolean"
         },
+        "context_management": {
+          "$ref": "#/definitions/FeatureToml_for_ContextManagementConfigToml"
+        },
         "current_time_reminder": {
           "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
         },
@@ -6052,6 +6148,9 @@
           "type": "boolean"
         },
         "mcp_2026_07_28": {
+          "type": "boolean"
+        },
+        "mcp_oauth_refresh_coordination": {
           "type": "boolean"
         },
         "memories": {

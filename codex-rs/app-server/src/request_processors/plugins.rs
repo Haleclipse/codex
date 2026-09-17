@@ -4,13 +4,15 @@ use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use codex_analytics::PluginInstallSource;
 use codex_app_server_protocol::PluginAvailability;
-use codex_app_server_protocol::PluginInstallPolicy;
 use codex_app_server_protocol::PluginSharePrincipalRole;
 use codex_app_server_protocol::PluginShareTargetRole;
 use codex_config::types::McpServerConfig;
 use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
 use codex_core_plugins::PluginListBackgroundTaskOptions;
 use codex_core_plugins::PluginMarketplaceContext;
+use codex_core_plugins::RemotePluginInstallRequest;
+use codex_core_plugins::RemotePluginOperationError;
+use codex_core_plugins::RemotePluginOperationErrorKind;
 use codex_core_plugins::is_openai_curated_marketplace_name;
 use codex_core_plugins::loader::load_configured_plugin_mcp_servers;
 use codex_core_plugins::manifest::is_agent_plugin_manifest;
@@ -40,6 +42,7 @@ use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::perform_oauth_login_silent;
 
 mod local;
+mod reconcile;
 mod search;
 
 fn plugin_redirect_mode(plugin_root: &Path) -> StreamableHttpRedirectMode {
@@ -677,8 +680,11 @@ impl PluginRequestProcessor {
             match codex_core_plugins::remote::fetch_openai_curated_remote_collection_marketplace(
                 &remote_plugin_service_config,
                 auth.as_ref(),
+                /*catalog_cache_root*/ None,
+                RemotePluginCatalogCacheMode::ForceRefetch,
             )
             .await
+            .map(|outcome| outcome.marketplace)
             {
                 Ok(Some(remote_marketplace)) => {
                     data.push(remote_marketplace_to_info(remote_marketplace));
@@ -1485,7 +1491,7 @@ impl PluginRequestProcessor {
         };
 
         let result = match plugins_manager
-            .install_plugin(&config.config_layer_stack, request)
+            .install_plugin(&config.plugins_config_input(), request)
             .await
         {
             Ok(result) => result,
@@ -1552,173 +1558,62 @@ impl PluginRequestProcessor {
         install_attempt_id: Option<String>,
     ) -> Result<PluginInstallResponse, JSONRPCErrorError> {
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        if !config.features.enabled(Feature::Plugins) {
-            return Err(invalid_request(format!(
-                "remote plugin install is not enabled for marketplace {remote_marketplace_name}"
-            )));
-        }
-        validate_remote_plugin_id(&remote_plugin_id)?;
-
         let auth = self.auth_manager.auth().await;
-        let remote_plugin_service_config = remote_plugin_service_config(&config);
-        let remote_detail =
-            codex_core_plugins::remote::fetch_remote_plugin_detail_with_download_urls(
-                &remote_plugin_service_config,
-                auth.as_ref(),
-                &remote_marketplace_name,
-                &remote_plugin_id,
-            )
-            .await
-            .map_err(|err| {
-                let error_type = remote_plugin_catalog_error_type(&err);
-                let sub_error_type = err.sub_error_type();
-                self.track_plugin_install_failed_for_remote_plugin(
-                    &remote_plugin_id,
-                    &remote_marketplace_name,
-                    /*plugin_id*/ None,
-                    error_type,
-                    sub_error_type,
-                    err.to_string(),
-                );
-                remote_plugin_catalog_error_to_jsonrpc(
-                    err,
-                    "read remote plugin details before install",
-                )
-            })?;
-        let actual_remote_marketplace_name = remote_detail.marketplace_name.clone();
-        let remote_plugin_name = remote_detail.summary.name.clone();
-        let resolved_plugin_id = PluginId::parse(&remote_detail.summary.id).map_err(|err| {
-            internal_error(format!(
-                "invalid resolved plugin id `{}`: {err}",
-                remote_detail.summary.id
-            ))
-        })?;
-        if remote_detail.summary.availability == PluginAvailability::DisabledByAdmin {
-            let error_message = format!("remote plugin {remote_plugin_id} is disabled by admin");
-            self.track_plugin_install_failed_for_remote_plugin(
-                &remote_plugin_id,
-                &actual_remote_marketplace_name,
-                Some(&resolved_plugin_id),
-                "remote_plugin_not_available",
-                Some("disabled_by_admin".to_string()),
-                error_message.clone(),
-            );
-            return Err(invalid_request(error_message));
-        }
-        if remote_detail.summary.install_policy == PluginInstallPolicy::NotAvailable {
-            let error_message =
-                format!("remote plugin {remote_plugin_id} is not available for install");
-            self.track_plugin_install_failed_for_remote_plugin(
-                &remote_plugin_id,
-                &actual_remote_marketplace_name,
-                Some(&resolved_plugin_id),
-                "remote_plugin_not_available",
-                Some("install_policy_not_available".to_string()),
-                error_message.clone(),
-            );
-            return Err(invalid_request(error_message));
-        }
-        let validated_bundle = codex_core_plugins::remote_bundle::validate_remote_plugin_bundle(
-            &remote_plugin_id,
-            &actual_remote_marketplace_name,
-            &remote_plugin_name,
-            remote_detail.release_version.as_deref(),
-            remote_detail.bundle_download_url.as_deref(),
-            remote_detail.app_manifest.clone(),
-        )
-        .map_err(|err| {
-            let error_type = remote_plugin_bundle_install_error_type(&err);
-            let sub_error_type = err.sub_error_type();
-            self.track_plugin_install_failed_for_remote_plugin(
-                &remote_plugin_id,
-                &actual_remote_marketplace_name,
-                Some(&resolved_plugin_id),
-                error_type,
-                sub_error_type,
-                err.to_string(),
-            );
-            remote_plugin_bundle_install_error_to_jsonrpc(err)
-        })?;
-
-        // Direct install writes the same cache tree that installed-plugin sync prunes. Hold the
-        // shared cache-root gate through the backend mutation so a full sync cannot commit a
-        // snapshot fetched before this plugin became installed.
         let plugins_manager = self.thread_manager.plugins_manager();
-        let remote_plugin_sync_guard = plugins_manager
-            .acquire_remote_installed_plugin_sync_guard()
+        let installation = plugins_manager
+            .install_remote_plugin(
+                &config.plugins_config_input(),
+                auth.as_ref(),
+                RemotePluginInstallRequest {
+                    marketplace_name: remote_marketplace_name.clone(),
+                    remote_plugin_id: remote_plugin_id.clone(),
+                    install_attempt_id,
+                },
+                Some(self.effective_plugins_changed_callback()),
+            )
             .await
             .map_err(|err| {
-                internal_error(format!("failed to coordinate remote plugin install: {err}"))
+                let classification = match err.kind.as_ref() {
+                    RemotePluginOperationErrorKind::Catalog { source, .. } => Some((
+                        remote_plugin_catalog_error_type(source),
+                        source.sub_error_type(),
+                    )),
+                    RemotePluginOperationErrorKind::Bundle(source) => Some((
+                        remote_plugin_bundle_install_error_type(source),
+                        source.sub_error_type(),
+                    )),
+                    RemotePluginOperationErrorKind::DisabledByAdmin(_) => Some((
+                        "remote_plugin_not_available",
+                        Some("disabled_by_admin".to_string()),
+                    )),
+                    RemotePluginOperationErrorKind::NotAvailable(_) => Some((
+                        "remote_plugin_not_available",
+                        Some("install_policy_not_available".to_string()),
+                    )),
+                    RemotePluginOperationErrorKind::Sync { .. }
+                    | RemotePluginOperationErrorKind::InvalidRequest(_)
+                    | RemotePluginOperationErrorKind::Internal(_) => None,
+                };
+                if let Some((error_type, sub_error_type)) = classification {
+                    let marketplace = err
+                        .plugin_id
+                        .as_ref()
+                        .map(|id| id.marketplace_name.as_str())
+                        .unwrap_or(&remote_marketplace_name);
+                    self.track_plugin_install_failed_for_remote_plugin(
+                        &remote_plugin_id,
+                        marketplace,
+                        err.plugin_id.as_ref(),
+                        error_type,
+                        sub_error_type,
+                        err.to_string(),
+                    );
+                }
+                remote_plugin_operation_error_to_jsonrpc(err)
             })?;
-        // Keep this marker through downstream setup after releasing the shared gate. A new sync
-        // may start then, but it must not prune the bundle that this install just materialized.
-        let _remote_plugin_cache_mutation =
-            codex_core_plugins::remote::mark_remote_plugin_cache_mutation_in_flight(
-                config.codex_home.as_path(),
-                &actual_remote_marketplace_name,
-                &remote_plugin_name,
-            );
-        let result = codex_core_plugins::remote_bundle::download_and_install_remote_plugin_bundle(
-            &remote_plugin_service_config,
-            config.codex_home.to_path_buf(),
-            validated_bundle,
-        )
-        .await
-        .map_err(|err| {
-            let error_type = remote_plugin_bundle_install_error_type(&err);
-            let sub_error_type = err.sub_error_type();
-            self.track_plugin_install_failed_for_remote_plugin(
-                &remote_plugin_id,
-                &actual_remote_marketplace_name,
-                Some(&resolved_plugin_id),
-                error_type,
-                sub_error_type,
-                err.to_string(),
-            );
-            remote_plugin_bundle_install_error_to_jsonrpc(err)
-        })?;
-
-        // Cache first so a backend install cannot succeed when local materialization fails.
-        // If this backend call fails, the cache entry is harmless because remote installed state
-        // is still backend-gated.
-        let install_result = if let Some(install_attempt_id) = install_attempt_id.as_deref() {
-            codex_core_plugins::remote::install_remote_plugin_with_install_attempt_id(
-                &remote_plugin_service_config,
-                auth.as_ref(),
-                &actual_remote_marketplace_name,
-                &remote_plugin_id,
-                install_attempt_id,
-            )
-            .await
-        } else {
-            codex_core_plugins::remote::install_remote_plugin(
-                &remote_plugin_service_config,
-                auth.as_ref(),
-                &actual_remote_marketplace_name,
-                &remote_plugin_id,
-            )
-            .await
-        }
-        .map_err(|err| {
-            let error_type = remote_plugin_catalog_error_type(&err);
-            let sub_error_type = err.sub_error_type();
-            self.track_plugin_install_failed_for_remote_plugin(
-                &remote_plugin_id,
-                &actual_remote_marketplace_name,
-                Some(&result.plugin_id),
-                error_type,
-                sub_error_type,
-                err.to_string(),
-            );
-            remote_plugin_catalog_error_to_jsonrpc(err, "install remote plugin")
-        })?;
-
-        plugins_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
-            &config.plugins_config_input(),
-            auth.clone(),
-            Some(self.effective_plugins_changed_callback()),
-        );
-        drop(remote_plugin_sync_guard);
+        // Retain the installation outcome through OAuth/app setup: it protects the bundle from pruning.
+        let remote_detail = installation.detail;
+        let result = installation.installed;
 
         let plugin_metadata = self
             .thread_manager
@@ -1752,7 +1647,7 @@ impl PluginRequestProcessor {
 
         let is_chatgpt_auth = auth.as_ref().is_some_and(CodexAuth::is_chatgpt_auth);
         let apps_needing_auth = if let Some(app_ids_needing_auth) =
-            install_result.app_ids_needing_auth
+            installation.app_ids_needing_auth
         {
             if app_ids_needing_auth.is_empty()
                 || !config.features.apps_enabled_for_auth(is_chatgpt_auth)
@@ -2135,78 +2030,30 @@ impl PluginRequestProcessor {
         plugin_id: String,
     ) -> Result<PluginUninstallResponse, JSONRPCErrorError> {
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        if !config.features.enabled(Feature::Plugins) {
-            return Err(invalid_request("remote plugin uninstall is not enabled"));
-        }
-        validate_remote_plugin_id(&plugin_id)?;
-
         let auth = self.auth_manager.auth().await;
-        let remote_plugin_service_config = remote_plugin_service_config(&config);
-        let uninstall_target = codex_core_plugins::remote::resolve_remote_plugin_uninstall_target(
-            &remote_plugin_service_config,
-            auth.as_ref(),
-            &plugin_id,
-        )
-        .await
-        .map_err(|err| {
-            remote_plugin_catalog_error_to_jsonrpc(err, "resolve remote plugin before uninstall")
-        })?;
-        let plugins_manager = self.thread_manager.plugins_manager();
-        let mut plugin_telemetry = plugins_manager
-            .telemetry_metadata_for_installed_plugin_with_remote_id(
-                &uninstall_target.plugin_id,
-                &uninstall_target.remote_plugin_id,
-            )
-            .await;
-        if plugin_telemetry.capability_summary.is_none() {
-            plugin_telemetry.capability_summary =
-                Some(uninstall_target.fallback_capability_summary.clone());
-        }
-        let remote_plugin_sync_guard = plugins_manager
-            .acquire_remote_installed_plugin_sync_guard()
-            .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to coordinate remote plugin uninstall: {err}"
-                ))
-            })?;
-        let remote_plugin_cache_mutation =
-            codex_core_plugins::remote::mark_remote_plugin_cache_mutation_in_flight(
-                config.codex_home.as_path(),
-                &uninstall_target.plugin_id.marketplace_name,
-                &uninstall_target.plugin_id.plugin_name,
-            );
-        let uninstall_result = codex_core_plugins::remote::uninstall_remote_plugin(
-            &remote_plugin_service_config,
-            auth.as_ref(),
-            config.codex_home.to_path_buf(),
-            uninstall_target,
-        )
-        .await;
-
-        let mut refresh_effective_plugins = false;
-        if matches!(
-            &uninstall_result,
-            Ok(()) | Err(RemotePluginCatalogError::CacheRemove(_))
-        ) {
-            self.analytics_events_client
-                .track_plugin_uninstalled(plugin_telemetry);
-            refresh_effective_plugins = plugins_manager.clear_remote_installed_plugins_cache();
-            plugins_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
+        let outcome = self
+            .thread_manager
+            .plugins_manager()
+            .uninstall_remote_plugin(
                 &config.plugins_config_input(),
-                auth.clone(),
+                auth.as_ref(),
+                &plugin_id,
                 Some(self.effective_plugins_changed_callback()),
-            );
-        }
-        drop(remote_plugin_cache_mutation);
-        drop(remote_plugin_sync_guard);
-        if refresh_effective_plugins {
+            )
+            .await
+            .map_err(remote_plugin_operation_error_to_jsonrpc)?;
+        self.analytics_events_client
+            .track_plugin_uninstalled(outcome.telemetry);
+        if outcome.effective_plugins_changed {
             self.on_effective_plugins_changed().await;
         }
+        if let Some(err) = outcome.cache_removal_error {
+            return Err(remote_plugin_catalog_error_to_jsonrpc(
+                err,
+                "uninstall remote plugin",
+            ));
+        }
 
-        uninstall_result.map_err(|err| {
-            remote_plugin_catalog_error_to_jsonrpc(err, "uninstall remote plugin")
-        })?;
         Ok(PluginUninstallResponse {})
     }
 }
@@ -2526,4 +2373,22 @@ fn remote_plugin_bundle_install_error_to_jsonrpc(
     err: codex_core_plugins::remote_bundle::RemotePluginBundleInstallError,
 ) -> JSONRPCErrorError {
     internal_error(format!("install remote plugin bundle: {err}"))
+}
+
+fn remote_plugin_operation_error_to_jsonrpc(err: RemotePluginOperationError) -> JSONRPCErrorError {
+    match *err.kind {
+        RemotePluginOperationErrorKind::Catalog { context, source } => {
+            remote_plugin_catalog_error_to_jsonrpc(source, context)
+        }
+        RemotePluginOperationErrorKind::Bundle(source) => {
+            remote_plugin_bundle_install_error_to_jsonrpc(source)
+        }
+        RemotePluginOperationErrorKind::Sync { context, source } => {
+            internal_error(format!("{context}: {source}"))
+        }
+        err @ (RemotePluginOperationErrorKind::DisabledByAdmin(_)
+        | RemotePluginOperationErrorKind::NotAvailable(_)
+        | RemotePluginOperationErrorKind::InvalidRequest(_)) => invalid_request(err.to_string()),
+        RemotePluginOperationErrorKind::Internal(message) => internal_error(message),
+    }
 }

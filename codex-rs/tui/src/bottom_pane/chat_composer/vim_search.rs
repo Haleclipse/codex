@@ -6,7 +6,11 @@ use ratatui::layout::Rect;
 
 impl ChatComposer {
     pub(crate) fn cancel_vim_search(&mut self) -> bool {
-        self.draft.textarea.cancel_vim_search()
+        let canceled = self.draft.textarea.cancel_vim_search();
+        if canceled {
+            self.finish_vim_edit();
+        }
+        canceled
     }
 
     pub(super) fn vim_search_cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {

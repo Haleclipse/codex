@@ -17,6 +17,10 @@
 
 mod scrolling;
 
+#[cfg(test)]
+#[path = "pager_overlay/highlight_tests.rs"]
+mod highlight_tests;
+
 use std::io::Result;
 use std::sync::Arc;
 
@@ -834,9 +838,22 @@ impl TranscriptOverlay {
     }
 
     pub(crate) fn set_highlight_cell(&mut self, cell: Option<usize>) {
-        let live_tail = self.take_live_tail_renderable();
+        let previous = self.highlight_cell;
         self.highlight_cell = cell;
-        self.rebuild_renderables(live_tail);
+        // Highlighting changes only these cells' styling. Keep the other renderables and their
+        // cached heights so moving between prompts does not lay out the entire transcript again.
+        if previous != cell {
+            for index in [previous, cell].into_iter().flatten() {
+                if let Some(history_cell) = self.cells.get(index) {
+                    self.view.renderables[index] = Self::render_cell(
+                        history_cell,
+                        index,
+                        self.highlight_cell,
+                        self.history_state,
+                    );
+                }
+            }
+        }
         if let Some(idx) = self.highlight_cell {
             self.view.scroll_chunk_into_view(idx);
         }

@@ -98,7 +98,7 @@ const BACKWARD_COMPATIBLE_RESERVED_METADATA_KEYS: &[&str] =
     &[WINDOW_NUMBER_KEY, FORKED_FROM_ORDINAL_EXCLUSIVE_KEY];
 const MAX_EXTRA_METADATA_ENTRIES: usize = 16;
 const MAX_EXTRA_METADATA_KEY_BYTES: usize = 64;
-const MAX_EXTRA_METADATA_VALUE_BYTES: usize = 128;
+pub(crate) const MAX_EXTRA_METADATA_VALUE_BYTES: usize = 128;
 
 /// Metadata attached to model requests whose purpose is conversation compaction.
 ///

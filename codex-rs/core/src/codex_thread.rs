@@ -86,6 +86,8 @@ pub struct ThreadConfigSnapshot {
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
     pub permission_profile: PermissionProfile,
+    /// Resolved Full Access across the thread and every selected environment.
+    pub full_access: bool,
     pub active_permission_profile: Option<ActivePermissionProfile>,
     pub environments: TurnEnvironmentSelections,
     pub workspace_roots: Vec<AbsolutePathBuf>,
@@ -151,30 +153,7 @@ pub struct CodexThreadSettingsOverrides {
     pub personality: Option<Personality>,
 }
 
-/// One root conversation message exposed only to a worker's Guardian reviewers.
-#[derive(Debug, Eq, PartialEq)]
-pub enum GuardianRootMessage {
-    /// Genuine root-user input that can establish or revoke authorization.
-    User(String),
-    /// Root assistant final output that provides untrusted conversational context.
-    Assistant(String),
-    /// Bounded, already role-labeled genuine user answers and their assistant questions.
-    UserInput(String),
-}
-
-impl GuardianRootMessage {
-    /// Renders every line with its original role so message content cannot impersonate another role.
-    pub fn render(self) -> String {
-        let (role, text) = match self {
-            Self::User(text) => ("user", text),
-            Self::Assistant(text) => ("assistant", text),
-            Self::UserInput(fragment) => return fragment,
-        };
-        text.lines()
-            .map(|line| format!("{role}: {line}\n"))
-            .collect()
-    }
-}
+pub use codex_guardian_context::GuardianRootMessage;
 
 /// Authorization state that changes on genuine user input or history resets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -390,8 +369,15 @@ impl CodexThread {
             trace,
             cyber_access_program,
         } = request;
+        let root_turn_id = self
+            .session
+            .reference_context_item()
+            .await
+            .filter(|context| context.turn_id.as_deref() == Some(turn_id.as_str()))
+            .and_then(|context| context.root_turn_id);
         let start_options = TurnStartOptions {
             cyber_access_program,
+            root_turn_id,
             ..Default::default()
         };
         match self
@@ -512,18 +498,6 @@ impl CodexThread {
             return None;
         }
         task.turn_context.turn_metadata_state.root_turn_id()
-    }
-
-    /// Invalidates the trusted root when the expected turn is currently active.
-    pub async fn invalidate_turn_lineage(&self, expected_turn_id: &str) {
-        let active = self.session.active_turn.lock().await;
-        if let Some(task) = active.as_ref().and_then(|turn| turn.task.as_ref())
-            && task.turn_context.sub_id == expected_turn_id
-        {
-            task.turn_context
-                .turn_metadata_state
-                .mark_root_turn_ambiguous();
-        }
     }
 
     pub async fn set_app_server_client_info(
@@ -761,6 +735,20 @@ impl CodexThread {
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
         self.session.thread_config_snapshot().await
+    }
+
+    /// Returns the active turn's reviewer, including live updates, or the thread default.
+    pub async fn approvals_reviewer_for_turn(&self, turn_id: &str) -> ApprovalsReviewer {
+        if let Some((turn, settings, _)) = self
+            .session
+            .active_turn_context_and_strict_auto_review()
+            .await
+            && turn.sub_id == turn_id
+        {
+            settings.approvals_reviewer()
+        } else {
+            self.config_snapshot().await.approvals_reviewer
+        }
     }
 
     /// Returns thread-owned settings suitable for rollout persistence and resume.

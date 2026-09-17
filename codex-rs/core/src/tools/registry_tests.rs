@@ -728,7 +728,6 @@ async fn dispatch_uses_canonical_tool_names_for_lifecycle_contributors() -> anyh
             /*terminal_outcome_reached*/ None,
         )
         .await?;
-    turn.turn_metadata_state.mark_root_turn_ambiguous();
     let err = match registry
         .dispatch_any_with_terminal_outcome(
             test_invocation(
@@ -760,7 +759,7 @@ async fn dispatch_uses_canonical_tool_names_for_lifecycle_contributors() -> anyh
         RecordedToolLifecycle::Start {
             call_id: "failing-call".to_string(),
             tool_name: failing_tool.clone(),
-            root_turn_id: None,
+            root_turn_id: Some("root-turn".to_string()),
         },
         RecordedToolLifecycle::Finish {
             call_id: "failing-call".to_string(),

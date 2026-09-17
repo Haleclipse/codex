@@ -4,6 +4,7 @@ use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_parented_rollout_with_source;
 use app_test_support::create_fake_rollout;
 use app_test_support::rollout_path;
+use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::JSONRPCError;
@@ -47,6 +48,7 @@ enum HistoryCapabilities {
     LegacyOnlyUnsupportedVariant,
     LegacyDynamicToolsAndHistory,
     ForkHydrationFails,
+    ThreadListFails,
 }
 
 /// Returns and resets `(thread/loaded/list, thread/read)` request counts.
@@ -127,6 +129,7 @@ async fn start_recording_app_server_with_history(
         let mut websocket = accept_async(stream).await?;
         let mut inventories = usize::from(failed_thread_name == Some("background"));
         let mut reject_detach = false;
+        let mut reject_thread_list = history_capabilities == HistoryCapabilities::ThreadListFails;
         while let Some(frame) = websocket.next().await {
             let Message::Text(text) = frame? else {
                 continue;
@@ -182,7 +185,30 @@ async fn start_recording_app_server_with_history(
                             .is_some_and(|tools| {
                                 tools.iter().any(|tool| tool["type"] == "namespace")
                             });
-                    let response = if reject_dynamic_tools {
+                    let response = if request.method == "thread/list"
+                        && std::mem::take(&mut reject_thread_list)
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32603,
+                                data: None,
+                                message: "thread listing unavailable".to_string(),
+                            },
+                        })
+                    } else if history_capabilities == HistoryCapabilities::LegacyOnly
+                        && request.method == "thread/list"
+                        && params.is_some_and(|params| params["sortKey"] == "recency_at")
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32602,
+                                data: None,
+                                message: "unknown variant `recency_at`".to_string(),
+                            },
+                        })
+                    } else if reject_dynamic_tools {
                         JSONRPCMessage::Error(JSONRPCError {
                             id: request_id,
                             error: JSONRPCErrorError {
@@ -601,7 +627,7 @@ async fn archive_current_thread_reports_success_only_after_archiving() -> Result
 
 #[tokio::test]
 async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() -> Result<()> {
-    let (mut app, mut events, _ops) = make_test_app_with_channels().await;
+    let (mut app, events, _ops) = make_test_app_with_channels().await;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
@@ -612,7 +638,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         codex_home.path().join("config.toml"),
         "web_search = \"disabled\"\n",
     )?;
-    let (mut app_server, requests, proxy) = start_recording_app_server(
+    let (mut app_server, mut requests, mut proxy) = start_recording_app_server(
         &app.config,
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ None,
@@ -776,6 +802,41 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
                 }
             }))
     };
+    let transport = app_server.thread_tool_transport();
+    let crate::dynamic_tools_mcp::ThreadToolTransport::Mcp(tool_server) = &transport else {
+        panic!("expected the daemon task-tool bridge");
+    };
+    tool_server.suspend();
+    let paused = call_tool(0, "list_threads", serde_json::json!({}))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(
+        paused.contains("TUI is reconnecting; tool was not sent"),
+        "{paused}"
+    );
+    let (replacement, replacement_requests, replacement_proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let (new_tx, new_rx) = mpsc::unbounded_channel();
+    let new_sender = AppEventSender::new(new_tx);
+    drop(events);
+    let mut events = new_rx;
+    assert!(app.app_event_tx.app_event_tx.is_closed());
+    tool_server.reconnect(replacement.request_handle(), new_sender);
+    let previous = std::mem::replace(
+        &mut app_server,
+        replacement.with_thread_tool_transport(transport),
+    );
+    previous.shutdown().await?;
+    proxy.await??;
+    requests = replacement_requests;
+    proxy = replacement_proxy;
+    // The same MCP URL and credentials now use the new connection and event receiver.
     let response = call_tool(1, "list_threads", serde_json::json!({}))
         .send()
         .await?;
@@ -824,9 +885,13 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         child["config"]["mcp_servers.codex_tui"],
         starts[0]["config"]["mcp_servers.codex_tui"]
     );
-    let forked = call_tool(3, "fork_thread", serde_json::json!({"threadId": thread_id}))
-        .send()
-        .await?;
+    let forked = call_tool(
+        3,
+        "fork_thread",
+        serde_json::json!({"threadId": delegation_source}),
+    )
+    .send()
+    .await?;
     assert!(forked.status().is_success());
     let forked = recorded_params(&requests, "thread/fork")
         .pop()
@@ -1450,6 +1515,7 @@ async fn older_pagination_reconciles_review_prompts_across_page_boundaries() -> 
             phase: None,
             memory_citation: None,
             delivery: None,
+            questions: None,
         })
     }));
     items.extend([
@@ -1639,6 +1705,7 @@ async fn transcript_home_loads_every_older_history_page() -> Result<()> {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             started_at_ms: None,
             completed_at_ms: 0,
@@ -2037,6 +2104,7 @@ async fn underfilled_scrollback_fetches_older_pages_without_opening_the_transcri
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             started_at_ms: None,
             completed_at_ms: 0,
@@ -2325,6 +2393,88 @@ async fn agents_overview_stop_uses_history_mode_for_turn_lookup() -> Result<()> 
 
     app_server.shutdown().await?;
     proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agents_overview_seeds_loaded_threads_when_recent_listing_is_unavailable() -> Result<()> {
+    for (capabilities, expected_sort_keys) in [
+        (
+            HistoryCapabilities::LegacyOnly,
+            vec!["recency_at", "recency_at", "updated_at", "updated_at"],
+        ),
+        (
+            HistoryCapabilities::ThreadListFails,
+            vec!["recency_at", "recency_at", "recency_at", "recency_at"],
+        ),
+    ] {
+        let (mut app, _codex_home) = make_history_test_app().await?;
+        let (mut app_server, requests, proxy) = start_recording_app_server_with_history(
+            &app.config,
+            capabilities,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+        )
+        .await?;
+        let started = app_server.start_thread(&app.config).await?;
+        app.app_server_target = AppServerTarget::LocalDaemon {
+            endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
+                socket_path: test_path_buf("/tmp/unused.sock").abs(),
+            },
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.app_event_tx = AppEventSender::new(tx);
+        for attempt in 0..2 {
+            if attempt == 0 {
+                app.refresh_agents_overview_threads(&app_server);
+            } else {
+                app.open_agents_overview(&app_server);
+            }
+            let Some(AppEvent::AgentsOverviewThreadsLoaded { request_id, result }) =
+                tokio::time::timeout(Duration::from_secs(10), rx.recv()).await?
+            else {
+                panic!("expected overview result")
+            };
+            app.apply_agents_overview_thread_refresh(&app_server, request_id, result);
+            assert_eq!(
+                app.agents_overview
+                    .threads
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![started.session.thread_id]
+            );
+            assert_eq!(
+                app.agents_overview.initialized,
+                capabilities != HistoryCapabilities::ThreadListFails || attempt > 0
+            );
+            if attempt == 0 {
+                app.handle_app_server_event(
+                    &app_server,
+                    AppServerEvent::ServerNotification(Box::new(
+                        ServerNotification::ThreadStatusChanged(
+                            codex_app_server_protocol::ThreadStatusChangedNotification {
+                                thread_id: started.session.thread_id.to_string(),
+                                status: codex_app_server_protocol::ThreadStatus::Idle,
+                            },
+                        ),
+                    )),
+                )
+                .await;
+                assert!(app.agents_overview.request_id.is_none());
+            }
+        }
+        let list_requests = recorded_params(&requests, "thread/list");
+        let mut sort_keys = list_requests
+            .iter()
+            .map(|params| params["sortKey"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        sort_keys.sort_unstable();
+        assert_eq!(sort_keys, expected_sort_keys);
+        app_server.shutdown().await?;
+        proxy.await??;
+    }
     Ok(())
 }
 
@@ -2659,8 +2809,9 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
             matches!(kind, "approval" | "profile" | "reviewer").then_some(requirements.clone());
         app.harness_overrides.permission_profile =
             (kind != "named").then_some(PermissionProfile::workspace_write());
-        app.runtime_approval_policy_override =
-            (kind == "approval").then_some(AskForApproval::OnRequest);
+        app.runtime_approval_policy_override = (kind == "approval").then_some(
+            RuntimeApprovalPolicyOverride::Explicit(AskForApproval::OnRequest),
+        );
         let mut profile = RuntimePermissionProfileOverride::from_config(&app.config);
         profile.active_permission_profile =
             (kind == "named").then(|| ActivePermissionProfile::new("dev"));
@@ -2917,7 +3068,7 @@ fn fresh_session_applies_requested_name() -> Result<()> {
 
 #[test]
 fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
-    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+    const TEST_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
     std::thread::Builder::new()
         .name("tui-session-lifecycle-requests".to_string())

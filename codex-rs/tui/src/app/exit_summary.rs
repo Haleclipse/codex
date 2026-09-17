@@ -1,9 +1,17 @@
 //! Exit output distinguishes a disconnected client from a stopped embedded server.
+//! Persisted sessions offer a direct UUID command and an optional named picker hint.
 
 use super::*;
 use crate::RemoteAppServerEndpoint;
 use crate::exec_command::escape_command;
 use crate::status::remote_connection::sanitized_websocket_url;
+
+/// A persisted thread that can be resumed after the TUI exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumableThread {
+    pub thread_id: ThreadId,
+    pub thread_name: Option<String>,
+}
 
 /// Reconnection and stop guidance for a task owned by a persistent app server.
 #[derive(Debug, Clone)]
@@ -57,7 +65,7 @@ impl App {
         AppExitInfo {
             token_usage: self.token_usage(),
             thread_id,
-            resume_hint: resume_hint_for_resumable_thread(
+            resume_hint: resumable_thread(
                 thread_id,
                 self.chat_widget.thread_name(),
                 self.chat_widget.rollout_path().as_deref(),
@@ -125,11 +133,19 @@ impl AppExitInfo {
         }
         if let ExitReason::Archived(thread_id) = self.exit_reason {
             lines.push(format!("Session archived: {thread_id}"));
-        } else if let Some(resume_command) = self.resume_hint {
+        } else if let Some(thread) = self.resume_hint {
+            lines.push("To continue this session, run:".to_string());
             lines.push(format!(
-                "To continue this session, run {}",
-                color_command(resume_command),
+                "  {}",
+                color_command(format!("codex resume {}", thread.thread_id)),
             ));
+            if let Some(thread_name) = thread.thread_name.filter(|name| !name.is_empty()) {
+                lines.push(format!(
+                    "Or run {} and select {}.",
+                    color_command("codex resume".to_string()),
+                    color_command(thread_name),
+                ));
+            }
         } else if let Some(thread_id) = self.thread_id {
             lines.push(format!("Session ID: {thread_id}"));
         }

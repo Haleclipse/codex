@@ -32,11 +32,15 @@ use tracing_subscriber::registry::LookupSpan;
 
 mod attachment_truncation;
 pub(crate) mod feedback_diagnostics;
+mod guardian;
 mod report_upload;
 mod upload;
 pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 pub use feedback_diagnostics::FeedbackDiagnostic;
 pub use feedback_diagnostics::FeedbackDiagnostics;
+pub use guardian::GuardianReviewFailures;
+pub use guardian::guardian_review_failures;
+pub use guardian::record_guardian_review_failure;
 pub use report_upload::FeedbackDelivery;
 pub use report_upload::FeedbackTransport;
 pub use report_upload::prepare_report_attachment;
@@ -52,7 +56,7 @@ pub const WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME: &str = "windows-sandbox.log";
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const SENTRY_DSN: &str =
     "https://ae32ed50620d7a7792c1ce5df38b3e3e@o33249.ingest.us.sentry.io/4510195390611458";
-const UPLOAD_TIMEOUT_SECS: u64 = 10;
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 300);
 // Raw collection budgets used by the report API, not the interactive upload.
 pub const MAX_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ATTACHMENTS_BYTES: usize = 126 * 1024 * 1024;
@@ -549,8 +553,13 @@ impl FeedbackSnapshot {
         options: FeedbackUploadOptions<'_>,
         http_client_factory: &HttpClientFactory,
     ) -> Result<()> {
-        self.upload_feedback_with_dsn(options, http_client_factory, SENTRY_DSN)
-            .await
+        self.upload_feedback_with_dsn(
+            options,
+            http_client_factory,
+            SENTRY_DSN,
+            Instant::now() + UPLOAD_TIMEOUT,
+        )
+        .await
     }
 
     async fn upload_feedback_with_dsn(
@@ -558,6 +567,7 @@ impl FeedbackSnapshot {
         options: FeedbackUploadOptions<'_>,
         http_client_factory: &HttpClientFactory,
         dsn: &str,
+        deadline: Instant,
     ) -> Result<()> {
         use std::str::FromStr;
 
@@ -588,15 +598,15 @@ impl FeedbackSnapshot {
             http_client_factory.clone(),
             ClientRouteClass::Other,
         );
-        // Acknowledge the report before reading diagnostic files. Keep one network wait
-        // budget for the whole submission; file reads and compression do not consume it.
-        let mut remaining_upload_time = Duration::from_secs(UPLOAD_TIMEOUT_SECS);
+        // Accept the report before reading diagnostics; all envelopes share one deadline.
+        let mut rate_limited = false;
         let status = upload::send_gzip_envelope(
             &client_pool,
             &dsn,
             event_body,
             upload::EnvelopeKind::Event,
-            &mut remaining_upload_time,
+            deadline,
+            &mut rate_limited,
         )
         .await?;
         anyhow::ensure!(
@@ -604,7 +614,7 @@ impl FeedbackSnapshot {
             "Sentry rejected feedback upload with HTTP status {status}"
         );
 
-        let attachments = self.feedback_attachments(
+        let mut attachments = self.feedback_attachments(
             options.include_logs,
             options.extra_attachments,
             options.extra_attachment_paths,
@@ -613,8 +623,16 @@ impl FeedbackSnapshot {
         let mut uploaded_attachments = 0;
         let mut attachments_failed = false;
         // Keep attachments linked to the accepted event, without replaying its contents.
-        for attachment in attachments {
-            if remaining_upload_time.is_zero() {
+        // Inspect the upper bound without reading the next file after the deadline.
+        while attachments.size_hint().1 != Some(0) {
+            if rate_limited || Instant::now() >= deadline {
+                attachments_failed = true;
+                break;
+            }
+            let Some(attachment) = attachments.next() else {
+                break;
+            };
+            if Instant::now() >= deadline {
                 attachments_failed = true;
                 break;
             }
@@ -626,7 +644,8 @@ impl FeedbackSnapshot {
                     &dsn,
                     body,
                     upload::EnvelopeKind::Attachment,
-                    &mut remaining_upload_time,
+                    deadline,
+                    &mut rate_limited,
                 )
                 .await?;
                 status = Some(response_status.as_u16());
@@ -851,6 +870,7 @@ mod tests {
     use std::fs;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use super::*;
     use crate::FeedbackDiagnostic;
@@ -963,8 +983,92 @@ mod tests {
                 },
                 &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
                 dsn,
+                Instant::now() + UPLOAD_TIMEOUT,
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_allows_slow_reports() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/42/envelope/"))
+            .respond_with(
+                ResponseTemplate::new(StatusCode::OK)
+                    .set_delay(Duration::from_secs(/*secs*/ 4)),
+            )
+            .expect(/*r*/ 3)
+            .mount(&server)
+            .await;
+
+        let dsn = format!("http://public@{}/42", server.address());
+        let attachment = FeedbackAttachment {
+            filename: "later.txt".to_string(),
+            content_type: None,
+            buffer: b"later diagnostic".to_vec(),
+        };
+        upload_test_feedback(&CodexFeedback::new(), &dsn, &[attachment])
+            .await
+            .expect("all three envelopes should finish across twelve seconds of network waits");
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_deadline_stops_retries_and_later_attachments() {
+        let server = MockServer::start().await;
+        let attempt = AtomicUsize::default();
+        Mock::given(method("POST"))
+            .and(path("/api/42/envelope/"))
+            .respond_with(move |_: &wiremock::Request| {
+                match attempt.fetch_add(/*val*/ 1, Ordering::SeqCst) {
+                    0 | 2 => ResponseTemplate::new(StatusCode::OK)
+                        .set_delay(Duration::from_secs(/*secs*/ 1)),
+                    1 => ResponseTemplate::new(StatusCode::SERVICE_UNAVAILABLE)
+                        .set_delay(Duration::from_secs(/*secs*/ 1)),
+                    _ => ResponseTemplate::new(StatusCode::OK)
+                        .set_delay(Duration::from_secs(/*secs*/ 20)),
+                }
+            })
+            .expect(/*r*/ 4)
+            .mount(&server)
+            .await;
+
+        let dsn = format!("http://public@{}/42", server.address());
+        let attachments = ["stalled.txt", "later.txt"].map(|filename| FeedbackAttachment {
+            filename: filename.to_string(),
+            content_type: None,
+            buffer: filename.as_bytes().to_vec(),
+        });
+        let snapshot = CodexFeedback::new()
+            .snapshot(/*session_id*/ None)
+            .with_feedback_diagnostics(FeedbackDiagnostics::default());
+        let error = tokio::time::timeout(
+            Duration::from_secs(/*secs*/ 10),
+            snapshot.upload_feedback_with_dsn(
+                FeedbackUploadOptions {
+                    classification: "bug",
+                    reason: None,
+                    tags: None,
+                    include_logs: true,
+                    extra_attachments: &attachments,
+                    extra_attachment_paths: &[],
+                    session_source: Some(SessionSource::Cli),
+                    logs_override: Some(b"log contents".to_vec()),
+                },
+                &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                &dsn,
+                Instant::now() + Duration::from_secs(/*secs*/ 8),
+            ),
+        )
+        .await
+        .expect("each request must use only the time left in the report deadline")
+        .expect_err("the accepted report must report incomplete attachments");
+        assert_eq!(
+            error.to_string(),
+            "feedback report was accepted, but some attachments failed to upload"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1].body, requests[2].body);
     }
 
     #[tokio::test]
@@ -1110,6 +1214,7 @@ mod tests {
                 },
                 &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
                 &format!("http://public@{}/42", server.address()),
+                Instant::now() + UPLOAD_TIMEOUT,
             )
             .await
             .unwrap();
@@ -1193,6 +1298,16 @@ mod tests {
             (
                 0,
                 ResponseTemplate::new(StatusCode::OK).insert_header("Retry-After", "60"),
+            ),
+            (
+                1,
+                ResponseTemplate::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .insert_header("Retry-After", "300"),
+            ),
+            (
+                1,
+                ResponseTemplate::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .insert_header("Retry-After", "invalid"),
             ),
         ] {
             let server = MockServer::start().await;

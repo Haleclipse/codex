@@ -26,6 +26,13 @@ pub(crate) enum VimEdit {
     Text(String),
 }
 
+/// Vim command recording and searches preserved across same-draft restoration.
+#[derive(Debug, Default)]
+pub(crate) struct VimPersistentState {
+    pub(crate) commands: VimCommandState,
+    search: crate::vim_search::SearchQuery,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct VimEditorEdit(VimAction);
 
@@ -84,14 +91,19 @@ pub(super) enum VimAction {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct VimCommandState {
+pub(crate) struct VimCommandState {
     pub(super) pending_change: Vec<VimEdit>,
-    last_change: Vec<VimEdit>,
+    pub(crate) last_change: Vec<VimEdit>,
     changed: bool,
     pub(super) replaying: bool,
 }
 
 impl TextArea {
+    pub(crate) fn swap_vim_persistent_state(&mut self, state: &mut VimPersistentState) {
+        std::mem::swap(&mut self.vim_commands, &mut state.commands);
+        std::mem::swap(&mut self.vim_search.last, &mut state.search);
+    }
+
     pub(crate) fn vim_repeat_actions(&self) -> Option<Vec<VimEdit>> {
         (!self.vim_commands.last_change.is_empty()).then(|| self.vim_commands.last_change.clone())
     }

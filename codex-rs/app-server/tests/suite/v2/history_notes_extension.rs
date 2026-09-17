@@ -260,8 +260,8 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
         ),
         (
             "functions",
-            "send_user_message_async",
-            json!({"message": "PRIVATE_MESSAGE"}),
+            "request_user_input_async",
+            json!({"questions": [{"title": "PRIVATE_MESSAGE"}]}),
         ),
         (
             "notes",
@@ -270,8 +270,8 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
         ),
         (
             "functions",
-            "send_user_message_async",
-            json!({"message": " "}),
+            "request_user_input_async",
+            json!({"questions": [{"title": " "}]}),
         ),
     ];
     let server = responses::start_mock_server().await;

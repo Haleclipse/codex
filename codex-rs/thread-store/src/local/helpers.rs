@@ -164,8 +164,8 @@ pub(super) fn stored_thread_from_rollout_item(
             .model_provider
             .filter(|provider| !provider.is_empty())
             .unwrap_or_else(|| default_provider.to_string()),
-        model: None,
-        reasoning_effort: None,
+        model: item.model,
+        reasoning_effort: item.reasoning_effort,
         created_at,
         updated_at,
         recency_at,

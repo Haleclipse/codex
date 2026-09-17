@@ -67,7 +67,6 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
-use codex_rollout::RolloutCompressionMode;
 use codex_rollout::state_db::StateDbHandle;
 use codex_skills_extension::HostSkillsService;
 use codex_thread_store::InMemoryThreadStore;
@@ -85,6 +84,7 @@ use codex_thread_store::ThreadStore;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::UpdateThreadMetadataParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_git_discovery::GitRootDiscovery;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
@@ -346,6 +346,7 @@ pub(crate) struct ThreadManagerState {
     thread_id_generator: ThreadIdGenerator,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
+    git_root_discovery: Arc<GitRootDiscovery>,
     environment_manager: Arc<EnvironmentManager>,
     starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
     skills_service: Arc<HostSkillsService>,
@@ -385,14 +386,6 @@ pub fn thread_store_from_config(
             let compression_enabled = config
                 .features
                 .enabled(Feature::LocalThreadStoreCompression);
-            let compression_mode = if config
-                .features
-                .enabled(Feature::LocalThreadStoreSharedCompression)
-            {
-                RolloutCompressionMode::IncludeShared
-            } else {
-                RolloutCompressionMode::Standalone
-            };
             let background_migration_enabled = config
                 .features
                 .enabled(Feature::BackgroundPaginatedRolloutMigration);
@@ -409,17 +402,11 @@ pub fn thread_store_from_config(
                         warn!("failed to migrate legacy rollouts on startup: {err}");
                     }
                     if compression_enabled {
-                        codex_rollout::spawn_rollout_compression_worker(
-                            codex_home,
-                            compression_mode,
-                        );
+                        codex_rollout::spawn_rollout_compression_worker(codex_home);
                     }
                 });
             } else if compression_enabled {
-                codex_rollout::spawn_rollout_compression_worker(
-                    config.codex_home.to_path_buf(),
-                    compression_mode,
-                );
+                codex_rollout::spawn_rollout_compression_worker(config.codex_home.to_path_buf());
             }
             store
         }
@@ -487,6 +474,7 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager,
+                git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
@@ -634,6 +622,7 @@ impl ThreadManager {
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
                     .models_manager(codex_home, /*config_model_catalog*/ None),
+                git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,
@@ -792,6 +781,10 @@ impl ThreadManager {
                 })?;
         }
         Ok(())
+    }
+
+    pub(crate) fn git_root_discovery(&self) -> Arc<GitRootDiscovery> {
+        Arc::clone(&self.state.git_root_discovery)
     }
 
     pub fn get_models_manager(&self) -> SharedModelsManager {
@@ -1994,6 +1987,7 @@ impl ThreadManagerState {
             installation_id: self.installation_id.clone(),
             auth_manager,
             models_manager: Arc::clone(&self.models_manager),
+            git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),
             plugins_manager: Arc::clone(&self.plugins_manager),

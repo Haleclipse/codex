@@ -624,13 +624,17 @@ impl Session {
             input => pending_turn_input(input.clone()),
         };
         pending_input.push(input);
-        if let Some(incoming_root_turn_id) = incoming_root_turn_id
-            && active_task.turn_context.turn_metadata_state.root_turn_id() != incoming_root_turn_id
+        if active_task
+            .turn_context
+            .turn_metadata_state
+            .root_turn_id()
+            .is_none()
+            && let Some(Some(incoming_root_turn_id)) = incoming_root_turn_id
         {
             active_task
                 .turn_context
                 .turn_metadata_state
-                .mark_root_turn_ambiguous();
+                .set_root_turn_id(incoming_root_turn_id);
         }
         self.input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(

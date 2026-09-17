@@ -685,6 +685,67 @@ async fn remote_compact_v2_retains_only_client_developer_messages_when_enabled(
         })
         .count();
     assert_eq!(retained_client_developers, usize::from(enabled));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_v2_records_usage_before_output_validation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_auto_env_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config
+                    .features
+                    .enable(Feature::RemoteCompactionV2)
+                    .expect("remote compaction v2 should be configurable");
+            }),
+    )
+    .await?;
+    let codex = &harness.test().codex;
+    let rollout_path = codex.rollout_path().context("rollout path")?;
+    responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![responses::ev_completed("before-compact")]),
+            sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "FIRST_SUMMARY",
+                    },
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "SECOND_SUMMARY",
+                    },
+                }),
+                responses::ev_completed_with_tokens("invalid-compact", /*total_tokens*/ 8_200),
+            ]),
+        ],
+    )
+    .await;
+
+    harness.test().submit_turn("before compact").await?;
+    codex.submit(Op::Compact).await?;
+    wait_for_event(codex, |event| matches!(event, EventMsg::Error(_))).await;
+    wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.shutdown_and_wait().await?;
+
+    let record = fs::read_to_string(&rollout_path)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| match line.item {
+            RolloutItem::TokenUsageRecord(record) => Some(record),
+            _ => None,
+        })
+        .find(|record| record.response_id == "invalid-compact")
+        .context("remote compaction usage record")?;
+    assert_eq!(record.usage.total_tokens, 8_200);
 
     Ok(())
 }

@@ -2071,19 +2071,4 @@ mod tests {
         );
         assert_eq!(model.service_tier_for_request(/*service_tier*/ None), None);
     }
-
-    #[test]
-    fn service_tier_for_request_does_not_apply_catalog_default() {
-        let model = ModelInfo {
-            default_service_tier: Some(ServiceTier::Fast.request_value().to_string()),
-            service_tiers: vec![ModelServiceTier {
-                id: ServiceTier::Fast.request_value().to_string(),
-                name: "Fast".to_string(),
-                description: "Priority processing.".to_string(),
-            }],
-            ..test_model(/*spec*/ None)
-        };
-
-        assert_eq!(model.service_tier_for_request(/*service_tier*/ None), None);
-    }
 }

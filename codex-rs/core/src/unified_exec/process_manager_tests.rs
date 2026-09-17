@@ -37,6 +37,16 @@ fn unified_exec_env_overrides_existing_values() {
     assert_eq!(env.get("PATH"), Some(&"/usr/bin".to_string()));
 }
 
+#[tokio::test]
+async fn deterministic_process_ids_are_not_reused_after_release() {
+    let manager = UnifiedExecProcessManager::default();
+    let first = manager.allocate_process_id().await;
+    manager.release_process_id(first).await;
+    let second = manager.allocate_process_id().await;
+
+    assert_eq!((first, second), (1000, 1001));
+}
+
 #[test]
 fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
     let local_policy_env = HashMap::from([

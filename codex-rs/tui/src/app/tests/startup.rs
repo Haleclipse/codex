@@ -465,6 +465,16 @@ async fn startup_draft_delayed_approval_becomes_protected_on_redraw() -> Result<
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let mut app_server =
         crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    app.app_server_target = AppServerTarget::Remote {
+        endpoint: crate::RemoteAppServerEndpoint::WebSocket {
+            websocket_url: "ws://127.0.0.1:1".into(),
+            auth_token: None,
+        },
+    };
+    app.begin_reconnect();
+    assert!(app.startup_protected_input_boundary);
+    // The replacement connection replays the protected request after the old request was dropped.
+    app.reconnect.offline = false;
 
     let (mut startup_pane, _startup_app_event_rx) = startup_bottom_pane();
     startup_pane.set_composer_text("draft".to_string(), Vec::new(), Vec::new());
@@ -935,6 +945,8 @@ async fn known_thread_started_preserves_session_without_reading_unmaterialized_r
             project_id: None,
             history_mode: Default::default(),
             model_provider: "notification-provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 2,
             recency_at: Some(2),
@@ -1232,7 +1244,7 @@ async fn startup_thread_start_failure_returns_error() {
     .await
     .expect("embedded app server");
     let err = app
-        .handle_startup_thread_started(&mut app_server, Err("boom".to_string()))
+        .handle_startup_thread_started(&mut app_server, Err(color_eyre::eyre::eyre!("boom")))
         .await
         .expect_err("startup thread failure should exit instead of leaving chat unconfigured");
 

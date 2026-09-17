@@ -247,6 +247,7 @@ async fn settings_updates_preserve_turn_identity_and_target(target: SettingsTarg
                 effort: Some(Some(ReasoningEffort::High)),
                 summary: Some(ReasoningSummary::Detailed),
                 service_tier: Some(Some(ServiceTier::Fast.request_value().to_string())),
+                ..Default::default()
             };
             assert_eq!(
                 submit_turn_settings(&test.codex, "different-turn", update.clone()).await?,
@@ -1133,7 +1134,7 @@ async fn model_activation_uses_destination_metadata_defaults(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn send_user_message_async_description_follows_mid_turn_model_changes() -> Result<()> {
+async fn request_user_input_async_description_follows_mid_turn_model_changes() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1200,7 +1201,7 @@ async fn send_user_message_async_description_follows_mid_turn_model_changes() ->
                     .as_array()
                     .expect("request tools")
                     .iter()
-                    .find(|tool| tool["name"] == "send_user_message_async")
+                    .find(|tool| tool["name"] == "request_user_input_async")
                     .expect("async message tool");
                 json!({"model": body["model"], "description": tool["description"]})
             })

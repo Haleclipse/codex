@@ -63,7 +63,11 @@ use core_test_support::zsh_fork::zsh_fork_test_builder;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use test_case::test_case;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 const SAMPLE_PLUGIN_CONFIG_NAME: &str = "sample@test";
 const SAMPLE_REMOTE_PLUGIN_CONFIG_NAME: &str = "sample@openai-curated-remote";
@@ -629,10 +633,8 @@ async fn plugin_skill_product_policy_and_migrated_command_precedence_reach_agent
     })
     .await;
 
-    let developer_text = response
-        .single_request()
-        .message_input_texts("developer")
-        .join("\n");
+    let requests = response.requests();
+    let developer_text = requests[0].message_input_texts("developer").join("\n");
     assert_eq!(
         (
             developer_text.contains("sample:source-command-review: native review skill"),
@@ -685,6 +687,107 @@ async fn legacy_plugin_skill_prompt_remains_complete() -> Result<()> {
         .message_input_texts("user")
         .join("\n");
     assert!(user_text.contains(&skill_contents));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sites_migration_agent_turn_prefers_loadable_remote_sites() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "plugins": [{
+                "id": "plugins~plugin_connector_1p_689987207de08191979cf68eca2941c6",
+                "name": "sites",
+                "scope": "GLOBAL",
+                "status": "ENABLED",
+                "installation_policy": "AVAILABLE",
+                "authentication_policy": "ON_USE",
+                "release": {
+                    "version": "local",
+                    "display_name": "Sites",
+                    "description": "Sites",
+                    "interface": {},
+                },
+                "enabled": true,
+            }],
+            "pagination": {"next_page_token": null},
+        })))
+        .mount(&server)
+        .await;
+
+    let codex_home = Arc::new(TempDir::new()?);
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[features]
+plugins = true
+remote_plugin = true
+
+[plugins."sites@openai-bundled"]
+enabled = true
+"#,
+    )?;
+    for (marketplace, skill) in [
+        ("openai-bundled", "bundled-sites"),
+        ("openai-curated-remote", "remote-sites"),
+    ] {
+        let root = codex_home
+            .path()
+            .join(format!("plugins/cache/{marketplace}/sites/local"));
+        std::fs::create_dir_all(root.join(".codex-plugin"))?;
+        std::fs::write(
+            root.join(".codex-plugin/plugin.json"),
+            r#"{"name":"sites"}"#,
+        )?;
+        let skill_dir = root.join("skills").join(skill);
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {skill}\ndescription: test skill\n---\n\n# body\n"),
+        )?;
+    }
+
+    let chatgpt_base_url = server.uri();
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_extensions(skills_extensions())
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| config.chatgpt_base_url = chatgpt_base_url);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let auth = test.thread_manager.auth_manager().auth().await;
+    test.thread_manager
+        .plugins_manager()
+        .reconcile_remote_installed_plugins(&test.config.plugins_config_input(), auth.as_ref())
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Inspect the available Sites skills.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = response.requests();
+    let developer_text = requests[0].message_input_texts("developer").join("\n");
+    assert_eq!(
+        (
+            developer_text.contains("sites:remote-sites"),
+            developer_text.contains("sites:bundled-sites"),
+        ),
+        (true, false),
+        "unexpected Sites skills in developer prompt: {developer_text:?}"
+    );
     Ok(())
 }
 

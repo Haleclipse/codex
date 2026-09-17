@@ -66,6 +66,7 @@ fn skills_to_info(
 fn hooks_to_info(hooks: &[codex_hooks::HookListEntry]) -> Vec<HookMetadata> {
     hooks
         .iter()
+        .filter(|hook| !hook.builtin)
         .map(|hook| {
             let handler = match &hook.handler {
                 HookListEntryHandler::Command { command, r#async } => {

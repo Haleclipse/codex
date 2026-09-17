@@ -116,8 +116,7 @@ pub(crate) struct ListedAgent {
 /// which keeps the registry scoped to that root thread rather than the entire `ThreadManager`.
 #[derive(Clone)]
 pub(crate) struct AgentControl {
-    /// ID shared by the whole agent control session. This means every sub-agents from a common
-    /// root share the same session ID.
+    /// session_id is equal to the root thread's ID.
     session_id: SessionId,
     /// Weak handle back to the global thread registry/state.
     /// This is `Weak` to avoid reference cycles and shadow persistence of the form

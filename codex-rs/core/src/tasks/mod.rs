@@ -307,16 +307,13 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        // Reserved turn input already has its context; only newly arriving mail can change lineage.
         let (pending_items, start_options) = self.input_queue.drain_mailbox_input_items().await;
-        if pending_items.iter().any(|item| {
-            matches!(
-                item,
-                TurnInput::InterAgentCommunication(communication) if communication.trigger_turn
-            )
-        }) && turn_context.turn_metadata_state.root_turn_id() != start_options.root_turn_id
+        if turn_context.turn_metadata_state.root_turn_id().is_none()
+            && let Some(root_turn_id) = start_options.root_turn_id
         {
-            turn_context.turn_metadata_state.mark_root_turn_ambiguous();
+            turn_context
+                .turn_metadata_state
+                .set_root_turn_id(root_turn_id);
         }
         let turn_state = {
             let mut active = self.active_turn.lock().await;

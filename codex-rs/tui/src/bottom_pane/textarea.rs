@@ -64,6 +64,7 @@ use self::vim_commands::VimAction;
 use self::vim_commands::VimCommandState;
 use self::vim_commands::VimEditTarget;
 use self::vim_commands::VimInsertPosition;
+pub(crate) use self::vim_commands::VimPersistentState;
 
 const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 

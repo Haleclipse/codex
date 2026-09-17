@@ -1,7 +1,7 @@
 //! Bounded, chronological review evidence independent of the parent's compaction.
 //!
 //! User messages and other entries have separate limits and keep their original order.
-//! Hosts append original items and reset this history on rollback or reconstruction.
+//! Hosts append original items, restore bounded checkpoints, and trim rolled-back turns.
 //! Clones share immutable payloads; eviction changes the generation so readers cannot
 //! reuse an offset into a different retained prefix. Prompt selection remains caller-owned.
 
@@ -140,6 +140,19 @@ impl TranscriptHistory {
         for item in items {
             self.record(item);
         }
+    }
+
+    /// Removes a rolled-back boundary and everything after it. If retention already
+    /// evicted the boundary, discard the remaining evidence rather than keep later grants.
+    pub fn truncate_before(&mut self, boundary: &ResponseItem) {
+        let index = self.items.iter().position(|(item, _)| {
+            item.id()
+                .zip(boundary.id())
+                .is_some_and(|(item_id, boundary_id)| item_id == boundary_id)
+                || item.as_ref() == boundary
+        });
+        self.items.truncate(index.unwrap_or(0));
+        self.generation = self.generation.saturating_add(1);
     }
 
     /// Generation of the retained prefix, independent of parent compaction.

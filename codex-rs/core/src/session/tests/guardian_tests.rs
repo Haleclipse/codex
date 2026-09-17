@@ -647,10 +647,13 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
         .set(AskForApproval::Never)
         .expect("test setup should allow updating approval policy");
     let mut config = (*turn_context_raw.config).clone();
+    // Keep Never outside Full Access without requiring an OS sandbox for this routing test.
     config
         .permissions
-        .set_permission_profile(codex_protocol::models::PermissionProfile::Disabled)
-        .expect("test setup should allow disabling the permission profile");
+        .set_permission_profile(codex_protocol::models::PermissionProfile::External {
+            network: NetworkSandboxPolicy::Restricted,
+        })
+        .expect("test setup should allow external sandbox permissions");
     let TurnEnvironmentState::Ready(environment) =
         &mut turn_context_raw.environments.environments[0]
     else {
@@ -1287,6 +1290,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         auth_manager,
         models_manager,
+        git_root_discovery: Arc::default(),
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         skills_service,
         plugins_manager,

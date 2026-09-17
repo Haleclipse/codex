@@ -140,9 +140,6 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
     config
         .features
         .enable(Feature::LocalThreadStoreCompression)?;
-    config
-        .features
-        .enable(Feature::LocalThreadStoreSharedCompression)?;
     // Use production feature wiring, rather than manually writing zstd files or calling the worker.
     let store =
         codex_core::thread_store_from_config(&config, codex_core::init_state_db(&config).await);

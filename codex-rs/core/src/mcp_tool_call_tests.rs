@@ -1,3 +1,4 @@
+use super::account::McpToolAccountError;
 use super::*;
 use crate::config::ConfigBuilder;
 use crate::config::ManagedFeatures;
@@ -95,6 +96,97 @@ fn approval_metadata(
 
 fn approval_config(turn_context: &TurnContext) -> codex_mcp::McpConfig {
     (*mcp_config_for_test(&turn_context.config)).clone()
+}
+
+#[test_case::test_case(false, None, Ok(Some("default_link")); "catalog_account")]
+#[test_case::test_case(true, None, Err(McpToolAccountError::InvalidSelector); "required_selector_omitted")]
+#[test_case::test_case(true, Some(serde_json::json!(null)), Err(McpToolAccountError::InvalidSelector); "null_selector")]
+#[test_case::test_case(true, Some(serde_json::json!(42)), Err(McpToolAccountError::InvalidSelector); "invalid_selector")]
+#[test_case::test_case(true, Some(serde_json::json!(" ")), Err(McpToolAccountError::InvalidSelector); "empty_selector")]
+#[test_case::test_case(true, Some(serde_json::json!(" selected_link ")), Ok(Some(" selected_link ")); "opaque_selector")]
+#[test_case::test_case(false, Some(serde_json::json!("selected_link")), Ok(Some("default_link")); "unrelated_link_argument")]
+fn mcp_tool_metadata_resolves_advertised_account_selector(
+    requires_explicit_link_id: bool,
+    selected_link: Option<JsonValue>,
+    expected: Result<Option<&str>, McpToolAccountError>,
+) {
+    let tool_info = serde_json::from_value(serde_json::json!({
+        "server_name": CODEX_APPS_MCP_SERVER_NAME,
+        "tool_name": "events/create",
+        "tool_namespace": "calendar",
+        "connector_id": "calendar",
+        "tool": {
+            "name": "calendar/events/create",
+            "inputSchema": {},
+            "_meta": {
+                "link_id": "default_link",
+                "_codex_apps": {
+                    "requires_explicit_link_id": requires_explicit_link_id,
+                },
+            },
+        },
+    }))
+    .expect("tool info");
+    let arguments = selected_link.map(|link_id| serde_json::json!({ "link_id": link_id }));
+    assert_eq!(
+        mcp_tool_metadata(&tool_info, /*plugin_id*/ None, arguments.as_ref())
+            .map(|metadata| metadata.link_id),
+        expected.map(|link_id| link_id.map(str::to_owned)),
+    );
+}
+
+#[test_case::test_case(None, Ok(None); "no_tool_metadata_uses_legacy_fallback")]
+#[test_case::test_case(Some(serde_json::json!({})), Ok(None); "no_apps_metadata_uses_legacy_fallback")]
+#[test_case::test_case(Some(serde_json::json!({ "_codex_apps": {} })), Ok(None); "missing_selector_flag_uses_legacy_fallback")]
+#[test_case::test_case(Some(serde_json::json!({ "_codex_apps": { "requires_explicit_link_id": false } })), Ok(None); "false_selector_flag_uses_legacy_fallback")]
+#[test_case::test_case(Some(serde_json::json!({ "_codex_apps": { "requires_explicit_link_id": null } })), Ok(None); "null_selector_flag_uses_legacy_fallback")]
+#[test_case::test_case(Some(serde_json::json!({ "_codex_apps": { "requires_explicit_link_id": "true" } })), Ok(None); "string_true_does_not_require_selector")]
+#[test_case::test_case(Some(serde_json::json!({ "_codex_apps": { "requires_explicit_link_id": 1 } })), Ok(None); "numeric_one_does_not_require_selector")]
+#[test_case::test_case(Some(serde_json::json!({ "_codex_apps": [] })), Ok(None); "malformed_apps_metadata_uses_legacy_fallback")]
+#[test_case::test_case(Some(serde_json::json!({ "link_id": null })), Ok(None); "null_catalog_link_uses_legacy_fallback")]
+#[test_case::test_case(Some(serde_json::json!({ "link_id": 42, "_codex_apps": { "requires_explicit_link_id": false } })), Ok(None); "invalid_optional_catalog_link_uses_legacy_fallback")]
+#[test_case::test_case(Some(serde_json::json!({ "link_id": " ", "_codex_apps": { "requires_explicit_link_id": false } })), Ok(None); "empty_optional_catalog_link_uses_legacy_fallback")]
+#[test_case::test_case(Some(serde_json::json!({ "link_id": "default_link" })), Ok(Some("default_link")); "legacy_catalog_link_needs_no_selector_metadata")]
+fn mcp_tool_metadata_preserves_legacy_account_fallback(
+    meta: Option<JsonValue>,
+    expected: Result<Option<&str>, McpToolAccountError>,
+) {
+    let mut tool = serde_json::json!({ "name": "calendar/events/create", "inputSchema": {} });
+    if let Some(meta) = meta {
+        tool["_meta"] = meta;
+    }
+    let tool_info = serde_json::from_value(serde_json::json!({
+        "server_name": CODEX_APPS_MCP_SERVER_NAME,
+        "tool_name": "events/create",
+        "tool_namespace": "calendar",
+        "connector_id": "calendar",
+        "tool": tool,
+    }))
+    .expect("tool info");
+
+    assert_eq!(
+        mcp_tool_metadata(&tool_info, /*plugin_id*/ None, /*arguments*/ None)
+            .map(|metadata| metadata.link_id),
+        expected.map(|link_id| link_id.map(str::to_owned)),
+    );
+}
+
+#[test_case::test_case(serde_json::json!({}); "no_account_metadata")]
+#[test_case::test_case(serde_json::json!({ "_codex_apps": { "requires_explicit_link_id": true } }); "unrelated_apps_metadata")]
+fn non_apps_tool_does_not_require_account_metadata(meta: JsonValue) {
+    let tool_info = serde_json::from_value(serde_json::json!({
+        "server_name": "custom_server",
+        "tool_name": "events/create",
+        "tool_namespace": "calendar",
+        "tool": { "name": "calendar/events/create", "inputSchema": {}, "_meta": meta },
+    }))
+    .expect("tool info");
+
+    assert_eq!(
+        mcp_tool_metadata(&tool_info, /*plugin_id*/ None, /*arguments*/ None)
+            .map(|metadata| metadata.link_id),
+        Ok(None),
+    );
 }
 
 fn mcp_turn_metadata_context(turn_context: &TurnContext) -> McpTurnMetadataContext<'_> {
@@ -819,6 +911,7 @@ fn custom_servers_support_session_and_persistent_approval() {
     let expected = McpToolApprovalKey {
         server: "custom_server".to_string(),
         connector_id: None,
+        link_id: None,
         tool_name: "run_action".to_string(),
     };
 
@@ -843,16 +936,18 @@ fn codex_apps_connectors_support_persistent_approval() {
         tool: "calendar/list_events".to_string(),
         arguments: None,
     };
-    let metadata = approval_metadata(
+    let mut metadata = approval_metadata(
         Some("calendar"),
         Some("Calendar"),
         /*connector_description*/ None,
         /*tool_title*/ None,
         /*tool_description*/ None,
     );
+    metadata.link_id = Some("link_a".to_string());
     let expected = McpToolApprovalKey {
         server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
         connector_id: Some("calendar".to_string()),
+        link_id: Some("link_a".to_string()),
         tool_name: "calendar/list_events".to_string(),
     };
 
@@ -2065,6 +2160,7 @@ async fn persist_codex_app_tool_approval_writes_tool_override() {
                             },
                         )]),
                     }),
+                    links: None,
                 },
             )]),
         })
@@ -2246,6 +2342,7 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config() {
     let key = McpToolApprovalKey {
         server: CODEX_APPS_MCP_SERVER_NAME.to_string(),
         connector_id: Some("calendar".to_string()),
+        link_id: None,
         tool_name: "calendar/list_events".to_string(),
     };
 
@@ -2296,6 +2393,7 @@ async fn maybe_persist_mcp_tool_approval_reloads_session_config_for_custom_serve
     let key = McpToolApprovalKey {
         server: "docs".to_string(),
         connector_id: None,
+        link_id: None,
         tool_name: "search".to_string(),
     };
 
@@ -2352,6 +2450,7 @@ enabled = true
     let key = McpToolApprovalKey {
         server: "sample".to_string(),
         connector_id: None,
+        link_id: None,
         tool_name: "search".to_string(),
     };
 
@@ -2408,6 +2507,7 @@ async fn maybe_persist_mcp_tool_approval_writes_project_config_for_project_serve
     let key = McpToolApprovalKey {
         server: "docs".to_string(),
         connector_id: None,
+        link_id: None,
         tool_name: "search".to_string(),
     };
 

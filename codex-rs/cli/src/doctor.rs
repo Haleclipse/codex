@@ -876,6 +876,10 @@ fn installation_check(show_details: bool) -> DoctorCheck {
         env::var_os("CODEX_MANAGED_BY_BUN").is_some()
     ));
     details.push(format!(
+        "managed by Vite+: {}",
+        env::var_os("CODEX_MANAGED_BY_VITE_PLUS").is_some()
+    ));
+    details.push(format!(
         "managed by pnpm: {}",
         env::var_os("CODEX_MANAGED_BY_PNPM").is_some()
     ));
@@ -967,6 +971,7 @@ fn doctor_managed_by_npm(current_exe: Option<&Path>) -> bool {
 fn inherited_managed_env_for_cargo_binary(current_exe: Option<&Path>) -> bool {
     if env::var_os("CODEX_MANAGED_BY_NPM").is_none()
         && env::var_os("CODEX_MANAGED_BY_BUN").is_none()
+        && env::var_os("CODEX_MANAGED_BY_VITE_PLUS").is_none()
         && env::var_os("CODEX_MANAGED_BY_PNPM").is_none()
     {
         return false;
@@ -1019,6 +1024,9 @@ fn describe_install_context(context: &InstallContext) -> String {
         }
         InstallMethod::Bun => {
             describe_method_with_package_layout("bun", context.package_layout.as_ref())
+        }
+        InstallMethod::VitePlus => {
+            describe_method_with_package_layout("vite+", context.package_layout.as_ref())
         }
         InstallMethod::Pnpm => {
             describe_method_with_package_layout("pnpm", context.package_layout.as_ref())

@@ -396,6 +396,7 @@ impl ThreadHistoryBuilder {
             RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::SecurityRiskScore(_)
@@ -496,6 +497,7 @@ impl ThreadHistoryBuilder {
             phase: payload.phase.clone(),
             memory_citation: payload.memory_citation.clone().map(Into::into),
             delivery: payload.delivery,
+            questions: payload.questions.clone(),
         });
     }
 
@@ -1656,6 +1658,7 @@ impl From<&PendingTurn> for Turn {
 mod tests {
     use super::*;
     use crate::protocol::v2::AgentMessageDelivery;
+    use crate::protocol::v2::AsyncUserInputQuestion;
     use crate::protocol::v2::CommandExecutionSource;
     use codex_extension_items::ExtensionItem as CoreExtensionItem;
     use codex_extension_items::sleep::SleepItem as CoreSleepItem;
@@ -1758,6 +1761,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             EventMsg::AgentReasoning(AgentReasoningEvent {
                 text: "thinking".into(),
@@ -1778,6 +1782,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
         ];
 
@@ -1817,6 +1822,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }
         );
         assert_eq!(
@@ -1851,6 +1857,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }
         );
     }
@@ -2421,12 +2428,23 @@ mod tests {
     }
 
     #[test]
-    fn preserves_agent_message_phase_and_delivery_in_history() {
+    fn preserves_agent_message_phase_delivery_and_questions_in_history() {
+        let questions = vec![
+            AsyncUserInputQuestion {
+                title: "Which environment?".into(),
+                options: Some(vec!["Staging".into(), "Production".into()]),
+            },
+            AsyncUserInputQuestion {
+                title: "Anything else?".into(),
+                options: None,
+            },
+        ];
         let events = vec![EventMsg::AgentMessage(AgentMessageEvent {
             message: "Final reply".into(),
             phase: Some(CoreMessagePhase::FinalAnswer),
             memory_citation: None,
             delivery: Some(AgentMessageDelivery::Async),
+            questions: Some(questions.clone()),
         })];
 
         let items = events
@@ -2443,6 +2461,7 @@ mod tests {
                 phase: Some(CoreMessagePhase::FinalAnswer),
                 memory_citation: None,
                 delivery: Some(AgentMessageDelivery::Async),
+                questions: Some(questions),
             }
         );
     }
@@ -2553,6 +2572,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             EventMsg::AgentReasoning(AgentReasoningEvent {
                 text: "second summary".into(),
@@ -2602,6 +2622,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some("turn-1".into()),
@@ -2623,6 +2644,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
         ];
 
@@ -2655,6 +2677,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }
         );
 
@@ -2680,6 +2703,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }
         );
     }
@@ -2700,6 +2724,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 client_id: None,
@@ -2714,6 +2739,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
             EventMsg::UserMessage(UserMessageEvent {
@@ -2729,6 +2755,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
         ];
 
@@ -2760,6 +2787,7 @@ mod tests {
                     phase: None,
                     memory_citation: None,
                     delivery: None,
+                    questions: None,
                 },
             ]
         );
@@ -2780,6 +2808,7 @@ mod tests {
                     phase: None,
                     memory_citation: None,
                     delivery: None,
+                    questions: None,
                 },
             ]
         );
@@ -2801,6 +2830,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 client_id: None,
@@ -2815,6 +2845,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 99 }),
         ];
@@ -3848,6 +3879,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-b".into(),
@@ -4027,6 +4059,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
         ];
 
@@ -4055,11 +4088,14 @@ mod tests {
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
                 replacement_history: None,
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-compact".into(),
@@ -4291,6 +4327,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }),
             EventMsg::Error(ErrorEvent {
                 misalignment: None,

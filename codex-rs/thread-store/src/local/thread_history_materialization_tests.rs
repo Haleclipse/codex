@@ -232,6 +232,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                 ),
                 turn_completed("turn-1"),
@@ -325,6 +326,7 @@ async fn paginated_live_append_materializes_turn_items_and_state() {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                 ),
                 turn_completed("turn-1"),
@@ -480,6 +482,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                 ),
                 RolloutItem::RealtimeItem(RealtimeItem {
@@ -2669,6 +2672,7 @@ fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
         phase: Some(phase),
         memory_citation: None,
         delivery: None,
+        questions: None,
     })
 }
 

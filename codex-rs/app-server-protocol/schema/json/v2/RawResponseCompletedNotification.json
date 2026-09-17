@@ -9,7 +9,8 @@
             "string",
             "null"
           ]
-        }
+        },
+        "metadata": true
       },
       "type": "object"
     },

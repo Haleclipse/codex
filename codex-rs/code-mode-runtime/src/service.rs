@@ -242,6 +242,17 @@ struct ProtocolDelegate {
 }
 
 impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
+    #[tracing::instrument(
+        name = "code_mode.runtime.invoke_tool",
+        level = "info",
+        skip_all,
+        fields(
+            cell.id = %invocation.cell_id,
+            runtime_tool_call_id = invocation.runtime_tool_call_id.as_str(),
+            tool_name = invocation.tool_name.name.as_str(),
+            tool_namespace = invocation.tool_name.namespace.as_deref(),
+        )
+    )]
     async fn invoke_tool(
         &self,
         invocation: runtime::NestedToolCall,

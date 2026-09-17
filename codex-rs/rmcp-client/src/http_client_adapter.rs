@@ -55,9 +55,9 @@ use sse_stream::Sse;
 use sse_stream::SseStream;
 use tokio::sync::oneshot;
 
+use crate::bounded_stdio_transport::MAX_MCP_STDIO_LINE_BYTES;
 use crate::event_notification_transport::MAX_EVENT_NOTIFICATION_BYTES;
 use crate::http_client_redirect::SameOriginRedirectHttpClient;
-use crate::local_stdio_transport::MAX_MCP_STDIO_LINE_BYTES;
 
 use crate::www_authenticate::insufficient_scope_challenge;
 

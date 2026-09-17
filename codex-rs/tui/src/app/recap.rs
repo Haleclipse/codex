@@ -1,4 +1,5 @@
 //! Determines when an unfocused conversation is ready for an automatic recap.
+//! The TUI opt-out suppresses automatic scheduling and requests, but not manual `/recap`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -176,7 +177,34 @@ pub(super) struct RecapRequest {
 }
 
 impl App {
-    fn clear_recap_request(&mut self, trigger: RecapTrigger) {
+    fn recap_trigger_enabled(&self, trigger: RecapTrigger) -> bool {
+        match trigger {
+            RecapTrigger::Automatic => self.config.tui_auto_recap,
+            RecapTrigger::Manual => true,
+        }
+    }
+
+    pub(super) fn schedule_recap_check(&mut self, thread_id: ThreadId, now: Instant) {
+        if let Some(task) = self.recap.scheduled_check.take() {
+            task.abort();
+        }
+
+        if !self.config.tui_auto_recap {
+            return;
+        }
+        let Some(deadline) = self.recap.next_check_deadline() else {
+            return;
+        };
+        let delay = deadline.saturating_duration_since(now);
+        let app_event_tx = self.app_event_tx.clone();
+
+        self.recap.scheduled_check = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            app_event_tx.send(AppEvent::CheckRecap { thread_id });
+        }));
+    }
+
+    pub(super) fn clear_recap_request(&mut self, trigger: RecapTrigger) {
         self.recap.clear_in_flight_request();
 
         if !matches!(trigger, RecapTrigger::Manual) {
@@ -200,6 +228,9 @@ impl App {
     }
 
     fn retry_or_report_recap_failure(&mut self, request: RecapRequest) {
+        if !self.recap_trigger_enabled(request.trigger) {
+            return;
+        }
         match request.trigger {
             RecapTrigger::Automatic => self.recap.schedule_retry(
                 request.thread_id,
@@ -218,6 +249,9 @@ impl App {
         thread_id: ThreadId,
         trigger: RecapTrigger,
     ) {
+        if !self.recap_trigger_enabled(trigger) {
+            return;
+        }
         if self.recap.in_flight_request.is_some() {
             if matches!(trigger, RecapTrigger::Manual) {
                 self.chat_widget
@@ -332,6 +366,7 @@ impl App {
             && !self.chat_widget.is_user_turn_pending_or_running()
             && self.recap.completed_turns == completed_turn_count
             && self.recap.turn_revision == turn_revision
+            && self.recap_trigger_enabled(trigger)
             && trigger_is_eligible;
         let Ok(temporary_thread_id) = ThreadId::from_string(&temporary_thread_id_text) else {
             if is_current_request {
@@ -408,7 +443,8 @@ impl App {
 
         self.clear_recap_request(trigger);
 
-        if self.current_displayed_thread_id() != Some(thread_id)
+        if !self.recap_trigger_enabled(trigger)
+            || self.current_displayed_thread_id() != Some(thread_id)
             || self.chat_widget.is_user_turn_pending_or_running()
             || self.recap.completed_turns != completed_turn_count
             || self.recap.turn_revision != turn_revision
@@ -539,28 +575,6 @@ impl RecapState {
         }
         self.turn_revision += 1;
         self.last_turn_finished_at = Some(now);
-    }
-
-    pub(super) fn schedule_check(
-        &mut self,
-        thread_id: ThreadId,
-        app_event_tx: AppEventSender,
-        now: Instant,
-    ) {
-        if let Some(task) = self.scheduled_check.take() {
-            task.abort();
-        }
-
-        let Some(deadline) = self.next_check_deadline() else {
-            return;
-        };
-
-        let delay = deadline.saturating_duration_since(now);
-
-        self.scheduled_check = Some(tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            app_event_tx.send(AppEvent::CheckRecap { thread_id });
-        }));
     }
 
     pub(super) fn schedule_retry(

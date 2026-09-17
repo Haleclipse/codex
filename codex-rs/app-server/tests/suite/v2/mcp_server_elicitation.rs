@@ -142,9 +142,10 @@ impl StrictReviewScenario {
 
     fn review_outcomes(self) -> &'static [bool] {
         match self {
-            Self::Approved | Self::ApproveForMe | Self::Never | Self::FullAccess => &[true],
+            Self::Approved | Self::ApproveForMe | Self::Never => &[true],
             Self::DeniedBurst => &[false, false, false],
-            Self::GuardianDisabled
+            Self::FullAccess
+            | Self::GuardianDisabled
             | Self::ManagedGuardianDisabled
             | Self::ManagedReviewerForbidden
             | Self::AppReviewerUser
@@ -1148,7 +1149,12 @@ impl ServerHandler for ElicitationAppsMcpServer {
                             .map_err(|err| {
                                 rmcp::ErrorData::internal_error(err.to_string(), None)
                             })?;
-                        let expected = match strict.review_outcomes().get(index) {
+                        let expected = match strict
+                            .review_outcomes()
+                            .get(index)
+                            .copied()
+                            .or_else(|| (strict == Review::FullAccess).then_some(true))
+                        {
                             Some(true) => json!({
                                 "action": "accept",
                                 "content": {},

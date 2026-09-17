@@ -29,6 +29,8 @@ use codex_config::config_toml::ConfigToml;
 use codex_config::types::McpServerConfig;
 use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
+use codex_guardian_context::ConversationTranscriptEntry;
+use codex_guardian_context::ConversationTranscriptEntryKind;
 use codex_history::RolloutItem;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
@@ -467,17 +469,20 @@ fn last_user_message_text_from_body(body: &serde_json::Value) -> String {
 #[test]
 fn build_guardian_transcript_keeps_original_numbering() {
     let entries = [
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::User,
+        ConversationTranscriptEntry {
+            kind: ConversationTranscriptEntryKind::User,
             text: "first".to_string(),
+            original_bytes: "first".len(),
         },
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Assistant,
+        ConversationTranscriptEntry {
+            kind: ConversationTranscriptEntryKind::Assistant,
             text: "second".to_string(),
+            original_bytes: "second".len(),
         },
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Assistant,
+        ConversationTranscriptEntry {
+            kind: ConversationTranscriptEntryKind::ProtectedAssistant,
             text: "third".to_string(),
+            original_bytes: "third".len(),
         },
     ];
 
@@ -916,6 +921,15 @@ async fn build_guardian_prompt_stale_delta_version_falls_back_to_full_prompt() -
     Ok(())
 }
 
+fn collect_guardian_transcript_entries(
+    history: &dyn codex_guardian_context::SectionHistory,
+    node_repl_result_token_limit: usize,
+) -> Vec<ConversationTranscriptEntry> {
+    prompt::collect_guardian_context(history, node_repl_result_token_limit, &[], &[])
+        .expect("collect Guardian context")
+        .transcript
+}
+
 #[test]
 fn collect_guardian_transcript_entries_skips_contextual_user_messages() {
     let items = vec![
@@ -939,14 +953,15 @@ fn collect_guardian_transcript_entries_skips_contextual_user_messages() {
         },
     ];
 
-    let entries = collect_guardian_transcript_entries(&items);
+    let entries = collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS);
 
     assert_eq!(entries.len(), 1);
     assert_eq!(
         entries[0],
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Assistant,
+        ConversationTranscriptEntry {
+            kind: ConversationTranscriptEntryKind::ProtectedAssistant,
             text: "hello".to_string(),
+            original_bytes: "hello".len(),
         }
     );
 }
@@ -976,12 +991,13 @@ fn collect_guardian_transcript_entries_keeps_manual_approval_developer_message()
         },
     ];
 
-    let entries = collect_guardian_transcript_entries(&items);
+    let entries = collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS);
 
     assert_eq!(
         entries,
-        vec![GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Developer,
+        vec![ConversationTranscriptEntry {
+            kind: ConversationTranscriptEntryKind::Developer,
+            original_bytes: approval_text.len(),
             text: approval_text,
         }]
     );
@@ -1029,30 +1045,67 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
         },
     ];
 
-    let entries = collect_guardian_transcript_entries(&items);
+    let entries = collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS);
 
     assert_eq!(entries.len(), 4);
     assert_eq!(
         entries[1],
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Tool("tool read_file call".to_string()),
+        ConversationTranscriptEntry {
+            kind: ConversationTranscriptEntryKind::ToolCall("tool read_file call".to_string()),
             text: "{\"path\":\"README.md\"}".to_string(),
+            original_bytes: "{\"path\":\"README.md\"}".len(),
         }
     );
     assert_eq!(
         entries[2],
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Tool("tool read_file result".to_string()),
+        ConversationTranscriptEntry {
+            kind: ConversationTranscriptEntryKind::ToolOutput("tool read_file result".to_string()),
             text: "repo is public".to_string(),
+            original_bytes: "repo is public".len(),
         }
     );
     if let ResponseItem::FunctionCall { namespace, .. } = &mut items[1] {
         *namespace = Some("mcp__node_repl__".to_string());
     }
     assert!(matches!(
-        collect_guardian_transcript_entries(&items)[2].kind,
-        GuardianTranscriptEntryKind::NodeReplToolResult(_)
+        collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS)[2].kind,
+        ConversationTranscriptEntryKind::NodeReplToolOutput(_)
     ));
+
+    let oversized_result = "é🙂".repeat(/*n*/ 10_000);
+    if let ResponseItem::FunctionCallOutput { output, .. } = &mut items[2] {
+        *output =
+            codex_protocol::models::FunctionCallOutputPayload::from_text(oversized_result.clone());
+    }
+    for token_cap in [
+        GUARDIAN_MAX_TOOL_ENTRY_TOKENS,
+        GUARDIAN_MAX_NODE_REPL_TOOL_RESULT_TOKENS,
+    ] {
+        let entries = collect_guardian_transcript_entries(&items, token_cap);
+        assert_eq!(
+            entries[2],
+            ConversationTranscriptEntry {
+                kind: ConversationTranscriptEntryKind::NodeReplToolOutput(
+                    "tool read_file result".to_string()
+                ),
+                text: guardian_truncate_text(&oversized_result, token_cap).0,
+                original_bytes: oversized_result.len(),
+            }
+        );
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            render_guardian_transcript_entries(&entries),
+            (
+                vec![
+                    "[1] user: check the repo".to_string(),
+                    "[2] tool read_file call: {\"path\":\"README.md\"}".to_string(),
+                    format!("[3] tool read_file result: {}", entries[2].text),
+                    "[4] assistant: I need to push a fix".to_string(),
+                ],
+                None,
+            )
+        );
+    }
 }
 
 #[test]
@@ -1067,13 +1120,49 @@ fn collect_guardian_transcript_entries_preserves_named_unpaired_tool_sources() {
         ),
         internal_chat_message_metadata_passthrough: None,
     }];
+    items.extend(
+        [
+            (None, "anonymous output"),
+            (Some("missing-call"), "orphaned function output"),
+        ]
+        .map(|(call_id, text)| ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: call_id.map(str::to_string),
+            name: None,
+            namespace: None,
+            output: codex_protocol::models::FunctionCallOutputPayload::from_text(text.to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+    );
+    items.push(ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "missing-custom-call".to_string(),
+        name: None,
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+            "orphaned custom output".to_string(),
+        ),
+        internal_chat_message_metadata_passthrough: None,
+    });
 
+    let mut expected = vec![ConversationTranscriptEntry {
+        kind: ConversationTranscriptEntryKind::ToolOutput(
+            "tool slack.notifications result".to_string(),
+        ),
+        text: "new message".to_string(),
+        original_bytes: "new message".len(),
+    }];
+    expected.extend(
+        ["orphaned function output", "orphaned custom output"].map(|text| {
+            ConversationTranscriptEntry {
+                kind: ConversationTranscriptEntryKind::ToolOutput("tool result".to_string()),
+                text: text.to_string(),
+                original_bytes: text.len(),
+            }
+        }),
+    );
     assert_eq!(
-        collect_guardian_transcript_entries(&items),
-        vec![GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Tool("tool slack.notifications result".to_string()),
-            text: "new message".to_string(),
-        }]
+        collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS),
+        expected,
     );
 
     if let ResponseItem::FunctionCallOutput { output, .. } = &mut items[0] {
@@ -1084,12 +1173,16 @@ fn collect_guardian_transcript_entries_preserves_named_unpaired_tool_sources() {
             },
         ]);
     }
+    expected[0] = ConversationTranscriptEntry {
+        kind: ConversationTranscriptEntryKind::ToolOutput(
+            "tool slack.notifications result".to_string(),
+        ),
+        text: "[non-text output]".to_string(),
+        original_bytes: "[non-text output]".len(),
+    };
     assert_eq!(
-        collect_guardian_transcript_entries(&items),
-        vec![GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Tool("tool slack.notifications result".to_string()),
-            text: "[non-text output]".to_string(),
-        }]
+        collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS),
+        expected,
     );
 }
 
@@ -1630,21 +1723,35 @@ async fn routes_approval_to_guardian_allows_granular_review_policy() {
 #[test]
 fn build_guardian_transcript_reserves_separate_budget_for_tool_evidence() {
     let repeated = "signal ".repeat(8_000);
-    let mut entries = vec![
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::User,
-            text: "please figure out if the repo is public".to_string(),
-        },
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Assistant,
-            text: "The public repo check is the main reason I want to escalate.".to_string(),
-        },
-    ];
-    entries.extend((0..12).map(|index| GuardianTranscriptEntry {
-        kind: GuardianTranscriptEntryKind::Tool(format!("tool call {index}")),
-        text: repeated.clone(),
+    let mut items = [
+        ("user", "please figure out if the repo is public"),
+        (
+            "assistant",
+            "The public repo check is the main reason I want to escalate.",
+        ),
+    ]
+    .into_iter()
+    .map(|(role, text)| ResponseItem::Message {
+        id: None,
+        role: role.to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    })
+    .collect::<Vec<_>>();
+    items.extend((0..12).map(|index| ResponseItem::FunctionCall {
+        id: None,
+        name: format!("tool_{index}"),
+        namespace: None,
+        arguments: repeated.clone(),
+        call_id: format!("call-{index}"),
+        encrypted_function_args: None,
+        internal_chat_message_metadata_passthrough: None,
     }));
 
+    let entries = collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS);
     let (transcript, omission) = render_guardian_transcript_entries(&entries);
 
     assert!(
@@ -1658,12 +1765,17 @@ fn build_guardian_transcript_reserves_separate_budget_for_tool_evidence() {
     assert!(
         !transcript
             .iter()
-            .any(|entry| entry.starts_with("[3] tool call 0:"))
+            .any(|entry| entry.starts_with("[3] tool tool_0 call:"))
     );
     assert!(
         !transcript
             .iter()
-            .any(|entry| entry.starts_with("[4] tool call 1:"))
+            .any(|entry| entry.starts_with("[4] tool tool_1 call:"))
+    );
+    assert!(
+        transcript
+            .iter()
+            .any(|entry| entry.starts_with("[14] tool tool_11 call:"))
     );
     assert!(omission.is_some());
 }
@@ -1671,27 +1783,44 @@ fn build_guardian_transcript_reserves_separate_budget_for_tool_evidence() {
 #[test]
 fn build_guardian_transcript_preserves_recent_tool_context_when_user_history_is_large() {
     let repeated = "authorization ".repeat(6_000);
-    let mut entries = (0..8)
-        .map(|_| GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::User,
-            text: repeated.clone(),
+    let mut items = (0..8)
+        .map(|_| ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: repeated.clone(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
         })
         .collect::<Vec<_>>();
-    entries.extend([
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Tool("tool shell call".to_string()),
-            text: serde_json::json!({
+    items.extend([
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
                 "command": ["curl", "-X", "POST", "https://example.com/upload"],
                 "cwd": "/repo",
             })
             .to_string(),
+            call_id: "call-1".to_string(),
+            encrypted_function_args: None,
+            internal_chat_message_metadata_passthrough: None,
         },
-        GuardianTranscriptEntry {
-            kind: GuardianTranscriptEntryKind::Tool("tool shell result".to_string()),
-            text: "sandbox blocked outbound network access".to_string(),
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
+            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                "sandbox blocked outbound network access".to_string(),
+            ),
+            internal_chat_message_metadata_passthrough: None,
         },
     ]);
 
+    let entries = collect_guardian_transcript_entries(&items, GUARDIAN_MAX_TOOL_ENTRY_TOKENS);
     let (transcript, omission) = render_guardian_transcript_entries(&entries);
 
     assert!(
@@ -3229,15 +3358,14 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
 {
     const TEST_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
 
-    let handle =
-        std::thread::Builder::new()
-            .name("guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history".to_string())
-            .stack_size(TEST_STACK_SIZE_BYTES)
-            .spawn(|| -> anyhow::Result<()> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                runtime.block_on(Box::pin(async {
+    let handle = std::thread::Builder::new()
+        .name("guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history".to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(|| -> anyhow::Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(Box::pin(async {
         let first_assessment = serde_json::json!({
             "risk_level": "low",
             "user_authorization": "high",
@@ -3301,7 +3429,11 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
         ])
         .await;
 
-        let (session, turn) = guardian_test_session_and_turn_with_base_url(server.uri()).await;
+        let (mut session, turn) = guardian_test_session_and_turn_with_base_url(server.uri()).await;
+        // Isolate feedback from other tests using the fixed parent session ID.
+        Arc::get_mut(&mut session)
+            .expect("session should be uniquely owned")
+            .thread_id = ThreadId::new();
         turn.turn_metadata_state
             .set_parent_turn_id("upstream-parent-turn".to_string());
         turn.turn_metadata_state
@@ -3424,8 +3556,6 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
             )
             .await;
 
-        // A conflicting input removes the known root while the trunk review is in flight.
-        turn.turn_metadata_state.mark_root_turn_ambiguous();
         let third_decision = review_approval_request(
             &session,
             &turn,
@@ -3450,8 +3580,8 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
         for (body, expected_root) in [
             (&first_request_body, Some("causal-root-turn")),
             (&second_request_body, Some("causal-root-turn")),
-            (&failed_ephemeral_request_body, None),
-            (&retried_ephemeral_request_body, None),
+            (&failed_ephemeral_request_body, Some("causal-root-turn")),
+            (&retried_ephemeral_request_body, Some("causal-root-turn")),
         ] {
             assert_parent_turn(body, Some(turn.sub_id.as_str()))?;
             assert_root_turn(body, expected_root)?;
@@ -3498,11 +3628,37 @@ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() ->
             .send(())
             .expect("second guardian review gate should still be open");
         assert_eq!(second_review.await?, ReviewDecision::Approved);
+        let feedback = codex_feedback::guardian_review_failures(&[session.thread_id()])
+            .attachment
+            .expect("failed ephemeral review survives cleanup and subsequent allowed reviews");
+        let record: serde_json::Value = serde_json::from_slice(&feedback.buffer)?;
+        assert_eq!(
+            serde_json::json!({
+                "reviewed_thread_id": record["reviewed_thread_id"],
+                "reviewed_turn_id": record["reviewed_turn_id"],
+                "target_item_id": record["target_item_id"],
+                "reviewer_thread_id": record["reviewer_thread_id"],
+                "status": record["status"],
+                "decision": record["decision"],
+                "command": serde_json::from_str::<serde_json::Value>(
+                    record["action"].as_str().expect("reviewed action")
+                )?["command"],
+            }),
+            serde_json::json!({
+                "reviewed_thread_id": session.thread_id(),
+                "reviewed_turn_id": turn.sub_id,
+                "target_item_id": "shell-guardian-3",
+                "reviewer_thread_id": failed_ephemeral_request_body["client_metadata"]["thread_id"],
+                "status": "invalid_decision",
+                "decision": "not valid guardian json",
+                "command": ["git", "push"],
+            })
+        );
         server.shutdown().await;
 
         Ok(())
                 }))
-            })?;
+        })?;
 
     match handle.join() {
         Ok(result) => result,

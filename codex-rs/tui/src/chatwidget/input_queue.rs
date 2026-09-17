@@ -44,6 +44,7 @@ pub(super) struct InputQueueState {
     pub(super) suppress_queue_autosend: bool,
     /// Hold submissions while a usage failure or backend-directed model fallback is resolved.
     pub(super) rate_limit_recovery_pending: bool,
+    pub(super) recovered_queue: bool,
 }
 
 impl InputQueueState {
@@ -52,6 +53,7 @@ impl InputQueueState {
     }
 
     pub(super) fn clear(&mut self) {
+        self.recovered_queue = false;
         self.queued_user_messages.clear();
         self.queued_user_message_history_records.clear();
         self.user_turn_pending_start = false;

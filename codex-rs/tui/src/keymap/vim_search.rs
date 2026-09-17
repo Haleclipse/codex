@@ -45,7 +45,6 @@ impl RuntimeKeymap {
         ];
         for (action, configured, bindings) in &mut actions {
             let path = format!("tui.keymap.vim_search.{action}");
-            **bindings = resolve_bindings(configured.as_ref(), bindings, &path)?;
             if configured.is_none() {
                 bindings.retain(|key| {
                     !others.iter().any(|other| {

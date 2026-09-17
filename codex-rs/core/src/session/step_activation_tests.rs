@@ -607,6 +607,60 @@ enum ManagedAuthorizationChange {
     ApprovalsReviewer,
 }
 
+#[test_case(false; "reviewer allow-list")]
+#[test_case(true; "model-required review")]
+#[tokio::test]
+async fn reviewer_only_activation_enforces_managed_authority(required_review: bool) {
+    let ActivationFixture { session, turn, .. } = activation_fixture(activation_models()).await;
+    let original = turn.current_settings.load_full();
+    let desired = desired_step_settings(&session).await;
+    let source = RequirementSource::Unknown;
+    let mut sourced = ConfigRequirementsWithSources::default();
+    let reviewer = if required_review {
+        sourced.auto_review = Some(Sourced::new(
+            AutoReviewRequirementsToml {
+                required_on_models: Some(vec![turn.model_info().slug.clone()]),
+                ..Default::default()
+            },
+            source,
+        ));
+        ApprovalsReviewer::User
+    } else {
+        sourced.allowed_approvals_reviewers =
+            Some(Sourced::new(vec![ApprovalsReviewer::User], source));
+        ApprovalsReviewer::AutoReview
+    };
+    {
+        let mut state = session.state.lock().await;
+        let config = Arc::make_mut(&mut state.session_configuration.original_config_do_not_use);
+        config.config_layer_stack = ConfigLayerStack::new(
+            config
+                .config_layer_stack
+                .all_layers_low_to_high()
+                .cloned()
+                .collect(),
+            ConfigRequirements::try_from(sourced.clone()).expect("managed requirements"),
+            sourced.into_toml(),
+        )
+        .expect("managed config stack");
+    }
+    assert!(matches!(
+        session
+            .apply_turn_settings(
+                &turn.sub_id,
+                TurnSettingsUpdate {
+                    approvals_reviewer: Some(reviewer),
+                    ..Default::default()
+                }
+            )
+            .await,
+        TurnSettingsUpdateOutcome::Rejected { .. }
+    ));
+    assert!(Arc::ptr_eq(&turn.current_settings.load_full(), &original));
+    assert_eq!(desired_step_settings(&session).await, desired);
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
 #[test_case(ManagedAuthorizationChange::ApprovalPolicy; "approval policy refreshed during lookup")]
 #[test_case(ManagedAuthorizationChange::ApprovalsReviewer; "approvals reviewer refreshed during lookup")]
 #[tokio::test]

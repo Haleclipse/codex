@@ -314,8 +314,8 @@ async fn effective_patch_permissions(
         .collect::<Result<Vec<_>, _>>()?;
     let effective_additional_permissions = apply_granted_turn_permissions(
         session,
-        environment_id,
-        native_cwd.as_path(),
+        environment,
+        cwd,
         crate::sandboxing::SandboxPermissions::UseDefault,
         write_permissions_for_paths(&native_file_paths, &file_system_sandbox_policy, &native_cwd),
     )

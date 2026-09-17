@@ -3,6 +3,7 @@ use crate::error_code::invalid_request;
 use crate::notification_media::without_notification_media;
 use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
+use crate::request_processors::apply_live_model_settings;
 use crate::request_processors::populate_thread_turns_from_history;
 use crate::request_processors::thread_from_stored_thread;
 use crate::request_processors::thread_settings_from_config_snapshot;
@@ -61,6 +62,9 @@ use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadRealtimeClosedNotification;
 use codex_app_server_protocol::ThreadRealtimeErrorNotification;
 use codex_app_server_protocol::ThreadRealtimeItemAddedNotification;
+use codex_app_server_protocol::ThreadRealtimeItemCompletedNotification;
+use codex_app_server_protocol::ThreadRealtimeItemStartedNotification;
+use codex_app_server_protocol::ThreadRealtimeItemTranscriptDeltaNotification;
 use codex_app_server_protocol::ThreadRealtimeOutputAudioDeltaNotification;
 use codex_app_server_protocol::ThreadRealtimeSdpNotification;
 use codex_app_server_protocol::ThreadRealtimeStartedNotification;
@@ -116,7 +120,6 @@ use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequest
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
-use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_shell_command::parse_command::shlex_join;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
@@ -463,6 +466,39 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .await;
         }
         EventMsg::RealtimeConversationRealtime(event) => match event.payload {
+            RealtimeEvent::HistoryItemStarted(item) => {
+                outgoing
+                    .send_server_notification(ServerNotification::ThreadRealtimeItemStarted(
+                        ThreadRealtimeItemStartedNotification {
+                            thread_id: conversation_id.to_string(),
+                            item: item.into(),
+                        },
+                    ))
+                    .await;
+            }
+            RealtimeEvent::HistoryTranscriptDelta { item_id, delta } => {
+                outgoing
+                    .send_server_notification(
+                        ServerNotification::ThreadRealtimeItemTranscriptDelta(
+                            ThreadRealtimeItemTranscriptDeltaNotification {
+                                thread_id: conversation_id.to_string(),
+                                item_id,
+                                delta,
+                            },
+                        ),
+                    )
+                    .await;
+            }
+            RealtimeEvent::HistoryItemCompleted(item) => {
+                outgoing
+                    .send_server_notification(ServerNotification::ThreadRealtimeItemCompleted(
+                        ThreadRealtimeItemCompletedNotification {
+                            thread_id: conversation_id.to_string(),
+                            item: item.into(),
+                        },
+                    ))
+                    .await;
+            }
             RealtimeEvent::SessionUpdated { .. } => {}
             RealtimeEvent::InputAudioSpeechStarted(event) => {
                 let notification = ThreadRealtimeItemAddedNotification {
@@ -894,8 +930,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             let permission_guard = thread_watch_manager
                 .note_permission_requested(&conversation_id.to_string())
                 .await;
-            let requested_permissions = request.permissions.clone();
-            let request_cwd = match request.cwd.clone() {
+            let request_cwd = match request.cwd {
                 Some(cwd) => cwd,
                 None => conversation.config_snapshot().await.cwd().clone(),
             };
@@ -905,7 +940,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 item_id: request.call_id.clone(),
                 environment_id: request.environment_id.clone(),
                 started_at_ms: request.started_at_ms,
-                cwd: request_cwd.clone(),
+                cwd: request_cwd,
                 reason: request.reason,
                 permissions: request.permissions.into(),
             };
@@ -916,8 +951,6 @@ pub(crate) async fn apply_bespoke_event_handling(
                 call_id: request.call_id,
                 conversation_id,
                 turn_id: request.turn_id,
-                requested_permissions,
-                request_cwd,
                 pending_request_id,
                 outgoing,
                 receiver: rx,
@@ -1213,7 +1246,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                         return;
                     }
                 };
-                let fallback_cwd = conversation.config_snapshot().await.cwd().clone();
+                let config_snapshot = conversation.config_snapshot().await;
                 let stored_thread = match conversation
                     .read_thread(
                         /*include_archived*/ true, /*include_history*/ true,
@@ -1236,11 +1269,11 @@ pub(crate) async fn apply_bespoke_event_handling(
                 let loaded_status = thread_watch_manager
                     .loaded_status_for_thread(&conversation_id.to_string())
                     .await;
-                let response = match thread_rollback_response_from_stored_thread(
+                let mut response = match thread_rollback_response_from_stored_thread(
                     stored_thread,
                     conversation.session_configured().session_id.to_string(),
                     fallback_model_provider.as_str(),
-                    &fallback_cwd,
+                    config_snapshot.cwd(),
                     loaded_status,
                 ) {
                     Ok(response) => response,
@@ -1252,6 +1285,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                     }
                 };
 
+                apply_live_model_settings(&mut response.thread, &config_snapshot);
                 outgoing.send_response(request_id, response).await;
             }
         }
@@ -1851,8 +1885,6 @@ async fn on_request_permissions_response(
         call_id,
         conversation_id,
         turn_id,
-        requested_permissions,
-        request_cwd,
         pending_request_id,
         outgoing,
         receiver,
@@ -1861,11 +1893,7 @@ async fn on_request_permissions_response(
     let response = receiver.await;
     resolve_server_request_on_thread_listener(&thread_state, pending_request_id.clone()).await;
     drop(request_permissions_guard);
-    let response = match request_permissions_response_from_client_result(
-        requested_permissions,
-        response,
-        request_cwd.as_path(),
-    ) {
+    let response = match request_permissions_response_from_client_result(response) {
         Ok(Some(response)) => response,
         Ok(None) => return,
         // TODO(anp): Remove this native-path localization error path once core permission paths
@@ -1908,8 +1936,6 @@ struct PendingRequestPermissionsResponse {
     call_id: String,
     conversation_id: ThreadId,
     turn_id: String,
-    requested_permissions: CoreRequestPermissionProfile,
-    request_cwd: AbsolutePathBuf,
     pending_request_id: RequestId,
     outgoing: ThreadScopedOutgoingMessageSender,
     receiver: oneshot::Receiver<ClientRequestResult>,
@@ -1917,9 +1943,7 @@ struct PendingRequestPermissionsResponse {
 }
 
 fn request_permissions_response_from_client_result(
-    requested_permissions: CoreRequestPermissionProfile,
     response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
-    cwd: &std::path::Path,
 ) -> std::io::Result<Option<CoreRequestPermissionsResponse>> {
     let value = match response {
         Ok(Ok(value)) => value,
@@ -1966,13 +1990,9 @@ fn request_permissions_response_from_client_result(
         }));
     }
     let granted_permissions: CoreAdditionalPermissionProfile = response.permissions.try_into()?;
-    let permissions = if granted_permissions.is_empty() {
-        CoreRequestPermissionProfile::default()
-    } else {
-        intersect_permission_profiles(requested_permissions.into(), granted_permissions, cwd).into()
-    };
+    // Core intersects with the request using the originating environment's policy context.
     Ok(Some(CoreRequestPermissionsResponse {
-        permissions,
+        permissions: CoreRequestPermissionProfile::from(granted_permissions),
         scope: response.scope.to_core(),
         strict_auto_review,
     }))
@@ -2193,10 +2213,6 @@ mod tests {
     use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
     use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
     use codex_protocol::models::PermissionProfile;
-    use codex_protocol::permissions::FileSystemAccessMode;
-    use codex_protocol::permissions::FileSystemPath;
-    use codex_protocol::permissions::FileSystemSandboxEntry;
-    use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
     use codex_protocol::protocol::AgentMessageEvent;
@@ -2275,6 +2291,7 @@ mod tests {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             })),
         ];
         let stored_thread = StoredThread {
@@ -3022,18 +3039,14 @@ mod tests {
             data: Some(serde_json::json!({ "reason": "turnTransition" })),
         };
 
-        let response = request_permissions_response_from_client_result(
-            CoreRequestPermissionProfile::default(),
-            Ok(Err(error)),
-            std::env::current_dir().expect("current dir").as_path(),
-        )
-        .expect("paths should localize");
+        let response = request_permissions_response_from_client_result(Ok(Err(error)))
+            .expect("paths should localize");
 
         assert_eq!(response, None);
     }
 
     #[test]
-    fn request_permissions_response_accepts_partial_network_and_file_system_grants() {
+    fn request_permissions_response_deserializes_network_and_file_system_grants() {
         let input_path = if cfg!(target_os = "windows") {
             r"C:\tmp\input"
         } else {
@@ -3044,22 +3057,13 @@ mod tests {
         } else {
             "/tmp/output"
         };
-        let ignored_path = if cfg!(target_os = "windows") {
-            r"C:\tmp\ignored"
+        let extra_path = if cfg!(target_os = "windows") {
+            r"C:\tmp\extra"
         } else {
-            "/tmp/ignored"
+            "/tmp/extra"
         };
         let absolute_path = |path: &str| {
             AbsolutePathBuf::try_from(std::path::PathBuf::from(path)).expect("absolute path")
-        };
-        let requested_permissions = CoreRequestPermissionProfile {
-            network: Some(CoreNetworkPermissions {
-                enabled: Some(true),
-            }),
-            file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
-                Some(vec![absolute_path(input_path)]),
-                Some(vec![absolute_path(output_path)]),
-            )),
         };
         let cases = vec![
             (
@@ -3097,7 +3101,7 @@ mod tests {
                 serde_json::json!({
                     "fileSystem": {
                         "read": [input_path],
-                        "write": [output_path, ignored_path],
+                        "write": [output_path, extra_path],
                     },
                     "macos": {
                         "calendar": true,
@@ -3106,24 +3110,20 @@ mod tests {
                 CoreRequestPermissionProfile {
                     file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
                         Some(vec![absolute_path(input_path)]),
-                        Some(vec![absolute_path(output_path)]),
+                        Some(vec![absolute_path(output_path), absolute_path(extra_path)]),
                     )),
                     ..CoreRequestPermissionProfile::default()
                 },
             ),
         ];
 
-        let cwd = std::env::current_dir().expect("current dir");
         for (granted_permissions, expected_permissions) in cases {
-            let response = request_permissions_response_from_client_result(
-                requested_permissions.clone(),
-                Ok(Ok(serde_json::json!({
+            let response =
+                request_permissions_response_from_client_result(Ok(Ok(serde_json::json!({
                     "permissions": granted_permissions,
-                }))),
-                cwd.as_path(),
-            )
-            .expect("paths should localize")
-            .expect("response should be accepted");
+                }))))
+                .expect("paths should localize")
+                .expect("response should be accepted");
 
             assert_eq!(
                 response,
@@ -3138,14 +3138,10 @@ mod tests {
 
     #[test]
     fn request_permissions_response_preserves_session_scope() {
-        let response = request_permissions_response_from_client_result(
-            CoreRequestPermissionProfile::default(),
-            Ok(Ok(serde_json::json!({
-                "scope": "session",
-                "permissions": {},
-            }))),
-            std::env::current_dir().expect("current dir").as_path(),
-        )
+        let response = request_permissions_response_from_client_result(Ok(Ok(serde_json::json!({
+            "scope": "session",
+            "permissions": {},
+        }))))
         .expect("paths should localize")
         .expect("response should be accepted");
 
@@ -3161,19 +3157,15 @@ mod tests {
 
     #[test]
     fn request_permissions_response_rejects_session_scoped_strict_auto_review() {
-        let response = request_permissions_response_from_client_result(
-            CoreRequestPermissionProfile::default(),
-            Ok(Ok(serde_json::json!({
-                "scope": "session",
-                "strictAutoReview": true,
-                "permissions": {
-                    "network": {
-                        "enabled": true,
-                    },
+        let response = request_permissions_response_from_client_result(Ok(Ok(serde_json::json!({
+            "scope": "session",
+            "strictAutoReview": true,
+            "permissions": {
+                "network": {
+                    "enabled": true,
                 },
-            }))),
-            std::env::current_dir().expect("current dir").as_path(),
-        )
+            },
+        }))))
         .expect("paths should localize")
         .expect("response should be accepted");
 
@@ -3189,157 +3181,19 @@ mod tests {
 
     #[test]
     fn request_permissions_response_preserves_turn_scoped_strict_auto_review() {
-        let response = request_permissions_response_from_client_result(
-            CoreRequestPermissionProfile {
-                network: Some(codex_protocol::models::NetworkPermissions {
-                    enabled: Some(true),
-                }),
-                ..Default::default()
-            },
-            Ok(Ok(serde_json::json!({
-                "strictAutoReview": true,
-                "permissions": {
-                    "network": {
-                        "enabled": true,
-                    },
+        let response = request_permissions_response_from_client_result(Ok(Ok(serde_json::json!({
+            "strictAutoReview": true,
+            "permissions": {
+                "network": {
+                    "enabled": true,
                 },
-            }))),
-            std::env::current_dir().expect("current dir").as_path(),
-        )
+            },
+        }))))
         .expect("paths should localize")
         .expect("response should be accepted");
 
         assert_eq!(response.scope, CorePermissionGrantScope::Turn);
         assert!(response.strict_auto_review);
-    }
-
-    #[test]
-    fn request_permissions_response_accepts_explicit_child_grant_for_requested_cwd_scope() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
-        let child = cwd.join("child");
-        let requested_permissions = CoreRequestPermissionProfile {
-            file_system: Some(CoreFileSystemPermissions {
-                entries: vec![FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
-                    },
-                    access: FileSystemAccessMode::Write,
-                    missing_path_behavior: None,
-                }],
-                glob_scan_max_depth: None,
-            }),
-            ..Default::default()
-        };
-
-        let response = request_permissions_response_from_client_result(
-            requested_permissions,
-            Ok(Ok(serde_json::json!({
-                "permissions": {
-                    "fileSystem": {
-                        "write": [child],
-                    },
-                },
-            }))),
-            cwd.as_path(),
-        )
-        .expect("paths should localize")
-        .expect("response should be accepted");
-
-        assert_eq!(
-            response.permissions,
-            CoreRequestPermissionProfile {
-                file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
-                    /*read*/ None,
-                    Some(vec![child]),
-                )),
-                ..Default::default()
-            }
-        );
-    }
-
-    #[test]
-    fn request_permissions_response_rejects_child_grant_outside_requested_cwd_scope() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let request_cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("request-cwd"))
-            .expect("absolute request cwd");
-        let later_cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path().join("later-cwd"))
-            .expect("absolute later cwd");
-        let later_child = later_cwd.join("child");
-        let requested_permissions = CoreRequestPermissionProfile {
-            file_system: Some(CoreFileSystemPermissions {
-                entries: vec![FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
-                    },
-                    access: FileSystemAccessMode::Write,
-                    missing_path_behavior: None,
-                }],
-                glob_scan_max_depth: None,
-            }),
-            ..Default::default()
-        };
-
-        let response = request_permissions_response_from_client_result(
-            requested_permissions,
-            Ok(Ok(serde_json::json!({
-                "permissions": {
-                    "fileSystem": {
-                        "write": [later_child],
-                    },
-                },
-            }))),
-            request_cwd.as_path(),
-        )
-        .expect("paths should localize")
-        .expect("response should be accepted");
-
-        assert_eq!(
-            response.permissions,
-            CoreRequestPermissionProfile::default()
-        );
-    }
-
-    #[test]
-    fn request_permissions_response_ignores_broader_cwd_grant_for_requested_child_path() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let cwd = AbsolutePathBuf::from_absolute_path(temp_dir.path()).expect("absolute cwd");
-        let child = cwd.join("child");
-        let requested_permissions = CoreRequestPermissionProfile {
-            file_system: Some(CoreFileSystemPermissions::from_read_write_roots(
-                /*read*/ None,
-                Some(vec![child]),
-            )),
-            ..Default::default()
-        };
-
-        let response = request_permissions_response_from_client_result(
-            requested_permissions,
-            Ok(Ok(serde_json::json!({
-                "permissions": {
-                    "fileSystem": {
-                        "entries": [{
-                            "path": {
-                                "type": "special",
-                                "value": {
-                                    "kind": "project_roots",
-                                    "subpath": null
-                                }
-                            },
-                            "access": "write"
-                        }],
-                    },
-                },
-            }))),
-            cwd.as_path(),
-        )
-        .expect("paths should localize")
-        .expect("response should be accepted");
-
-        assert_eq!(
-            response.permissions,
-            CoreRequestPermissionProfile::default()
-        );
     }
 
     #[tokio::test]
@@ -3733,6 +3587,7 @@ mod tests {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                     started_at_ms: Some(0),
                     completed_at_ms: 0,
@@ -3751,6 +3606,7 @@ mod tests {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                     started_at_ms: Some(0),
                     completed_at_ms: 0,

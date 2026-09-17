@@ -100,7 +100,6 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::PlanDeltaEvent;
-use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
 use codex_protocol::protocol::SafetyBufferingEvent;
@@ -268,6 +267,15 @@ pub(crate) async fn run_turn(
     let mut can_drain_pending_input = input.is_empty();
     if run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::TurnStart).await {
         return Ok(None);
+    }
+
+    // Only speculate after hooks accept the turn, using its finalized tools and permissions.
+    {
+        let mut state = sess.state.lock().await;
+        if state.shell_snapshot_prewarm.is_none() {
+            state.shell_snapshot_prewarm =
+                sess.prewarm_shell_snapshots(first_step_context.as_ref());
+        }
     }
 
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
@@ -1021,6 +1029,18 @@ async fn track_turn_resolved_config_analytics(
                 .and_then(ServiceTier::from_request_value),
             approval_policy: turn_context.approval_policy(),
             approvals_reviewer: turn_context.config.approvals_reviewer,
+            guardian_v2_enabled: sess
+                .services
+                .thread_extension_data
+                .get::<codex_extension_api::GuardianV2Enabled>()
+                .is_some_and(|state| {
+                    state.computer_use_only
+                        || !turn_context
+                            .config
+                            .config_layer_stack
+                            .requirements()
+                            .auto_review_required_for_model(&turn_context.model_info().slug)
+                }),
             sandbox_network_access: turn_context.network_sandbox_policy().is_enabled(),
             collaboration_mode: turn_context.mode(),
             personality: turn_context.personality(),
@@ -2068,6 +2088,7 @@ async fn emit_agent_message_in_plan_mode(
                     phase: None,
                     memory_citation: None,
                     delivery: None,
+                    questions: None,
                 })
             });
         sess.emit_turn_item_started(turn_context, &start_item).await;
@@ -2590,13 +2611,11 @@ async fn try_run_sampling_request(
                     &mut assistant_message_stream_parsers,
                 )
                 .await;
-                sess.send_event(
+                sess.record_observed_response_completed(
                     &turn_context,
-                    EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
-                        response_id,
-                        token_usage: token_usage.clone(),
-                        usage_metadata,
-                    }),
+                    &response_id,
+                    token_usage.as_ref(),
+                    usage_metadata.as_ref(),
                 )
                 .await;
                 let budget_result = sess

@@ -325,7 +325,12 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    create_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        "sandbox_mode = \"read-only\"\nmodel_reasoning_effort = \"high\"",
+        "",
+    )?;
 
     // Start server and initialize.
     let mut mcp = TestAppServer::builder()
@@ -364,6 +369,10 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
         "new threads should start with an empty preview"
     );
     assert_eq!(model_provider, "mock_provider");
+    assert_eq!(
+        (thread.model.as_deref(), thread.reasoning_effort.clone()),
+        (Some("gpt-5.2"), Some(ReasoningEffort::High))
+    );
     assert!(
         thread.created_at > 0,
         "created_at should be a positive UNIX timestamp"

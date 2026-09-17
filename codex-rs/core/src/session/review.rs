@@ -191,7 +191,8 @@ pub(super) async fn spawn_review_thread(
     }];
     let tc = Arc::new(review_turn_context);
     if tc.environments.single_local_environment_cwd().is_some() {
-        tc.turn_metadata_state.spawn_git_enrichment_task();
+        tc.turn_metadata_state
+            .spawn_git_enrichment_task(Arc::clone(&sess.services.git_root_discovery));
     }
     // TODO(ccunningham): Review turns currently rely on `spawn_task` for TurnComplete but do not
     // emit a parent TurnStarted. Consider giving review a full parent turn lifecycle

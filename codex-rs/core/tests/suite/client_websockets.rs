@@ -158,6 +158,7 @@ async fn responses_websocket_preserves_credit_usage_metadata() {
 
     let mut completed = ev_completed("resp-1");
     completed["response"]["usage_metadata"] = json!({ "amount": "0.12345678901234567890" });
+    let expected_metadata = completed["response"]["usage"].clone();
     let server =
         start_websocket_server(vec![vec![vec![ev_response_created("resp-1"), completed]]]).await;
     let harness = websocket_harness_for_codex_backend(&server).await;
@@ -193,6 +194,7 @@ async fn responses_websocket_preserves_credit_usage_metadata() {
         usage_metadata,
         Some(codex_protocol::ResponseUsageMetadata {
             amount: Some("0.12345678901234567890".to_string()),
+            metadata: Some(expected_metadata),
         }),
     );
     assert_eq!(server.single_connection().len(), 1);

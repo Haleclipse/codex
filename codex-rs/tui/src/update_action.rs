@@ -12,6 +12,8 @@ pub enum UpdateAction {
     NpmGlobalLatest,
     /// Update via `bun install -g @cometix/codex`.
     BunGlobalLatest,
+    /// Update via `vp install -g @cometix/codex`.
+    VitePlusGlobalLatest,
     /// Update via `pnpm add -g @cometix/codex`.
     PnpmGlobalLatest,
     /// Update via `brew upgrade codex`.
@@ -28,6 +30,7 @@ impl UpdateAction {
         match &context.method {
             InstallMethod::Npm => Some(UpdateAction::NpmGlobalLatest),
             InstallMethod::Bun => Some(UpdateAction::BunGlobalLatest),
+            InstallMethod::VitePlus => Some(UpdateAction::VitePlusGlobalLatest),
             InstallMethod::Pnpm => Some(UpdateAction::PnpmGlobalLatest),
             InstallMethod::Brew => Some(UpdateAction::BrewUpgrade),
             InstallMethod::Standalone { platform, .. } => Some(match platform {
@@ -43,6 +46,7 @@ impl UpdateAction {
         match self {
             UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@cometix/codex"]),
             UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@cometix/codex"]),
+            UpdateAction::VitePlusGlobalLatest => ("vp", &["install", "-g", "@cometix/codex"]),
             UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@cometix/codex"]),
             UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
             // @cometix: standalone installers fall back to npm (fork has no standalone packages)

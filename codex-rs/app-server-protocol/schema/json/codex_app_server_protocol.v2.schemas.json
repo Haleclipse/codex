@@ -490,6 +490,17 @@
           "default": true,
           "type": "boolean"
         },
+        "links": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AppLinksConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-account approval settings keyed by link ID."
+        },
         "open_world_enabled": {
           "type": [
             "boolean",
@@ -616,6 +627,36 @@
         "id",
         "name"
       ],
+      "type": "object"
+    },
+    "AppLinkConfig": {
+      "description": "Approval settings for a connected account within an app.",
+      "properties": {
+        "approvals_reviewer": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ApprovalsReviewer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "default_tools_approval_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AppToolApproval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AppLinksConfig": {
+      "description": "Account settings for a single app.",
       "type": "object"
     },
     "AppListUpdatedNotification": {
@@ -1183,6 +1224,27 @@
           "type": "object"
         }
       ]
+    },
+    "AsyncUserInputQuestion": {
+      "additionalProperties": false,
+      "properties": {
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
     },
     "AuthMode": {
       "description": "Authentication mode for OpenAI-backed providers.",
@@ -2519,6 +2581,30 @@
             "params"
           ],
           "title": "Plugin/installedRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "plugin/reconcile"
+              ],
+              "title": "Plugin/reconcileRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/PluginReconcileParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Plugin/reconcileRequest",
           "type": "object"
         },
         {
@@ -12253,6 +12339,84 @@
       "title": "PluginReadResponse",
       "type": "object"
     },
+    "PluginReconcileChangedPlugin": {
+      "description": "Runtime categories affected by this change, not just capabilities currently present. Flags describe declarations before runtime policy filtering. Updates OR the old and new bundle flags; enablement changes and cached reinstalls use the cached bundle; removals retain the old bundle's flags.",
+      "properties": {
+        "hasApps": {
+          "type": "boolean"
+        },
+        "hasHooks": {
+          "type": "boolean"
+        },
+        "hasMcps": {
+          "type": "boolean"
+        },
+        "hasSkills": {
+          "description": "Whether either bundle declares skill roots; not a validated inventory of enabled skills.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "Local plugin ID (`name@marketplace`), matching `PluginSummary.id`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hasApps",
+        "hasHooks",
+        "hasMcps",
+        "hasSkills",
+        "id"
+      ],
+      "type": "object"
+    },
+    "PluginReconcileParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "reason": {
+          "description": "Optional client-provided reason recorded with the reconciliation attempt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "PluginReconcileParams",
+      "type": "object"
+    },
+    "PluginReconcileResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Bundle and installed-state changes observed by this pass, not a runtime-readiness acknowledgement or a cumulative diff since the client's last request. Other metadata-only changes are not listed.",
+      "properties": {
+        "changedPlugins": {
+          "description": "Plugins affected by bundle changes, enablement changes, or removals. Installed-state changes compare against the previous cached snapshot, including cached reinstalls. Removal hints survive cache cleanup failures; unchanged plugins are omitted.",
+          "items": {
+            "$ref": "#/definitions/PluginReconcileChangedPlugin"
+          },
+          "type": "array"
+        },
+        "failedMaterializationRemotePluginIds": {
+          "description": "Subset of failures for which the requested bundle could not be materialized. A previously cached version may still be available.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "failedRemotePluginIds": {
+          "description": "Backend remote plugin IDs whose bundle or identity update failed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "changedPlugins",
+        "failedMaterializationRemotePluginIds",
+        "failedRemotePluginIds"
+      ],
+      "title": "PluginReconcileResponse",
+      "type": "object"
+    },
     "PluginSearchResult": {
       "properties": {
         "marketplaceName": {
@@ -14702,7 +14866,8 @@
             "string",
             "null"
           ]
-        }
+        },
+        "metadata": true
       },
       "type": "object"
     },
@@ -17756,6 +17921,13 @@
           "description": "Identifier for this thread. Codex-generated thread IDs are UUIDv7.",
           "type": "string"
         },
+        "model": {
+          "description": "Current configured model when loaded, otherwise the latest persisted model. Null when unavailable. This is not per-turn execution telemetry.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "modelProvider": {
           "description": "Model provider used for this thread (for example, 'openai').",
           "type": "string"
@@ -17791,6 +17963,17 @@
             "string",
             "null"
           ]
+        },
+        "reasoningEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Current configured reasoning effort when loaded, otherwise the latest persisted effort. Null when unset or unavailable. This is not per-turn execution telemetry."
         },
         "recencyAt": {
           "description": "Unix timestamp (in seconds) used for thread recency ordering.",
@@ -18524,6 +18707,16 @@
                 }
               ],
               "default": null
+            },
+            "questions": {
+              "default": null,
+              "items": {
+                "$ref": "#/definitions/AsyncUserInputQuestion"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "text": {
               "type": "string"

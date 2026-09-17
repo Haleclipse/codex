@@ -26,7 +26,7 @@ use std::ops::Range;
 #[derive(Debug, Default)]
 pub(super) struct VimSearch {
     input: Option<Box<SearchInput>>,
-    last: SearchQuery,
+    pub(super) last: SearchQuery,
 }
 
 /// Footer query editor, boxed by its owning textarea to keep the draft and query independent.

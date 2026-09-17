@@ -989,7 +989,7 @@ async fn manual_compact_uses_custom_prompt() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_compact_emits_api_and_local_token_usage_events() {
+async fn manual_compact_records_durable_and_local_token_usage() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -1008,7 +1008,9 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let rollout_path = test.codex.rollout_path().expect("rollout path");
+    let codex = test.codex;
 
     // Trigger manual compact and collect TokenCount events for the compact turn.
     codex.submit(Op::Compact).await.unwrap();
@@ -1043,6 +1045,36 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
     assert!(
         last > 0,
         "second TokenCount should reflect a non-zero estimated context size after compaction"
+    );
+    let rollout_items = fs::read_to_string(rollout_path)
+        .expect("read rollout")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .map(|line| line.item)
+        .collect::<Vec<_>>();
+    let records = rollout_items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::TokenUsageRecord(record) => Some(record),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].response_id, "r1");
+    assert_eq!(records[0].usage.total_tokens, 0);
+    let compacted = rollout_items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => Some(compacted),
+            _ => None,
+        })
+        .expect("compaction checkpoint");
+    assert_eq!(
+        (
+            compacted.compaction_response_id.as_deref(),
+            compacted.latest_token_usage_record.as_ref(),
+        ),
+        (Some("r1"), records.first().copied())
     );
 }
 

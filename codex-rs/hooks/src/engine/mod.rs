@@ -57,6 +57,8 @@ pub(crate) struct CommandShell {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredHandler {
+    /// Internally admitted cleanup hook, enabled independently of per-hook state.
+    pub builtin: bool,
     pub event_name: codex_protocol::protocol::HookEventName,
     pub matcher: Option<String>,
     pub timeout_sec: u64,
@@ -195,6 +197,8 @@ pub enum HookListEntryHandler {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookListEntry {
+    /// Builtin hooks remain available internally but are omitted from the public hooks list.
+    pub builtin: bool,
     pub key: String,
     pub event_name: HookEventName,
     pub handler: HookListEntryHandler,
@@ -231,7 +235,7 @@ impl ClaudeHooksEngine {
         command_runtime: CommandHookRuntime,
         mcp_executor: Arc<dyn HookMcpExecutor>,
     ) -> Self {
-        if !enabled {
+        if !enabled && plugin_hook_sources.is_empty() {
             return Self {
                 handlers: Vec::new(),
                 warnings: Vec::new(),
@@ -242,12 +246,18 @@ impl ClaudeHooksEngine {
         }
 
         let _ = schema_loader::generated_hook_schemas();
-        let discovered = discovery::discover_handlers(
+        let mut discovered = discovery::discover_handlers(
             config_layer_stack,
             plugin_hook_sources,
             plugin_hook_load_warnings,
             bypass_hook_trust,
         );
+        if !enabled {
+            discovered.handlers.retain(|handler| handler.builtin);
+            // Disabled ordinary hooks must not emit warnings or reject session startup.
+            discovered.warnings.clear();
+            discovered.required_load_errors.clear();
+        }
         Self {
             handlers: discovered.handlers,
             warnings: discovered.warnings,
@@ -308,6 +318,7 @@ impl ClaudeHooksEngine {
                     continue;
                 }
                 self.handlers.push(ConfiguredHandler {
+                    builtin: true,
                     event_name,
                     matcher: None,
                     timeout_sec: timeout_sec.unwrap_or(5).max(1),

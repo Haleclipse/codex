@@ -37,8 +37,7 @@ fn spawn_startup_thread_start(
             remote_cwd_override,
             thread_tool_transport,
         )
-        .await
-        .map_err(|err| format!("{err:#}"));
+        .await;
         app_event_tx.send(AppEvent::StartupThreadStarted { result });
     });
 }
@@ -459,6 +458,10 @@ impl App {
         };
         chat_widget.note_rendered_width(tui.terminal.last_known_screen_size.width);
         chat_widget.remote_connection = remote_connection;
+        chat_widget.set_agents_navigation_enabled(matches!(
+            app_server_target,
+            AppServerTarget::LocalDaemon { .. }
+        ));
         let thread_and_widget_ms = thread_and_widget_started_at.elapsed().as_millis();
         chat_widget
             .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
@@ -514,6 +517,7 @@ See the Codex keymap documentation for supported actions and examples."
             feedback_audience,
             environment_manager,
             app_server_target,
+            reconnect: Default::default(),
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
@@ -547,6 +551,8 @@ See the Codex keymap documentation for supported actions and examples."
         }
         if start_in_agents_overview {
             app.open_agents_overview(&app_server);
+        } else if !matches!(app.app_server_target, AppServerTarget::Embedded) {
+            app.refresh_agents_overview_threads(&app_server);
         }
         if let Some(entry) = startup_hooks_browser {
             app.chat_widget.open_hooks_browser(entry);
@@ -683,6 +689,7 @@ See the Codex keymap documentation for supported actions and examples."
         }
 
         let mut listen_for_app_server_events = true;
+        let mut reconnect = None;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
         let mut waiting_for_initial_session_header = true;
 
@@ -711,17 +718,31 @@ See the Codex keymap documentation for supported actions and examples."
             Ok(exit_reason)
         } else {
             loop {
+                if app.reconnect.offline && !app.reconnect.failed && reconnect.is_none() {
+                    reconnect = Some(Box::pin(reconnect::reconnect(
+                        app.app_server_target.clone(),
+                        app.config.clone(),
+                        app.current_displayed_thread_id(),
+                        app_server.remote_cwd_override().map(Path::to_path_buf),
+                        app_server.thread_tool_transport(),
+                        app.reconnect.presentation,
+                    )));
+                }
                 // Replay queues history and operations. A buffered closure must not switch
                 // widgets before those app events have been applied.
                 let has_pending_app_events = !app_event_rx.is_empty();
                 let initial_session_header_pending = waiting_for_initial_session_header
                     && app.primary_session_configured.is_some()
                     && has_pending_app_events;
-                let block_terminal_input_for_pending_startup_events = initial_session_header_pending
-                    || (pending_startup_draft.is_some() || app.startup_protected_input_boundary)
-                        && has_pending_app_events
-                    || (!waiting_for_initial_session_configured
-                        && app.has_queued_startup_protected_request());
+                let block_terminal_input_for_pending_startup_events =
+                    (!matches!(app.app_server_target, AppServerTarget::Embedded)
+                        && has_pending_app_events)
+                        || initial_session_header_pending
+                        || (pending_startup_draft.is_some()
+                            || app.startup_protected_input_boundary)
+                            && has_pending_app_events
+                        || (!waiting_for_initial_session_configured
+                            && app.has_queued_startup_protected_request());
                 let control = select! {
                     Some(event) = app_event_rx.recv() => {
                         let is_initial_session_header = matches!(
@@ -744,6 +765,7 @@ See the Codex keymap documentation for supported actions and examples."
                                 AppRunControl::Continue
                             }
                             Ok(AppRunControl::Exit(reason)) => AppRunControl::Exit(reason),
+                            Err(err) if app.recover_transport_error(&err) => AppRunControl::Continue,
                             Err(err) => break Err(err),
                         }
                     }
@@ -756,7 +778,7 @@ See the Codex keymap documentation for supported actions and examples."
                     }, if App::should_handle_active_thread_events(
                         waiting_for_initial_session_configured,
                         app.active_thread_rx.is_some()
-                    ) && !has_pending_app_events => {
+                    ) && !has_pending_app_events && !app.reconnect.offline => {
                         if let Some(event) = active {
                             if let Err(err) = app.handle_active_thread_event(tui, &mut app_server, event).await {
                                 break Err(err);
@@ -766,13 +788,14 @@ See the Codex keymap documentation for supported actions and examples."
                         }
                         AppRunControl::Continue
                     }
-                    event = tui_events.next(), if !block_terminal_input_for_pending_startup_events => {
+                    event = tui_events.next(), if app.reconnect.offline || !block_terminal_input_for_pending_startup_events => {
                         if let Some(event) = event {
                             if (matches!(
                                 &event,
                                 TuiEvent::Key(key)
                                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                             ) || matches!(&event, TuiEvent::Paste(_)))
+                                && !app.reconnect.offline
                                 && pending_startup_draft.is_none()
                                 && !waiting_for_initial_session_configured
                                 && app_event_rx.is_empty()
@@ -789,19 +812,41 @@ See the Codex keymap documentation for supported actions and examples."
                             }
                             match app.handle_tui_event(tui, &mut app_server, event).await {
                                 Ok(control) => control,
-                                Err(err) => break Err(err),
+                                Err(err) if app.recover_transport_error(&err) => AppRunControl::Continue,
+                            Err(err) => break Err(err),
                             }
                         } else {
                             tracing::warn!("terminal input stream closed; shutting down active thread");
                             app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst).await
                         }
                     }
-                    app_server_event = app_server.next_event(), if listen_for_app_server_events => {
+                    app_server_event = app_server.next_event(), if listen_for_app_server_events && !app.reconnect.offline
+                        && (matches!(app.app_server_target, AppServerTarget::Embedded) || !has_pending_app_events) => {
                         match app_server_event {
                             Some(event) => app.handle_app_server_event(&app_server, event).await,
                             None => {
                                 listen_for_app_server_events = false;
+                                app.begin_reconnect();
                                 tracing::warn!("app-server event stream closed");
+                            }
+                        }
+                        AppRunControl::Continue
+                    }
+                    result = async { match reconnect.as_mut() { Some(future) => future.await, None => std::future::pending().await } }, if reconnect.is_some() && !has_pending_app_events => {
+                        reconnect = None;
+                        match result {
+                            Ok(connected) => {
+                                app.finish_reconnect(tui, &mut app_server, &mut app_event_rx, connected).await?;
+                                listen_for_app_server_events = true;
+                                waiting_for_initial_session_configured = false;
+                            }
+                            Err(error) => {
+                                app.reconnect.failed = true;
+                                app.chat_widget.reconnect_failed();
+                                app.chat_widget.add_error_message(error.to_string());
+                                if let Ok(mut state) = app.agents_overview.view_state.lock() {
+                                    state.connection_notice = Some("Reconnect failed — agent list is stale; relaunch to retry");
+                                }
                             }
                         }
                         AppRunControl::Continue

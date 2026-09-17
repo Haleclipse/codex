@@ -1,5 +1,5 @@
 //! Model history and bounded original evidence for approval review.
-//! Compaction replaces only model history; explicit resets also replace retained evidence.
+//! Compaction replaces only model history; replay restores retained evidence and rollback trims it.
 
 use crate::context::ContextualUserFragment;
 use crate::context::ModelSwitchInstructions;
@@ -20,6 +20,7 @@ use codex_extension_api::ConversationHistorySnapshot;
 use codex_guardian_context::SectionHistory;
 use codex_guardian_context::TranscriptHistory;
 use codex_history::CodexHarnessMetadata;
+use codex_history::GuardianHistoryCheckpoint;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::BaseInstructions;
@@ -147,6 +148,28 @@ impl ContextManager {
             history_version: self.history_version,
             user_message_revision: self.user_message_revision,
         })
+    }
+
+    pub(crate) fn guardian_history_checkpoint(&self) -> Option<GuardianHistoryCheckpoint> {
+        self.review_history
+            .as_ref()
+            .map(|history| GuardianHistoryCheckpoint(history.items().cloned().collect()))
+    }
+
+    pub(crate) fn restore_guardian_history(
+        &mut self,
+        checkpoint: Option<&GuardianHistoryCheckpoint>,
+    ) {
+        let generation = self
+            .review_history
+            .as_ref()
+            .map_or(self.history_version, TranscriptHistory::generation)
+            .saturating_add(1);
+        self.review_history = checkpoint.map(|checkpoint| {
+            let mut history = TranscriptHistory::new(generation);
+            history.reset(checkpoint.0.iter());
+            history
+        });
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
@@ -420,6 +443,11 @@ impl ContextManager {
             user_positions[user_positions.len() - n_from_end]
         };
 
+        let mut review_history = self.review_history.take();
+        if let Some(history) = &mut review_history {
+            history.truncate_before(&snapshot[cut_idx].item);
+        }
+
         cut_idx =
             self.trim_pre_turn_context_updates(&snapshot, first_instruction_turn_idx, cut_idx);
 
@@ -451,6 +479,7 @@ impl ContextManager {
         }
 
         self.replace_annotated(retained_items);
+        self.review_history = review_history;
     }
 
     pub(crate) fn update_token_info(

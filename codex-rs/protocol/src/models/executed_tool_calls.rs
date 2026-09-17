@@ -7,6 +7,10 @@ use super::InternalChatMessageMetadataPassthrough;
 use super::ResponseItem;
 
 const MAX_EXECUTED_TOOL_CALL_ARGUMENT_BYTES: usize = 8 * 1024;
+/// Maximum distinct result sources retained for one tool invocation.
+const MAX_TOOL_RESULT_SOURCES: usize = 32;
+/// Maximum UTF-8 bytes for each source's `type` and `id` separately, not the source list.
+pub const MAX_TOOL_RESULT_SOURCE_FIELD_BYTES: usize = 128;
 /// Maximum serialized warehouse-only attempted-tool metadata in one request.
 const MAX_EXECUTED_TOOL_CALL_METADATA_BYTES: usize = 32 * 1024;
 const EXECUTED_TOOL_CALL_METADATA_FIELD_BYTES: usize = b"\"executed_tool_calls\":".len();
@@ -54,6 +58,18 @@ pub fn executed_tool_call_metadata_bytes(item: &ResponseItem) -> usize {
                 .unwrap_or(usize::MAX)
         })
         .saturating_add(executed_tool_call_metadata_field_bytes(metadata))
+}
+
+impl InternalChatMessageMetadataPassthrough {
+    /// Compares call order, names and arguments, ignoring optional source metadata.
+    pub fn has_same_tool_calls(&self, calls: &[ExecutedToolCall]) -> bool {
+        self.executed_tool_calls.as_ref().is_some_and(|recorded| {
+            recorded.len() == calls.len()
+                && recorded.iter().zip(calls).all(|(recorded, call)| {
+                    recorded.name == call.name && recorded.arguments() == call.arguments()
+                })
+        })
+    }
 }
 
 /// Bounds attempted-tool metadata fairly across the complete serialized request.
@@ -110,6 +126,23 @@ fn bound_executed_tool_calls_for_prompt_with_priority(
         remaining_items += 1;
         original_metadata_bytes =
             original_metadata_bytes.saturating_add(executed_tool_call_metadata_bytes(item));
+    }
+
+    // Source evidence is optional; dropping it must not discard calls or their completion proof.
+    if original_metadata_bytes > MAX_EXECUTED_TOOL_CALL_METADATA_BYTES {
+        original_metadata_bytes = 0;
+        for item in items.iter_mut() {
+            if let Some(metadata) = item
+                .internal_chat_message_metadata_passthrough_mut()
+                .and_then(Option::as_mut)
+            {
+                for call in metadata.executed_tool_calls.iter_mut().flatten() {
+                    call.tool_result_sources = None;
+                }
+            }
+            original_metadata_bytes =
+                original_metadata_bytes.saturating_add(executed_tool_call_metadata_bytes(item));
+        }
     }
 
     // A terminal marker can be on an empty wait output, separate from the lost calls.
@@ -298,6 +331,58 @@ pub struct ExecutedToolCall {
     pub name: String,
     #[ts(type = "unknown")]
     arguments: ExecutedToolCallArguments,
+    /// Host-generated analytics only: ignore input JSON rather than accepting caller-supplied
+    /// evidence, and keep this out of public schemas and generated clients.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    tool_result_sources: Option<ToolResultSourcesValue>,
+}
+
+/// A bounded capture update. Omitted updates still clear any previously recorded evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResultSources(Option<ToolResultSourcesValue>);
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+enum ToolResultSourcesValue {
+    #[serde(rename = "parse_failed")]
+    ParseFailed,
+    // Preserve the existing array shape for successful captures, including an empty array.
+    #[serde(untagged)]
+    Sources(Vec<ToolResultSource>),
+}
+
+impl ToolResultSources {
+    /// Deduplicates a complete source list, discarding all sources if it exceeds a limit.
+    pub fn new(sources: Vec<ToolResultSource>) -> Self {
+        let mut unique_sources = Vec::new();
+        for source in sources {
+            if unique_sources.contains(&source) {
+                continue;
+            }
+            if unique_sources.len() == MAX_TOOL_RESULT_SOURCES
+                || source.r#type.len() > MAX_TOOL_RESULT_SOURCE_FIELD_BYTES
+                || source.id.len() > MAX_TOOL_RESULT_SOURCE_FIELD_BYTES
+            {
+                return Self(None);
+            }
+            unique_sources.push(source);
+        }
+        Self(Some(ToolResultSourcesValue::Sources(unique_sources)))
+    }
+
+    /// Records that source parsing was attempted but failed, not that a budget was exceeded.
+    pub fn parse_failed() -> Self {
+        Self(Some(ToolResultSourcesValue::ParseFailed))
+    }
+}
+
+/// A trusted source identity observed in an accepted tool result by the host.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ToolResultSource {
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub id: String,
 }
 
 /// Trusted truncation details generated locally for an oversized attempted tool call.
@@ -325,6 +410,7 @@ impl ExecutedToolCall {
         Self {
             name,
             arguments: ExecutedToolCallArguments::Raw(arguments),
+            tool_result_sources: None,
         }
     }
 
@@ -338,6 +424,12 @@ impl ExecutedToolCall {
     /// Returns the raw arguments or locally generated truncation payload.
     pub fn arguments(&self) -> &ExecutedToolCallArguments {
         &self.arguments
+    }
+
+    /// Replaces this invocation's capture outcome, including clearing omitted evidence.
+    pub fn set_tool_result_sources(&mut self, sources: ToolResultSources) -> bool {
+        self.tool_result_sources = sources.0;
+        self.tool_result_sources.is_some()
     }
 
     fn truncation(&self) -> Option<&ExecutedToolCallTruncation> {

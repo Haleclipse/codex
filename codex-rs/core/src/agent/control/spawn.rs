@@ -96,6 +96,8 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         // from the parent's durable baseline. Truncated forks drop part of that prompt,
         // so they must rebuild context on their first child turn.
         RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => preserve_reference_context_item,
+        // Child threads inherit model context, not the parent's cumulative usage state.
+        RolloutItem::TokenUsageRecord(_) => false,
         RolloutItem::Compacted(_) | RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => true,
     }
 }
@@ -992,6 +994,11 @@ impl AgentControl {
                     retain_forked_item(response_item, &mut replaced_parent_developer_instructions)
                 }
                 RolloutItem::Compacted(compacted) => {
+                    // This checkpoint belongs to the inherited parent prefix.
+                    compacted.latest_token_usage_record = None;
+                    // Parent-local review evidence must not become the child's authorization.
+                    // Root user authorization is collected separately by the host.
+                    compacted.guardian_history = None;
                     if let Some(replacement_history) = compacted.replacement_history.as_mut() {
                         // Matches before this checkpoint cannot survive its replacement history.
                         replaced_parent_developer_instructions = false;
@@ -1016,7 +1023,7 @@ impl AgentControl {
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. } => true,
-                RolloutItem::SecurityRiskScore(_) => false,
+                RolloutItem::TokenUsageRecord(_) | RolloutItem::SecurityRiskScore(_) => false,
             }
         });
         // Full forks reuse the parent's reference context instead of rebuilding it. If that

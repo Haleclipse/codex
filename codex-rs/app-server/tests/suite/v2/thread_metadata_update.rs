@@ -33,6 +33,7 @@ use codex_features::Feature;
 use codex_git_utils::GitSha;
 use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::GitInfo as RolloutGitInfo;
 use codex_rollout::state_db::reconcile_rollout;
 use codex_state::PINNED_THREAD_SECTION_ID;
@@ -41,6 +42,7 @@ use codex_state::StateRuntime;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use serde_json::json;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -961,6 +963,8 @@ async fn thread_metadata_update_repairs_loaded_thread_without_resetting_summary(
     let resume_id = mcp
         .send_thread_resume_request(ThreadResumeParams {
             thread_id: thread_id.clone(),
+            model: Some("gpt-5.2".to_string()),
+            config: Some([("model_reasoning_effort".to_string(), json!("high"))].into()),
             ..Default::default()
         })
         .await?;
@@ -995,6 +999,10 @@ async fn thread_metadata_update_repairs_loaded_thread_without_resetting_summary(
     assert_eq!(updated.id, thread_id);
     assert_eq!(updated.preview, preview);
     assert_eq!(updated.created_at, 1736152200);
+    assert_eq!(
+        (updated.model.as_deref(), updated.reasoning_effort),
+        (Some("gpt-5.2"), Some(ReasoningEffort::High))
+    );
     assert_eq!(
         updated.git_info,
         Some(GitInfo {

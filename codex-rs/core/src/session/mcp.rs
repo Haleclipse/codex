@@ -13,6 +13,7 @@ use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::mcp::is_node_repl_backed_server;
 use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY as MCP_ELICITATION_APPROVAL_KIND_KEY;
 use codex_protocol::mcp_approval_meta::APPROVAL_KIND_MCP_TOOL_CALL as MCP_ELICITATION_APPROVAL_KIND_MCP_TOOL_CALL;
 use codex_protocol::mcp_approval_meta::APPROVAL_KIND_TOOL_SUGGESTION as MCP_ELICITATION_APPROVAL_KIND_TOOL_SUGGESTION;
@@ -723,6 +724,64 @@ async fn review_guardian_mcp_elicitation(
     let Some(mcp_config) = session.services.mcp_runtime.current_config() else {
         return Ok(None);
     };
+    let step_settings = turn_context.current_settings.load_full();
+
+    // User approval skips ordinary CUA checks, not separate sensitive requests.
+    let user_cua_execution = step_settings.approvals_reviewer() == ApprovalsReviewer::User
+        && is_node_repl_backed_server(&request.server_name)
+        && request.elicitation.meta().is_some_and(|meta| {
+            metadata_str(meta, MCP_ELICITATION_TOOL_NAME_KEY) == Some("js")
+                && metadata_str(meta, MCP_ELICITATION_CONNECTOR_ID_KEY) == Some("node_repl")
+                && metadata_str(meta, MCP_ELICITATION_APPROVAL_KIND_KEY)
+                    == Some(MCP_ELICITATION_APPROVAL_KIND_MCP_TOOL_CALL)
+                && meta.get(MCP_ELICITATION_SENSITIVE_ACTION_KEY) != Some(&Value::Bool(true))
+                && meta.get("codex_requires_user_input") != Some(&Value::Bool(true))
+        });
+
+    // Full Access skips inference, not the active-turn and cancellation checks.
+    if (user_cua_execution
+        || turn_context.environments.has_full_access(
+            turn_context.approval_policy(),
+            &turn_context
+                .config
+                .permissions
+                .effective_permission_profile(),
+        ))
+        && matches!(
+            &request.elicitation,
+            Elicitation::Mcp(rmcp::model::ElicitRequestParams::FormElicitationParams {
+                requested_schema, ..
+            }) if requested_schema.properties.is_empty()
+        )
+    {
+        let decision = if cancellation_token.is_cancelled() {
+            ReviewDecision::Abort
+        } else {
+            ReviewDecision::Approved
+        };
+        return Ok(Some(mcp_elicitation_response_from_guardian_decision(
+            decision,
+            turn_context.model_info(),
+        )));
+    }
+
+    // The invocation identifies the tool event, but a nested elicitation can
+    // review a different action and connector than the enclosing JavaScript.
+    let originating_call_id = if is_node_repl_backed_server(&request.server_name)
+        && let Some(call_id) = request
+            .elicitation
+            .meta()
+            .and_then(|meta| meta.get("callId"))
+            .and_then(Value::as_str)
+        && let Some((Some(invocation), _)) = session
+            .mcp_tool_approval_metadata(&turn_context.sub_id, call_id)
+            .await
+        && invocation.server == request.server_name
+    {
+        Some(call_id)
+    } else {
+        None
+    };
 
     let require_synchronous_review = matches!(
         request
@@ -793,6 +852,7 @@ async fn review_guardian_mcp_elicitation(
                 Some(turn_context.model_info().slug.as_str()),
                 request.server_name.as_str(),
                 connector_id,
+                /*link_id*/ None,
             ) != ApprovalsReviewer::AutoReview
             || request
                 .elicitation
@@ -803,7 +863,7 @@ async fn review_guardian_mcp_elicitation(
         }
 
         let GuardianElicitationReview::ApprovalRequest(guardian_request) =
-            guardian_elicitation_review_request(&request)
+            guardian_elicitation_review_request(&request, originating_call_id)
         else {
             return Ok(None);
         };
@@ -873,16 +933,20 @@ async fn review_guardian_mcp_elicitation(
 
     let approvals_reviewer = crate::connectors::mcp_approvals_reviewer_from_layers(
         &mcp_config.config_layer_stack,
-        mcp_config.approvals_reviewer,
+        step_settings
+            .mcp_approvals_reviewer_override
+            .unwrap_or(mcp_config.approvals_reviewer),
         Some(turn_context.model_info().slug.as_str()),
         request.server_name.as_str(),
         elicitation_connector_id(&request.elicitation),
+        /*link_id*/ None,
     );
     if !crate::guardian::routes_approval_policy_to_guardian(approval_policy, approvals_reviewer) {
         return Ok(None);
     }
 
-    let guardian_request = match guardian_elicitation_review_request(&request) {
+    let guardian_request = match guardian_elicitation_review_request(&request, originating_call_id)
+    {
         GuardianElicitationReview::NotRequested => return Ok(None),
         GuardianElicitationReview::Decline(reason) => {
             warn!(
@@ -919,6 +983,7 @@ async fn review_guardian_mcp_elicitation(
 
 fn guardian_elicitation_review_request(
     request: &ElicitationReviewRequest,
+    originating_call_id: Option<&str>,
 ) -> GuardianElicitationReview {
     let (meta, requested_schema) = match &request.elicitation {
         Elicitation::Mcp(rmcp::model::ElicitRequestParams::FormElicitationParams {
@@ -985,11 +1050,13 @@ fn guardian_elicitation_review_request(
 
     GuardianElicitationReview::ApprovalRequest(Box::new(
         crate::guardian::GuardianApprovalRequest::McpToolCall {
-            id: format!(
-                "mcp_elicitation:{}:{}",
-                request.server_name,
-                mcp_elicitation_request_id(&request.request_id)
-            ),
+            id: originating_call_id.map(str::to_owned).unwrap_or_else(|| {
+                format!(
+                    "mcp_elicitation:{}:{}",
+                    request.server_name,
+                    mcp_elicitation_request_id(&request.request_id)
+                )
+            }),
             server: request.server_name.clone(),
             tool_name,
             arguments,

@@ -196,11 +196,14 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
         &RolloutItem::Compacted(CompactedItem {
             message: "compacted history".to_string(),
             replacement_history: Some(Vec::new()),
+            guardian_history: None,
             mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
     )
     .await?;
@@ -3238,7 +3241,10 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
         reopened_original_request["client_metadata"]["turn_id"].as_str(),
         Some(original_turn.turn.id.as_str())
     );
-    responses::assert_root_turn(&reopened_original_request, /*expected*/ None)?;
+    responses::assert_root_turn(
+        &reopened_original_request,
+        Some(original_turn.turn.id.as_str()),
+    )?;
     let intervening_request = serde_json::from_slice::<serde_json::Value>(&requests[3])?;
     let intervening_turn_id = intervening_request["client_metadata"]["turn_id"]
         .as_str()
@@ -3265,7 +3271,7 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
         reopened_request["client_metadata"]["turn_id"].as_str(),
         Some(edited_turn_id)
     );
-    responses::assert_root_turn(&reopened_request, /*expected*/ None)?;
+    responses::assert_root_turn(&reopened_request, Some(original_turn.turn.id.as_str()))?;
     let continuation_request = serde_json::from_slice::<serde_json::Value>(&requests[7])?;
     assert_ne!(
         continuation_request["client_metadata"]["turn_id"].as_str(),
@@ -3830,6 +3836,7 @@ async fn thread_resume_token_usage_replay_ignores_stale_interrupted_tail_turn() 
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }))?,
         })
         .to_string(),
@@ -3917,6 +3924,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }))?,
         })
         .to_string(),
@@ -4227,6 +4235,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             }))?,
         })
         .to_string(),

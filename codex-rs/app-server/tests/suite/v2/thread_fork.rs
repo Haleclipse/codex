@@ -1508,6 +1508,62 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn thread_fork_accepts_resumed_rollout_under_symlinked_sessions_root() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let external = TempDir::new()?;
+    let external_sessions = external.path().join("sessions");
+    std::fs::create_dir_all(external_sessions.as_path())?;
+    std::os::unix::fs::symlink(
+        external_sessions.as_path(),
+        codex_home.path().join("sessions"),
+    )?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let conversation_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let source_path = rollout_path(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        conversation_id.as_str(),
+    );
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            path: Some(source_path),
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    assert_eq!(thread.forked_from_id, Some(conversation_id));
+    Ok(())
+}
+
 #[tokio::test]
 async fn thread_fork_warns_for_paginated_full_history_hydration() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;

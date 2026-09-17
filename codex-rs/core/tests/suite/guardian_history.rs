@@ -1,21 +1,33 @@
-//! Exercises retained review history through compaction, eviction, large images, and rollback.
+//! Exercises retained review history through compaction, resume, fork, eviction, and rollback.
 
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_core::ForkSnapshot;
 use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
+use codex_core::config::ThreadStoreConfig;
 use codex_features::Feature;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_history::RolloutItem;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::ForkBoundary;
+use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::PrepareForkParams;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
@@ -33,6 +45,167 @@ use rand::rngs::StdRng;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::Arc;
+use test_case::test_case;
+
+#[test_case(ThreadHistoryMode::Paginated, ThreadStoreConfig::Local; "paginated")]
+// The pathless test store only supports Legacy mode; this case tests the store interface,
+// not legacy rollout compatibility.
+#[test_case(ThreadHistoryMode::Legacy, ThreadStoreConfig::InMemory {
+    id: uuid::Uuid::new_v4().to_string(),
+}; "pathless")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_history_survives_restart_and_user_fork(
+    history_mode: ThreadHistoryMode,
+    store_config: ThreadStoreConfig,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "Guardian approval actions require host-native paths"
+    );
+    let server = start_mock_server().await;
+    let pathless_store = match &store_config {
+        ThreadStoreConfig::Local => None,
+        ThreadStoreConfig::InMemory { id } => Some(InMemoryThreadStore::for_id(id)),
+    };
+    let mut builder = test_codex()
+        .with_history_mode(history_mode)
+        .with_config(move |config| {
+            config.experimental_thread_store = store_config;
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("enable token budget");
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        });
+    let initial = builder.build_with_auto_env(&server).await?;
+    let authorization = "You may publish the reviewed release.";
+    mount_sse_once(&server, sse(vec![ev_completed("authorized")])).await;
+    initial.submit_text_turn(authorization).await?;
+    initial.codex.submit(Op::Compact).await?;
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let restriction = "Keep the release private.";
+    mount_sse_once(&server, sse(vec![ev_completed("restriction")])).await;
+    initial.submit_text_turn(restriction).await?;
+    initial.codex.shutdown_and_wait().await?;
+    let thread_id = initial.session_configured.thread_id;
+    initial.thread_manager.remove_thread(&thread_id).await;
+    let model_context = initial
+        .thread_store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await?;
+    // Cross the wire boundary even for the pathless in-memory store: replay must not rely on
+    // retained runtime metadata or the original live ContextManager.
+    let items: Vec<RolloutItem> =
+        serde_json::from_value(serde_json::to_value(model_context.items)?)?;
+    let history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(items),
+        rollout_path: None,
+    });
+    let fork = if history_mode == ThreadHistoryMode::Paginated {
+        let prepared = initial
+            .thread_store
+            .prepare_fork(PrepareForkParams {
+                thread_id,
+                boundary: ForkBoundary::Latest,
+            })
+            .await?;
+        initial
+            .thread_manager
+            .fork_prepared_thread(
+                initial.config.clone(),
+                prepared,
+                /*thread_source*/ None,
+                /*parent_trace*/ None,
+                ClientMcpExtensions::default(),
+                /*reserved_thread_id*/ None,
+            )
+            .await?
+    } else {
+        initial
+            .thread_manager
+            .fork_thread_from_history(
+                ForkSnapshot::Interrupted,
+                initial.config.clone(),
+                history.clone(),
+                /*thread_source*/ None,
+                /*parent_trace*/ None,
+                ClientMcpExtensions::default(),
+                /*reserved_thread_id*/ None,
+            )
+            .await?
+    };
+    let resumed = initial
+        .thread_manager
+        .resume_thread_with_history(
+            initial.config.clone(),
+            history,
+            initial.thread_manager.auth_manager(),
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+        )
+        .await?;
+    for thread in [&fork.thread, &resumed.thread] {
+        if pathless_store.is_some() {
+            assert_eq!(thread.rollout_path(), None);
+        }
+        let review = mount_sse_sequence(
+            &server,
+            vec![
+                sse(vec![
+                    ev_function_call(
+                        "publish",
+                        "exec_command",
+                        r#"{"cmd":"echo publish","sandbox_permissions":"require_escalated"}"#,
+                    ),
+                    ev_completed("publish"),
+                ]),
+                sse(vec![
+                    ev_assistant_message("review", r#"{"outcome":"deny"}"#),
+                    ev_completed("review"),
+                ]),
+                sse(vec![ev_completed("done")]),
+            ],
+        )
+        .await;
+        thread
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "Continue with the release.".into(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        let requests = review.requests();
+        let guardian = requests
+            .iter()
+            .find(|request| {
+                request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian"
+            })
+            .expect("Guardian request");
+        let transcript = serde_json::to_string(&guardian.input())?;
+        assert!(transcript.contains(authorization));
+        assert!(transcript.contains(restriction));
+        assert!(!serde_json::to_string(&requests[0].input())?.contains(authorization));
+        thread.shutdown_and_wait().await?;
+    }
+    if let Some(store) = pathless_store {
+        assert_eq!(store.calls().await.read_thread_by_rollout_path, 0);
+        if let ThreadStoreConfig::InMemory { id } = &initial.config.experimental_thread_store {
+            InMemoryThreadStore::remove_id(id);
+        }
+    }
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_history_survives_compaction_and_eviction_but_not_rollback() -> Result<()> {

@@ -118,11 +118,13 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
                 "input_tokens": 10,
                 "output_tokens": 5,
                 "total_tokens": 15,
+                "extra": { "label": "example", "items": [0, null, true] },
                 "codex_rollout_budget_units": 2.5
             }
         }
     });
 
+    let expected_metadata = completed["response"]["usage"].clone();
     let body = build_responses_body(vec![item1, item2, completed]);
     let transport = FixtureSseTransport::new(body);
     let client = ResponsesClient::new(transport, provider("openai"), Arc::new(NoAuth));
@@ -174,6 +176,7 @@ async fn responses_stream_parses_items_and_completed_end_to_end() -> Result<()> 
                 usage_metadata,
                 &Some(codex_protocol::ResponseUsageMetadata {
                     amount: Some("0.12345678901234567890".to_string()),
+                    metadata: Some(expected_metadata),
                 })
             );
             assert_eq!(

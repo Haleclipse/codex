@@ -34,11 +34,15 @@ use codex_login::ExternalAuthRefreshContext;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+use codex_protocol::models::LocalShellAction;
+use codex_protocol::models::LocalShellExecAction;
+use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
@@ -81,6 +85,8 @@ use crate::async_scorer::sampler::CLASSIFICATION_TOKEN_USAGE_METRIC;
 use crate::async_scorer::sampler::INITIAL_WEBSOCKET_CONNECTIONS;
 use crate::async_scorer::sampler::LunaSampler;
 use crate::async_scorer::sampler::MODEL;
+use crate::async_scorer::transcript::MAX_MESSAGE_ENTRY_TOKENS;
+use crate::async_scorer::transcript::MAX_TOOL_ENTRY_TOKENS;
 use crate::async_scorer::transcript::truncate_entry;
 use crate::async_scorer::truncation::CLASSIFICATION_TRUNCATION_BYTES_METRIC;
 use crate::async_scorer::truncation::CLASSIFICATION_TRUNCATION_METRIC;
@@ -110,7 +116,10 @@ async fn installed_extension_warms_connections_without_blocking_thread_start() -
     skip_if_no_network!(Ok(()));
 
     let thread_server = responses::start_mock_server().await;
-    let test = test_codex().build_with_auto_env(&thread_server).await?;
+    let test = test_codex()
+        .with_config(|config| config.approvals_reviewer = ApprovalsReviewer::AutoReview)
+        .build_with_auto_env(&thread_server)
+        .await?;
     let mut connections = vec![
         WebSocketConnectionConfig {
             requests: Vec::new(),
@@ -167,7 +176,10 @@ async fn installed_extension_reconnects_after_auth_refresh() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let thread_server = responses::start_mock_server().await;
-    let test = test_codex().build_with_auto_env(&thread_server).await?;
+    let test = test_codex()
+        .with_config(|config| config.approvals_reviewer = ApprovalsReviewer::AutoReview)
+        .build_with_auto_env(&thread_server)
+        .await?;
     let events = vec![
         ev_assistant_message("sample", "low"),
         ev_completed("response-1"),
@@ -898,7 +910,10 @@ async fn sample_configured_conversation_history_with_source(
                 .policy = Some(TEST_CATALOG_GUARDIAN_POLICY.to_owned());
         })
         .with_model("gpt-5.5")
-        .with_config(move |config| config.guardian_policy_config = guardian_policy)
+        .with_config(move |config| {
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config.guardian_policy_config = guardian_policy;
+        })
         .with_pre_build_hook(move |home| {
             std::fs::write(home.join("config.toml"), guardian_config)
                 .expect("Guardian v2 configuration should be written");
@@ -1441,7 +1456,7 @@ max_recent_non_user_entries = 8
             .latest_scored_tool_call
             .load(Ordering::Acquire)
             == 0
-            || metrics.0.lock().unwrap().len() < 10
+            || metrics.0.lock().unwrap().len() < 14
         {
             tokio::task::yield_now().await;
         }
@@ -2166,6 +2181,7 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
     let test = test_codex()
         .with_home(Arc::clone(&initial.home))
         .with_config(move |config| {
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
             config.config_layer_stack = config_layer_stack;
             config
                 .features
@@ -2666,6 +2682,56 @@ async fn contributor_sends_compacted_conversation_history_to_luna() -> Result<()
             },
         ]
     }));
+    history.extend(
+        [
+            (None, None, "unattributed anonymous output"),
+            (Some("missing-call"), None, "unattributed orphaned output"),
+            (
+                Some("missing-named-call"),
+                Some("notifications"),
+                "named orphaned output",
+            ),
+            (None, Some("notifications"), "attributed notification"),
+        ]
+        .map(|(call_id, name, text)| ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: call_id.map(str::to_string),
+            name: name.map(str::to_string),
+            namespace: Some("slack".to_string()),
+            output: FunctionCallOutputPayload::from_text(text.to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+    );
+    history.push(ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "missing-custom-call".to_string(),
+        name: None,
+        output: FunctionCallOutputPayload::from_text("unattributed custom output".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    history.extend([
+        ResponseItem::LocalShellCall {
+            id: None,
+            call_id: Some("shell-1".to_string()),
+            status: LocalShellStatus::Completed,
+            action: LocalShellAction::Exec(LocalShellExecAction {
+                command: vec!["echo".to_string(), "hello".to_string()],
+                timeout_ms: None,
+                working_directory: None,
+                env: None,
+                user: None,
+            }),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some("shell-1".to_string()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_text("local shell evidence".to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]);
 
     let (request, _test, _registry) = sample_conversation_history(
         history,
@@ -2705,6 +2771,42 @@ async fn contributor_sends_compacted_conversation_history_to_luna() -> Result<()
             .any(|entry| entry.contains("result evidence 0:"))
     );
     assert!(entries.iter().any(|entry| entry.contains("<truncated")));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.contains("unattributed anonymous output"))
+    );
+    for output in [
+        "tool result: unattributed orphaned output",
+        "tool result: named orphaned output",
+        "tool result: unattributed custom output",
+        "tool result: local shell evidence",
+    ] {
+        assert!(
+            entries.iter().any(|entry| entry.contains(output)),
+            "missing {output}"
+        );
+    }
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.contains("tool shell call:"))
+    );
+    assert!(entries.iter().any(|entry| {
+        entry.contains("tool slack.notifications result: attributed notification")
+    }));
+
+    for entry in entries.into_iter().filter(|entry| entry.starts_with('[')) {
+        let (label, text) = entry.split_once(": ").expect("numbered transcript entry");
+        let max_tokens = if label.contains("tool ") {
+            MAX_TOOL_ENTRY_TOKENS
+        } else {
+            MAX_MESSAGE_ENTRY_TOKENS
+        };
+        assert!(
+            text.trim_end_matches('\n').len() <= TruncationPolicy::Tokens(max_tokens).byte_budget()
+        );
+    }
 
     Ok(())
 }
@@ -2715,6 +2817,7 @@ async fn contributor_reuses_the_latest_compatible_parent_compaction() -> Result<
 
     let thread_server = responses::start_mock_server().await;
     let test = test_codex()
+        .with_config(|config| config.approvals_reviewer = ApprovalsReviewer::AutoReview)
         .with_pre_build_hook(|home| {
             std::fs::write(
                 home.join("config.toml"),

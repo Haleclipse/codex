@@ -8,171 +8,13 @@ use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_mcp::ToolInfo;
 use codex_plugin::ExecutorPluginHookSource;
 use codex_plugin::PluginId;
+use codex_plugin::is_allowlisted_bundled_cleanup_hook;
 use codex_plugin::manifest::PluginManifestHooks;
 use codex_protocol::capabilities::CapabilityRootLocation;
-use codex_protocol::protocol::HookEventName;
 use serde_json::Map;
 use serde_json::Value;
 
 use crate::manifest::parse_plugin_manifest_uri;
-
-struct AllowlistedExecutorPluginHook {
-    plugin_id: &'static str,
-    event: HookEventName,
-    target: ExecutorPluginHookTarget,
-}
-
-enum ExecutorPluginHookTarget {
-    Executor {
-        server: &'static str,
-        tool: &'static str,
-    },
-    App {
-        connector_id: &'static str,
-        tool: &'static str,
-    },
-}
-
-// Executor plugin manifests are unsigned, so temporarily hardcode the expected
-// plugin identities, events, and MCP targets until plugin signing lands.
-const ALLOWLISTED_EXECUTOR_PLUGIN_HOOKS: &[AllowlistedExecutorPluginHook] = &[
-    AllowlistedExecutorPluginHook {
-        plugin_id: "browser@openai-bundled",
-        event: HookEventName::Stop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "browser@openai-bundled",
-        event: HookEventName::Interrupt,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "browser@openai-bundled",
-        event: HookEventName::SubagentStop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "chrome@openai-bundled",
-        event: HookEventName::Stop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "chrome@openai-bundled",
-        event: HookEventName::Interrupt,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "chrome@openai-bundled",
-        event: HookEventName::SubagentStop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "chrome-dev@openai-bundled",
-        event: HookEventName::Stop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "chrome-dev@openai-bundled",
-        event: HookEventName::Interrupt,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "chrome-dev@openai-bundled",
-        event: HookEventName::SubagentStop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "chrome-internal@openai-bundled",
-        event: HookEventName::Stop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "chrome-internal@openai-bundled",
-        event: HookEventName::Interrupt,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "chrome-internal@openai-bundled",
-        event: HookEventName::SubagentStop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "computer-use@openai-bundled",
-        event: HookEventName::Stop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "computer-use@openai-bundled",
-        event: HookEventName::Interrupt,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "computer-use@openai-bundled",
-        event: HookEventName::SubagentStop,
-        target: ExecutorPluginHookTarget::Executor {
-            server: "node_repl",
-            tool: "turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "browser@openai-curated-remote",
-        event: HookEventName::Stop,
-        target: ExecutorPluginHookTarget::App {
-            connector_id: "connector_openai_browser",
-            tool: "browser.turn_ended",
-        },
-    },
-    AllowlistedExecutorPluginHook {
-        plugin_id: "browser@openai-curated-remote",
-        event: HookEventName::SubagentStop,
-        target: ExecutorPluginHookTarget::App {
-            connector_id: "connector_openai_browser",
-            tool: "browser.turn_ended",
-        },
-    },
-];
 
 /// Returns accepted inline hook sources from executor-discovered plugin manifests.
 /// Each source carries its trusted MCP routing metadata. `lookup_enabled_tool` must use a
@@ -183,7 +25,7 @@ const ALLOWLISTED_EXECUTOR_PLUGIN_HOOKS: &[AllowlistedExecutorPluginHook] = &[
 /// after earlier lifecycle events have passed.
 ///
 /// Note: Executor manifests are not signed yet, so temporarily we only admit the known cleanup
-/// hooks from the bundled plugins above and the remote Browser plugin.
+/// hooks from the bundled cleanup allowlist and the remote Browser plugin.
 pub fn executor_plugin_hook_sources<'a>(
     snapshot: &ExecutorCapabilityDiscoverySnapshot,
     lookup_enabled_tool: impl Fn(&str, &str) -> Option<&'a ToolInfo>,
@@ -239,60 +81,35 @@ pub fn executor_plugin_hook_sources<'a>(
     // FIXME: Remove this temporary filter once executor plugin hooks can be trusted.
     sources
         .into_iter()
-        .filter_map(|source| allowlisted_source(source, &lookup_enabled_tool))
+        .filter_map(|mut source| {
+            let plugin_id = source.plugin_id.as_key();
+            for (event, groups) in source.hooks.matcher_groups_mut() {
+                groups.retain_mut(|group| {
+                    group.hooks.retain(|handler| {
+                        let app_connector_id = match handler {
+                            HookHandlerConfig::McpTool { server, tool, .. }
+                                if server == CODEX_APPS_MCP_SERVER_NAME =>
+                            {
+                                lookup_enabled_tool(server, tool)
+                                    .and_then(|info| info.connector_id.as_deref())
+                            }
+                            _ => None,
+                        };
+                        is_allowlisted_bundled_cleanup_hook(
+                            &plugin_id,
+                            event,
+                            group.matcher.as_deref(),
+                            handler,
+                            app_connector_id,
+                        )
+                    });
+                    !group.hooks.is_empty()
+                });
+            }
+            (!source.hooks.is_empty()).then_some(source)
+        })
         .filter_map(|source| resolve_mcp_routing(source, &lookup_enabled_tool))
         .collect()
-}
-
-fn allowlisted_source<'a>(
-    mut source: ExecutorPluginHookSource,
-    lookup_enabled_tool: &impl Fn(&str, &str) -> Option<&'a ToolInfo>,
-) -> Option<ExecutorPluginHookSource> {
-    let plugin_id = source.plugin_id.as_key();
-    for (event, groups) in source.hooks.matcher_groups_mut() {
-        groups.retain_mut(|group| {
-            if group.matcher.is_some() {
-                return false;
-            }
-            group.hooks.retain(|handler| {
-                let HookHandlerConfig::McpTool {
-                    server,
-                    tool,
-                    input,
-                    ..
-                } = handler
-                else {
-                    return false;
-                };
-                let Some(hook) = ALLOWLISTED_EXECUTOR_PLUGIN_HOOKS
-                    .iter()
-                    .find(|hook| hook.plugin_id == plugin_id && hook.event == event)
-                else {
-                    return false;
-                };
-                match hook.target {
-                    ExecutorPluginHookTarget::Executor {
-                        server: expected_server,
-                        tool: expected_tool,
-                    } => server == expected_server && tool == expected_tool,
-                    ExecutorPluginHookTarget::App {
-                        connector_id,
-                        tool: expected_tool,
-                    } => {
-                        // Raw Apps tool names can collide; admission must also match the listed connector.
-                        server == CODEX_APPS_MCP_SERVER_NAME
-                            && tool == expected_tool
-                            && input.is_empty()
-                            && lookup_enabled_tool(server, tool).is_some_and(|tool_info| {
-                                tool_info.connector_id.as_deref() == Some(connector_id)
-                            })
-                    }
-                }
-            });
-            !group.hooks.is_empty()
-        });
-    }
-    (!source.hooks.is_empty()).then_some(source)
 }
 
 /// Resolves routing for an admitted MCP hook source.

@@ -453,8 +453,10 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
         responses::mount_response_sequence(&server, vec![first_response, second_response]).await;
 
     MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
         .with_provider_config("supports_websockets = false")
         .write(codex_home.path())?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -467,8 +469,10 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
     let ThreadStartResponse { thread, .. } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(thread_req)).await??;
 
-    let start_metadata =
-        HashMap::from([("fiber_run_id".to_string(), "fiber-start-123".to_string())]);
+    let start_metadata = HashMap::from([
+        ("fiber_run_id".to_string(), "fiber-start-123".to_string()),
+        ("source".to_string(), "initial-source".to_string()),
+    ]);
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
@@ -496,6 +500,7 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
     let steer_metadata = HashMap::from([
         ("fiber_run_id".to_string(), "fiber-steer-456".to_string()),
         ("origin".to_string(), "gaas".to_string()),
+        ("source".to_string(), "steer-source".to_string()),
     ]);
     let steer_req = mcp
         .send_turn_steer_request(TurnSteerParams {
@@ -532,6 +537,7 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
     );
     assert_eq!(first_metadata["turn_id"].as_str(), Some(turn_id.as_str()));
     assert_eq!(first_metadata["turn_trigger"].as_str(), Some("user"));
+    assert_eq!(first_metadata["source"].as_str(), Some("initial-source"));
 
     let second_metadata = requests[1]
         .header("x-codex-turn-metadata")
@@ -545,6 +551,16 @@ async fn turn_steer_updates_client_metadata_on_follow_up_responses_request_v2() 
     assert_eq!(second_metadata["origin"].as_str(), Some("gaas"));
     assert_eq!(second_metadata["turn_id"].as_str(), Some(turn_id.as_str()));
     assert_eq!(second_metadata["turn_trigger"].as_str(), Some("user"));
+    assert_eq!(second_metadata["source"].as_str(), Some("steer-source"));
+
+    let event = wait_for_analytics_event(&server, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
+    assert_eq!(
+        (
+            event["event_params"]["turn_trigger"].as_str(),
+            event["event_params"]["codex_turn_source"].as_str(),
+        ),
+        (Some("user"), Some("steer-source"))
+    );
 
     Ok(())
 }

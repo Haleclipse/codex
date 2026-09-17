@@ -15,6 +15,7 @@ use codex_connectors::ConnectorRuntimeContextKey;
 use codex_exec_server::Environment;
 use codex_login::CodexAuth;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_rmcp_client::McpOAuthRefreshMode;
 use codex_rmcp_client::StoredOAuthCredentialSnapshot;
 use codex_rmcp_client::StoredOAuthTokens;
 use codex_utils_path_uri::PathUri;
@@ -99,6 +100,7 @@ pub(crate) struct McpServerConnectionIdentity {
     environment_id: String,
     host_plugin_root: Option<PathUri>,
     oauth_store: Option<(OAuthCredentialsStoreMode, AuthKeyringBackendKind)>,
+    oauth_refresh_mode: Option<McpOAuthRefreshMode>,
     oauth_credentials: Result<Option<StoredOAuthCredentialSnapshot>, String>,
     pub(crate) oauth_store_was_contended: bool,
     resolved_environment: Result<Option<Arc<Environment>>, String>,
@@ -120,6 +122,7 @@ impl McpServerConnectionIdentity {
         host_plugin_root: Option<&PathUri>,
         store_mode: OAuthCredentialsStoreMode,
         keyring_backend_kind: AuthKeyringBackendKind,
+        oauth_refresh_mode: McpOAuthRefreshMode,
         resolved_environment: &Result<Option<Arc<Environment>>, String>,
         runtime_context: &McpRuntimeContext,
         runtime_auth_provider: Option<&SharedAuthProvider>,
@@ -217,6 +220,7 @@ impl McpServerConnectionIdentity {
             oauth_store: stored_oauth_url
                 .is_some()
                 .then_some((store_mode, keyring_backend_kind)),
+            oauth_refresh_mode: stored_oauth_url.is_some().then_some(oauth_refresh_mode),
             oauth_credentials,
             oauth_store_was_contended,
             resolved_environment: resolved_environment.clone(),
@@ -250,6 +254,7 @@ impl McpServerConnectionIdentity {
             && self.environment_id == other.environment_id
             && self.host_plugin_root == other.host_plugin_root
             && self.oauth_store == other.oauth_store
+            && self.oauth_refresh_mode == other.oauth_refresh_mode
             && same_resolved_environment(&self.resolved_environment, &other.resolved_environment)
             && self.local_stdio_fallback_cwd == other.local_stdio_fallback_cwd
             && self.referenced_environment_variables == other.referenced_environment_variables

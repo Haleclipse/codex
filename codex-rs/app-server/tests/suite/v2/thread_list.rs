@@ -51,7 +51,9 @@ use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::FileTimes;
 use std::fs::OpenOptions;
@@ -1389,19 +1391,28 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
     }
 
     let mut mcp = init_mcp(codex_home.path()).await?;
+    let mut loaded_settings = HashMap::new();
     for (thread_id, source, capability) in threads_to_resume {
+        let (model, effort) = if thread_id == cli_id {
+            ("gpt-5.2", "high")
+        } else {
+            ("gpt-5.4", "low")
+        };
         let request_id = mcp
             .send_thread_resume_request(ThreadResumeParams {
                 thread_id: thread_id.clone(),
+                model: Some(model.to_string()),
+                config: Some([("model_reasoning_effort".to_string(), json!(effort))].into()),
                 ..Default::default()
             })
             .await?;
         let ThreadResumeResponse { thread, .. } =
             timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
         assert_eq!(
-            (thread.id, thread.source, thread.can_accept_direct_input),
-            (thread_id, source, capability)
+            (&thread.id, &thread.source, thread.can_accept_direct_input),
+            (&thread_id, &source, capability)
         );
+        loaded_settings.insert(thread_id, (thread.model, thread.reasoning_effort));
     }
 
     let response = list_threads(
@@ -1416,6 +1427,16 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
         /*archived*/ None,
     )
     .await?;
+    for thread in &response.data {
+        let expected_settings = loaded_settings
+            .get(&thread.id)
+            .map(|(model, effort)| (model.as_deref(), effort.clone()))
+            .unwrap_or((None, None));
+        assert_eq!(
+            (thread.model.as_deref(), thread.reasoning_effort.clone()),
+            expected_settings
+        );
+    }
     expected.reverse();
     assert_eq!(
         response

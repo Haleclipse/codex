@@ -32,6 +32,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_skills::SkillError;
+use codex_utils_git_discovery::GitRootDiscovery;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
@@ -64,6 +65,7 @@ pub(crate) struct Session {
     pub(super) mcp_prewarm_shutdown: CancellationToken,
     pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
+    pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
@@ -248,6 +250,13 @@ impl SessionConfiguration {
             approval_policy: self.step_settings.approval_policy.value(),
             approvals_reviewer: self.step_settings.approvals_reviewer,
             permission_profile: self.effective_permission_profile(&environment_selections),
+            full_access: codex_protocol::protocol::has_full_access(
+                self.step_settings.approval_policy.value(),
+                &self.permission_profile(),
+                environment_selections
+                    .iter()
+                    .map(|environment| &environment.config),
+            ),
             active_permission_profile: permission_profile.active_permission_profile(),
             environments: TurnEnvironmentSelections::new(
                 self.legacy_fallback_cwd.clone(),
@@ -635,6 +644,7 @@ impl Session {
         installation_id: String,
         auth_manager: Arc<AuthManager>,
         models_manager: SharedModelsManager,
+        git_root_discovery: Arc<GitRootDiscovery>,
         model_info: ModelInfo,
         exec_policy: Arc<ExecPolicyManager>,
         tx_event: Sender<Event>,
@@ -770,11 +780,12 @@ impl Session {
             }
             InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => None,
         };
-        // Legacy subagent rollouts synthesize session_id from their own thread id.
+        // Legacy subagent rollouts synthesized session_id from their own thread ID.
         let resumed_session_id = resumed_session_id.filter(|session_id| {
             !session_configuration.session_source.is_non_root_agent()
                 || *session_id != SessionId::from(thread_id)
         });
+        // session_id is equal to the root thread's ID.
         let session_id = resumed_session_id.unwrap_or_else(|| {
             if session_configuration.session_source.is_non_root_agent() {
                 agent_control.session_id()
@@ -1357,6 +1368,7 @@ impl Session {
                     | RolloutItem::TurnContext(_)
                     | RolloutItem::WorldState(_)
                     | RolloutItem::RealtimeItem(_)
+                    | RolloutItem::TokenUsageRecord(_)
                     | RolloutItem::SecurityRiskScore(_) => {}
                 }
             }
@@ -1408,6 +1420,7 @@ impl Session {
                 .with_legacy_custom_ca_fallback(),
                 session_telemetry,
                 models_manager: Arc::clone(&models_manager),
+                git_root_discovery,
                 tool_approvals: Mutex::new(ApprovalStore::default()),
                 guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
                 runtime_handle: tokio::runtime::Handle::current(),
@@ -1490,6 +1503,9 @@ impl Session {
                 mcp_prewarm_shutdown: CancellationToken::new(),
                 mcp_prewarm_task: std::sync::Mutex::new(None),
                 conversation: Arc::new(RealtimeConversationManager::new()),
+                realtime_history: (session_configuration.history_mode == ThreadHistoryMode::Paginated
+                    && services.live_thread.is_some())
+                .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
                 async_hook_results,
                 input_queue: InputQueue::new(),

@@ -33,6 +33,7 @@ use crate::binding::call_tool_result_from_rmcp;
 use crate::catalog::McpServerSource;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
+use crate::event_stream::EventStreamConnectionSettings;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::pagination::MAX_CODEX_APPS_TOOL_CATALOG_ITEMS;
@@ -184,6 +185,7 @@ impl McpServerView {
 /// A published view over a set of running MCP server connections.
 pub(crate) struct McpConnectionSet {
     servers: HashMap<String, McpServerView>,
+    pub(crate) event_stream_connection: Option<Arc<EventStreamConnectionSettings>>,
     disabled_servers: Vec<String>,
     protocol_mode: crate::McpProtocolMode,
     required_servers: Vec<String>,
@@ -229,6 +231,7 @@ impl McpConnectionSet {
         } = input;
         let store_mode = config.mcp_oauth_credentials_store_mode;
         let keyring_backend_kind = config.auth_keyring_backend_kind;
+        let oauth_refresh_mode = config.oauth_refresh_mode;
         let codex_home = config.codex_home.clone();
         let prefix_mcp_tool_names = config.prefix_mcp_tool_names;
         let non_prefixed_mcp_tool_servers = config.non_prefixed_mcp_tool_servers.clone();
@@ -237,6 +240,7 @@ impl McpConnectionSet {
         let tool_plugin_provenance = crate::mcp::tool_plugin_provenance(&config);
         let auth = auth.as_ref();
         let mut servers = HashMap::new();
+        let mut event_stream_connection = None;
         let disabled_servers = mcp_servers
             .iter()
             .filter(|(_, server)| !server.enabled())
@@ -276,9 +280,12 @@ impl McpConnectionSet {
         let static_chatgpt_auth_provider = auth
             .filter(|auth| auth.uses_codex_backend())
             .map(codex_model_provider::auth_provider_from_auth);
-        let codex_apps_auth_provider = auth_manager.and_then(|auth_manager| {
+        let codex_apps_auth_provider = auth_manager.as_ref().and_then(|auth_manager| {
             auth.filter(|auth| auth.uses_codex_backend()).map(|auth| {
-                codex_model_provider::auth_provider_from_auth_manager(auth_manager, auth)
+                codex_model_provider::auth_provider_from_auth_manager(
+                    Arc::clone(auth_manager),
+                    auth,
+                )
             })
         });
         for (server_name, server) in mcp_servers
@@ -351,12 +358,28 @@ impl McpConnectionSet {
                 } else {
                     chatgpt_auth_provider_for_server(&server, chatgpt_auth_provider)
                 };
+            if is_host_owned_codex_apps {
+                event_stream_connection = Some(Arc::new(EventStreamConnectionSettings {
+                    server: server.clone(),
+                    store_mode,
+                    keyring_backend_kind,
+                    oauth_refresh_mode,
+                    runtime_context: runtime_context.clone(),
+                    resolved_environment: resolved_environment.clone(),
+                    auth_provider: runtime_auth_provider.clone(),
+                    auth_manager: auth_manager.clone(),
+                    auth: auth.cloned(),
+                    protocol_mode,
+                    client_mcp_extensions: client_mcp_extensions.clone(),
+                }));
+            }
             let connection_identity = McpServerConnectionIdentity::new(
                 &server_name,
                 &server,
                 host_plugin_root,
                 store_mode,
                 keyring_backend_kind,
+                oauth_refresh_mode,
                 &resolved_environment,
                 &runtime_context,
                 runtime_auth_provider.as_ref(),
@@ -519,6 +542,7 @@ impl McpConnectionSet {
                 server,
                 store_mode,
                 keyring_backend_kind,
+                oauth_refresh_mode,
                 cancel_token.clone(),
                 tx_event.clone(),
                 elicitation_requests.clone(),
@@ -682,6 +706,7 @@ impl McpConnectionSet {
         }
         let manager = Self {
             servers,
+            event_stream_connection,
             disabled_servers,
             protocol_mode,
             required_servers,
@@ -743,6 +768,7 @@ impl McpConnectionSet {
     pub fn empty(prefix_mcp_tool_names: bool) -> Self {
         Self {
             servers: HashMap::new(),
+            event_stream_connection: None,
             disabled_servers: Vec::new(),
             protocol_mode: crate::McpProtocolMode::Legacy,
             required_servers: Vec::new(),

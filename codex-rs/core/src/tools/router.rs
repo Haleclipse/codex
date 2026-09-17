@@ -238,8 +238,8 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
-    pub(crate) fn tool_runtime(&self, call: &ToolCall) -> Option<Arc<dyn CoreToolRuntime>> {
-        self.registry.tool(&call.tool_name)
+    pub(crate) fn tool_runtime(&self, tool_name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
+        self.registry.tool(tool_name)
     }
 
     #[instrument(level = "trace", skip_all, err)]
