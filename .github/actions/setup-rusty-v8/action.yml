@@ -35,9 +35,21 @@ runs:
         checksums_path="${binding_dir}/${checksums_name}"
 
         mkdir -p "${binding_dir}"
-        curl -fsSL "${base_url}/${archive_name}" -o "${archive_path}"
-        curl -fsSL "${base_url}/${binding_name}" -o "${binding_path}"
-        curl -fsSL "${base_url}/${checksums_name}" -o "${checksums_path}"
+
+        # @cometix: release-asset downloads intermittently return 5xx, which used
+        # to fail the whole build matrix entry. Retry transient errors instead.
+        download() {
+          curl -fsSL \
+            --retry 5 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            "$1" -o "$2"
+        }
+
+        download "${base_url}/${archive_name}" "${archive_path}"
+        download "${base_url}/${binding_name}" "${binding_path}"
+        download "${base_url}/${checksums_name}" "${checksums_path}"
 
         if [[ "$(wc -l < "${checksums_path}")" -ne 2 ]]; then
           echo "Expected exactly two checksums for ${TARGET} in ${checksums_path}" >&2
