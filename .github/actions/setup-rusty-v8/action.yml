@@ -12,6 +12,9 @@ runs:
       shell: bash
       env:
         TARGET: ${{ inputs.target }}
+        # @cometix: authenticates `gh release download` so the matrix does not share
+        # the anonymous rate limit. Reading a public release needs no extra scope.
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
 
@@ -43,18 +46,33 @@ runs:
 
         mkdir -p "${binding_dir}"
 
-        # @cometix: release-asset downloads intermittently return 5xx, which used
-        # to fail the whole build matrix entry. Retry transient errors instead.
+        # @cometix: release-asset downloads intermittently fail for the whole build
+        # matrix entry: 5xx from the CDN, and 403 when several matrix jobs pull the
+        # same release anonymously and trip the unauthenticated rate limit. Prefer
+        # `gh release download`, which authenticates and gets the much higher quota,
+        # and keep the anonymous curl path as a fallback.
         download() {
+          local url="$1" out="$2" name="$3"
+
+          if command -v gh >/dev/null 2>&1 && [[ -n "${GH_TOKEN:-}" ]] \
+            && gh release download "${release_tag}" \
+                 --repo openai/codex \
+                 --pattern "${name}" \
+                 --output "${out}" \
+                 --clobber; then
+            return 0
+          fi
+
+          echo "gh release download failed for ${name}; falling back to curl" >&2
           curl -fsSL \
             --retry 5 \
-            --retry-delay 5 \
+            --retry-delay 15 \
             --retry-all-errors \
             --connect-timeout 30 \
-            "$1" -o "$2"
+            "${url}" -o "${out}"
         }
 
-        download "${base_url}/${checksums_name}" "${checksums_path}"
+        download "${base_url}/${checksums_name}" "${checksums_path}" "${checksums_name}"
         # Check the original manifest bytes even when either checksum file uses CRLF.
         expected_manifest_checksum="$(grep -F "  ${checksums_name}" "${trusted_checksums}" | cut -d ' ' -f 1)"
         actual_manifest_checksum="$(python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "${checksums_path}")"
@@ -62,8 +80,8 @@ runs:
           echo "Checksum mismatch for ${checksums_name}: expected ${expected_manifest_checksum}, got ${actual_manifest_checksum}" >&2
           exit 1
         fi
-        download "${base_url}/${archive_name}" "${archive_path}"
-        download "${base_url}/${binding_name}" "${binding_path}"
+        download "${base_url}/${archive_name}" "${archive_path}" "${archive_name}"
+        download "${base_url}/${binding_name}" "${binding_path}" "${binding_name}"
 
         if [[ "$(wc -l < "${checksums_path}")" -ne 2 ]]; then
           echo "Expected exactly two checksums for ${TARGET} in ${checksums_path}" >&2
