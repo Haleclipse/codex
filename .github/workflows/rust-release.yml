@@ -462,8 +462,11 @@ jobs:
             echo "npm_tag=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download staged npm packages
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      # @cometix: upstream stages npm packages in a separate job and downloads the
+      # `npm-packages` artifact here; this fork stages them inline below, so pnpm
+      # must be installed in this job.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a8198c4bff370c8506180b035930dea56dbd5288 # v5
         with:
           run_install: false
 
