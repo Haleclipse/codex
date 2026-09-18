@@ -204,6 +204,9 @@ jobs:
           fi
           # @cometix: codex-code-mode-host is a separate process that runs model
           # authored JS inside a V8 sandbox, so it must ship next to `codex`.
+          # Upstream drives this from matrix.binaries, which this fork does not use.
+          STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
+          export STABLE_GIT_COMMIT
           if [[ "${{ contains(matrix.target, 'windows') }}" == 'true' ]]; then
             cargo build --target "$target" --release --timings --bin codex --bin codex-code-mode-host --bin codex-windows-sandbox-setup --bin codex-command-runner
           else
@@ -364,7 +367,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: read
     outputs:
       version: ${{ steps.release_name.outputs.name }}
       tag: ${{ github.ref_name }}
@@ -460,8 +462,8 @@ jobs:
             echo "npm_tag=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@a8198c4bff370c8506180b035930dea56dbd5288 # v5
+      - name: Download staged npm packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           run_install: false
 

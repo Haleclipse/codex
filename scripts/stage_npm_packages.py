@@ -128,7 +128,7 @@ def resolve_workflow_url(version: str, override: str | None) -> tuple[str, str |
 
 
 def install_native_components(
-    workflow_url: str,
+    workflow_url: str | None,
     components: set[str],
     vendor_root: Path,
     *,

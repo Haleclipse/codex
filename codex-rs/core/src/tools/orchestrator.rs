@@ -37,9 +37,7 @@ use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(crate) struct ToolOrchestrator {
-    sandbox: SandboxManager,
-}
+pub(crate) struct ToolOrchestrator;
 
 pub(crate) struct OrchestratorRunResult<Out> {
     pub output: Out,
@@ -48,9 +46,7 @@ pub(crate) struct OrchestratorRunResult<Out> {
 
 impl ToolOrchestrator {
     pub fn new() -> Self {
-        Self {
-            sandbox: SandboxManager::new(),
-        }
+        Self
     }
 
     async fn run_attempt<Rq, Out, T>(
@@ -145,6 +141,14 @@ impl ToolOrchestrator {
         let mut already_approved = false;
 
         let environment = tool.turn_environment(req);
+        let sandbox_manager = SandboxManager::new();
+        #[cfg(target_os = "macos")]
+        let sandbox_manager = sandbox_manager.with_allowed_symlinked_codex_home(
+            environment
+                .environment
+                .local_runtime_paths()
+                .and_then(|paths| paths.allowed_symlinked_codex_home.clone()),
+        );
         let sandbox_config = environment.config();
         let owner_network_policy = sandbox_config.network_policy.is_some();
         if owner_network_policy
@@ -264,14 +268,14 @@ impl ToolOrchestrator {
         let sandbox_preference = tool.sandbox_preference();
         let sandbox_requested = match sandbox_override {
             SandboxOverride::BypassSandboxFirstAttempt => false,
-            SandboxOverride::NoOverride => self.sandbox.should_sandbox(
+            SandboxOverride::NoOverride => sandbox_manager.should_sandbox(
                 &permissions,
                 sandbox_preference,
                 managed_network_active,
             ),
         };
         let initial_sandbox = if sandbox_requested && !executor_managed_process_sandbox {
-            self.sandbox.select_initial(
+            sandbox_manager.select_initial(
                 &permissions,
                 sandbox_preference,
                 sandbox_config.windows_sandbox_level,
@@ -291,7 +295,7 @@ impl ToolOrchestrator {
             permissions: &permissions,
             exec_server_permissions: permission_profile,
             enforce_managed_network: managed_network_active,
-            manager: &self.sandbox,
+            manager: &sandbox_manager,
             sandbox_cwd: &sandbox_policy_cwd,
             workspace_roots,
             codex_linux_sandbox_exe: turn_ctx.config.codex_linux_sandbox_exe.as_ref(),
@@ -438,14 +442,14 @@ impl ToolOrchestrator {
                 }
 
                 let retry_sandbox_requested = !unsandboxed_allowed
-                    && self.sandbox.should_sandbox(
+                    && sandbox_manager.should_sandbox(
                         &permissions,
                         sandbox_preference,
                         managed_network_active,
                     );
                 let retry_sandbox = if retry_sandbox_requested && !executor_managed_process_sandbox
                 {
-                    self.sandbox.select_initial(
+                    sandbox_manager.select_initial(
                         &permissions,
                         sandbox_preference,
                         sandbox_config.windows_sandbox_level,
@@ -465,7 +469,7 @@ impl ToolOrchestrator {
                     permissions: &permissions,
                     exec_server_permissions: permission_profile,
                     enforce_managed_network: managed_network_active,
-                    manager: &self.sandbox,
+                    manager: &sandbox_manager,
                     sandbox_cwd: &sandbox_policy_cwd,
                     workspace_roots,
                     codex_linux_sandbox_exe: retry_codex_linux_sandbox_exe,

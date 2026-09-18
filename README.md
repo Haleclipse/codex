@@ -27,7 +27,7 @@ This fork includes the following enhancements over the upstream [openai/codex](h
 
 ## Upstream Sync
 
-This fork is regularly synced with the upstream OpenAI Codex repository. Current base: **0.153.4**.
+This fork is regularly synced with the upstream OpenAI Codex repository. Current base: **0.154.0**.
 
 ## Using Codex with your ChatGPT plan
 

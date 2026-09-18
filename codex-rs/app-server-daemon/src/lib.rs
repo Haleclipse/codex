@@ -1,4 +1,8 @@
+//! Managed app-server lifecycle, serialized across CLI invocations and the updater.
+
 mod backend;
+#[cfg(windows)]
+use backend::windows::try_lock_file;
 mod client;
 mod managed_install;
 mod remote_control_client;
@@ -19,7 +23,7 @@ use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_transport::app_server_control_socket_path;
 use codex_utils_home_dir::find_codex_home;
 use managed_install::managed_codex_bin;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use managed_install::managed_codex_version;
 use serde::Serialize;
 use settings::DaemonSettings;
@@ -156,7 +160,7 @@ pub struct RemoteControlOutput {
     pub app_server_version: Option<String>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartIfRunningOutcome {
     Busy,
@@ -166,21 +170,21 @@ pub(crate) enum RestartIfRunningOutcome {
     Restarted,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartMode {
     IfVersionChanged,
     Always,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdaterRefreshMode {
     None,
     ReexecIfManagedBinaryChanged,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartDecision {
     NotReady,
@@ -190,16 +194,24 @@ enum RestartDecision {
 
 pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
     ensure_supported_platform()?;
+    #[cfg(windows)]
+    if matches!(command, LifecycleCommand::Start | LifecycleCommand::Restart) {
+        backend::windows::ensure_not_elevated()?;
+    }
     Daemon::from_environment()?.run(command).await
 }
 
 pub async fn bootstrap(options: BootstrapOptions) -> Result<BootstrapOutput> {
     ensure_supported_platform()?;
+    #[cfg(windows)]
+    backend::windows::ensure_not_elevated()?;
     Daemon::from_environment()?.bootstrap(options).await
 }
 
 pub async fn ensure_remote_control_ready() -> Result<RemoteControlReadyOutput> {
     ensure_supported_platform()?;
+    #[cfg(windows)]
+    backend::windows::ensure_not_elevated()?;
     Daemon::from_environment()?
         .ensure_remote_control_ready()
         .await
@@ -228,6 +240,8 @@ pub async fn start_remote_control_pairing() -> Result<RemoteControlPairingStartR
 
 pub async fn set_remote_control(mode: RemoteControlMode) -> Result<RemoteControlOutput> {
     ensure_supported_platform()?;
+    #[cfg(windows)]
+    backend::windows::ensure_not_elevated()?;
     Daemon::from_environment()?.set_remote_control(mode).await
 }
 
@@ -235,18 +249,20 @@ pub async fn run_pid_update_loop(
     http_client_factory: codex_http_client::HttpClientFactory,
 ) -> Result<()> {
     ensure_supported_platform()?;
+    #[cfg(windows)]
+    backend::windows::ensure_not_elevated()?;
     update_loop::run(http_client_factory).await
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ensure_supported_platform() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn ensure_supported_platform() -> Result<()> {
     Err(anyhow!(
-        "codex app-server daemon lifecycle is only supported on Unix platforms"
+        "codex app-server daemon lifecycle is only supported on Unix and Windows platforms"
     ))
 }
 
@@ -359,7 +375,7 @@ impl Daemon {
             .await)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) async fn try_restart_if_running(
         &self,
         mode: RestartMode,
@@ -382,6 +398,8 @@ impl Daemon {
                 RestartDecision::NotReady => return Ok(RestartIfRunningOutcome::NotReady),
                 RestartDecision::AlreadyCurrent => RestartIfRunningOutcome::AlreadyCurrent,
                 RestartDecision::Restart => {
+                    #[cfg(windows)]
+                    backend::windows::ensure_detached_launch(managed_codex_bin)?;
                     backend.stop().await?;
                     let _ = self
                         .start_managed_backend_with_bin(&settings, managed_codex_bin)
@@ -398,8 +416,17 @@ impl Daemon {
             RestartIfRunningOutcome::NotRunning
         };
 
+        #[cfg(unix)]
         if should_reexec_updater(updater_refresh_mode, outcome) {
             crate::update_loop::reexec_managed_updater(managed_codex_bin)?;
+        }
+        #[cfg(windows)]
+        if should_reexec_updater(updater_refresh_mode, outcome) {
+            backend::pid_update_loop_backend(
+                self.backend_paths_with_bin(&settings, managed_codex_bin),
+            )
+            .replace_current_updater()
+            .await?;
         }
 
         Ok(outcome)
@@ -564,11 +591,13 @@ impl Daemon {
             ));
         }
 
+        if backend.is_some() {
+            self.ensure_managed_codex_bin()?;
+        }
         settings.remote_control_enabled = remote_control_enabled;
         settings.save(&self.settings_file).await?;
 
         let app_server_version = if let Some(backend) = backend {
-            self.ensure_managed_codex_bin()?;
             backend.stop().await?;
             let _ = self.start_managed_backend(&settings).await?;
             Some(self.wait_until_ready().await?.app_server_version)
@@ -666,25 +695,32 @@ impl Daemon {
 
     fn ensure_managed_codex_bin(&self) -> Result<()> {
         if self.managed_codex_bin.is_file() {
+            #[cfg(windows)]
+            backend::windows::ensure_detached_launch(&self.managed_codex_bin)?;
             return Ok(());
         }
 
         let managed_codex_path = self.managed_codex_bin.display();
+        let install_command = if cfg!(windows) {
+            "irm https://chatgpt.com/codex/install.ps1 | iex"
+        } else {
+            "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+        };
         Err(anyhow!(
             "managed standalone Codex install not found at {managed_codex_path}\n\n\
              This command requires the standalone install managed by the Codex installer, because \
              the daemon starts and updates app-server from that fixed path.\n\n\
-             Install it with:\n  curl -fsSL https://chatgpt.com/codex/install.sh | sh\n\n\
+             Install it with:\n  {install_command}\n\n\
              Then rerun the command you just tried."
         ))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn managed_codex_version_best_effort(&self) -> Option<String> {
         managed_codex_version(&self.managed_codex_bin).await.ok()
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     async fn managed_codex_version_best_effort(&self) -> Option<String> {
         None
     }
@@ -727,12 +763,18 @@ impl Daemon {
 
     async fn open_operation_lock_file(&self) -> Result<tokio::fs::File> {
         if let Some(parent) = self.operation_lock_file.parent() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!(
-                    "failed to create daemon state directory {}",
-                    parent.display()
-                )
-            })?;
+            #[cfg(unix)]
+            if let Some(home) = parent.parent() {
+                tokio::fs::create_dir_all(home).await?;
+            }
+            codex_uds::prepare_private_socket_directory(parent)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to create daemon state directory {}",
+                        parent.display()
+                    )
+                })?;
         }
         tokio::fs::OpenOptions::new()
             .create(true)
@@ -800,7 +842,7 @@ fn already_remote_control_status(mode: RemoteControlMode) -> RemoteControlStatus
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn restart_decision(
     mode: RestartMode,
     info: Option<&client::ProbeInfo>,
@@ -817,7 +859,7 @@ fn restart_decision(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn should_reexec_updater(
     updater_refresh_mode: UpdaterRefreshMode,
     outcome: RestartIfRunningOutcome,
@@ -842,12 +884,12 @@ fn try_lock_file(file: &tokio::fs::File) -> Result<bool> {
     Err(err).context("failed to lock daemon operation")
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn try_lock_file(_file: &tokio::fs::File) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -1003,6 +1045,28 @@ mod tests {
         assert_eq!(
             serde_json::to_value(output).expect("serialize"),
             serde_json::to_value(bootstrap_output).expect("serialize")
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_creates_missing_home_parent() {
+        let temp = TempDir::new().expect("temp dir");
+        let state = temp.path().join("missing-home").join("daemon-state");
+        let daemon = Daemon {
+            socket_path: state.join("server.sock"),
+            pid_file: state.join("server.pid"),
+            update_pid_file: state.join("updater.pid"),
+            operation_lock_file: state.join("daemon.lock"),
+            settings_file: state.join("settings.json"),
+            managed_codex_bin: state.join("missing-codex"),
+        };
+        assert_eq!(
+            daemon
+                .run(super::LifecycleCommand::Stop)
+                .await
+                .expect("stop on fresh home")
+                .status,
+            LifecycleStatus::NotRunning,
         );
     }
 

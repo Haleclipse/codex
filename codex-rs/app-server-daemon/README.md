@@ -10,9 +10,22 @@ machines that should expose app-server with `remote_control` enabled.
 
 ## Platform support
 
-The current daemon implementation is Unix-only. It uses pidfile-backed
-daemonization plus Unix process and file-locking primitives, and does not yet
-support Windows lifecycle management.
+The daemon supports Linux, macOS, and Windows using platform-specific process
+and file-locking primitives. Windows startup requires a non-elevated terminal
+whose host permits detached child processes.
+
+Windows automatic attachment requires the canonical socket address to fit the
+108-byte AF_UNIX limit (including its terminator). A short junction alias whose
+resolved address exceeds that limit falls back to the embedded server. Use a
+shorter `CODEX_HOME` to share the daemon; discovery does not trust a mutable alias.
+
+Shared clients use the environment inherited when the daemon started. Opening a
+new terminal or clearing variables there does not clear the running daemon's
+environment; per-client environment isolation is not provided.
+An invocation that sets `CODEX_EXEC_SERVER_URL` skips implicit daemon attachment
+so its executor selection is preserved. If an implicitly discovered daemon cannot
+initialize the connection, the TUI starts an embedded server instead. Explicit
+`--remote` endpoints remain authoritative and report connection failures.
 
 ## Commands
 
@@ -33,11 +46,19 @@ running app-server version when applicable.
 
 ## Bootstrap flow
 
-For a new remote machine:
+For a new Linux or macOS machine:
 
 ```sh
 curl -fsSL https://chatgpt.com/codex/install.sh | sh
 $HOME/.codex/packages/standalone/current/codex app-server daemon bootstrap --remote-control
+```
+
+On Windows, use a non-elevated PowerShell terminal whose host allows breakaway:
+
+```powershell
+irm https://chatgpt.com/codex/install.ps1 | iex
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+& "$codexHome\packages\standalone\current\bin\codex.exe" app-server daemon bootstrap --remote-control
 ```
 
 `bootstrap` requires the standalone managed install. It records the daemon
@@ -46,23 +67,24 @@ pidfile-backed detached process, and launches a detached updater loop.
 
 ## Installation and update cases
 
-The daemon assumes Codex is installed through `install.sh` and always launches
-the standalone managed binary under `CODEX_HOME`.
+The daemon uses the standalone installer (`install.sh` on Unix, `install.ps1`
+on Windows) and its managed binary under `CODEX_HOME/packages/standalone/current`:
+`bin/codex` or `bin/codex.exe`, falling back to the legacy flat layout when present.
 
 | Situation | What starts | Does this daemon fetch new binaries? | Does a running app-server eventually move to a newer binary on its own? |
 | --- | --- | --- | --- |
-| `install.sh` has run, but only `start` is used | `start` uses `CODEX_HOME/packages/standalone/current/codex` | No | No. The managed path is used when starting or restarting, but no updater is installed. |
-| `install.sh` has run, then `bootstrap` is used | The pidfile backend uses `CODEX_HOME/packages/standalone/current/codex` | Yes. Bootstrap launches a detached updater loop that runs `install.sh` hourly. | Yes, while that updater process is alive and app-server is already running. After a successful fetch, the updater restarts app-server with the refreshed binary and only then replaces its own process image. |
-| Some other tool updates the managed binary path | The next fresh start or restart uses the updated file at that path | Only if `bootstrap` is active, because the updater still runs `install.sh` on its normal cadence. | Without `bootstrap`, no. With `bootstrap`, the next successful updater pass compares the managed binary contents after `install.sh` runs; if app-server is running and they differ from the updater's current image, it refreshes app-server first and then itself. |
+| Installer has run; only `start` is used | Managed binary | No | No; explicit restart is required. |
+| Installer has run; `bootstrap` is used | Managed binary and detached updater | Yes; the platform's installer runs hourly. | Yes; after a successful update, a running app-server restarts with the new binary before the updater replaces itself. |
+| Another tool updates the managed binary | Next start or restart uses it | Only with `bootstrap`, on its normal cadence. | With `bootstrap`, the next successful installer pass compares binary contents and refreshes a running app-server before the updater. |
 
 ### Standalone installs
 
-For installs created by `install.sh`:
+For installs created by either platform's standalone installer:
 
 - lifecycle commands always use the standalone managed binary path
 - `bootstrap` is supported
 - `bootstrap` starts a detached pid-backed updater loop that fetches via
-  `install.sh`
+  the platform's installer
 - after a successful refresh, if app-server is running and the managed binary
   contents changed, the updater restarts app-server with that binary first and
   only then replaces its own process image
@@ -77,7 +99,7 @@ other tool updates the managed binary path:
 - without `bootstrap`, a currently running app-server remains on the old
   executable image until an explicit `restart`
 - with `bootstrap`, the detached updater loop notices the changed managed
-  binary on its next successful scheduled pass after running `install.sh`; if
+  binary on its next successful scheduled installer pass; if
   app-server is running, it refreshes app-server first and then refreshes itself
   once that replacement starts successfully
 

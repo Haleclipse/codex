@@ -12,7 +12,7 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
-  # --- Detect what changed (always runs) --------------------------------------
+  # --- Detect changed paths so the fast PR workflow only runs relevant jobs ---
   changed:
     name: Detect changed areas
     runs-on: ubuntu-24.04
@@ -140,8 +140,10 @@ jobs:
 
       - name: cargo clippy
         # @cometix: exclude v8-poc (a standalone demo crate the fork does not ship)
+        # @cometix: exclude voice-host; it pulls gstreamer/cpal system libraries that
+        # neither runner installs, and upstream's release matrix does not ship it either.
         # @cometix: --workspace without --all-features to keep optional features off
-        run: cargo clippy --workspace --target ${{ matrix.target }} --tests --profile ${{ matrix.profile }} --exclude codex-v8-poc -- -D warnings
+        run: cargo clippy --workspace --target ${{ matrix.target }} --tests --profile ${{ matrix.profile }} --exclude codex-v8-poc --exclude codex-voice-host -- -D warnings
 
   # --- Gatherer job (the ONLY required status check) --------------------------
   results:
