@@ -959,7 +959,7 @@
         }
       ],
       "shell_type": "shell_command",
-      "visibility": "list",
+      "visibility": "hide",
       "minimal_client_version": "0.142.2",
       "supported_in_api": true,
       "availability_nux": null,
@@ -1076,7 +1076,7 @@
         }
       ],
       "shell_type": "shell_command",
-      "visibility": "list",
+      "visibility": "hide",
       "minimal_client_version": "0.142.2",
       "supported_in_api": true,
       "availability_nux": null,
