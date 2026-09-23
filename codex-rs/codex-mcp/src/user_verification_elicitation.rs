@@ -13,7 +13,18 @@ pub(super) async fn route(
         .lock()
         .ok()
         .and_then(|authority| authority.clone());
-    let Some(events) = events.filter(|_| !router.auto_deny()) else {
+    let plugin_service = authority.as_ref().is_some_and(|authority| {
+        authority
+            .config
+            .mcp_server_catalog
+            .server(&server_name)
+            .is_some_and(|server| {
+                server
+                    .source()
+                    .is_host_owned_apps(&server_name, server.config())
+            })
+    });
+    let Some(events) = events.filter(|_| plugin_service && !router.auto_deny()) else {
         return Ok(ElicitationResponse {
             action: ElicitationAction::Cancel,
             content: None,

@@ -163,7 +163,16 @@ pub(crate) async fn execute_user_shell_command(
         .await;
         return;
     };
-    let shell_snapshot_location = turn_environment.shell_snapshot(&cwd);
+    let shell_snapshot = turn_environment
+        .shell_snapshot(
+            &cwd,
+            &display_command,
+            environment_shell,
+            &turn_context.config,
+            /*sandbox*/ None,
+        )
+        .await;
+    let shell_snapshot_location = shell_snapshot.as_ref().map(|snapshot| snapshot.path());
     let shell_environment_policy = turn_environment.shell_environment_policy();
     let mut exec_env_map = create_env(shell_environment_policy, Some(session.thread_id));
     inject_session_env(&mut exec_env_map, session.session_id());
@@ -460,7 +469,11 @@ async fn persist_user_shell_output(
 
     if mode == UserShellCommandMode::StandaloneTurn {
         session
-            .record_conversation_items(turn_context, std::slice::from_ref(&output_item))
+            .record_conversation_items(
+                turn_context,
+                turn_context.model_info(),
+                std::slice::from_ref(&output_item),
+            )
             .await;
         // Standalone shell turns can run before any regular user turn, so
         // explicitly materialize rollout persistence after recording output.

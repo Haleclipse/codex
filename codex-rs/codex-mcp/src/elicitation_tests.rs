@@ -587,3 +587,52 @@ async fn user_verification_drops_pending_response_when_the_request_is_cancelled(
     assert!(pending.await.unwrap_err().is_cancelled());
     assert!(manager.router.requests.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn user_verification_rejects_attached_servers_even_if_they_use_the_plugin_service_name() {
+    for name in ["attached", crate::CODEX_APPS_MCP_SERVER_NAME] {
+        let (manager, _, _) =
+            verification_fixture(AskForApproval::OnRequest, /*reviewer*/ None);
+        {
+            let mut authority = manager.authority.lock().unwrap();
+            let config = Arc::make_mut(&mut authority.as_mut().unwrap().config);
+            let mut catalog = crate::catalog::ResolvedMcpCatalog::builder();
+            catalog.register(crate::catalog::McpServerRegistration::from_config(
+                name.into(),
+                crate::mcp::codex_apps_mcp_server_config(
+                    "https://example.com",
+                    /*apps_mcp_product_sku*/ None,
+                    /*originator*/ None,
+                ),
+            ));
+            config.mcp_server_catalog = catalog.build();
+        }
+        let (tx, events) = async_channel::bounded(1);
+        let sender = manager.make_sender(
+            name.into(),
+            Some(tx),
+            &ClientMcpExtensions::new([(
+                OPENAI_ELICITATION_EXTENSION_ID.to_string(),
+                json!({"userVerification": {}}),
+            )]),
+        );
+        assert_eq!(
+            sender(
+                RequestId::Number(7),
+                Elicitation::UserVerification {
+                    title: "Approve".into(),
+                    description: String::new(),
+                    challenge: "AQID".into()
+                }
+            )
+            .await
+            .unwrap(),
+            ElicitationResponse {
+                action: ElicitationAction::Cancel,
+                content: None,
+                meta: None
+            },
+        );
+        assert!(events.try_recv().is_err());
+    }
+}

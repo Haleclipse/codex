@@ -207,7 +207,7 @@ macro_rules! assert_chatwidget_snapshot {
         settings.bind(|| {
             insta::assert_snapshot!(
                 format!("codex_tui__chatwidget__tests__{}", $name),
-                &($value),
+                $value,
                 @$snapshot
             );
         });
@@ -240,7 +240,11 @@ mod bedrock_catalog_tests;
 mod collaboration_catalog_tests;
 #[path = "tests/compaction_tests.rs"]
 mod compaction_tests;
+#[path = "tests/completion_styling_tests.rs"]
+mod completion_styling;
 mod composer_submission;
+#[path = "tests/computer_activity_tests.rs"]
+mod computer_activity_tests;
 #[path = "tests/config_errors_tests.rs"]
 mod config_errors;
 mod exec_flow;
@@ -263,6 +267,8 @@ mod plugin_catalog;
 mod popups_and_settings;
 #[path = "tests/rate_limit_recovery_tests.rs"]
 mod rate_limit_recovery_tests;
+#[path = "tests/reasoning_status_tests.rs"]
+mod reasoning_status_tests;
 #[path = "tests/replay_render_tests.rs"]
 mod replay_render_tests;
 mod review_mode;

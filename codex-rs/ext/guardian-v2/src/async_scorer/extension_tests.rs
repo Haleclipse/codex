@@ -71,7 +71,6 @@ use super::GuardianV2Extension;
 use super::GuardianV2ScoreProgress;
 
 use crate::async_scorer::config::CLASSIFICATION_OUTPUT_INSTRUCTIONS;
-use crate::async_scorer::config::DEFAULT_MODEL_CONTEXT_ITEM_TOKENS;
 use crate::async_scorer::config::DEFAULT_PARENT_COMPACTION_TOKENS;
 use crate::async_scorer::config::GuardianV2Config;
 use crate::async_scorer::coverage::GuardianPolicy;
@@ -90,8 +89,6 @@ use crate::async_scorer::sampler::tests::proxy_websocket_servers_with_http;
 use crate::async_scorer::transcript::MAX_MESSAGE_ENTRY_TOKENS;
 use crate::async_scorer::transcript::MAX_TOOL_ENTRY_TOKENS;
 use crate::async_scorer::transcript::truncate_entry;
-use crate::async_scorer::truncation::CLASSIFICATION_TRUNCATION_BYTES_METRIC;
-use crate::async_scorer::truncation::CLASSIFICATION_TRUNCATION_METRIC;
 use codex_features::GuardianV2ReviewScopeConfigToml;
 
 const TEST_GUARDIAN_POLICY: &str =
@@ -270,6 +267,7 @@ async fn installed_extension_uses_http_after_warm_socket_auth_expires() -> Resul
                 turn_id: "turn-1",
                 root_turn_id: None,
                 call_id,
+                originating_item_id: None,
                 tool_name: &tool_name,
                 mcp_tool: None,
                 payload: &payload,
@@ -348,7 +346,25 @@ fn fast_decision_metric(decision: &str, reason: &str) -> RecordedMetric {
 #[derive(Default)]
 struct RecordingMetrics(Mutex<Vec<RecordedMetric>>);
 
+impl RecordingMetrics {
+    fn classification_samples(&self) -> Vec<RecordedMetric> {
+        self.0.lock().unwrap().iter().filter(|sample| {
+            !matches!(sample, RecordedMetric::Histogram(name, _, _) if name == codex_guardian_context::SECTION_COST_METRIC || name == codex_guardian_context::REQUEST_TOKENS_METRIC)
+        }).cloned().collect()
+    }
+}
+
 impl ExtensionMetrics for RecordingMetrics {
+    fn histogram_with_boundaries(
+        &self,
+        name: &str,
+        value: i64,
+        _boundaries: &[f64],
+        tags: &[(&str, &str)],
+    ) {
+        self.histogram(name, value, tags);
+    }
+
     fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) {
         self.0.lock().unwrap().push(RecordedMetric::Counter(
             name.to_owned(),
@@ -543,6 +559,7 @@ async fn sandboxed_shell_classification_respects_review_scope() -> Result<()> {
             turn_id: "turn-1",
             root_turn_id: None,
             call_id: "call-2",
+            originating_item_id: None,
             tool_name: &tool_name,
             mcp_tool: None,
             payload: &payload,
@@ -634,6 +651,7 @@ async fn computer_use_only_scores_cannot_approve_other_actions() -> Result<()> {
             turn_id: "turn-1",
             root_turn_id: None,
             call_id: "ordinary-call",
+            originating_item_id: None,
             tool_name: &ordinary_tool,
             mcp_tool: None,
             payload: &payload,
@@ -946,6 +964,7 @@ async fn sample_configured_conversation_history_with_source(
             turn_id: "turn-1",
             root_turn_id: Some("root-turn"),
             call_id: "call-1",
+            originating_item_id: None,
             tool_name: &tool_name,
             mcp_tool: None,
             payload: &tool_payload,
@@ -1080,6 +1099,7 @@ impl GuardianFailureFixture {
                 turn_id: "turn-1",
                 root_turn_id: None,
                 call_id: "call-1",
+                originating_item_id: None,
                 tool_name: &tool_name,
                 mcp_tool: None,
                 payload: &payload,
@@ -1178,19 +1198,6 @@ async fn contributor_fails_closed_when_model_configuration_is_invalid() -> Resul
         .insert(parent_model);
 
     fixture.score_tool(ToolName::plain("read_file")).await;
-    fixture.assert_fails_closed("elevated_risk").await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn contributor_fails_closed_when_action_serialization_fails() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let fixture = GuardianFailureFixture::new().await?;
-    let oversized_tool_name = ToolName::plain(
-        "x".repeat(TruncationPolicy::Tokens(DEFAULT_MODEL_CONTEXT_ITEM_TOKENS).byte_budget()),
-    );
-
-    fixture.score_tool(oversized_tool_name).await;
     fixture.assert_fails_closed("elevated_risk").await
 }
 
@@ -1365,7 +1372,7 @@ max_recent_non_user_entries = 8
             internal_chat_message_metadata_passthrough: None,
         },
     ];
-    let arguments = json!({"body": "x".repeat(4_000)}).to_string();
+    let arguments = json!({"body": "x".repeat(/*n*/ 128)}).to_string();
     let (request, test, registry) = sample_configured_conversation_history(
         conversation_history,
         &arguments,
@@ -1410,16 +1417,11 @@ max_recent_non_user_entries = 8
         .as_str()
         .expect("planned action should be a text item");
     assert!(action.len() <= TruncationPolicy::Tokens(/*limit*/ 128).byte_budget());
-    let original_action_bytes = i64::try_from(
-        serde_json::to_string_pretty(&json!({
-            "body": "x".repeat(4_000),
-            "tool": "read_file",
-        }))?
-        .len(),
-    )?;
     let action: serde_json::Value = serde_json::from_str(action)?;
-    let retained_action_bytes = i64::try_from(serde_json::to_string_pretty(&action)?.len())?;
-    assert_eq!(action["tool"], "read_file");
+    assert_eq!(
+        action,
+        json!({"body": "x".repeat(/*n*/ 128), "tool": "read_file"})
+    );
 
     let thread_store = test.codex.thread_extension_data();
     let score_progress = thread_store
@@ -1431,12 +1433,22 @@ max_recent_non_user_entries = 8
             .latest_scored_tool_call
             .load(Ordering::Acquire)
             == 0
-            || metrics.0.lock().unwrap().len() < 14
+            || metrics.classification_samples().len() < 10
         {
             tokio::task::yield_now().await;
         }
     })
     .await?;
+    assert!(metrics.0.lock().unwrap().iter().any(|sample| {
+        matches!(sample, RecordedMetric::Histogram(name, value, tags)
+        if name == codex_guardian_context::SECTION_COST_METRIC
+            && *value > 0
+            && tags == &[
+                ("target".to_owned(), "async".to_owned()),
+                ("section".to_owned(), "conversation_transcript".to_owned()),
+                ("measurement".to_owned(), "text_bytes".to_owned()),
+            ])
+    }));
     thread_store.insert(SecurityRiskScore {
         scores: BTreeMap::from([("action_risk".to_owned(), 0.65)]),
         call_id: None,
@@ -1473,6 +1485,33 @@ max_recent_non_user_entries = 8
         .await,
         Some(ReviewDecision::Approved)
     );
+
+    // A small scored call does not cover expanded elicitation arguments or an
+    // intercepted exec with no tool-call ID. Both must still fit the action budget.
+    for (argument, expected) in [
+        ("small".to_owned(), Some(ReviewDecision::Approved)),
+        ("expanded argument ".repeat(/*n*/ 128), None),
+    ] {
+        for action in [
+            json!({
+                "tool": "mcp_tool_call", "server": "example", "id": "call-1",
+                "arguments": {"body": argument},
+                "tool_description": "optional metadata ".repeat(/*n*/ 128),
+            }),
+            json!({"tool": "exec_command", "program": "example", "argv": [argument]}),
+        ] {
+            assert_eq!(
+                cached_approval(
+                    &registry,
+                    thread_store,
+                    &action.to_string(),
+                    /*metrics*/ None
+                )
+                .await,
+                expected
+            );
+        }
+    }
 
     assert_eq!(
         score_progress
@@ -1530,7 +1569,7 @@ max_recent_non_user_entries = 8
         Some(ReviewDecision::Approved)
     );
 
-    let samples = initial_metrics.0.lock().unwrap();
+    let samples = initial_metrics.classification_samples();
     let classification_duration_ms = match &samples[9] {
         RecordedMetric::Histogram(name, duration_ms, _)
             if name == CLASSIFICATION_DURATION_METRIC =>
@@ -1540,7 +1579,7 @@ max_recent_non_user_entries = 8
         sample => panic!("expected classification duration metric, got {sample:?}"),
     };
     assert_eq!(
-        *samples,
+        samples,
         [
             ("total", 150),
             ("input", 120),
@@ -1574,34 +1613,7 @@ max_recent_non_user_entries = 8
                 classification_duration_ms,
                 vec![("outcome".to_owned(), "success".to_owned())],
             ),
-            RecordedMetric::Counter(
-                CLASSIFICATION_TRUNCATION_METRIC.to_owned(),
-                1,
-                vec![
-                    ("component".to_owned(), "action".to_owned()),
-                    ("disposition".to_owned(), "truncated".to_owned()),
-                ],
-            ),
         ])
-        .chain(
-            [
-                ("original", original_action_bytes),
-                ("retained", retained_action_bytes),
-                ("omitted", original_action_bytes - retained_action_bytes),
-            ]
-            .into_iter()
-            .map(|(measurement, bytes)| {
-                RecordedMetric::Histogram(
-                    CLASSIFICATION_TRUNCATION_BYTES_METRIC.to_owned(),
-                    bytes,
-                    vec![
-                        ("component".to_owned(), "action".to_owned()),
-                        ("disposition".to_owned(), "truncated".to_owned()),
-                        ("measurement".to_owned(), measurement.to_owned()),
-                    ],
-                )
-            }),
-        )
         .chain([
             RecordedMetric::Histogram(TOOL_CALL_LAG_METRIC.to_owned(), 0, vec![]),
             fast_decision_metric("deferred", "elevated_risk"),
@@ -1754,7 +1766,7 @@ async fn contributor_uses_model_defaults_and_preserves_local_overrides() -> Resu
             internal_chat_message_metadata_passthrough: None,
         },
     ];
-    let arguments = json!({"body": "x".repeat(4_000)}).to_string();
+    let arguments = json!({"body": "x".repeat(/*n*/ 128)}).to_string();
     let local_config = "[features.guardianv2]\nenabled = true\nreview_threshold = 0.70\n";
     let (request, test, registry) = sample_configured_conversation_history(
         conversation_history,
@@ -1925,6 +1937,7 @@ async fn assert_luna_pool_context(thread_context_enabled: bool) -> Result<()> {
             "parent_turn_id": "turn-1",
             "root_turn_id": "root-turn",
             "thread_source": "guardian_classifier",
+            "turn_trigger": "guardian_classifier",
         })
     );
     assert_eq!(request["client_metadata"]["x-openai-subagent"], "guardian");
@@ -2248,6 +2261,7 @@ async fn contributor_skips_required_models_in_standard_scope() -> Result<()> {
             turn_id: "turn-1",
             root_turn_id: None,
             call_id: "protected.md",
+            originating_item_id: None,
             tool_name: &tool_name,
             mcp_tool: None,
             payload: &payload,
@@ -2505,6 +2519,7 @@ async fn contributor_counts_failed_thread_lookups_toward_score_lag() -> Result<(
             turn_id: "turn-1",
             root_turn_id: None,
             call_id: "missing.md",
+            originating_item_id: None,
             tool_name: &tool_name,
             mcp_tool: None,
             payload: &payload,
@@ -2810,9 +2825,12 @@ async fn contributor_sends_compacted_conversation_history_to_luna() -> Result<()
         .filter_map(|entry| entry["text"].as_str())
         .collect::<Vec<_>>();
 
-    assert!(entries.iter().any(|entry| entry.contains("user turn 0:")));
-    assert!(entries.iter().any(|entry| entry.contains("user turn 7:")));
-    assert!(!entries.iter().any(|entry| entry.contains("user turn 1:")));
+    for index in 0..8 {
+        assert!(entries.iter().any(|entry| entry.contains(&format!(
+            "user turn {index}: {}",
+            "authorization ".repeat(/*n*/ 1_000)
+        ))));
+    }
     assert!(
         entries
             .iter()
@@ -2861,6 +2879,9 @@ async fn contributor_sends_compacted_conversation_history_to_luna() -> Result<()
 
     for entry in entries.into_iter().filter(|entry| entry.starts_with('[')) {
         let (label, text) = entry.split_once(": ").expect("numbered transcript entry");
+        if label.ends_with(" user") {
+            continue;
+        }
         let max_tokens = if label.contains("tool ") {
             MAX_TOOL_ENTRY_TOKENS
         } else {
@@ -2997,6 +3018,7 @@ async fn assert_parent_compaction_reuse(thread_context_enabled: bool) -> Result<
             turn_id: "turn-1",
             root_turn_id: None,
             call_id: "call-1",
+            originating_item_id: None,
             tool_name: &tool_name,
             mcp_tool: None,
             payload: &tool_payload,
@@ -3072,6 +3094,7 @@ async fn assert_parent_compaction_reuse(thread_context_enabled: bool) -> Result<
             turn_id: "turn-1",
             root_turn_id: None,
             call_id: "call-2",
+            originating_item_id: None,
             tool_name: &tool_name,
             mcp_tool: None,
             payload: &tool_payload,
@@ -3174,79 +3197,121 @@ async fn legacy_contributor_can_disable_parent_compaction_reuse() -> Result<()> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn contributor_bounds_oversized_actions_and_fairly_truncates_nested_fields() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let arguments = json!({
-        "attachments": [{
-            "content": "🦀\"\\\n".repeat(20_000),
-            "name": "financials.csv",
-        }],
-        "call_id": "untrusted-call",
-        "metadata": { "reason": "b".repeat(100_000) },
-        "path": "a".repeat(100_000),
-        "recipient": "finance@example.com",
-        "tool": "untrusted-tool",
-    })
-    .to_string();
-    let (request, _test, _registry) =
-        sample_conversation_history(Vec::new(), &arguments, Some(TEST_GUARDIAN_POLICY)).await?;
-    let content = request["input"][2]["content"]
-        .as_array()
-        .expect("Luna user content should contain separate text items");
-    let action_text = content[content.len() - 2]["text"]
-        .as_str()
-        .expect("the current action should be an input text item");
-    let action = serde_json::from_str::<serde_json::Value>(action_text)?;
-    let max_action_bytes =
-        TruncationPolicy::Tokens(DEFAULT_MODEL_CONTEXT_ITEM_TOKENS).byte_budget();
-    assert!(action_text.ends_with('\n'));
-    assert!(
-        action_text.len() <= max_action_bytes,
-        "the complete model-visible action must remain bounded"
-    );
-    assert!(
-        action_text.len() >= max_action_bytes * 9 / 10,
-        "water-filling should use the available action budget"
-    );
-    assert_eq!(action["tool"], "read_file");
-    assert_eq!(action["call_id"], "untrusted-call");
-    assert_eq!(action["recipient"], "finance@example.com");
-    assert_eq!(action["attachments"][0]["name"], "financials.csv");
-    assert!(action.get("arguments_preview").is_none());
-    assert!(action.get("truncated").is_none());
-    let retained_values = [
-        &action["path"],
-        &action["metadata"]["reason"],
-        &action["attachments"][0]["content"],
-    ]
-    .map(|value| {
-        value
-            .as_str()
-            .expect("action string field should remain present")
-    });
-    for text in retained_values {
-        assert!(text.contains("<truncated omitted_approx_tokens=\""));
-    }
-    let smallest_retained = retained_values.iter().map(|text| text.len()).min().unwrap();
-    let largest_retained = retained_values.iter().map(|text| text.len()).max().unwrap();
-    assert!(
-        largest_retained.saturating_sub(smallest_retained) <= 16,
-        "long nested strings should receive comparable shares of the action budget"
-    );
-
-    Ok(())
-}
-
 struct CacheMiss;
 impl codex_extension_api::SynchronousApprovalReviewer for CacheMiss {
     fn review(
         &self,
         _reason: codex_protocol::approvals::GuardianReviewReason,
-    ) -> codex_extension_api::ExtensionFuture<'_, ReviewDecision> {
-        Box::pin(async { ReviewDecision::denied("cache miss") })
+    ) -> codex_extension_api::ExtensionFuture<'_, Option<ReviewDecision>> {
+        Box::pin(async { Some(ReviewDecision::denied("cache miss")) })
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_approval_discounts_only_its_own_unscored_wrapper() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let fixture = GuardianFailureFixture::new().await?;
+    let store = fixture.test.codex.thread_extension_data();
+    let progress = store.get::<GuardianV2ScoreProgress>().unwrap();
+    let mut score = store.get::<SecurityRiskScore>().unwrap().as_ref().clone();
+    score.scores.insert("action_risk".to_owned(), 0.0);
+    store.insert(score);
+    // Hold the cached score fixed while advancing real tool-start metadata.
+    let start = |call_id: &str, origin: &ResponseItemId, source: ToolCallSource| {
+        let tool_name = match source {
+            ToolCallSource::Direct => ToolName::plain("exec"),
+            ToolCallSource::CodeMode { .. } => ToolName::namespaced("mcp__example", "read"),
+        };
+        let payload = match source {
+            ToolCallSource::Direct => ToolPayload::Custom {
+                input: String::new(),
+            },
+            ToolCallSource::CodeMode { .. } => ToolPayload::Function {
+                arguments: "{}".to_owned(),
+            },
+        };
+        let index = progress
+            .latest_tool_call
+            .fetch_add(/*val*/ 1, Ordering::Relaxed)
+            + 1;
+        progress.wrapper_lag.record(
+            &ToolStartInput {
+                session_store: &fixture.session_store,
+                thread_store: store,
+                turn_store: &fixture.session_store,
+                turn_id: "turn",
+                root_turn_id: None,
+                call_id,
+                originating_item_id: Some(origin),
+                tool_name: &tool_name,
+                mcp_tool: None,
+                payload: &payload,
+                conversation_history: Arc::new(TestConversationHistory(Vec::new())),
+                source,
+            },
+            index,
+        );
+        index
+    };
+    let approve = async |call_id: &str| {
+        cached_approval(
+            &fixture.registry,
+            store,
+            &json!({"tool": "mcp_tool_call", "server": "example", "id": call_id}).to_string(),
+            /*metrics*/ None,
+        )
+        .await
+    };
+    let nested = ToolCallSource::CodeMode {
+        cell_id: "cell".to_owned(),
+        runtime_tool_call_id: "nested".to_owned(),
+    };
+    let origin = ResponseItemId::from_server("wrapper".to_owned());
+    let wrapper = start("wrapper", &origin, ToolCallSource::Direct);
+    for (call_id, expected) in [
+        ("first", Some(ReviewDecision::Approved)),
+        ("second", Some(ReviewDecision::Approved)),
+        ("third", None),
+    ] {
+        start(call_id, &origin, nested.clone());
+        assert_eq!(approve(call_id).await, expected);
+    }
+    // A score covering the wrapper must not receive another discount.
+    progress
+        .latest_scored_tool_call
+        .store(wrapper, Ordering::Release);
+    assert_eq!(approve("third").await, None);
+    progress
+        .latest_scored_tool_call
+        .store(wrapper + 3, Ordering::Release);
+    let output = start("output-only", &origin, ToolCallSource::Direct);
+    let other = ResponseItemId::from_server("other-wrapper".to_owned());
+    start("other-wrapper", &other, ToolCallSource::Direct);
+    start("other-first", &other, nested.clone());
+    assert_eq!(approve("other-first").await, Some(ReviewDecision::Approved));
+    assert_eq!(approve("unknown").await, None);
+    start("other-second", &other, nested.clone());
+    assert_eq!(approve("other-second").await, None);
+    // Covering a different wrapper still leaves this call's parent in its lag.
+    progress
+        .latest_scored_tool_call
+        .store(output, Ordering::Release);
+    assert_eq!(
+        approve("other-second").await,
+        Some(ReviewDecision::Approved)
+    );
+    // Evicted provenance falls back to the full lag.
+    for _ in 0..300 {
+        start("output-only", &origin, ToolCallSource::Direct);
+    }
+    start("late-child", &other, nested);
+    assert_eq!(
+        progress
+            .wrapper_lag
+            .discount(Some("late-child"), /*latest_scored*/ 0),
+        0
+    );
+    Ok(())
 }
 
 /// Exercises decision routing; a fresh review is observed as a cache miss.
@@ -3275,6 +3340,7 @@ async fn cached_approval(
     };
     let input = codex_extension_api::ApprovalDecisionInput {
         approval_id: "cache-probe",
+        tool_call_id: action.get("id").and_then(serde_json::Value::as_str),
         action: &action,
         thread_id: codex_protocol::ThreadId::from_string(store.level_id()).unwrap(),
         thread_store: store,
@@ -3303,3 +3369,6 @@ fn review_scope(action: &serde_json::Value) -> Option<GuardianScope> {
         tool => GuardianScope::for_tool(&ToolName::plain(tool)),
     }
 }
+
+#[path = "budget_tests.rs"]
+mod budget;

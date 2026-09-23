@@ -358,7 +358,6 @@ async fn status_snapshot_includes_reasoning_details() {
 #[tokio::test]
 async fn status_snapshot_shows_chatgpt_plan_without_email() {
     let temp_home = TempDir::new().expect("temp home");
-    write_models_cache(temp_home.path()).expect("write models cache");
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
@@ -371,6 +370,9 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         AuthCredentialsStoreMode::File,
     )
     .expect("write email-less ChatGPT auth");
+    write_models_cache(temp_home.path())
+        .await
+        .expect("write models cache");
     let mut app_server = crate::start_embedded_app_server_for_picker(&config)
         .await
         .expect("start embedded app server");
@@ -742,6 +744,7 @@ async fn status_uses_server_provider_id_and_auth_requirement() {
         ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
             profile: None,
             region: Some("eu-west-1".to_string()),
+            credential_export: None,
             auth_refresh: None,
         }));
     config.model_provider.base_url =

@@ -58,10 +58,19 @@ pub fn tool_is_model_visible(tool: &ToolInfo) -> bool {
         .any(|target| target.as_str() == Some(MCP_UI_MODEL_VISIBILITY))
 }
 
+/// Catalog identity within one published connection set, including dormant servers.
+#[derive(PartialEq, Eq)]
+pub(crate) enum BindingCatalogRevision {
+    Ready(ClientToolCatalogRevision),
+    Dormant(u64),
+}
+
 impl McpConnectionSet {
     pub(crate) async fn stable_catalog_revisions(
         &self,
-    ) -> Option<HashMap<String, ClientToolCatalogRevision>> {
+        required_servers: &[String],
+        required_plugins: &HashSet<String>,
+    ) -> Option<HashMap<String, BindingCatalogRevision>> {
         let mut revisions = HashMap::new();
         for (server_name, view) in &self.servers {
             if !view
@@ -70,7 +79,31 @@ impl McpConnectionSet {
                 .startup_complete
                 .load(Ordering::Acquire)
             {
-                return None;
+                // A cached catalog can remain stable without starting its server.
+                // Explicit requirements must still start the server during binding capture.
+                if !view.connection.startup_is_dormant()
+                    || view.connection.client.cancel_token.is_cancelled()
+                    || required_servers
+                        .iter()
+                        .any(|required| required == server_name)
+                    || (self.is_selected_plugin_mcp_server(server_name)
+                        && self
+                            .plugin_id_for_mcp_server_name(server_name)
+                            .is_some_and(|plugin_id| required_plugins.contains(plugin_id)))
+                {
+                    return None;
+                }
+                let revision = view
+                    .connection
+                    .client
+                    .tool_catalog_cache_context
+                    .as_ref()?
+                    .current_revision()?;
+                revisions.insert(
+                    server_name.clone(),
+                    BindingCatalogRevision::Dormant(revision),
+                );
+                continue;
             }
             let Some(client) = view.connection.client.ready_client() else {
                 if !view.connection.client.is_codex_apps_mcp_server
@@ -87,10 +120,10 @@ impl McpConnectionSet {
             let revision = client.tool_catalog.read(|catalog| catalog.revision).await;
             revisions.insert(
                 server_name.clone(),
-                ClientToolCatalogRevision {
+                BindingCatalogRevision::Ready(ClientToolCatalogRevision {
                     catalog: Arc::clone(&client.tool_catalog),
                     revision,
-                },
+                }),
             );
         }
         Some(revisions)
@@ -168,6 +201,7 @@ impl McpConnectionSet {
         (tools, errors)
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub(crate) async fn capture_binding_with_metadata(
         self: &Arc<Self>,
         config: Arc<crate::McpConfig>,
@@ -446,7 +480,7 @@ impl McpConnectionSet {
             .client()
             .await
             .context("failed to get client")?;
-        let (client_tools, tools, list_start) = managed_client
+        let (tools, list_start) = managed_client
             .tool_catalog
             .refresh(
                 || async {
@@ -474,8 +508,8 @@ impl McpConnectionSet {
                     Ok((client_tools, (fetch_ticket, list_start)))
                 },
                 |client_tools, (fetch_ticket, list_start)| {
-                    // Discovery may accept another client's newer fetch. The catalog
-                    // retains the tools fetched through this exact connection.
+                    // Discovery can accept another scope's winner; executable catalogs
+                    // receive only the latest successful fetch from their own scope.
                     let tools = match (
                         managed_client.codex_apps_tools_cache_context.as_ref(),
                         fetch_ticket,
@@ -489,10 +523,14 @@ impl McpConnectionSet {
                         (None, None) => client_tools.to_vec(),
                         _ => unreachable!("Codex Apps fetch ticket requires cache context"),
                     };
-                    (client_tools.to_vec(), tools, list_start)
+                    (tools, list_start)
                 },
             )
             .await?;
+        let client_tools = managed_client
+            .tool_catalog
+            .read(|catalog| catalog.tools.clone())
+            .await;
         emit_duration(
             MCP_TOOLS_LIST_DURATION_METRIC,
             list_start.elapsed(),

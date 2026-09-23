@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::managed_install::ExecutableIdentity;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -19,9 +20,10 @@ use tokio::io::AsyncSeekExt;
 use tokio::process::Command;
 use tokio::time::sleep;
 
+use crate::settings::DEFAULT_SHUTDOWN_GRACE_SECONDS;
+
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const STOP_GRACE_PERIOD: Duration = Duration::from_secs(60);
-const STOP_TIMEOUT: Duration = Duration::from_secs(70);
+const STOP_FORCE_TIMEOUT: Duration = Duration::from_secs(10);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const STDERR_LOG_TAIL_BYTES: u64 = 4096;
 
@@ -39,6 +41,8 @@ pub(crate) struct PidBackend {
 struct PidRecord {
     pid: u32,
     process_start_time: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executable_identity: Option<ExecutableIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +79,15 @@ enum PidCommandKind {
 }
 
 impl PidBackend {
+    pub(crate) async fn running_executable_identity(&self) -> Result<Option<ExecutableIdentity>> {
+        match self.read_pid_file_state().await? {
+            PidFileState::Running(record) if self.record_is_active(&record).await? => {
+                Ok(record.executable_identity)
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn new(codex_bin: PathBuf, pid_file: PathBuf, remote_control_enabled: bool) -> Self {
         let lock_file = pid_file.with_extension("pid.lock");
         Self {
@@ -126,6 +139,10 @@ impl PidBackend {
     }
 
     pub(crate) async fn stop(&self) -> Result<()> {
+        self.stop_with_grace(DEFAULT_SHUTDOWN_GRACE_SECONDS).await
+    }
+
+    pub(crate) async fn stop_with_grace(&self, grace_seconds: u32) -> Result<()> {
         loop {
             let Some(record) = self.wait_for_pid_start().await? else {
                 return Ok(());
@@ -139,7 +156,8 @@ impl PidBackend {
 
             let pid = record.pid;
             let started_at = tokio::time::Instant::now();
-            let deadline = started_at + STOP_TIMEOUT;
+            let force_after = Duration::from_secs(grace_seconds.into());
+            let deadline = started_at + force_after + STOP_FORCE_TIMEOUT;
             #[cfg(unix)]
             self.terminate_process(pid)?;
             #[cfg(windows)]
@@ -191,7 +209,7 @@ impl PidBackend {
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                if !forced && started_at.elapsed() >= STOP_GRACE_PERIOD {
+                if !forced && started_at.elapsed() >= force_after {
                     #[cfg(unix)]
                     self.force_terminate_process(pid)?;
                     #[cfg(windows)]
@@ -361,6 +379,9 @@ impl PidBackend {
     fn terminate_process(&self, pid: u32) -> Result<()> {
         match self.command_kind {
             PidCommandKind::AppServer { .. } => terminate_process(pid),
+            #[cfg(unix)]
+            PidCommandKind::UpdateLoop => terminate_process_group(pid),
+            #[cfg(not(unix))]
             PidCommandKind::UpdateLoop => terminate_process(pid),
         }
     }
@@ -465,6 +486,21 @@ fn force_terminate_process(pid: u32) -> Result<()> {
         return Ok(());
     }
     Err(err).with_context(|| format!("failed to force terminate pid-managed app server {pid}"))
+}
+
+#[cfg(unix)]
+fn terminate_process_group(pid: u32) -> Result<()> {
+    let raw_pid = libc::pid_t::try_from(pid)
+        .with_context(|| format!("pid-managed updater pid {pid} is out of range"))?;
+    let result = unsafe { libc::kill(-raw_pid, libc::SIGTERM) };
+    if result == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err).with_context(|| format!("failed to terminate pid-managed updater group {pid}"))
 }
 
 #[cfg(unix)]

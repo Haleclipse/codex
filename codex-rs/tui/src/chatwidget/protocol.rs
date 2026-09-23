@@ -15,6 +15,11 @@ impl ChatWidget {
             return;
         }
 
+        if replay_kind != Some(ReplayKind::ResumeInitialMessages)
+            && !self.recover_resumed_reasoning(&notification)
+        {
+            return;
+        }
         let was_replaying_turn_completion = self.thread_usage.replaying_turn_completion;
         self.thread_usage.replaying_turn_completion = replay_kind.is_some();
         let from_replay = replay_kind.is_some();
@@ -61,7 +66,10 @@ impl ChatWidget {
             }
             ServerNotification::TurnStarted(notification) => {
                 if replay_kind.is_none() {
-                    self.clear_misalignment_for_new_turn(&notification.turn.id);
+                    self.clear_misalignment_for_new_turn(
+                        &notification.turn.id,
+                        MisalignmentTurnSource::ServerNotification,
+                    );
                 }
                 self.turn_lifecycle.last_turn_id = Some(notification.turn.id);
                 self.last_non_retry_error = None;
@@ -80,18 +88,48 @@ impl ChatWidget {
                 self.handle_item_completed_notification(notification, replay_kind);
             }
             ServerNotification::AgentMessageDelta(notification) => {
-                self.on_agent_message_delta(notification.delta);
+                if !self.is_realtime_delegated_reasoning_turn(&notification.turn_id)
+                    && (from_replay
+                        || !self.is_realtime_delegated_agent_item(
+                            &notification.turn_id,
+                            &notification.item_id,
+                        ))
+                {
+                    self.on_agent_message_delta(notification.delta);
+                }
             }
             ServerNotification::PlanDelta(notification) => self.on_plan_delta(notification.delta),
             ServerNotification::ReasoningSummaryTextDelta(notification) => {
-                self.on_agent_reasoning_delta(notification.delta);
-            }
-            ServerNotification::ReasoningTextDelta(notification) => {
-                if self.config.show_raw_agent_reasoning {
+                if !self.is_realtime_delegated_reasoning_item(
+                    &notification.turn_id,
+                    &notification.item_id,
+                ) && self.status_state.reasoning_item_id.as_deref()
+                    == Some(&notification.item_id)
+                {
                     self.on_agent_reasoning_delta(notification.delta);
                 }
             }
-            ServerNotification::ReasoningSummaryPartAdded(_) => self.on_reasoning_section_break(),
+            ServerNotification::ReasoningTextDelta(notification) => {
+                if self.config.show_raw_agent_reasoning
+                    && !self.is_realtime_delegated_reasoning_item(
+                        &notification.turn_id,
+                        &notification.item_id,
+                    )
+                    && self.status_state.reasoning_item_id.as_deref() == Some(&notification.item_id)
+                {
+                    self.on_agent_reasoning_delta(notification.delta);
+                }
+            }
+            ServerNotification::ReasoningSummaryPartAdded(notification) => {
+                if !self.is_realtime_delegated_reasoning_item(
+                    &notification.turn_id,
+                    &notification.item_id,
+                ) && self.status_state.reasoning_item_id.as_deref()
+                    == Some(&notification.item_id)
+                {
+                    self.on_reasoning_section_break();
+                }
+            }
             ServerNotification::TerminalInteraction(notification) => {
                 self.on_terminal_interaction(notification.process_id, notification.stdin)
             }
@@ -239,6 +277,36 @@ impl ChatWidget {
             ServerNotification::AccountRateLimitsUpdated(notification) => {
                 self.on_rate_limit_snapshot(Some(notification.rate_limits));
             }
+            ServerNotification::ThreadRealtimeSdp(notification) => {
+                if !from_replay {
+                    self.on_realtime_conversation_sdp(notification.sdp);
+                }
+            }
+            ServerNotification::ThreadRealtimeStarted(_) => {
+                if !from_replay {
+                    self.on_realtime_conversation_started();
+                }
+            }
+            ServerNotification::ThreadRealtimeTranscriptDelta(notification) => {
+                if !from_replay {
+                    self.on_realtime_transcript_delta(notification.role, notification.delta);
+                }
+            }
+            ServerNotification::ThreadRealtimeTranscriptDone(notification) => {
+                if !from_replay {
+                    self.on_realtime_transcript_done(notification.role, notification.text);
+                }
+            }
+            ServerNotification::ThreadRealtimeError(notification) => {
+                if !from_replay {
+                    self.on_realtime_error(notification.message);
+                }
+            }
+            ServerNotification::ThreadRealtimeClosed(notification) => {
+                if !from_replay {
+                    self.on_realtime_conversation_closed(notification.reason);
+                }
+            }
             ServerNotification::ServerRequestResolved(_)
             | ServerNotification::AccountUpdated(_)
             | ServerNotification::ThreadStarted(_)
@@ -248,6 +316,7 @@ impl ChatWidget {
             | ServerNotification::ThreadArchived(_)
             | ServerNotification::ThreadDeleted(_)
             | ServerNotification::ThreadUnarchived(_)
+            | ServerNotification::ThreadAttachmentUpdated(_)
             | ServerNotification::RawResponseItemCompleted(_)
             | ServerNotification::RawResponseCompleted(_)
             | ServerNotification::CommandExecOutputDelta(_)
@@ -267,23 +336,31 @@ impl ChatWidget {
             | ServerNotification::TurnModerationMetadata(_)
             | ServerNotification::FuzzyFileSearchSessionUpdated(_)
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
-            | ServerNotification::ThreadRealtimeStarted(_)
             | ServerNotification::ThreadRealtimeItemAdded(_)
             | ServerNotification::ThreadRealtimeItemStarted(_)
             | ServerNotification::ThreadRealtimeItemTranscriptDelta(_)
             | ServerNotification::ThreadRealtimeItemCompleted(_)
             | ServerNotification::ThreadRealtimeOutputAudioDelta(_)
-            | ServerNotification::ThreadRealtimeError(_)
-            | ServerNotification::ThreadRealtimeClosed(_)
-            | ServerNotification::ThreadRealtimeSdp(_)
-            | ServerNotification::ThreadRealtimeTranscriptDelta(_)
-            | ServerNotification::ThreadRealtimeTranscriptDone(_)
             | ServerNotification::WindowsWorldWritableWarning(_)
             | ServerNotification::WindowsSandboxSetupCompleted(_)
             | ServerNotification::AccountLoginCompleted(_)
             | ServerNotification::ProjectChanged(_)
             | ServerNotification::ThreadProjectUpdated(_) => {}
             ServerNotification::ContextCompacted(_) => {}
+        }
+        // Tool and hook activity can recreate a hidden row with its default
+        // heading. Restore the selected status before that row is rendered.
+        if self
+            .bottom_pane
+            .status_widget()
+            .is_some_and(|status| status.header() != self.status_state.current_status.header)
+        {
+            self.bottom_pane.update_status(
+                self.status_state.current_status.header.clone(),
+                self.status_state.current_status.details.clone(),
+                StatusDetailsCapitalization::Preserve,
+                self.status_state.current_status.details_max_lines,
+            );
         }
         self.thread_usage.replaying_turn_completion = was_replaying_turn_completion;
     }
@@ -313,7 +390,12 @@ impl ChatWidget {
                                 text,
                                 phase: Some(MessagePhase::FinalAnswer) | None,
                                 ..
-                            } => Some((item.clone(), id.clone(), text.clone())),
+                            } if !self
+                                .is_realtime_delegated_reasoning_turn(&notification.turn.id)
+                                || !realtime::is_private_realtime_agent_item(item) =>
+                            {
+                                Some((item.clone(), id.clone(), text.clone()))
+                            }
                             _ => None,
                         });
                 if let Some((item, id, _)) = &last_agent_message
@@ -332,10 +414,16 @@ impl ChatWidget {
                             .map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
                     );
                 }
+                if replay_kind.is_none()
+                    && let Some((item, _, _)) = &last_agent_message
+                {
+                    self.speak_completed_realtime_delegation(&notification.turn.id, item);
+                }
                 self.last_non_retry_error = None;
+                let completion = self.completion_cell(&notification.turn, replay_kind);
                 self.on_task_complete(
                     last_agent_message.map(|(_, _, text)| text),
-                    notification.turn.duration_ms,
+                    completion,
                     replay_kind.is_some(),
                 );
             }
@@ -357,7 +445,10 @@ impl ChatWidget {
                         && error.codex_error_info
                             == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation)
                     {
-                        self.on_misalignment_error(Some(notification.turn.id), error.misalignment);
+                        self.on_misalignment_error(
+                            Some(notification.turn.id.clone()),
+                            error.misalignment,
+                        );
                         self.last_non_retry_error = None;
                     } else if self.last_non_retry_error.as_ref()
                         == Some(&(notification.turn.id.clone(), error.message.clone()))
@@ -375,6 +466,9 @@ impl ChatWidget {
             }
             TurnStatus::InProgress => {}
         }
+        if replay_kind.is_none() {
+            self.finish_realtime_turn(&notification.turn.id);
+        }
         self.thread_usage.replaying_turn_completion = was_replaying_turn_completion;
     }
 
@@ -384,6 +478,34 @@ impl ChatWidget {
         replay_kind: Option<ReplayKind>,
     ) {
         match notification.item {
+            ThreadItem::UserMessage { content, .. } if replay_kind.is_none() => {
+                self.note_realtime_user_item_started(&notification.turn_id, &content);
+            }
+            ThreadItem::UserMessage { content, .. }
+                if realtime::realtime_delegation_input(&content).is_some() =>
+            {
+                self.remember_realtime_delegated_reasoning_turn(&notification.turn_id);
+            }
+            ThreadItem::AgentMessage { id, .. } if replay_kind.is_none() => {
+                self.is_realtime_delegated_agent_item(&notification.turn_id, &id);
+            }
+            ThreadItem::Reasoning { id, .. } => {
+                if replay_kind.is_none()
+                    && !self.is_realtime_delegated_reasoning_turn(&notification.turn_id)
+                {
+                    // A later voice handoff can steer this turn without making an
+                    // already-started typed reasoning item private.
+                    self.realtime_conversation
+                        .agent_items
+                        .entry((notification.turn_id.clone(), id.clone()))
+                        .or_insert(realtime::RealtimeAgentItemOrigin::Typed);
+                }
+                if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages))
+                    && !self.is_realtime_delegated_reasoning_item(&notification.turn_id, &id)
+                {
+                    self.on_reasoning_item_started(id);
+                }
+            }
             ThreadItem::ContextCompaction { id }
                 if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) =>
             {
@@ -443,6 +565,17 @@ impl ChatWidget {
         notification: ItemCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
+        if replay_kind.is_none()
+            && self.is_realtime_delegated_reasoning_turn(&notification.turn_id)
+            && realtime::is_private_realtime_agent_item(&notification.item)
+            && !matches!(&notification.item, ThreadItem::AgentMessage { id, .. } | ThreadItem::Reasoning { id, .. }
+            if matches!(
+                self.realtime_conversation.agent_items.get(&(notification.turn_id.clone(), id.clone())),
+                Some(realtime::RealtimeAgentItemOrigin::Typed)
+            ))
+        {
+            return;
+        }
         // Buffered live notifications can introduce questions; historical turn replay cannot.
         if replay_kind == Some(ReplayKind::ThreadSnapshot)
             && let ThreadItem::AgentMessage {
@@ -452,6 +585,12 @@ impl ChatWidget {
             } = &notification.item
         {
             self.add_async_questions(id, questions);
+        }
+        if replay_kind.is_none()
+            && let ThreadItem::Reasoning { id, .. } = &notification.item
+            && self.status_state.reasoning_item_id.as_ref() != Some(id)
+        {
+            return;
         }
         match notification.item {
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),

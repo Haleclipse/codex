@@ -1,8 +1,4 @@
-//! Production synchronous reviewer helpers shared with the Guardian extension.
-//! These use the current policy, output contract and reviewer configuration;
-//! making them available does not select a new transcript mode or start a review.
+//! Opaque host capabilities for the synchronous Guardian extension.
+//! Core supplies context and runtime operations; the extension owns review policy and pooling.
 
-pub use crate::guardian::GuardianAssessment;
-pub use crate::guardian::build_guardian_review_session_config;
-pub use crate::guardian::guardian_output_schema;
-pub use crate::guardian::parse_guardian_assessment;
+pub use crate::guardian::GuardianReviewSessionHost;

@@ -48,6 +48,7 @@ pub(crate) struct CommandPopupFlags {
     pub(crate) service_tier_commands_enabled: bool,
     pub(crate) goal_command_enabled: bool,
     pub(crate) personality_command_enabled: bool,
+    pub(crate) voice_command_enabled: bool,
     pub(crate) worktrees_enabled: bool,
     pub(crate) windows_degraded_sandbox_active: bool,
     pub(crate) side_conversation_active: bool,
@@ -63,6 +64,7 @@ impl From<CommandPopupFlags> for BuiltinCommandFlags {
             service_tier_commands_enabled: value.service_tier_commands_enabled,
             goal_command_enabled: value.goal_command_enabled,
             personality_command_enabled: value.personality_command_enabled,
+            voice_command_enabled: value.voice_command_enabled,
             worktrees_enabled: value.worktrees_enabled,
             allow_elevate_sandbox: value.windows_degraded_sandbox_active,
             side_conversation_active: value.side_conversation_active,
@@ -412,6 +414,31 @@ mod tests {
         insta::assert_snapshot!("command_popup_app", format!("{buf:?}"));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn voice_command_popup_snapshot() {
+        let mut popup = CommandPopup::new(
+            CommandPopupFlags {
+                voice_command_enabled: true,
+                ..CommandPopupFlags::default()
+            },
+            Vec::new(),
+        );
+        popup.on_composer_text_change("/voice".to_string());
+
+        let width = 72;
+        let area = Rect::new(
+            /*x*/ 0,
+            /*y*/ 0,
+            width,
+            popup.calculate_required_height(width),
+        );
+        let mut buf = Buffer::empty(area);
+        popup.render_ref(area, &mut buf);
+
+        insta::assert_snapshot!("command_popup_voice", format!("{buf:?}"));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn default_command_popup_items_snapshot() {
@@ -537,6 +564,7 @@ mod tests {
                 service_tier_commands_enabled: false,
                 goal_command_enabled: false,
                 personality_command_enabled: true,
+                voice_command_enabled: false,
                 worktrees_enabled: true,
                 windows_degraded_sandbox_active: false,
                 side_conversation_active: false,
@@ -565,6 +593,7 @@ mod tests {
                 service_tier_commands_enabled: false,
                 goal_command_enabled: false,
                 personality_command_enabled: false,
+                voice_command_enabled: false,
                 worktrees_enabled: false,
                 windows_degraded_sandbox_active: false,
                 side_conversation_active: false,
@@ -598,6 +627,7 @@ mod tests {
                 service_tier_commands_enabled: false,
                 goal_command_enabled: false,
                 personality_command_enabled: true,
+                voice_command_enabled: false,
                 worktrees_enabled: true,
                 windows_degraded_sandbox_active: false,
                 side_conversation_active: false,

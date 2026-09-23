@@ -19,6 +19,22 @@ use crate::message_reader::MessageReader;
 const DEADLINE: Duration = Duration::from_secs(/*secs*/ 5);
 const RUNTIME_INITIALIZATION_DEADLINE: Duration = Duration::from_secs(/*secs*/ 30);
 
+/// Startup failures eligible for recovery remain distinct from all other failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionError {
+    NegotiationTimedOut,
+    Failed,
+}
+impl std::fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NegotiationTimedOut => "voice negotiation timed out",
+            Self::Failed => "voice connection failed",
+        })
+    }
+}
+impl std::error::Error for ConnectionError {}
+
 /// Owns one helper. Dropping it terminates the process and leaves its waiter to reap it.
 /// A successful handshake establishes compatibility only, not an active audio session.
 pub struct VoiceHost {
@@ -94,6 +110,12 @@ impl VoiceHost {
                 Duration::from_secs(/*secs*/ 20),
             )
             .await?;
+        if response == (Message::TransportTimedOut {}) {
+            self.process.terminate();
+            // A lost exit notification or failed cleanup is not retryable.
+            timeout(DEADLINE, &mut self.exit).await??;
+            return Err(ConnectionError::NegotiationTimedOut.into());
+        }
         ensure!(
             response == Message::TransportReady {},
             "unexpected voice helper response"

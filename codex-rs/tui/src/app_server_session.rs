@@ -6,6 +6,7 @@
 mod fs;
 mod history;
 mod models;
+mod realtime;
 mod rollout_history;
 mod thread_list;
 
@@ -553,6 +554,13 @@ impl AppServerSession {
             return None;
         };
         client.server_version()
+    }
+
+    pub(crate) fn server_codex_home(&self) -> Option<&str> {
+        let AppServerClient::Remote(client) = &self.client else {
+            return None;
+        };
+        client.codex_home()
     }
 
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
@@ -1915,6 +1923,36 @@ fn remove_permission_config_overrides(config: &mut Option<HashMap<String, serde_
     }
 }
 
+fn new_thread_reasoning_overrides(config: &Config) -> Option<HashMap<String, serde_json::Value>> {
+    let mut overrides = config_request_overrides_from_config(config).unwrap_or_default();
+    let summary = config
+        .model_reasoning_summary
+        .unwrap_or(codex_protocol::config_types::ReasoningSummary::Detailed);
+    overrides.insert(
+        "model_reasoning_summary".to_string(),
+        serde_json::Value::String(summary.to_string()),
+    );
+    let explicit_feature = config
+        .config_layer_stack
+        .effective_config()
+        .get("features")
+        .and_then(|features| features.get("concurrent_reasoning_summaries"))
+        .and_then(toml::Value::as_bool);
+    let features = overrides
+        .entry("features".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(features) = features.as_object_mut() {
+        features.insert(
+            "concurrent_reasoning_summaries".to_string(),
+            serde_json::Value::Bool(
+                summary != codex_protocol::config_types::ReasoningSummary::None
+                    && explicit_feature.unwrap_or(/*default*/ false),
+            ),
+        );
+    }
+    Some(overrides)
+}
+
 fn service_tier_override_from_config(config: &Config) -> Option<Option<String>> {
     let local_settings = LocalSettings::from(config);
     config.service_tier.clone().map(Some).or_else(|| {
@@ -2047,7 +2085,10 @@ pub(crate) fn thread_start_params_from_config(
         approvals_reviewer: approvals_reviewer_override_from_config(config),
         sandbox,
         permissions,
-        config: config_request_overrides_from_config(config),
+        config: match thread_params_mode {
+            ThreadParamsMode::Embedded => new_thread_reasoning_overrides(config),
+            ThreadParamsMode::Remote => config_request_overrides_from_config(config),
+        },
         ephemeral: Some(config.ephemeral),
         history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
         session_start_source,
@@ -2471,6 +2512,10 @@ pub(crate) fn app_server_rate_limit_snapshots(
     }
     snapshots
 }
+
+#[cfg(test)]
+#[path = "app_server_session/reasoning_defaults_tests.rs"]
+mod reasoning_defaults_tests;
 
 #[cfg(test)]
 #[path = "app_server_session/prompt_history_tests.rs"]
@@ -3360,7 +3405,12 @@ mod tests {
             ("web_search".to_string(), string("disabled")),
             ("bypass_hook_trust".to_string(), true.into()),
         ]);
-        assert_eq!(start.config, Some(expected_config.clone()));
+        let mut expected_start_config = expected_config.clone();
+        expected_start_config.insert(
+            "features".to_string(),
+            serde_json::json!({"concurrent_reasoning_summaries": false}),
+        );
+        assert_eq!(start.config, Some(expected_start_config));
         assert_eq!(resume.config, Some(expected_config.clone()));
         assert_eq!(fork.config, Some(expected_config));
     }
@@ -3430,7 +3480,7 @@ mod tests {
     async fn persisted_resume_does_not_forward_implicit_service_tier() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let mut config = build_config(&codex_home).await;
-        config.model = Some("gpt-5.4".to_string());
+        config.model = Some("gpt-5.5".to_string());
         config.service_tier = None;
         config
             .features
@@ -3450,8 +3500,8 @@ mod tests {
         let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
         let mut preset = crate::test_support::TEST_MODEL_PRESETS
             .iter()
-            .find(|preset| preset.model == "gpt-5.4")
-            .expect("gpt-5.4 test preset")
+            .find(|preset| preset.model == "gpt-5.5")
+            .expect("gpt-5.5 test preset")
             .clone();
         preset.service_tiers = vec![ModelServiceTier {
             id: ServiceTier::Fast.request_value().to_string(),

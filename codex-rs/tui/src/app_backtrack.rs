@@ -977,6 +977,7 @@ mod tests {
         assert!(!has_backtrack_target(&cells));
 
         cells.push(Arc::new(UserHistoryCell {
+            spoken: false,
             message: "hello".to_string(),
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),

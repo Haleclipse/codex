@@ -103,10 +103,9 @@ pub(crate) const MAX_EXTRA_METADATA_VALUE_BYTES: usize = 128;
 
 /// Metadata attached to model requests whose purpose is conversation compaction.
 ///
-/// This covers both local compaction requests sent through the normal `/responses` path and remote
-/// compaction requests sent through `/responses/compact`. These fields describe the operation at
-/// dispatch time. Post-response outcomes such as status, error, duration, and token deltas remain
-/// in compaction analytics events.
+/// This covers both local and remote compaction requests sent through the `/responses` path. These
+/// fields describe the operation at dispatch time. Post-response outcomes such as status, error,
+/// duration, and token deltas remain in compaction analytics events.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(crate) struct CompactionTurnMetadata {
     trigger: CompactionTrigger,

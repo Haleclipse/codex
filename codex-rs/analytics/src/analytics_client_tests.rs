@@ -22,6 +22,7 @@ use crate::events::CodexRuntimeMetadata;
 use crate::events::CodexToolItemEventBase;
 use crate::events::CodexTurnEventRequest;
 use crate::events::FinalApprovalOutcome;
+use crate::events::GuardianAdditionalPermissions;
 use crate::events::GuardianApprovalRequestSource;
 use crate::events::GuardianReviewDecision;
 use crate::events::GuardianReviewEventParams;
@@ -172,9 +173,12 @@ use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::error::CodexErr;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
 use codex_protocol::models::PermissionProfile as CorePermissionProfile;
+use codex_protocol::models::SandboxPermissions;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::GuardianCommandSource;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookExecutionMode;
 use codex_protocol::protocol::HookHandlerType;
@@ -1497,7 +1501,7 @@ fn compaction_event_serializes_expected_shape() {
                 turn_id: "turn-1".to_string(),
                 trigger: CompactionTrigger::Auto,
                 reason: CompactionReason::ContextLimit,
-                implementation: CompactionImplementation::ResponsesCompact,
+                implementation: CompactionImplementation::ResponsesCompactionV2,
                 phase: CompactionPhase::MidTurn,
                 strategy: CompactionStrategy::Memento,
                 status: CompactionStatus::Completed,
@@ -1550,7 +1554,7 @@ fn compaction_event_serializes_expected_shape() {
                 "parent_thread_id": null,
                 "trigger": "auto",
                 "reason": "context_limit",
-                "implementation": "responses_compact",
+                "implementation": "responses_compaction_v2",
                 "phase": "mid_turn",
                 "strategy": "memento",
                 "status": "completed",
@@ -1674,6 +1678,7 @@ fn thread_initialized_event_serializes_expected_shape() {
             },
             model: "gpt-5".to_string(),
             ephemeral: true,
+            is_worktree: Some(true),
             thread_source: Some(ThreadSource::Feature("automation".to_string())),
             initialization_mode: ThreadInitializationMode::New,
             subagent_source: None,
@@ -1707,6 +1712,7 @@ fn thread_initialized_event_serializes_expected_shape() {
                 },
                 "model": "gpt-5",
                 "ephemeral": true,
+                "is_worktree": true,
                 "thread_source": "automation",
                 "initialization_mode": "new",
                 "subagent_source": null,
@@ -1716,6 +1722,65 @@ fn thread_initialized_event_serializes_expected_shape() {
             }
         })
     );
+}
+
+#[tokio::test]
+async fn thread_initialized_classifies_validated_linked_worktrees() {
+    let root = std::env::temp_dir().join(format!(
+        "codex-analytics-worktree-{}",
+        codex_protocol::ThreadId::new()
+    ));
+    let primary = root.join("primary");
+    let linked = root.join("linked");
+    let admin = primary.join(".git/worktrees/linked");
+    std::fs::create_dir_all(&admin).expect("worktree administrative directory");
+    std::fs::create_dir_all(&linked).expect("linked checkout");
+    std::fs::write(primary.join(".git/HEAD"), "ref: refs/heads/main\n")
+        .expect("primary repository HEAD");
+    std::fs::write(admin.join("commondir"), "../..\n").expect("common directory");
+    std::fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", linked.join(".git").display()),
+    )
+    .expect("linked checkout backlink");
+    std::fs::write(
+        linked.join(".git"),
+        format!("gitdir: {}\n", admin.display()),
+    )
+    .expect("linked checkout git file");
+
+    let mut reducer = AnalyticsReducer::default();
+    let mut events = Vec::new();
+    ingest_initialize(&mut reducer, &mut events).await;
+    for (cwd, expected) in [
+        (primary.as_path(), json!(false)),
+        (linked.as_path(), json!(true)),
+        (root.as_path(), serde_json::Value::Null),
+    ] {
+        events.clear();
+        let mut response =
+            sample_thread_start_response("thread-1", /*ephemeral*/ false, "gpt-5");
+        let ClientResponsePayload::ThreadStart(start) = &mut response else {
+            panic!("expected thread/start response");
+        };
+        start.thread.cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(cwd)
+            .expect("absolute checkout path");
+        reducer
+            .ingest(
+                AnalyticsFact::ClientResponse {
+                    connection_id: 7,
+                    request_id: RequestId::Integer(1),
+                    response: Box::new(response),
+                    thread_originator: None,
+                },
+                &mut events,
+            )
+            .await;
+        let payload = serde_json::to_value(&events).expect("serialize thread event");
+        assert_eq!(payload[0]["event_params"]["is_worktree"], expected);
+    }
+
+    std::fs::remove_dir_all(root).expect("remove test checkout");
 }
 
 #[test]
@@ -2457,6 +2522,81 @@ async fn compaction_event_ingests_custom_fact() {
     assert_eq!(payload[0]["event_params"]["phase"], "standalone_turn");
     assert_eq!(payload[0]["event_params"]["strategy"], "memento");
     assert_eq!(payload[0]["event_params"]["status"], "failed");
+}
+
+#[test]
+fn execve_serializes_enabled_network_permissions() {
+    let permissions: AdditionalPermissionProfile = serde_json::from_value(json!({
+        "network": { "enabled": true },
+    }))
+    .expect("network permissions");
+
+    let action = GuardianReviewedAction::Execve {
+        source: GuardianCommandSource::UnifiedExec,
+        additional_permissions: Some(GuardianAdditionalPermissions::from(&permissions)),
+    };
+
+    assert_eq!(
+        serde_json::to_value(action).expect("serialize action"),
+        json!({
+            "type": "execve",
+            "source": "unified_exec",
+            "additional_permissions": {
+                "network": { "enabled": true },
+            },
+        }),
+    );
+}
+
+#[test]
+fn unified_exec_serializes_disabled_network_permissions() {
+    let permissions: AdditionalPermissionProfile = serde_json::from_value(json!({
+        "network": { "enabled": false },
+    }))
+    .expect("network permissions");
+
+    let action = GuardianReviewedAction::UnifiedExec {
+        sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
+        additional_permissions: Some(GuardianAdditionalPermissions::from(&permissions)),
+        tty: false,
+    };
+
+    assert_eq!(
+        serde_json::to_value(action).expect("serialize action"),
+        json!({
+            "type": "unified_exec",
+            "sandbox_permissions": "with_additional_permissions",
+            "additional_permissions": {
+                "network": { "enabled": false },
+            },
+            "tty": false,
+        }),
+    );
+}
+
+#[test]
+fn permission_metadata_preserves_absent_and_empty_requests() {
+    for (input, expected) in [
+        (json!(null), json!(null)),
+        (json!({}), json!({ "network": null })),
+        (
+            json!({ "network": { "enabled": null } }),
+            json!({
+                "network": { "enabled": null },
+            }),
+        ),
+    ] {
+        let permissions: Option<AdditionalPermissionProfile> =
+            serde_json::from_value(input).expect("optional permissions");
+        let metadata = permissions
+            .as_ref()
+            .map(GuardianAdditionalPermissions::from);
+
+        assert_eq!(
+            serde_json::to_value(metadata).expect("serialize permissions"),
+            expected,
+        );
+    }
 }
 
 #[tokio::test]
@@ -4302,7 +4442,6 @@ async fn reducer_ingests_skill_invoked_fact() {
                 "skill_scope": "user",
                 "plugin_id": null,
                 "remote_plugin_id": null,
-                "repo_url": null,
                 "thread_id": "thread-1",
                 "turn_id": "turn-1",
                 "invoke_type": "explicit",
@@ -5275,6 +5414,7 @@ async fn image_generation_events_preserve_transparent_background_metadata() {
             failure: None,
             saved_path: None,
             imagegen_request_id: None,
+            generation_id: None,
         });
 
         reducer
@@ -5420,6 +5560,7 @@ async fn turn_event_counts_completed_tool_items() {
             failure: None,
             saved_path: None,
             imagegen_request_id: Some("req-imagegen-123".to_string()),
+            generation_id: Some("gen-image-123".to_string()),
         }),
     ];
 
@@ -5518,6 +5659,10 @@ async fn turn_event_counts_completed_tool_items() {
     assert_eq!(
         payload["event_params"]["imagegen_request_id"],
         json!("req-imagegen-123")
+    );
+    assert_eq!(
+        payload["event_params"]["generation_id"],
+        json!("gen-image-123")
     );
 
     let mcp_tool_call_event = out

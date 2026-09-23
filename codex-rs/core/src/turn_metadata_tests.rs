@@ -241,6 +241,7 @@ async fn detached_memory_responses_metadata_omits_empty_workspace_metadata() {
             "request_kind": "memory",
             "sandbox_mode": "read-only",
             "thread_source": "memory_consolidation",
+            "turn_trigger": "memory_consolidation",
         })
     );
 }

@@ -1245,7 +1245,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 state.pending_rollbacks.take()
             };
 
-            if let Some(request_id) = pending {
+            if let Some((request_id, _completion_tx)) = pending {
                 let _thread_list_state_permit = match thread_list_state_permit.acquire().await {
                     Ok(permit) => permit,
                     Err(err) => {
@@ -1643,7 +1643,7 @@ async fn handle_thread_rollback_failed(
 ) {
     let pending_rollback = thread_state.lock().await.pending_rollbacks.take();
 
-    if let Some(request_id) = pending_rollback {
+    if let Some((request_id, _completion_tx)) = pending_rollback {
         outgoing
             .send_error(request_id, invalid_request(message))
             .await;

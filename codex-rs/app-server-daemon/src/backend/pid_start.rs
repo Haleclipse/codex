@@ -7,6 +7,7 @@ use super::PidCommandKind;
 use super::PidFileState;
 use super::PidRecord;
 use super::read_process_start_time;
+use crate::managed_install::executable_identity;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -67,14 +68,17 @@ impl PidBackend {
                 }
             }
         }
-        // Pin the Windows image path across installer junction retargeting.
-        #[cfg(windows)]
+        // Pin the selected release across installer symlink/junction retargeting.
         let codex_bin = fs::canonicalize(&self.codex_bin)
             .await
             .unwrap_or_else(|_| self.codex_bin.clone());
-        #[cfg(not(windows))]
-        let codex_bin = &self.codex_bin;
-        let mut command = Command::new(codex_bin);
+        let launched_identity =
+            if matches!(self.command_kind, super::PidCommandKind::AppServer { .. }) {
+                executable_identity(&codex_bin).await.ok()
+            } else {
+                None
+            };
+        let mut command = Command::new(&codex_bin);
         let stderr_log = match self.open_stderr_log().await {
             Ok(stderr_log) => stderr_log,
             Err(err) => {
@@ -89,6 +93,40 @@ impl PidBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_log.into_std().await));
+        // Older or pinned managed binaries may predate this optional startup flag.
+        let managed_app_server =
+            matches!(self.command_kind, super::PidCommandKind::AppServer { .. });
+        if managed_app_server
+            && matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    Command::new(&codex_bin)
+                        .args(["app-server", "--managed-daemon", "--help"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .kill_on_drop(true)
+                        .status(),
+                ).await,
+                Ok(Ok(status)) if status.success()
+            )
+        {
+            command.arg("--managed-daemon");
+        } else if managed_app_server {
+            let codex_home = self
+                .pid_file
+                .parent()
+                .and_then(std::path::Path::parent)
+                .context("daemon pid path has no Codex home")?;
+            let recovery_file = codex_app_server_transport::daemon_recovery_file_path(codex_home);
+            match fs::remove_file(&recovery_file).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(path = %recovery_file.display(), %err, "failed to clear daemon recovery state before legacy launch");
+                }
+            }
+        }
         if let Some((key, value)) = self.command_env() {
             command.env(key, value);
         }
@@ -229,6 +267,7 @@ impl PidBackend {
             Ok(process_start_time) => PidRecord {
                 pid,
                 process_start_time,
+                executable_identity: launched_identity,
             },
             Err(err) => {
                 let _ = self.terminate_process(pid);

@@ -180,3 +180,21 @@ fn startup_dispatch_is_ordered_but_acknowledgement_does_not_block_setters() {
     );
     drop(applied);
 }
+
+#[tokio::test]
+async fn startup_completion_preserves_classified_failure() {
+    for failure in [
+        crate::ConnectionError::NegotiationTimedOut,
+        crate::ConnectionError::Failed,
+    ] {
+        let (handle, mut commands, _) = handles();
+        let caller = handle.clone();
+        let thread = std::thread::spawn(move || caller.apply_answer_sdp("synthetic-answer".into()));
+        let Some(Command::Answer(_, complete)) = commands.recv().await else {
+            panic!("answer expected")
+        };
+        complete.send(Err(failure)).unwrap();
+        assert_eq!(thread.join().unwrap(), Err(failure));
+        assert_eq!(handle.take_error(), None);
+    }
+}

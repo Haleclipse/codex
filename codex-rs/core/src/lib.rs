@@ -29,7 +29,6 @@ pub use responses_metadata::CodexResponsesMetadata;
 pub use turn_metadata::detached_memory_responses_metadata;
 mod codex_thread;
 mod compact_model_fallback;
-mod compact_remote;
 mod compact_remote_history;
 mod compact_remote_v2;
 mod compact_token_budget;
@@ -112,6 +111,8 @@ mod stream_events_utils;
 pub mod test_support;
 mod unified_exec;
 pub mod windows_sandbox;
+#[cfg(windows)]
+mod windows_system_config;
 pub use client::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
 pub use codex_protocol::config_types::ModelProviderAuthInfo;
 mod event_mapping;
@@ -213,3 +214,6 @@ pub use installation_id::resolve_installation_id;
 pub mod compact;
 mod memory_usage;
 pub mod otel_init;
+
+// Captured environment bindings can be passed back to ThreadManager by internal reviewers.
+pub use environment_selection::TurnEnvironmentSnapshot;

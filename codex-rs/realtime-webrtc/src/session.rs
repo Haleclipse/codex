@@ -26,7 +26,10 @@ const ANSWER_WAIT: Duration = Duration::from_secs(/*secs*/ 40);
 static RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
 
 enum Command {
-    Answer(SessionDescription, blocking::SyncSender<()>),
+    Answer(
+        SessionDescription,
+        blocking::SyncSender<std::result::Result<(), crate::ConnectionError>>,
+    ),
     Controls(AudioControls),
 }
 
@@ -196,15 +199,22 @@ impl RealtimeWebrtcSessionHandle {
     }
 
     /// Called off the UI thread; return only after negotiation, device startup and restored controls.
-    pub fn apply_answer_sdp(&self, answer: String) -> Result<()> {
-        let sdp = SessionDescription::try_from(answer).map_err(anyhow::Error::msg)?;
+    pub fn apply_answer_sdp(
+        &self,
+        answer: String,
+    ) -> std::result::Result<(), crate::ConnectionError> {
+        let sdp =
+            SessionDescription::try_from(answer).map_err(|_| crate::ConnectionError::Failed)?;
         let (complete, result) = blocking::sync_channel(/*bound*/ 1);
-        self.send(Command::Answer(sdp, complete))?;
-        if result.recv_timeout(ANSWER_WAIT).is_err() {
-            self.close();
-            anyhow::bail!("voice connection failed");
+        self.send(Command::Answer(sdp, complete))
+            .map_err(|_| crate::ConnectionError::Failed)?;
+        match result.recv_timeout(ANSWER_WAIT) {
+            Ok(result) => result,
+            Err(_) => {
+                self.close();
+                Err(crate::ConnectionError::Failed)
+            }
         }
-        Ok(())
     }
 
     pub fn take_error(&self) -> Option<String> {
@@ -254,13 +264,23 @@ async fn run(
             biased;
             command = commands.recv() => match command {
                 Some(Command::Answer(sdp, complete)) if !connected => {
-                    host = host.apply_answer(sdp).await?.open_devices().await?;
+                    host = match host.apply_answer(sdp).await {
+                        Ok(host) => host,
+                        Err(error) => {
+                            let failure = error.downcast_ref::<crate::ConnectionError>()
+                                .copied().unwrap_or(crate::ConnectionError::Failed);
+                            let _ = complete.send(Err(failure));
+                            // This failure is delivered by the startup completion only.
+                            return Ok(());
+                        }
+                    };
+                    host = host.open_devices().await?;
                     let applied = startup_controls(&mut commands, controls, |initial| {
                         host.begin_audio_controls(initial)
                     })?;
                     applied.await?;
                     connected = true;
-                    let _ = complete.send(());
+                    let _ = complete.send(Ok(()));
                 }
                 Some(Command::Controls(next)) => {
                     if connected {

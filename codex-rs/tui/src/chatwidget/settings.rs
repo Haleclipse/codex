@@ -100,6 +100,21 @@ impl ChatWidget {
                 self.update_collaboration_mode_indicator();
             }
         }
+        if feature == Feature::RealtimeConversation && !enabled {
+            self.realtime_conversation_available_for_thread = false;
+            self.bottom_pane
+                .set_voice_command_enabled(/*enabled*/ false);
+            self.stop_realtime_conversation();
+        }
+        if feature == Feature::RealtimeConversation
+            && enabled
+            && !self.realtime_conversation_available_for_thread
+        {
+            self.add_info_message(
+                "Voice conversations will be available in new threads.".into(),
+                /*hint*/ None,
+            );
+        }
         if feature == Feature::MentionsV2 {
             self.sync_mentions_v2_enabled();
         }

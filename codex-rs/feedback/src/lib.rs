@@ -395,6 +395,10 @@ enum AttachmentReadMode {
     Prefix,
 }
 
+#[cfg(test)]
+#[path = "rollout_attachment_tests.rs"]
+mod rollout_attachment_tests;
+
 impl FeedbackAttachmentPath {
     /// Read a whole regular file within the caller's size limit.
     pub fn read_attachment(&self, max_bytes: usize) -> io::Result<Option<FeedbackAttachment>> {
@@ -406,18 +410,30 @@ impl FeedbackAttachmentPath {
         max_bytes: usize,
         mode: AttachmentReadMode,
     ) -> io::Result<Option<FeedbackAttachment>> {
-        let metadata = fs::metadata(&self.path)?;
-        if !metadata.is_file()
-            || (metadata.len() > max_bytes as u64 && matches!(mode, AttachmentReadMode::Whole))
-        {
-            return Ok(None);
-        }
-        let mut buffer = Vec::new();
-        // Keep one extra byte so the encoder can detect and label a truncated prefix,
-        // including when the file grows after the metadata check.
-        fs::File::open(&self.path)?
-            .take(max_bytes as u64 + 1)
-            .read_to_end(&mut buffer)?;
+        let rollout_path = codex_rollout::rollout_id_from_path(&self.path)
+            .map(|_| codex_rollout::plain_rollout_path(&self.path));
+        let buffer = if rollout_path.is_some() {
+            let Some(buffer) =
+                codex_rollout::read_rollout_prefix(&self.path, max_bytes.saturating_add(1))?
+            else {
+                return Ok(None);
+            };
+            buffer
+        } else {
+            let metadata = fs::metadata(&self.path)?;
+            if !metadata.is_file()
+                || (metadata.len() > max_bytes as u64 && matches!(mode, AttachmentReadMode::Whole))
+            {
+                return Ok(None);
+            }
+            let mut buffer = Vec::new();
+            // Keep one extra byte so the encoder can detect and label a truncated prefix,
+            // including when the file grows after the metadata check.
+            fs::File::open(&self.path)?
+                .take(max_bytes as u64 + 1)
+                .read_to_end(&mut buffer)?;
+            buffer
+        };
         if buffer.len() > max_bytes && matches!(mode, AttachmentReadMode::Whole) {
             return Ok(None);
         }
@@ -425,7 +441,9 @@ impl FeedbackAttachmentPath {
             .attachment_filename_override
             .clone()
             .unwrap_or_else(|| {
-                self.path
+                rollout_path
+                    .as_ref()
+                    .unwrap_or(&self.path)
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| "extra-log.log".to_string())

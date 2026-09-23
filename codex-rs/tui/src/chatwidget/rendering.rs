@@ -158,6 +158,17 @@ impl ChatWidget {
         };
         let mut flex = FlexRenderable::new();
         flex.push(/*flex*/ 1, active_cell_renderable);
+        if let Some(cell) = self.realtime_conversation.live_transcript_cell.as_ref() {
+            flex.push(
+                /*flex*/ 1,
+                RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
+                    child: cell.as_ref(),
+                    top: 1,
+                    right: active_cell_right_reserve,
+                    persistent_layout: None,
+                })),
+            );
+        }
         if let Some(cell) = self.pending_token_activity_output() {
             flex.push(
                 /*flex*/ 1,

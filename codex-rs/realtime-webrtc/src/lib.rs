@@ -3,6 +3,7 @@ mod message_reader;
 mod protocol;
 mod session;
 
+pub use client::ConnectionError;
 pub use client::VoiceHost;
 pub use protocol::AudioControls;
 pub use protocol::AudioState;

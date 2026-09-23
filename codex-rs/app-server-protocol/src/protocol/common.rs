@@ -546,6 +546,13 @@ client_request_definitions! {
         response: v2::UserVerificationVerifyResponse,
     },
 
+    #[experimental("userVerification/cancel")]
+    UserVerificationCancel => "userVerification/cancel" {
+        params: v2::UserVerificationCancelParams,
+        serialization: None,
+        response: v2::UserVerificationCancelResponse,
+    },
+
     /// NEW APIs
     // Thread lifecycle
     // Uses `inspect_params` because only some fields are experimental.
@@ -663,6 +670,21 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadMetadataUpdateResponse,
     },
+    ThreadAttachmentAdd => "thread/attachment/add" {
+        params: v2::ThreadAttachmentAddParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadAttachmentAddResponse,
+    },
+    ThreadAttachmentList => "thread/attachment/list" {
+        params: v2::ThreadAttachmentListParams,
+        serialization: None,
+        response: v2::ThreadAttachmentListResponse,
+    },
+    ThreadAttachmentRemove => "thread/attachment/remove" {
+        params: v2::ThreadAttachmentRemoveParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadAttachmentRemoveResponse,
+    },
     ThreadSectionMove => "thread/section/move" {
         params: v2::ThreadSectionMoveParams,
         serialization: thread_id(params.thread_id),
@@ -680,6 +702,12 @@ client_request_definitions! {
         params: v2::ThreadMemoryModeSetParams,
         serialization: thread_id(params.thread_id),
         response: v2::ThreadMemoryModeSetResponse,
+    },
+    #[experimental("memory/status")]
+    MemoryStatus => "memory/status" {
+        params: v2::MemoryStatusParams,
+        serialization: global("memory"),
+        response: v2::MemoryStatusResponse,
     },
     #[experimental("memory/reset")]
     MemoryReset => "memory/reset" {
@@ -1888,6 +1916,7 @@ server_notification_definitions! {
     ThreadReverted => "thread/reverted" (v2::ThreadRevertedNotification),
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
+    ThreadAttachmentUpdated => "thread/attachment/updated" (v2::ThreadAttachmentUpdatedNotification),
     ThreadGoalUpdated => "thread/goal/updated" (v2::ThreadGoalUpdatedNotification),
     ThreadGoalCleared => "thread/goal/cleared" (v2::ThreadGoalClearedNotification),
     #[experimental("thread/queue/changed")]

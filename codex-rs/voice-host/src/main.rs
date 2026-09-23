@@ -176,9 +176,15 @@ fn run(
                 let Some(peer) = transport.as_ref() else {
                     return Err(io::Error::other("voice transport not started"));
                 };
-                executor
+                let outcome = executor
                     .block_on(peer.apply_answer(sdp.into_sdp()))
                     .map_err(io::Error::other)?;
+                if outcome == transport::AnswerOutcome::TimedOut {
+                    // The client reaps this helper before considering a fresh negotiation.
+                    output.write_all(&encode_frame(&Message::TransportTimedOut {})?)?;
+                    output.flush()?;
+                    return Ok(());
+                }
                 answered = true;
                 Message::TransportReady {}
             }
@@ -207,6 +213,7 @@ fn run(
                 | Message::ApplyAnswer { .. }
                 | Message::Offer { .. }
                 | Message::TransportReady {}
+                | Message::TransportTimedOut {}
                 | Message::OpenDevices {}
                 | Message::DevicesOpened {}
                 | Message::AudioControlsApplied {}

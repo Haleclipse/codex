@@ -306,8 +306,14 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             ReconnectPresentation::Overview,
         )
         .await?;
-        app.finish_reconnect(&mut tui, &mut session, &mut events, connected)
-            .await?;
+        app.finish_reconnect(
+            &mut tui,
+            &mut session,
+            &mut events,
+            connected,
+            CODEX_CLI_VERSION,
+        )
+        .await?;
         assert!(!app.reconnect.offline);
         assert_eq!(app.current_displayed_thread_id(), previous_thread);
 
@@ -409,6 +415,12 @@ async fn reconnect_daemon_command_center_after_socket_replacement_without_a_conv
             )
             .await?;
 
+            assert!(app.chat_widget.has_active_view());
+            // Esc returns to the overview composer. Dismiss the retained view explicitly
+            // to inspect the unavailable conversation and its cached draft below.
+            app.agents_overview.view_state.lock().unwrap().completion =
+                Some(crate::bottom_pane::ViewCompletion::Accepted);
+            app.chat_widget.handle_key_event(KeyCode::Null.into());
             assert!(!app.chat_widget.has_active_view());
             assert_eq!(app.current_displayed_thread_id(), Some(id));
             let history = drain_history(&mut app, &mut tui, &mut session, &mut events).await?;
