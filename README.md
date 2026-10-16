@@ -20,7 +20,6 @@ This fork includes the following enhancements over the upstream [openai/codex](h
 
 - **StatusLine (CxLine)** — Bottom status bar displaying model name, reasoning effort, usage percentage, and rate limit reset time
 - **Reasoning Translation** — Real-time translation of agent reasoning content via `/translate` command, supporting 15+ LLM providers (OpenAI, Anthropic, DeepSeek, Moonshot, Qwen, Groq, Gemini, etc.)
-- **Personality for all models** — The Personality feature is enabled for every model, not limited to select ones
 - **CJK block cursor fix** — Correct block cursor width for CJK characters on Windows Terminal
 - **Thread Delete** — Delete threads directly from the resume picker with a two-step confirmation (press `Delete` twice)
 - **Update detection via npm** — Version checking uses the `@cometix/codex` npm registry instead of GitHub releases
