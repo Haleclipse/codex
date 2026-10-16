@@ -2,12 +2,12 @@
 source: tui/src/bottom_pane/chat_composer.rs
 expression: terminal.backend()
 ---
-"────────────────────────────────────────────────────────────────────────────────────────────────────"
-"❯ $sa                                                                                               "
+"                                                                                                    "
+"› Sample Plugin  [Plugin] Plugin that includes the Figma MCP server and Skills for common workflows "
+"                                                                                                    "
+"  enter insert · esc close                                                                          "
+"                                                                                                    "
+"› $sa                                                                                               "
 "                                                                                                    "
 "                                                                                                    "
-"────────────────────────────────────────────────────────────────────────────────────────────────────"
-"   - · - tokens                                                                                    "
-"  Sample Plugin  [Plugin] Plugin that includes the Figma MCP server and Skills for common workflows "
-"                                                                                                    "
-"  Press enter to insert or esc to close                                                             "
+"                                                                                 100% context left  "

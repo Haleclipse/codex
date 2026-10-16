@@ -307,7 +307,7 @@ impl TranslateOverlay {
                     self.render(frame.area(), frame.buffer_mut());
                 })?;
             }
-            TuiEvent::Resize(_) | TuiEvent::FocusLost => {}
+            TuiEvent::Resize(_) | TuiEvent::FocusLost | TuiEvent::Mouse(_) => {}
         }
         Ok(())
     }

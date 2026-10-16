@@ -1,6 +1,7 @@
 // @cometix: cells for displaying translated reasoning content.
 
 use super::*;
+use crate::markdown::append_markdown;
 
 pub(crate) fn new_agent_reasoning_translation_block(
     title: Option<String>,
@@ -87,9 +88,5 @@ impl HistoryCell for AgentReasoningTranslationCell {
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         self.lines(width)
-    }
-
-    fn desired_transcript_height(&self, width: u16) -> u16 {
-        self.lines(width).len() as u16
     }
 }

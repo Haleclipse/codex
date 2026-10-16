@@ -1,15 +1,16 @@
 ---
 source: tui/src/bottom_pane/request_user_input/mod.rs
+assertion_line: 3852
 expression: "render_snapshot(&overlay, area)"
 ---
                                                                                                                         
   Question 2/2 (2 unanswered)                                                                                           
   Share details.                                                                                                        
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
-  ❯ Type your answer (optional)                                                                                         
+                                                                                                                        
+  › Type your answer (optional)                                                                                         
                                                                                                                         
                                                                                                                         
                                                                                                                         
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
-     - · - tokens                                                                                                      
-  enter to submit all | ctrl + p / ctrl + n change question | esc to interrupt
+                                                                                                                        
+                                                                                                                        
+  enter to submit all | ctrl+p / ctrl+n change question | esc to interrupt

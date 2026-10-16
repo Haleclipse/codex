@@ -431,6 +431,7 @@ impl ChatWidget {
                     .map(|value| (item, value))
             }),
         );
+        preview_data.thread_id = self.thread_id;
 
         if self.rate_limit_snapshots_by_limit_id.contains_key("codex") {
             for item in [
