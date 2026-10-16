@@ -434,12 +434,14 @@ jobs:
           # "rust-v0.1.0".
           version="${GITHUB_REF_NAME#rust-v}"
           echo "name=${version}" >> $GITHUB_OUTPUT
-          if [[ "${version}" == *-* ]]; then
-            echo "make_latest=false" >> $GITHUB_OUTPUT
-            echo "prerelease=true" >> $GITHUB_OUTPUT
-          else
+          # @cometix: -cometix (and -cometix.N re-releases) are this fork's stable
+          # releases, matching the npm `latest` rule below; alpha/beta stay prereleases.
+          if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-cometix(\.[0-9]+)?)?$ ]]; then
             echo "make_latest=true" >> $GITHUB_OUTPUT
             echo "prerelease=false" >> $GITHUB_OUTPUT
+          else
+            echo "make_latest=false" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Determine npm publish settings
@@ -505,8 +507,8 @@ jobs:
           # https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#avoid-concurrent-requests
           preserve_order: true
           make_latest: ${{ steps.release_name.outputs.make_latest }}
-          # Mark as prerelease only when the version has a suffix after x.y.z
-          # (e.g. -alpha, -beta). Otherwise publish a normal release.
+          # Mark as prerelease when the version has a suffix after x.y.z other
+          # than -cometix (e.g. -alpha, -beta). Otherwise publish a normal release.
           prerelease: ${{ steps.release_name.outputs.prerelease }}
 
       # @cometix: removed dotslash-publish-release, publish-r2, and
