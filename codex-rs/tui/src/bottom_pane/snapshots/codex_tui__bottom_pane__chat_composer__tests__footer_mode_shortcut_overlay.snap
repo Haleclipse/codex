@@ -1,6 +1,5 @@
 ---
 source: tui/src/bottom_pane/chat_composer.rs
-assertion_line: 5294
 expression: terminal.backend()
 ---
 "  Keyboard shortcuts                                                                                "
@@ -16,11 +15,11 @@ expression: terminal.backend()
 "  esc          Edit last message                                                                    "
 "                                                                                                    "
 "  /keymap customize                                                                                 "
-"                                                                                                    "
-"› Ask Codex to do anything                                                                          "
-"                                                                                                    "
-"                                                                                                    "
+"────────────────────────────────────────────────────────────────────────────────────────────────────"
+"❯ Ask Codex to do anything                                                                          "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
+"                                                                                                    "
+"────────────────────────────────────────────────────────────────────────────────────────────────────"
 "  ? / esc close                                                                                     "
