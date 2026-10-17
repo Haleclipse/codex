@@ -22,6 +22,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CODEX_CLI_ROOT = SCRIPT_DIR.parent
 DEFAULT_WORKFLOW_URL = "https://github.com/Haleclipse/codex/actions/runs/21107751432"  # rust-v0.87.0-cometix
 VENDOR_DIR_NAME = "vendor"
+# @cometix: a complete Codex package archive built per target by
+# build-codex-package-archive.sh; extracted as the whole vendor/<target> root.
+CODEX_PACKAGE_COMPONENT = "codex-package"
 RG_MANIFEST = CODEX_CLI_ROOT.parent / "scripts" / "codex_package" / "rg"
 BINARY_TARGETS = (
     "x86_64-unknown-linux-musl",
@@ -145,7 +148,7 @@ def parse_args() -> argparse.Namespace:
         "--component",
         dest="components",
         action="append",
-        choices=tuple(list(BINARY_COMPONENTS) + ["rg"]),
+        choices=tuple(list(BINARY_COMPONENTS) + ["rg", CODEX_PACKAGE_COMPONENT]),
         help=(
             "Limit installation to the specified components."
             " May be repeated. Defaults to bwrap, codex, codex-windows-sandbox-setup,"
@@ -190,6 +193,8 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="codex-native-artifacts-") as artifacts_dir_str:
             artifacts_dir = Path(artifacts_dir_str)
             _download_artifacts(workflow_id, artifacts_dir)
+            if CODEX_PACKAGE_COMPONENT in components:
+                install_codex_packages(artifacts_dir, vendor_dir)
             install_binary_components(
                 artifacts_dir,
                 vendor_dir,
@@ -285,6 +290,24 @@ def _download_artifacts(workflow_id: str, dest_dir: Path) -> None:
         workflow_id,
     ]
     subprocess.check_call(cmd)
+
+
+def install_codex_packages(artifacts_dir: Path, vendor_dir: Path) -> None:
+    """Extract each target's codex-package archive as vendor/<target>."""
+    print("Installing Codex packages for targets: " + ", ".join(BINARY_TARGETS))
+    for target in BINARY_TARGETS:
+        archive_path = artifacts_dir / target / f"codex-package-{target}.tar.gz"
+        if not archive_path.exists():
+            raise FileNotFoundError(f"Expected artifact not found: {archive_path}")
+        dest = vendor_dir / target
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+        with tarfile.open(archive_path, "r:gz") as archive:
+            archive.extractall(dest, filter="data")
+        if not (dest / "codex-package.json").is_file():
+            raise RuntimeError(f"{archive_path} did not contain codex-package.json")
+        print(f"  installed {dest}")
 
 
 def install_binary_components(

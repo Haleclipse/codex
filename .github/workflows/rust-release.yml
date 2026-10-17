@@ -20,6 +20,8 @@ concurrency:
 # runners when cloning from chromium.googlesource.com (libyuv submodule).
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  # @cometix: scripts/codex_package (Codex package assembly) resolves the repo from this.
+  CODEX_REPO_ROOT: ${{ github.workspace }}
 
 jobs:
   tag-check:
@@ -260,6 +262,20 @@ jobs:
           path: codex-rs/symbols-dist/${{ matrix.target }}/*
           if-no-files-found: error
 
+      # @cometix: assemble the upstream Codex package layout (codex-package.json,
+      # bin/, codex-path/, codex-resources/) from the stripped binaries. npm
+      # platform packages ship this tree, and the app-server daemon seeds its
+      # managed install from it. DotSlash fetches the pinned rg and zsh helpers.
+      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
+      - name: Build Codex package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+            --target "${{ matrix.target }}" \
+            --bundle primary \
+            --entrypoint-dir "target/${{ matrix.target }}/release" \
+            --archive-dir "dist/${{ matrix.target }}"
 
       - name: Stage artifacts
         shell: bash

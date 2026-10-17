@@ -78,10 +78,12 @@ if (!platformPackage) {
 
 const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
 const localVendorRoot = path.join(__dirname, "..", "vendor");
+// @cometix: platform packages ship the Codex package layout (bin/, codex-path/,
+// codex-resources/, codex-package.json), matching upstream.
 const localBinaryPath = path.join(
   localVendorRoot,
   targetTriple,
-  "codex",
+  "bin",
   codexBinaryName,
 );
 
@@ -108,23 +110,13 @@ if (!vendorRoot) {
 }
 
 const archRoot = path.join(vendorRoot, targetTriple);
-const binaryPath = path.join(archRoot, "codex", codexBinaryName);
+const binaryPath = path.join(archRoot, "bin", codexBinaryName);
 
 // Use an asynchronous spawn instead of spawnSync so that Node is able to
 // respond to signals (e.g. Ctrl-C / SIGINT) while the native binary is
 // executing. This allows us to forward those signals to the child process
 // and guarantees that when either the child terminates or the parent
 // receives a fatal signal, both processes exit in a predictable manner.
-
-function getUpdatedPath(newDirs) {
-  const pathSep = process.platform === "win32" ? ";" : ":";
-  const existingPath = process.env.PATH || "";
-  const updatedPath = [
-    ...newDirs,
-    ...existingPath.split(pathSep).filter(Boolean),
-  ].join(pathSep);
-  return updatedPath;
-}
 
 function isPnpmOwnedCodexInstall(nodeModulesDir) {
   if (!existsSync(path.join(nodeModulesDir, ".modules.yaml"))) {
@@ -149,24 +141,25 @@ function isVitePlusOwnedCodexInstall(packagesDir) {
 
   try {
     const metadata = JSON.parse(
-      readFileSync(path.join(packagesDir, "@openai", "codex.json"), "utf8"),
+      readFileSync(path.join(packagesDir, "@cometix", "codex.json"), "utf8"),
     );
-    if (metadata.name !== "@openai/codex") {
+    if (metadata.name !== "@cometix/codex") {
       return false;
     }
 
-    // Vite+ records the active global installation in packages/@openai/codex.json.
+    // @cometix: package scope is @cometix/codex.
+    // Vite+ records the active global installation in packages/@cometix/codex.json.
     // Older installs have no ID or append a #-prefixed ID to the package name;
     // newer installs put the ID in a subdirectory of the package prefix.
     const installId = metadata.installId || "";
     const installDir = installId.startsWith("#")
-      ? path.join(packagesDir, `@openai/codex${installId}`)
-      : path.join(packagesDir, "@openai/codex", installId);
+      ? path.join(packagesDir, `@cometix/codex${installId}`)
+      : path.join(packagesDir, "@cometix/codex", installId);
     for (const nodeModulesDir of [
       path.join(installDir, "lib", "node_modules"),
       path.join(installDir, "node_modules"),
     ]) {
-      const packageRoot = path.join(nodeModulesDir, "@openai", "codex");
+      const packageRoot = path.join(nodeModulesDir, "@cometix", "codex");
       if (
         existsSync(packageRoot) &&
         realpathSync(packageRoot) === codexPackageRoot
@@ -242,13 +235,6 @@ function reinstallCommand(packageManager) {
   return "npm install -g @cometix/codex@latest";
 }
 
-const additionalDirs = [];
-const pathDir = path.join(archRoot, "path");
-if (existsSync(pathDir)) {
-  additionalDirs.push(pathDir);
-}
-const updatedPath = getUpdatedPath(additionalDirs);
-
 const packageManager = detectPackageManager();
 const packageManagerEnvVar =
   packageManager === "bun"
@@ -258,9 +244,9 @@ const packageManagerEnvVar =
       : packageManager === "vite-plus"
         ? "CODEX_MANAGED_BY_VITE_PLUS"
         : "CODEX_MANAGED_BY_NPM";
+// The native runtime resolves bundled tools from codex-path/ itself.
 const env = {
   ...process.env,
-  PATH: updatedPath,
   CODEX_MANAGED_PACKAGE_ROOT: codexPackageRoot,
 };
 delete env.CODEX_MANAGED_BY_NPM;

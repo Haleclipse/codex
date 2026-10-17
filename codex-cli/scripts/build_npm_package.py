@@ -61,19 +61,19 @@ PACKAGE_EXPANSIONS: dict[str, list[str]] = {
     "codex": ["codex", *CODEX_PLATFORM_PACKAGES],
 }
 
+# @cometix: platform packages carry the complete Codex package produced by
+# build-codex-package-archive.sh (codex-package.json, bin/, codex-path/,
+# codex-resources/). The daemon seeds its managed install from this layout, and
+# the runtime resolves rg, helpers, and bundled resources through it.
+CODEX_PACKAGE_COMPONENT = "codex-package"
+
 PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
     "codex": [],
-    "codex-linux-x64": ["bwrap", "codex", "codex-code-mode-host", "rg"],
-    "codex-linux-arm64": ["bwrap", "codex", "codex-code-mode-host", "rg"],
-    "codex-darwin-x64": ["codex", "codex-code-mode-host", "rg"],
-    "codex-darwin-arm64": ["codex", "codex-code-mode-host", "rg"],
-    "codex-win32-x64": [
-        "codex",
-        "codex-code-mode-host",
-        "rg",
-        "codex-windows-sandbox-setup",
-        "codex-command-runner",
-    ],
+    "codex-linux-x64": [CODEX_PACKAGE_COMPONENT],
+    "codex-linux-arm64": [CODEX_PACKAGE_COMPONENT],
+    "codex-darwin-x64": [CODEX_PACKAGE_COMPONENT],
+    "codex-darwin-arm64": [CODEX_PACKAGE_COMPONENT],
+    "codex-win32-x64": [CODEX_PACKAGE_COMPONENT],
     "codex-responses-api-proxy": ["codex-responses-api-proxy"],
     "codex-sdk": [],
 }
@@ -86,16 +86,7 @@ PACKAGE_TARGET_FILTERS: dict[str, str] = {
 PACKAGE_CHOICES = tuple(PACKAGE_NATIVE_COMPONENTS)
 
 COMPONENT_DEST_DIR: dict[str, str] = {
-    "bwrap": "codex-resources",
-    "codex": "codex",
-    # Must land beside `codex`: InstallContext::code_mode_host_program resolves the
-    # host from the running executable's directory when upstream's package layout
-    # (bin/ + codex-package.json) is absent, which is the case in this fork.
-    "codex-code-mode-host": "codex",
     "codex-responses-api-proxy": "codex-responses-api-proxy",
-    "codex-windows-sandbox-setup": "codex",
-    "codex-command-runner": "codex",
-    "rg": "path",
 }
 
 
@@ -390,7 +381,11 @@ def copy_native_binaries(
     if not vendor_src.exists():
         raise RuntimeError(f"Vendor source directory not found: {vendor_src}")
 
-    components_set = {component for component in components if component in COMPONENT_DEST_DIR}
+    components_set = {
+        component
+        for component in components
+        if component in COMPONENT_DEST_DIR or component == CODEX_PACKAGE_COMPONENT
+    }
     allow_missing_components = allow_missing_components or set()
     if not components_set:
         return
@@ -410,10 +405,21 @@ def copy_native_binaries(
             continue
 
         dest_target_dir = vendor_dest / target_dir.name
-        dest_target_dir.mkdir(parents=True, exist_ok=True)
         copied_targets.add(target_dir.name)
 
-        for component in components_set:
+        if CODEX_PACKAGE_COMPONENT in components_set:
+            # The whole target directory is the Codex package root.
+            if not (target_dir / "codex-package.json").is_file():
+                raise RuntimeError(
+                    f"Missing codex-package.json in vendor source: {target_dir}"
+                )
+            if dest_target_dir.exists():
+                shutil.rmtree(dest_target_dir)
+            shutil.copytree(target_dir, dest_target_dir, symlinks=True)
+        else:
+            dest_target_dir.mkdir(parents=True, exist_ok=True)
+
+        for component in components_set - {CODEX_PACKAGE_COMPONENT}:
             dest_dir_name = COMPONENT_DEST_DIR.get(component)
             if dest_dir_name is None:
                 continue
