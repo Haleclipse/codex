@@ -491,7 +491,13 @@ pub(super) async fn run_main_inner(
     } else {
         None
     };
+    // @cometix: a missing daemon is seeded by copying this CLI's Codex package
+    // (codex-package.json). Builds without that layout, such as `cargo run` or an
+    // incomplete install, stay embedded instead of failing startup.
     let auto_start_daemon = config.features.enabled(Feature::DaemonAutoStart)
+        && codex_install_context::InstallContext::current()
+            .package_layout
+            .is_some()
         && !cli.agents_overview
         && !cli.no_daemon
         && !app_server_target.uses_remote_workspace();
@@ -529,6 +535,14 @@ pub(super) async fn run_main_inner(
             .with_restored(|| async {
                 // Package installation may print progress; keep ordinary Ctrl+C handling.
                 crossterm::terminal::disable_raw_mode()?;
+                // @cometix: carry a stopped daemon along to this CLI build before starting it.
+                if let Err(err) = codex_app_server_daemon::sync_stopped_daemon_with_cli(
+                    crate::version::CODEX_CLI_VERSION,
+                )
+                .await
+                {
+                    tracing::warn!("failed to update the stopped daemon to this CLI: {err:#}");
+                }
                 let result = codex_app_server_daemon::start_with_features(&daemon_features).await;
                 daemon_telemetry::record_start(&config, &result).await;
                 result.map_err(|err| {

@@ -21,9 +21,10 @@ pub(crate) fn confirm_install(request: &InstallRequest, yes: bool) -> Result<boo
     Ok(confirmed)
 }
 
+// @cometix: daemon updates always copy a CLI package; there is no public channel to return to.
 fn describe_install(request: &InstallRequest) -> String {
     let mut message = format!(
-        "Replace installed daemon version {} with CLI version {} from {}.\nThe daemon package will be installed in {}.\nThe selected package will be pinned. Run `codex app-server daemon update` to return to production updates.",
+        "Replace installed daemon version {} with CLI version {} from {}.\nThe daemon package will be installed in {}.\nThe selected package will be pinned until the daemon is updated from another CLI build.",
         request.installed_version.as_deref().unwrap_or("unknown"),
         request.version,
         request.source.display(),

@@ -66,11 +66,16 @@ impl App {
         .into_iter()
         .map(|(source, name)| SelectionItem {
             name: name.to_string(),
-            is_disabled: unavailable.is_some(),
-            disabled_reason: (unavailable.is_none()
-                && source == DaemonUpdateSource::ThisCli
-                && !has_package)
-                .then(|| "This CLI has no local package to copy".to_string()),
+            // @cometix: the public stable channel installs upstream OpenAI builds,
+            // which would replace this fork's daemon; only this CLI build is offered.
+            is_disabled: unavailable.is_some() || source == DaemonUpdateSource::PublicStable,
+            disabled_reason: if unavailable.is_none() && source == DaemonUpdateSource::PublicStable
+            {
+                Some("Not available in this build".to_string())
+            } else {
+                (unavailable.is_none() && source == DaemonUpdateSource::ThisCli && !has_package)
+                    .then(|| "This CLI has no local package to copy".to_string())
+            },
             actions: vec![Box::new(move |tx| {
                 tx.send(AppEvent::ConfirmDaemonUpdate(source));
             })],
@@ -86,6 +91,10 @@ impl App {
     }
 
     pub(super) fn confirm_daemon_update(&mut self, source: DaemonUpdateSource) {
+        // @cometix: never install the public stable channel over this fork's daemon.
+        if source == DaemonUpdateSource::PublicStable {
+            return;
+        }
         let Some(executable) = &self.daemon_cli_executable else {
             return;
         };

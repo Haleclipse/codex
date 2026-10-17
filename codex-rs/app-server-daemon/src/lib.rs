@@ -4,6 +4,8 @@ mod backend;
 #[cfg(windows)]
 use backend::windows::try_lock_file;
 mod client;
+mod cometix_sync; // @cometix
+pub use cometix_sync::sync_stopped_daemon_with_cli; // @cometix
 mod install_lock;
 mod launch;
 pub use launch::restart_with_features;
