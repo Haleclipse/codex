@@ -23,6 +23,7 @@ This fork includes the following enhancements over the upstream [openai/codex](h
 - **CJK block cursor fix** — Correct block cursor width for CJK characters on Windows Terminal
 - **Thread Delete** — Delete threads directly from the resume picker with a two-step confirmation (press `Delete` twice)
 - **Update detection via npm** — Version checking uses the `@cometix/codex` npm registry instead of GitHub releases
+- **Self-contained background server** — The shared app-server daemon is installed from this CLI's own package, follows it across `npm update` while stopped, and never pulls upstream builds; run `codex --no-daemon` to stay in embedded mode
 
 ## Upstream Sync
 
