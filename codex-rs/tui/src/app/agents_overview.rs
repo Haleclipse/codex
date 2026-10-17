@@ -97,7 +97,7 @@ impl App {
                     (!workload_identity_selected).then(|| SelectionItem {
                         name: "Start background server".to_string(),
                         description: Some(
-                            "Open `codex agents` in another terminal afterward.".to_string(),
+                            "Open `codex agents` in another terminal afterward".to_string(),
                         ),
                         actions: vec![Box::new(|tx| tx.send(AppEvent::StartAgentsDaemon))],
                         dismiss_on_select: true,
@@ -130,7 +130,22 @@ impl App {
         let view = self.agents_overview_view(threads, /*selected_thread_id*/ None);
         self.agents_overview.visible_thread_ids = view.thread_ids();
         self.chat_widget.show_bottom_pane_view(Box::new(view));
-        self.refresh_agents_overview_threads(app_server);
+        if self.reconnect.offline {
+            self.reconnect.presentation = reconnect::ReconnectPresentation::Overview;
+            let mut state = self
+                .agents_overview
+                .view_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.loading = false;
+            state.connection_notice = Some(if self.reconnect.failed {
+                "Reconnect failed — agent list is stale; relaunch to retry"
+            } else {
+                "Reconnecting — agent list is stale"
+            });
+        } else {
+            self.refresh_agents_overview_threads(app_server);
+        }
     }
 
     pub(super) fn apply_agents_overview_thread_refresh(
@@ -276,6 +291,11 @@ impl App {
             }
         }
 
+        let voice_owner = self.voice_owner_thread_id().map(|id| id.to_string());
+        let voice_session = threads
+            .iter()
+            .find(|thread| Some(&thread.id) == voice_owner.as_ref())
+            .map(|thread| &thread.session_id);
         let mut roots = threads
             .iter()
             .filter(|thread| thread.parent_thread_id.is_none())
@@ -301,6 +321,7 @@ impl App {
                 thread_id,
                 group,
                 is_current: self.primary_thread_id == Some(thread_id),
+                has_voice: voice_session == Some(&root.session_id),
             });
         }
 
@@ -619,10 +640,19 @@ impl App {
                 match startup_draft.as_deref_mut() {
                     Some(draft) => {
                         draft
-                            .run_until(tui, self.shutdown_current_thread(app_server))
+                            .run_until(
+                                tui,
+                                self.detach_current_thread_for_navigation(
+                                    app_server,
+                                    Some(root_thread_id),
+                                ),
+                            )
                             .await?
                     }
-                    None => self.shutdown_current_thread(app_server).await,
+                    None => {
+                        self.detach_current_thread_for_navigation(app_server, Some(root_thread_id))
+                            .await
+                    }
                 }
             }
             // Explicit choices carry across cold resumes and new sessions.
@@ -712,6 +742,7 @@ impl App {
             for thread_id in previous_thread_ids {
                 if previous_running_thread_ids.is_empty()
                     && thread_id != root_thread_id
+                    && self.voice_owner_thread_id() != Some(thread_id)
                     && Some(thread_id) != previous_displayed_thread_id
                     && !self.agents_overview.blank_sessions.contains_key(&thread_id)
                     && let Err(error) = StartupDraftPump::run_with_optional_draft(

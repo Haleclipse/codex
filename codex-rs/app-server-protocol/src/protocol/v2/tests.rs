@@ -415,28 +415,43 @@ fn thread_items_list_round_trips() {
             "sortDirection": "asc",
         })
     );
-    let response = ThreadItemsListResponse {
-        data: vec![ThreadItemEntry {
-            turn_id: "turn_456".to_string(),
-            item: ThreadItem::ContextCompaction {
-                id: "item_1".to_string(),
-            },
-        }],
-        next_cursor: None,
-        backwards_cursor: Some("cursor_0".to_string()),
-    };
-
-    assert_eq!(
-        serde_json::to_value(&response).expect("serialize response"),
-        json!({
-            "data": [{
-                "turnId": "turn_456",
-                "item": {"type": "contextCompaction", "id": "item_1"},
+    for (started_at_ms, completed_at_ms) in [
+        (Some(1_789_855_978_123), Some(1_789_855_979_456)),
+        (Some(1_789_855_978_123), None),
+        (Some(1_789_855_978_123), Some(1_789_855_978_123)),
+        (None, None),
+    ] {
+        let response = ThreadItemsListResponse {
+            data: vec![ThreadItemEntry {
+                turn_id: "turn_456".to_string(),
+                item: ThreadItem::ContextCompaction {
+                    id: "item_1".to_string(),
+                },
+                started_at_ms,
+                completed_at_ms,
             }],
-            "nextCursor": null,
-            "backwardsCursor": "cursor_0",
-        })
-    );
+            next_cursor: None,
+            backwards_cursor: Some("cursor_0".to_string()),
+        };
+        let value = serde_json::to_value(&response).expect("serialize response");
+        assert_eq!(
+            value,
+            json!({
+                "data": [{
+                    "turnId": "turn_456",
+                    "item": {"type": "contextCompaction", "id": "item_1"},
+                    "startedAtMs": started_at_ms,
+                    "completedAtMs": completed_at_ms,
+                }],
+                "nextCursor": null,
+                "backwardsCursor": "cursor_0",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ThreadItemsListResponse>(value).expect("deserialize response"),
+            response
+        );
+    }
 
     let params_without_turn = ThreadItemsListParams {
         thread_id: "thr_123".to_string(),
@@ -2624,6 +2639,7 @@ fn mcp_server_status_serializes_absent_server_info_as_null() {
             name: "not-ready".to_string(),
             runtime_status: None,
             plugin_id: None,
+            http_origin: None,
             server_info: None,
             tools: HashMap::new(),
             resources: Vec::new(),
@@ -2640,6 +2656,7 @@ fn mcp_server_status_serializes_absent_server_info_as_null() {
                 "name": "not-ready",
                 "runtimeStatus": null,
                 "pluginId": null,
+                "httpOrigin": null,
                 "serverInfo": null,
                 "serverCapabilities": null,
                 "tools": {},
@@ -2673,6 +2690,7 @@ fn mcp_server_status_accepts_older_inventory_without_runtime_status() {
             name: "older-server".to_string(),
             runtime_status: None,
             plugin_id: None,
+            http_origin: None,
             server_info: None,
             tools: HashMap::new(),
             resources: Vec::new(),
@@ -2746,6 +2764,7 @@ fn mcp_server_status_serializes_absent_server_info_metadata_as_null() {
             name: "initialized".to_string(),
             runtime_status: None,
             plugin_id: Some("lookup@test".to_string()),
+            http_origin: None,
             server_info: Some(McpServerInfo {
                 name: "lookup-server".to_string(),
                 title: None,
@@ -2769,6 +2788,7 @@ fn mcp_server_status_serializes_absent_server_info_metadata_as_null() {
                 "name": "initialized",
                 "runtimeStatus": null,
                 "pluginId": "lookup@test",
+                "httpOrigin": null,
                 "serverCapabilities": null,
                 "serverInfo": {
                     "name": "lookup-server",
@@ -4450,6 +4470,7 @@ fn plugin_share_list_response_serializes_share_items() {
         serde_json::to_value(PluginShareListResponse {
             data: vec![PluginShareListItem {
                 plugin: PluginSummary {
+                    extensions: None,
                     id: "gmail@openai-curated-remote".to_string(),
                     remote_plugin_id: Some(
                         "plugins~Plugin_00000000000000000000000000000000".to_string(),
@@ -4479,6 +4500,7 @@ fn plugin_share_list_response_serializes_share_items() {
         json!({
             "data": [{
                 "plugin": {
+                    "extensions": null,
                     "id": "gmail@openai-curated-remote",
                     "remotePluginId": "plugins~Plugin_00000000000000000000000000000000",
                     "version": null,
@@ -4531,6 +4553,7 @@ fn plugin_summary_defaults_missing_availability_to_available() {
 #[test]
 fn plugin_summary_round_trips_plan_eligibility_metadata() {
     let value = json!({
+        "extensions": null,
         "id": "gmail@openai-curated-remote",
         "remotePluginId": "plugins~Plugin_00000000000000000000000000000000",
         "version": null,
@@ -4706,6 +4729,7 @@ fn core_error_info_converts_to_camel_case() {
     for (core, expected) in [
         (CoreCodexErrorInfo::CyberPolicy, json!("cyberPolicy")),
         (CoreCodexErrorInfo::BioPolicy, json!("other")),
+        (CoreCodexErrorInfo::InvalidPrompt, json!("other")),
         (
             CoreCodexErrorInfo::RateLimitExceeded,
             json!("rateLimitExceeded"),

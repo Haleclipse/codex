@@ -86,6 +86,7 @@ async fn owned_bottom_pane_preserves_draft_cursor_and_read_only_notice() {
         let bottom = widget.bottom_pane_renderable(
             /*footer*/ None,
             crate::bottom_pane::CommandPopupPlacement::Overlay,
+            /*composer_gap*/ None,
         );
         let mut buffer = Buffer::empty(area);
         bottom.render(area, &mut buffer);
@@ -262,6 +263,35 @@ async fn external_writer_view_shows_notice_instead_of_composer() {
     );
     assert_eq!(frame[(5, 5)].modifier, ratatui::style::Modifier::empty());
     assert!(!widget.bottom_pane.composer_input_enabled());
+}
+
+#[tokio::test]
+async fn external_writer_fork_progress_restores_the_previous_view() {
+    let (mut widget, _sender, _events, _operations) = make_chatwidget_manual_with_sender().await;
+    for locked in [false, true] {
+        widget.external_writer_view = locked;
+        let previous = render_frame(&widget, /*width*/ 60);
+        widget.fork_in_progress = true;
+        let frame = render_frame(&widget, /*width*/ 60);
+        let rows = frame
+            .content
+            .chunks(usize::from(frame.area.width))
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        insta::assert_snapshot!(
+            "fork_pending",
+            rows.iter()
+                .map(|row| row.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        widget.fork_in_progress = false;
+        assert_eq!(render_frame(&widget, /*width*/ 60), previous);
+    }
 }
 
 #[tokio::test]

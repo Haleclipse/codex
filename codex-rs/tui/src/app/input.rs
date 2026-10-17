@@ -190,26 +190,27 @@ impl App {
             } else {
                 KeymapContext::Pager
             };
-            let contexts = KeymapContextSet::new(context);
+            let contexts = KeymapContextSet::new(context).with_voice_toggle(&self.keymap);
             return if self.backtrack.overlay_preview_active && context == KeymapContext::Pager {
-                KeymapContextSet::browsing()
+                KeymapContextSet::browsing().with_voice_toggle(&self.keymap)
             } else {
                 contexts
             };
         }
         if self.transcript_view.is_search_active() && self.chat_widget.no_modal_or_popup_active() {
-            return KeymapContextSet::new(KeymapContext::Editor);
+            return KeymapContextSet::new(KeymapContext::Editor).with_voice_toggle(&self.keymap);
         }
         if self.transcript_view.is_activity_focused() && self.chat_widget.no_modal_or_popup_active()
         {
-            return KeymapContextSet::activity();
+            return KeymapContextSet::activity().with_voice_toggle(&self.keymap);
         }
         if self.backtrack.overlay_preview_active && self.chat_widget.no_modal_or_popup_active() {
-            return KeymapContextSet::browsing();
+            return KeymapContextSet::browsing().with_voice_toggle(&self.keymap);
         }
-        let voice_available = self.chat_widget.realtime_microphone_shortcut_available();
+        let voice_available = self.chat_widget.realtime_microphone_shortcut_available()
+            || self.voice_owner_thread_id().is_some();
         let contexts = self.chat_widget.keymap_contexts();
-        if self.chat_widget.no_modal_or_popup_active() {
+        let contexts = if self.chat_widget.no_modal_or_popup_active() {
             let contexts = contexts
                 .with(KeymapContext::Global)
                 .with(KeymapContext::Chat);
@@ -225,7 +226,8 @@ impl App {
             }
         } else {
             contexts
-        }
+        };
+        contexts.with_voice_toggle(&self.keymap)
     }
 
     pub(super) async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
@@ -346,6 +348,9 @@ impl App {
         app_server: &mut AppServerSession,
         key_event: KeyEvent,
     ) {
+        if self.chat_widget.fork_in_progress {
+            return;
+        }
         if self.chat_widget.is_external_writer_view()
             && self.overlay.is_none()
             && self.chat_widget.no_modal_or_popup_active()
@@ -372,6 +377,14 @@ impl App {
             };
             if quit {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+                return;
+            }
+            if matches!(key_event.code, KeyCode::Char('f' | 'F'))
+                && (modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT)
+            {
+                self.chat_widget.fork_in_progress = true;
+                self.app_event_tx
+                    .send(AppEvent::ForkCurrentSession { name: None });
                 return;
             }
             if matches!(key_event.code, KeyCode::Char('r' | 'R'))
@@ -703,7 +716,8 @@ impl App {
     }
 
     pub(crate) fn should_handle_backtrack_esc(&self, key_event: KeyEvent) -> bool {
-        !self.chat_widget.side_conversation_active()
+        !self.chat_widget.is_external_writer_view()
+            && !self.chat_widget.side_conversation_active()
             && !self.chat_widget.shortcut_overlay_visible()
             && self.chat_widget.is_normal_backtrack_mode()
             && self.chat_widget.composer_is_empty()

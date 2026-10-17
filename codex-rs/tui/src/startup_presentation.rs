@@ -56,12 +56,17 @@ pub(super) async fn load(
         .as_ref()
         .map(|tui| tui.alternate_screen)
         .unwrap_or_default();
-    let use_alt_screen = crate::determine_alt_screen_mode(cli.no_alt_screen, alternate_screen);
+    // Terminal probing happens after configuration loads; startup finalizes this before painting.
+    let use_alt_screen = crate::determine_alt_screen_mode(
+        cli.no_alt_screen,
+        alternate_screen,
+        /*terminal_app_over_ssh*/ false,
+    );
     let transcript_mode = crate::transcript_mode::TranscriptMode::resolve(
         config_toml
             .tui
             .as_ref()
-            .is_some_and(|tui| tui.fullscreen_transcript),
+            .is_none_or(|tui| tui.fullscreen_transcript),
         use_alt_screen,
     );
     let status_line_enabled = config_toml

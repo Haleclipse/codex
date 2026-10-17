@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::app_server_session::AppServerSession;
 use crate::clipboard_paste::normalize_pasted_search_query;
+use crate::clock_format::ClockFormat;
 use crate::color::blend;
 use crate::color::is_light;
 use crate::key_hint::KeyBindingListExt;
@@ -841,6 +842,7 @@ impl Drop for AltScreenGuard<'_> {
 }
 
 struct PickerState {
+    clock_format: ClockFormat,
     use_theme_colors: bool,
     // Resolve local filesystem membership once per cwd for each page-loading cycle.
     local_cwd_matches: HashMap<PathBuf, bool>,
@@ -1042,6 +1044,7 @@ impl PickerState {
         action: SessionPickerAction,
     ) -> Self {
         Self {
+            clock_format: ClockFormat::system(),
             use_theme_colors: true,
             requester,
             relative_time_reference: None,
@@ -3349,12 +3352,19 @@ fn render_expanded_session_details(
 
     vec![
         expanded_detail_line("Session:", &session, width),
-        expanded_time_detail_line("Created:", reference, row.created_at, width),
+        expanded_time_detail_line(
+            "Created:",
+            reference,
+            row.created_at,
+            width,
+            state.clock_format,
+        ),
         expanded_time_detail_line(
             "Updated:",
             reference,
             row.updated_at.or(row.created_at),
             width,
+            state.clock_format,
         ),
         expanded_detail_line("Directory:", &directory, width),
         expanded_detail_line("Branch:", &branch, width),
@@ -3499,6 +3509,7 @@ fn expanded_time_detail_line(
     reference: DateTime<Utc>,
     ts: Option<DateTime<Utc>>,
     width: u16,
+    clock_format: ClockFormat,
 ) -> Line<'static> {
     let Some(ts) = ts else {
         return expanded_detail_line(label, "-", width);
@@ -3506,7 +3517,7 @@ fn expanded_time_detail_line(
     let value = format!(
         "{} · {}",
         format_relative_time_long(reference, ts),
-        format_timestamp(ts)
+        format_timestamp(ts, clock_format)
     );
     expanded_detail_line(label, &value, width)
 }
@@ -3561,8 +3572,12 @@ fn plural_time(value: i64, unit: &str) -> String {
     }
 }
 
-fn format_timestamp(ts: DateTime<Utc>) -> String {
-    ts.format("%Y-%m-%d %H:%M:%S").to_string()
+fn format_timestamp(ts: DateTime<Utc>, clock_format: ClockFormat) -> String {
+    ts.format(match clock_format {
+        ClockFormat::TwelveHour => "%Y-%m-%d %-I:%M:%S %p",
+        ClockFormat::TwentyFourHour => "%Y-%m-%d %H:%M:%S",
+    })
+    .to_string()
 }
 
 fn render_empty_state_line(state: &PickerState) -> Line<'static> {
@@ -4202,6 +4217,7 @@ mod tests {
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
         );
+        state.clock_format = ClockFormat::TwentyFourHour;
         state.relative_time_reference = parse_timestamp_str("2026-05-02T14:48:19Z");
         let row = Row {
             path: Some(PathBuf::from("/tmp/a.jsonl")),
@@ -5880,6 +5896,7 @@ session_picker_view = "dense"
             /*filter_cwd*/ None,
             SessionPickerAction::Resume,
         );
+        state.clock_format = ClockFormat::TwelveHour;
         state.all_rows = vec![row.clone()];
         state.filtered_rows = vec![row];
         state.relative_time_reference =

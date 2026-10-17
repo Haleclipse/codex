@@ -92,6 +92,7 @@ pub(super) fn test_tracking_context(thread_id: &str, turn_id: &str) -> TrackEven
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
         product_client_id: TEST_PRODUCT_CLIENT_ID.to_string(),
+        turn_metadata: None,
     }
 }
 
@@ -584,6 +585,7 @@ pub(super) fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact {
                 version: "1.0.0".to_string(),
             },
             capabilities: Some(InitializeCapabilities {
+                explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
                 opt_out_notification_methods: None,

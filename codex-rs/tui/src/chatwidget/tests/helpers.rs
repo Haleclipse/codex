@@ -250,6 +250,7 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         session_telemetry,
     };
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
+    widget.clock_format = crate::clock_format::ClockFormat::TwentyFourHour;
     widget.windows_sandbox_host = crate::app::WindowsSandboxHost::Local;
     widget.windows_sandbox_config.requirements = Some(None);
     widget.transcript.active_cell = None;
@@ -373,7 +374,7 @@ pub(crate) async fn make_chatwidget_manual_with_sender() -> (
     tokio::sync::mpsc::UnboundedReceiver<Op>,
 ) {
     let (widget, rx, op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let app_event_tx = widget.app_event_tx.clone();
+    let app_event_tx = AppEventSender::new(widget.app_event_tx.app_event_tx.clone());
     (widget, app_event_tx, rx, op_rx)
 }
 
@@ -1483,6 +1484,7 @@ pub(super) fn plugins_test_summary(
     install_policy: PluginInstallPolicy,
 ) -> PluginSummary {
     PluginSummary {
+        extensions: None,
         id: id.to_string(),
         remote_plugin_id: None,
         version: None,
@@ -1519,6 +1521,7 @@ pub(super) fn plugins_test_remote_summary(
     installed: bool,
 ) -> PluginSummary {
     PluginSummary {
+        extensions: None,
         id: remote_plugin_id.to_string(),
         remote_plugin_id: Some(remote_plugin_id.to_string()),
         version: None,

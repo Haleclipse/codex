@@ -2,6 +2,7 @@ use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::context::ContextualUserFragment;
 use crate::context_manager::ContextManager;
+use crate::session::Submission;
 use codex_guardian_reviewer::ReviewerRequest;
 use codex_guardian_reviewer::guardian_output_contract_prompt;
 use codex_history::CodexHarnessMetadata;
@@ -13,7 +14,6 @@ use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ErrorEvent;
-use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -49,7 +49,6 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
     .unwrap();
     params.parent_session = Arc::clone(&parent);
     params.parent_context = GuardianReviewContext::from(Arc::clone(&turn));
-    params.compaction_model_hash = Some("matching".to_owned());
     let evidence: ResponseItem = serde_json::from_value(serde_json::json!({
         "type": "function_call_output", "call_id": "prior-inspection", "output": EVIDENCE
     }))
@@ -251,7 +250,6 @@ async fn test_review_params() -> GuardianReviewSessionParams {
             model_overridden: false,
             model_override: None,
         },
-        compaction_model_hash: None,
         reasoning_summary,
         personality,
         external_cancel: None,
@@ -478,7 +476,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(thread_context_en
     }]);
     assert_eq!(
         policy
-            .parent_compaction(&history, Some("compatible"))
+            .parent_compaction(&history)
             .expect("valid checkpoint"),
         Some(item)
     );
@@ -493,7 +491,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(thread_context_en
         .into(),
     );
     history.replace_annotated(items);
-    let result = policy.parent_compaction(&history, Some("compatible"));
+    let result = policy.parent_compaction(&history);
     if thread_context_enabled {
         assert!(result.is_err());
     } else {
@@ -657,6 +655,7 @@ async fn guardian_review_session_config_resolves_policy_and_template(
         Some(
             GuardianPolicyInstructions::new(
                 expected_policy,
+                "",
                 expected_template,
                 guardian_output_contract_prompt(),
             )

@@ -570,6 +570,7 @@ mod tests {
         let config = RemotePluginServiceConfig::new(
             format!("{}/backend-api", server.uri()),
             crate::test_support::test_http_client_factory(),
+            /*product_sku*/ None,
         );
         let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
 
@@ -756,11 +757,11 @@ mod tests {
             crate::test_support::recorded_http_client_urls(&selected_urls),
             vec![
                 format!(
-                    "{}/backend-api/ps/plugins/installed?limit=200&includeDownloadUrls=true",
+                    "{}/backend-api/ps/plugins/installed?includeExtensions=true&limit=200&includeDownloadUrls=true",
                     server.uri()
                 ),
                 format!(
-                    "{}/backend-api/ps/plugins/installed?limit=200&includeDownloadUrls=true&pageToken=page-2",
+                    "{}/backend-api/ps/plugins/installed?includeExtensions=true&limit=200&includeDownloadUrls=true&pageToken=page-2",
                     server.uri()
                 ),
             ]

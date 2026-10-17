@@ -17,6 +17,8 @@ SELECT
     threads.recency_at_ms AS recency_at,
     threads.source,
     threads.originator,
+    threads.creator_user_id,
+    threads.creator_account_id,
     threads.history_mode,
     threads.thread_source,
     threads.agent_nickname,
@@ -72,7 +74,7 @@ WHERE threads.id = ?
     ) -> anyhow::Result<bool> {
         // Legacy threads display `title`, then fall back to the name index. Paginated threads
         // display `name`; `title` remains derived metadata used for search. Preserve an existing
-        // `name`, otherwise carry over the legacy display name.
+        // `name`, unless it is the Guardian default seeded by metadata cleanup.
         let result = sqlx::query(
             r#"
 UPDATE threads
@@ -80,11 +82,16 @@ SET
     history_mode = 'paginated',
     name = CASE
         WHEN name IS NULL OR trim(name) = '' THEN ?
+        WHEN history_mode = 'legacy'
+            AND source = '{"subagent":{"other":"guardian"}}'
+            AND name = ? THEN COALESCE(?, name)
         ELSE name
     END
 WHERE id = ?
             "#,
         )
+        .bind(legacy_name)
+        .bind(crate::GUARDIAN_THREAD_TITLE)
         .bind(legacy_name)
         .bind(thread_id.to_string())
         .execute(self.pool.as_ref())
@@ -621,6 +628,8 @@ INSERT INTO threads (
     recency_at_ms,
     source,
     originator,
+    creator_user_id,
+    creator_account_id,
     history_mode,
     thread_source,
     agent_nickname,
@@ -649,7 +658,7 @@ INSERT INTO threads (
     memory_mode,
     project_id,
     daybreak_enabled
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
             "#,
         )
@@ -663,6 +672,8 @@ ON CONFLICT(id) DO NOTHING
         .bind(datetime_to_epoch_millis(recency_at))
         .bind(metadata.source.as_str())
         .bind(metadata.originator.as_deref())
+        .bind(metadata.creator_user_id.as_deref())
+        .bind(metadata.creator_account_id.as_deref())
         .bind(metadata.history_mode.as_str())
         .bind(
             metadata
@@ -917,6 +928,8 @@ INSERT INTO threads (
     recency_at_ms,
     source,
     originator,
+    creator_user_id,
+    creator_account_id,
     history_mode,
     thread_source,
     agent_nickname,
@@ -945,7 +958,7 @@ INSERT INTO threads (
     memory_mode,
     project_id,
     daybreak_enabled
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
@@ -956,6 +969,8 @@ ON CONFLICT(id) DO UPDATE SET
     recency_at_ms = threads.recency_at_ms,
     source = excluded.source,
     originator = COALESCE(threads.originator, excluded.originator),
+    creator_user_id = COALESCE(threads.creator_user_id, excluded.creator_user_id),
+    creator_account_id = COALESCE(threads.creator_account_id, excluded.creator_account_id),
     -- Paginated history is a one-way promotion; stale legacy metadata must not downgrade it.
     history_mode = CASE
         WHEN threads.history_mode = 'paginated' THEN threads.history_mode
@@ -993,6 +1008,8 @@ ON CONFLICT(id) DO UPDATE SET
         .bind(datetime_to_epoch_millis(insert_recency_at))
         .bind(metadata.source.as_str())
         .bind(metadata.originator.as_deref())
+        .bind(metadata.creator_user_id.as_deref())
+        .bind(metadata.creator_account_id.as_deref())
         .bind(metadata.history_mode.as_str())
         .bind(
             metadata
@@ -1300,6 +1317,8 @@ SELECT
     threads.recency_at_ms AS recency_at,
     threads.source,
     threads.originator,
+    threads.creator_user_id,
+    threads.creator_account_id,
     threads.history_mode,
     threads.thread_source,
     threads.agent_nickname,
@@ -2595,6 +2614,8 @@ mod tests {
         );
         let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
+                creator_user_id: None,
+                creator_account_id: None,
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
@@ -2667,6 +2688,8 @@ mod tests {
         );
         let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
+                creator_user_id: None,
+                creator_account_id: None,
                 session_id: thread_id.into(),
                 id: thread_id,
                 forked_from_id: None,
@@ -2750,6 +2773,8 @@ mod tests {
 
         let mut rollout_metadata = metadata.clone();
         rollout_metadata.originator = Some("recorded_client".to_string());
+        rollout_metadata.creator_user_id = Some("creator-user".to_string());
+        rollout_metadata.creator_account_id = Some("creator-account".to_string());
         rollout_metadata.git_sha = Some("rollout-sha".to_string());
         rollout_metadata.git_branch = Some("rollout-branch".to_string());
         rollout_metadata.git_origin_url = Some(
@@ -2777,6 +2802,8 @@ mod tests {
 
         for incoming_originator in [None, Some("resume_client")] {
             rollout_metadata.originator = incoming_originator.map(str::to_owned);
+            rollout_metadata.creator_user_id = incoming_originator.map(str::to_owned);
+            rollout_metadata.creator_account_id = incoming_originator.map(str::to_owned);
             runtime
                 .upsert_thread(&rollout_metadata)
                 .await
@@ -2787,6 +2814,13 @@ mod tests {
                 .expect("thread should load")
                 .expect("thread should exist");
             assert_eq!(persisted.originator.as_deref(), Some("recorded_client"));
+            assert_eq!(
+                (
+                    persisted.creator_user_id.as_deref(),
+                    persisted.creator_account_id.as_deref()
+                ),
+                (Some("creator-user"), Some("creator-account")),
+            );
         }
     }
 

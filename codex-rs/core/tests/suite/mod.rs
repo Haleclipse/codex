@@ -45,6 +45,7 @@ mod apply_patch_serialization;
 #[cfg(not(target_os = "windows"))]
 mod approvals;
 mod audio_truncation;
+mod auth_recovery_policy;
 mod auto_review;
 mod catalog_permission_messages;
 mod cli_stream;
@@ -53,6 +54,7 @@ mod client_websockets;
 mod cloud_config;
 mod code_mode;
 mod code_mode_elicitation;
+mod code_mode_model_messages;
 mod codex_apps_protocol;
 mod codex_delegate;
 mod collaboration_instructions;
@@ -155,6 +157,7 @@ mod realtime_conversation;
 mod realtime_initial_items;
 mod realtime_misalignment;
 mod realtime_sideband_endpoint;
+mod realtime_system_proxy;
 mod reasoning_effort_override;
 mod remote_env;
 mod remote_models;
@@ -217,6 +220,8 @@ mod user_notification;
 mod user_shell_cmd;
 mod view_image;
 mod web_search;
+#[path = "web_search_system_proxy_tests.rs"]
+mod web_search_system_proxy;
 mod websocket_fallback;
 mod window_headers;
 #[cfg(target_os = "windows")]

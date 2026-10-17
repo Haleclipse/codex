@@ -162,6 +162,74 @@ fn response_item_envelope_accessors_preserve_item() {
 }
 
 #[test]
+fn mcp_checkpoint_handles_missing_or_unknown_identity() -> Result<()> {
+    let metadata: CodexHarnessMetadata = serde_json::from_value(json!({}))?;
+    assert_eq!(metadata.mcp_attribution, None);
+
+    let restored: CodexHarnessMetadata = serde_json::from_value(json!({
+        "mcp_attribution": {
+            "status": "complete",
+            "sources": [{
+                "server_name": "example",
+                "tool_name": "search",
+                "first_turn_id": "turn_1",
+                "future_identity": "unknown to this reader"
+            }]
+        }
+    }))?;
+    assert_eq!(
+        restored.mcp_attribution,
+        Some(McpAttribution {
+            status: McpAttributionStatus::AttributionError,
+            error_reason: None,
+            sources: Vec::new(),
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn mcp_error_diagnostics_do_not_invalidate_checkpoints() -> Result<()> {
+    let metadata = CodexHarnessMetadata {
+        mcp_attribution: Some(McpAttribution {
+            status: McpAttributionStatus::AttributionError,
+            error_reason: Some(
+                codex_protocol::mcp::McpAttributionErrorReason::HistoryMissingCheckpoint,
+            ),
+            sources: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    for (reason, expected_reason) in [
+        (None, None),
+        (
+            Some(json!("future_reason")),
+            Some(codex_protocol::mcp::McpAttributionErrorReason::Unknown),
+        ),
+        (Some(json!({"invalid": true})), None),
+    ] {
+        let mut serialized = serde_json::to_value(&metadata)?;
+        let attribution = serialized["mcp_attribution"]
+            .as_object_mut()
+            .expect("attribution object");
+        if let Some(reason) = reason {
+            attribution.insert("error_reason".to_string(), reason);
+        } else {
+            attribution.remove("error_reason");
+        }
+        let restored: CodexHarnessMetadata = serde_json::from_value(serialized)?;
+        let mut expected = metadata.clone();
+        expected
+            .mcp_attribution
+            .as_mut()
+            .expect("attribution checkpoint")
+            .error_reason = expected_reason;
+        assert_eq!(restored, expected);
+    }
+    Ok(())
+}
+
+#[test]
 /// Keeps legacy response-item rollout lines readable and byte-shape compatible.
 fn response_item_rollout_line_preserves_shape() -> Result<()> {
     let legacy_line = json!({
@@ -388,6 +456,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     };
 
     let serialized = serde_json::to_value(item)?;
@@ -422,6 +491,34 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
             },
         ])
     );
+    Ok(())
+}
+
+#[test]
+fn compacted_resume_metadata_presence_round_trips_empty_values() -> Result<()> {
+    let resume_metadata = CompactionResumeMetadata {
+        multi_agent_version: None,
+        last_started_turn_id: None,
+        previous_turn_settings: None,
+    };
+    let item = CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: None,
+        retained_context: None,
+        guardian_history: None,
+        mcp_resource_origins: None,
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
+        resume_metadata: Some(resume_metadata.clone()),
+    };
+
+    let serialized = serde_json::to_value(&item)?;
+    assert_eq!(serialized["resume_metadata"], json!(resume_metadata));
+    assert_eq!(serde_json::from_value::<CompactedItem>(serialized)?, item);
     Ok(())
 }
 
@@ -499,6 +596,11 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: Some(CompactionResumeMetadata {
+            multi_agent_version: Some(MultiAgentVersion::V2),
+            last_started_turn_id: Some("turn-1".to_string()),
+            previous_turn_settings: None,
+        }),
     }))?;
 
     let restored: RolloutItem = serde_json::from_value(compacted_line.clone())?;
@@ -707,6 +809,7 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
         window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string()),
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     };
 
     assert_eq!(
@@ -746,6 +849,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
             window_id: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }
     );
     Ok(())
@@ -823,6 +927,22 @@ fn multi_agent_version_uses_newest_present_session_meta_value() -> Result<()> {
             ],
             Some(thread_id),
         ),
+        Some(MultiAgentVersion::V2)
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_agent_version_uses_compaction_metadata_without_turn_context() -> Result<()> {
+    let compacted = serde_json::from_value::<CompactedItem>(json!({
+        "message": "summary",
+        "replacement_history": [],
+        "window_number": 1,
+        "resume_metadata": {"multi_agent_version": "v2"}
+    }))?;
+
+    assert_eq!(
+        InitialHistory::Forked(vec![RolloutItem::Compacted(compacted)]).get_multi_agent_version(),
         Some(MultiAgentVersion::V2)
     );
     Ok(())

@@ -10,6 +10,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol::sandbox::SandboxType;
 
 use crate::config::ConstraintError;
 use crate::config::ConstraintResult;
@@ -19,7 +20,32 @@ use crate::session::session::Session;
 use crate::session::session::SessionConfiguration;
 use crate::session::session::SessionSettingsUpdate;
 
-pub(super) fn validate_environment_selections(
+/// Defaults for environments that inherit their configuration from the running turn.
+pub(crate) struct ThreadEnvironmentDefaults {
+    pub(crate) common: EnvironmentConfig,
+    // Chosen once when the session starts; it does not apply to remote environments.
+    local_windows_sandbox_type: SandboxType,
+}
+
+impl ThreadEnvironmentDefaults {
+    pub(crate) fn new(common: EnvironmentConfig, local_windows_sandbox_type: SandboxType) -> Self {
+        Self {
+            common,
+            local_windows_sandbox_type,
+        }
+    }
+
+    pub(crate) fn for_selection(&self, selection: &TurnEnvironmentSelection) -> EnvironmentConfig {
+        let mut config = self.common.clone();
+        config.workspace_roots = selection.workspace_roots.clone();
+        if selection.environment_id == LOCAL_ENVIRONMENT_ID {
+            config.windows_sandbox_type = self.local_windows_sandbox_type;
+        }
+        config
+    }
+}
+
+pub(super) fn validate_environment_configs(
     selections: &[TurnEnvironmentSelection],
 ) -> ConstraintResult<()> {
     for selection in selections {
@@ -38,6 +64,27 @@ pub(super) fn validate_environment_selections(
                 })?;
             }
         }
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_configs_stay_owner_provided(
+    current: &[TurnEnvironmentSelection],
+    proposed: &[TurnEnvironmentSelection],
+) -> ConstraintResult<()> {
+    if let Some(environment) = proposed.iter().find(|environment| {
+        environment.config == EnvironmentConfigState::FromThread
+            && current.iter().any(|current| {
+                current.environment_id == environment.environment_id
+                    && current.config != EnvironmentConfigState::FromThread
+            })
+    }) {
+        return Err(ConstraintError::InvalidValue {
+            field_name: "environments",
+            candidate: environment.environment_id.clone(),
+            allowed: "owner-provided environment configuration".to_string(),
+            requirement_source: codex_config::RequirementSource::Unknown,
+        });
     }
     Ok(())
 }
@@ -111,21 +158,8 @@ impl Session {
         updates: &SessionSettingsUpdate,
     ) -> ConstraintResult<SessionConfiguration> {
         let current_environments = &current.environments;
-        if let Some(environments) = &updates.environments
-            && let Some(environment) = environments.environments.iter().find(|environment| {
-                environment.config == EnvironmentConfigState::FromThread
-                    && current_environments.iter().any(|current| {
-                        current.environment_id == environment.environment_id
-                            && current.config != EnvironmentConfigState::FromThread
-                    })
-            })
-        {
-            return Err(ConstraintError::InvalidValue {
-                field_name: "environments",
-                candidate: environment.environment_id.clone(),
-                allowed: "owner-provided environment configuration".to_string(),
-                requirement_source: codex_config::RequirementSource::Unknown,
-            });
+        if let Some(environments) = &updates.environments {
+            ensure_configs_stay_owner_provided(current_environments, &environments.environments)?;
         }
 
         current.apply(updates, current_environments)
@@ -157,11 +191,14 @@ impl Session {
                         environment.config = latest.config.clone();
                     }
                 }
+                // Apply the saved defaults even if this turn selects the same environments.
+                self.services
+                    .turn_environments
+                    .set_active_thread_defaults(configuration.inferred_environment_config());
                 if environments != self.services.turn_environments.selections() {
-                    self.services.turn_environments.update_selections(
-                        &environments,
-                        &configuration.inferred_environment_config(),
-                    );
+                    self.services
+                        .turn_environments
+                        .update_selections(&environments);
                 }
             }
             self.services.turn_environments.snapshot()
@@ -256,10 +293,7 @@ impl Session {
         if update_current {
             // Invalidate MCP before installed configuration can wake a waiting turn.
             self.mark_mcp_runtime_dirty();
-            self.services.turn_environments.update_selections(
-                &current,
-                &state.session_configuration.inferred_environment_config(),
-            );
+            self.services.turn_environments.update_selections(&current);
         }
         Ok(())
     }

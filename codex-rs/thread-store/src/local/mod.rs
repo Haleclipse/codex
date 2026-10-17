@@ -527,9 +527,18 @@ impl ThreadStore for LocalThreadStore {
     fn persist_thread(
         &self,
         thread_id: ThreadId,
-        _context: PersistContext,
+        context: PersistContext,
     ) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::persist_thread(self, thread_id).await })
+        if context == PersistContext::SubagentSpawn {
+            return Box::pin(async { Ok(()) });
+        }
+        Box::pin(async move {
+            if context == PersistContext::ThreadPreparation {
+                live_writer::flush_thread(self, thread_id).await
+            } else {
+                live_writer::persist_thread(self, thread_id).await
+            }
+        })
     }
 
     fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
@@ -2063,6 +2072,8 @@ mod tests {
 
     fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,

@@ -99,6 +99,8 @@ pub(super) async fn run_main_inner(
         launch_loader_overrides.user_config_path = Some(user_config_path);
         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
     }
+    let embedded_network_policy =
+        codex_app_server_client::EmbeddedNetworkPolicy::load(&launch_loader_overrides).await;
     let workload_identity_selected = is_workload_identity_selected();
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -138,6 +140,7 @@ pub(super) async fn run_main_inner(
                 &validation_target,
                 &validation_bootstrap,
                 &codex_home,
+                &embedded_network_policy,
             )
             .await?
         } else {
@@ -272,8 +275,22 @@ pub(super) async fn run_main_inner(
     let startup_presentation::StartupPresentation {
         bootstrap_config,
         config_cwd,
-        screen,
+        mut screen,
     } = presentation;
+    screen.use_alt_screen = determine_alt_screen_mode(
+        cli.no_alt_screen,
+        bootstrap_config
+            .config_toml
+            .tui
+            .as_ref()
+            .map(|tui| tui.alternate_screen)
+            .unwrap_or_default(),
+        initialized_terminal.terminal_app_over_ssh,
+    );
+    screen.transcript_mode = crate::transcript_mode::TranscriptMode::resolve(
+        screen.transcript_mode.is_owned(),
+        screen.use_alt_screen,
+    );
     let mut startup_draft = startup_draft::StartupDraft::new(
         initialized_terminal,
         terminal_restore_guard,
@@ -321,6 +338,7 @@ pub(super) async fn run_main_inner(
             &app_server_target,
             &bootstrap_config,
             &codex_home,
+            &embedded_network_policy,
         ))
         .await??;
     let bootstrap_config_toml = &bootstrap_config.config_toml;
@@ -430,6 +448,9 @@ pub(super) async fn run_main_inner(
             strict_config,
         ))
         .await?;
+    if app_server_target.uses_embedded_network_policy() {
+        embedded_network_policy.activate(&mut config);
+    }
     startup_draft.apply_config(&config);
 
     let mut cloud_config_bundle = if workload_identity_selected {
@@ -437,7 +458,9 @@ pub(super) async fn run_main_inner(
     } else {
         startup_draft
             .run_until(cloud_config_bundle_loader_for_storage(
-                app_server_target.auth_config_for_cloud_loader(config.auth_config()),
+                embedded_network_policy.bind_bootstrap_auth(
+                    app_server_target.auth_config_for_cloud_loader(config.auth_config()),
+                ),
                 /*enable_codex_api_key_env*/ false,
             ))
             .await??
@@ -454,11 +477,15 @@ pub(super) async fn run_main_inner(
                 &app_server_target,
                 &arg0_paths,
                 cloud_config_bundle.clone(),
+                &embedded_network_policy,
             ))
             .await?
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         config = destination;
         cloud_config_bundle = bundle;
+        if app_server_target.uses_embedded_network_policy() {
+            embedded_network_policy.activate(&mut config);
+        }
         startup_draft.apply_config(&config);
         Some(worktree)
     } else {
@@ -491,7 +518,10 @@ pub(super) async fn run_main_inner(
         daemon_exclusion = Some("Bedrock sign-in");
         app_server_target = AppServerTarget::Embedded;
     }
-    let daemon_features = daemon_startup::server_features(&cli_kv_overrides);
+    let mut daemon_features = daemon_startup::server_features(&cli_kv_overrides);
+    // Disabling shared services requires confirmation, even on a fresh auto-start.
+    daemon_features.retain(|_, enabled| *enabled);
+    let mut managed_daemon = false;
     if auto_start_daemon && daemon_exclusion.is_none() {
         startup_draft.flush_pending_events().await?;
         let output = startup_draft
@@ -506,6 +536,7 @@ pub(super) async fn run_main_inner(
                 })
             })
             .await?;
+        managed_daemon = output.backend.is_some();
         app_server_target = AppServerTarget::LocalDaemon {
             endpoint: RemoteAppServerEndpoint::UnixSocket {
                 socket_path: AbsolutePathBuf::from_absolute_path_checked(output.socket_path)?,
@@ -517,16 +548,20 @@ pub(super) async fn run_main_inner(
     let compatibility_warning = if cli.agents_overview {
         None
     } else {
-        startup_draft
-            .run_until(daemon_startup::compatibility_warning(
-                &app_server_target,
-                &config,
-            ))
-            .await?
+        daemon_recovery::check(
+            &mut startup_draft,
+            &app_server_target,
+            &config,
+            managed_daemon,
+        )
+        .await?
     };
     if compatibility_warning.is_some() {
         app_server_target = AppServerTarget::Embedded;
         daemon_exclusion = Some("daemon feature settings");
+    }
+    if app_server_target.uses_embedded_network_policy() {
+        embedded_network_policy.activate(&mut config);
     }
     let daemon_startup_warning = compatibility_warning.or_else(|| {
         daemon_exclusion
@@ -543,7 +578,11 @@ pub(super) async fn run_main_inner(
     );
     let environment_manager = Arc::new(
         prepared_environment_manager
-            .build(Some(local_runtime_paths), config.http_client_factory())
+            .build(
+                Some(local_runtime_paths),
+                app_server_target
+                    .environment_http_client_factory(&config, &embedded_network_policy),
+            )
             .map_err(std::io::Error::other)?,
     );
 
@@ -824,6 +863,7 @@ pub(super) async fn run_main_inner(
         log_db,
         state_db,
         environment_manager,
+        embedded_network_policy,
         managed_worktree.clone(),
         daemon_startup_warning,
         launch_telemetry,

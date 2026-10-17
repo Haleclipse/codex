@@ -4,6 +4,7 @@
 #[cfg(test)]
 #[path = "executed_tool_calls_direct_tests.rs"]
 mod direct_tests;
+mod mcp_attribution;
 mod request_metadata;
 
 use std::collections::HashMap;
@@ -19,6 +20,8 @@ use codex_code_mode::CellId;
 use codex_features::Feature;
 use codex_features::Features;
 use codex_history::InitialHistory;
+use codex_protocol::mcp::McpAttribution;
+use codex_protocol::mcp::McpAttributionSource;
 use codex_protocol::models::ExecutedToolCall;
 use codex_protocol::models::ExecutedToolCallArguments;
 use codex_protocol::models::ResponseItem;
@@ -58,6 +61,7 @@ pub(crate) struct ExecutedToolCalls {
     state: Arc<Mutex<Option<ExecutedToolCallRecorderState>>>,
     retained_direct_metadata_bytes: Arc<AtomicUsize>,
     pending_direct_calls: Arc<AtomicUsize>,
+    mcp_attribution: mcp_attribution::McpAttributionRecorder,
 }
 
 // The tool future owns this reservation, so completion or cancellation releases it.
@@ -163,15 +167,20 @@ impl ExecutedToolCallRecorderState {
             self.output_cells
                 .retain(|_, cell_id| self.cells.contains_key(cell_id));
         }
-        while (self.cells.len() >= MAX_PENDING_EXECUTED_TOOL_CALLS
-            && !self.cells.contains_key(cell_id))
-            || self.pending_nested_calls >= MAX_PENDING_EXECUTED_TOOL_CALLS
-        {
+        loop {
+            let needs_cell_slot = self.cells.len() >= MAX_PENDING_EXECUTED_TOOL_CALLS
+                && !self.cells.contains_key(cell_id);
+            if !needs_cell_slot && self.pending_nested_calls < MAX_PENDING_EXECUTED_TOOL_CALLS {
+                break;
+            }
+
             let output_cells = self.output_cells.values().collect::<HashSet<_>>();
             let finished_cell = self.cells.iter().find_map(|(id, cell)| {
                 // Preserve late records until pressure, and never discard the cell
                 // whose output is about to make those records attachable again.
+                // Empty cells can free cell slots, but not pending-call slots.
                 (id != cell_id
+                    && (needs_cell_slot || !cell.pending_calls.is_empty())
                     && matches!(
                         cell.completion,
                         CellCompletion::Complete | CellCompletion::Incomplete
@@ -220,7 +229,24 @@ impl ExecutedToolCalls {
             }))),
             retained_direct_metadata_bytes: Arc::new(AtomicUsize::new(0)),
             pending_direct_calls: Arc::new(AtomicUsize::new(0)),
+            mcp_attribution: mcp_attribution::McpAttributionRecorder::new(history),
         }
+    }
+
+    pub(crate) fn record_mcp_source(&self, source: McpAttributionSource) {
+        self.mcp_attribution.record(source);
+    }
+
+    pub(crate) fn mcp_attribution_snapshot(&self) -> McpAttribution {
+        self.mcp_attribution.snapshot()
+    }
+
+    pub(crate) fn mcp_attribution_checkpoint(&self, force: bool) -> Option<(McpAttribution, u64)> {
+        self.mcp_attribution.checkpoint(force)
+    }
+
+    pub(crate) fn mark_mcp_attribution_persisted(&self, revision: u64) {
+        self.mcp_attribution.mark_persisted(revision);
     }
 
     fn lock_state(&self) -> MutexGuard<'_, Option<ExecutedToolCallRecorderState>> {

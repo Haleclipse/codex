@@ -1262,7 +1262,7 @@ fn config_toml_deserializes_model_availability_nux() {
             vim_mode_default: false,
             question_esc_back: true,
             raw_output_mode: false,
-            fullscreen_transcript: false,
+            fullscreen_transcript: true,
             alternate_screen: AltScreenMode::default(),
             status_line: None,
             status_line_use_colors: true,
@@ -2023,6 +2023,7 @@ respect_system_proxy = true
             codex_http_client::HttpClientFactory::new(
                 codex_http_client::OutboundProxyPolicy::RespectSystemProxy,
             ),
+            /*product_sku*/ None,
         )
     );
     Ok(())
@@ -3523,14 +3524,22 @@ async fn default_permissions_profile_can_extend_builtin_read_only() -> std::io::
     Ok(())
 }
 
+#[test_case::test_case(false; "legacy")]
+#[test_case::test_case(true; "prefer_mxc")]
 #[tokio::test]
-async fn empty_config_defaults_to_builtin_profile_for_trusted_project() -> std::io::Result<()> {
+async fn empty_config_defaults_to_builtin_profile_for_trusted_project(
+    prefer_mxc: bool,
+) -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
     let project_key = cwd.path().to_string_lossy().to_string();
 
     let config = Config::load_from_base_config_with_overrides(
         ConfigToml {
+            features: Some(FeaturesToml::from(BTreeMap::from([(
+                "prefer_mxc".to_string(),
+                prefer_mxc,
+            )]))),
             projects: Some(HashMap::from([(
                 project_key,
                 ProjectConfig {
@@ -3547,6 +3556,7 @@ async fn empty_config_defaults_to_builtin_profile_for_trusted_project() -> std::
     )
     .await?;
 
+    let mxc_selected = prefer_mxc && codex_sandboxing::windows_mxc_available();
     let policy = config.permissions.file_system_sandbox_policy();
     assert_eq!(
         config
@@ -3554,13 +3564,13 @@ async fn empty_config_defaults_to_builtin_profile_for_trusted_project() -> std::
             .active_permission_profile()
             .as_ref()
             .map(|active| active.id.as_str()),
-        Some(if cfg!(target_os = "windows") {
+        Some(if cfg!(target_os = "windows") && !mxc_selected {
             BUILT_IN_PERMISSION_PROFILE_READ_ONLY
         } else {
             BUILT_IN_PERMISSION_PROFILE_WORKSPACE
         })
     );
-    if cfg!(target_os = "windows") {
+    if cfg!(target_os = "windows") && !mxc_selected {
         assert!(
             !policy.can_write_local_path_with_cwd(cwd.path(), cwd.path()),
             "expected trusted project fallback to stay read-only without Windows sandbox support, policy: {policy:?}"
@@ -4391,7 +4401,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             vim_mode_default: false,
             question_esc_back: true,
             raw_output_mode: false,
-            fullscreen_transcript: false,
+            fullscreen_transcript: true,
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
             status_line_use_colors: true,
@@ -8366,6 +8376,7 @@ fn config_toml_deserializes_auto_review_policy_and_template() {
         r#"
 [auto_review]
 policy = "Use the user-configured guardian policy."
+extra_policy = "Use the user-configured additional policy."
 experimental_policy_template = "Configured template: {{ tenant_policy_config }}"
 "#,
     )
@@ -8375,10 +8386,12 @@ experimental_policy_template = "Configured template: {{ tenant_policy_config }}"
     assert_eq!(
         (
             auto_review.policy.as_deref(),
+            auto_review.extra_policy.as_deref(),
             auto_review.experimental_policy_template.as_deref(),
         ),
         (
             Some("Use the user-configured guardian policy."),
+            Some("Use the user-configured additional policy."),
             Some("Configured template: {{ tenant_policy_config }}"),
         )
     );
@@ -8390,6 +8403,7 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template() -> s
     let cfg = ConfigToml {
         auto_review: Some(AutoReviewToml {
             policy: Some("  Use the user-configured guardian policy.  ".to_string()),
+            extra_policy: Some("  Use the user-configured additional policy.  ".to_string()),
             experimental_policy_template: Some(
                 "  Configured template: {{ tenant_policy_config }}  ".to_string(),
             ),
@@ -8410,10 +8424,12 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template() -> s
     assert_eq!(
         (
             config.guardian_policy_config.as_deref(),
+            config.guardian_extra_policy.as_deref(),
             config.guardian_policy_template.as_deref(),
         ),
         (
             Some("Use the user-configured guardian policy."),
+            Some("Use the user-configured additional policy."),
             Some("Configured template: {{ tenant_policy_config }}"),
         )
     );
@@ -8424,40 +8440,56 @@ async fn load_config_uses_auto_review_guardian_policy_config_and_template() -> s
 #[tokio::test]
 async fn requirements_guardian_policy_beats_auto_review() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
-    let config_layer_stack = ConfigLayerStack::new(
-        Vec::new(),
-        Default::default(),
-        codex_config::ConfigRequirementsToml {
-            guardian_policy_config: Some("Use the managed guardian policy.".to_string()),
+    for (managed_extra, expected_extra) in [
+        (
+            Some("  Use the managed additional policy.  "),
+            "Use the managed additional policy.",
+        ),
+        (Some("   "), "Use the user-configured additional policy."),
+        (None, "Use the user-configured additional policy."),
+    ] {
+        let config_layer_stack = ConfigLayerStack::new(
+            Vec::new(),
+            Default::default(),
+            codex_config::ConfigRequirementsToml {
+                guardian_policy_config: Some("Use the managed guardian policy.".to_string()),
+                guardian_extra_policy: managed_extra.map(str::to_owned),
+                ..Default::default()
+            },
+        )
+        .map_err(std::io::Error::other)?;
+        let cfg = ConfigToml {
+            auto_review: Some(AutoReviewToml {
+                policy: Some("Use the user-configured guardian policy.".to_string()),
+                extra_policy: Some("Use the user-configured additional policy.".to_string()),
+                experimental_policy_template: None,
+            }),
             ..Default::default()
-        },
-    )
-    .map_err(std::io::Error::other)?;
-    let cfg = ConfigToml {
-        auto_review: Some(AutoReviewToml {
-            policy: Some("Use the user-configured guardian policy.".to_string()),
-            experimental_policy_template: None,
-        }),
-        ..Default::default()
-    };
+        };
 
-    let config = Config::load_config_with_layer_stack(
-        LOCAL_FS.as_ref(),
-        cfg,
-        ConfigOverrides {
-            cwd: Some(codex_home.path().to_path_buf()),
-            ..Default::default()
-        },
-        codex_home.abs(),
-        config_layer_stack,
-    )
-    .await?;
+        let config = Config::load_config_with_layer_stack(
+            LOCAL_FS.as_ref(),
+            cfg,
+            ConfigOverrides {
+                cwd: Some(codex_home.path().to_path_buf()),
+                ..Default::default()
+            },
+            codex_home.abs(),
+            config_layer_stack,
+        )
+        .await?;
 
-    assert_eq!(
-        config.guardian_policy_config.as_deref(),
-        Some("Use the managed guardian policy.")
-    );
-
+        assert_eq!(
+            (
+                config.guardian_policy_config.as_deref(),
+                config.guardian_extra_policy.as_deref(),
+            ),
+            (
+                Some("Use the managed guardian policy."),
+                Some(expected_extra),
+            )
+        );
+    }
     Ok(())
 }
 
@@ -8467,6 +8499,7 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
     let cfg = ConfigToml {
         auto_review: Some(AutoReviewToml {
             policy: Some("   ".to_string()),
+            extra_policy: Some("   ".to_string()),
             experimental_policy_template: None,
         }),
         ..Default::default()
@@ -8482,7 +8515,10 @@ async fn load_config_ignores_empty_auto_review_guardian_policy_config() -> std::
     )
     .await?;
 
-    assert_eq!(config.guardian_policy_config, None);
+    assert_eq!(
+        (config.guardian_policy_config, config.guardian_extra_policy),
+        (None, None)
+    );
 
     Ok(())
 }
@@ -8495,6 +8531,7 @@ async fn load_config_ignores_empty_requirements_guardian_policy_config() -> std:
         Default::default(),
         codex_config::ConfigRequirementsToml {
             guardian_policy_config: Some("   ".to_string()),
+            guardian_extra_policy: Some("   ".to_string()),
             ..Default::default()
         },
     )
@@ -8512,7 +8549,10 @@ async fn load_config_ignores_empty_requirements_guardian_policy_config() -> std:
     )
     .await?;
 
-    assert_eq!(config.guardian_policy_config, None);
+    assert_eq!(
+        (config.guardian_policy_config, config.guardian_extra_policy),
+        (None, None)
+    );
 
     Ok(())
 }
@@ -10220,6 +10260,7 @@ async fn test_requirements_web_search_mode_allowlist_does_not_warn_when_unset() 
         models: None,
         additional_developer_instructions: None,
         guardian_policy_config: None,
+        guardian_extra_policy: None,
     };
     let requirement_source = codex_config::RequirementSource::Unknown;
     let requirement_source_for_error = requirement_source.clone();
@@ -10735,6 +10776,49 @@ apps_mcp_product_sku = "tpp"
 }
 
 #[tokio::test]
+async fn config_loads_cloud_skills_with_legacy_noop() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    for (settings, expected) in [
+        ("", true),
+        ("[cloud.skills]", true),
+        ("[cloud.skills]\nenabled = false", false),
+        ("[cloud.skills]\nenabled = true", true),
+        ("[orchestrator.skills]\nenabled = false", true),
+        ("[orchestrator.skills]\nenabled = true", true),
+        (
+            "[orchestrator.skills]\nenabled = false\n[cloud.skills]",
+            true,
+        ),
+        (
+            "[orchestrator.skills]\nenabled = true\n[cloud.skills]\nenabled = false",
+            false,
+        ),
+        (
+            "[orchestrator.skills]\nenabled = false\n[cloud.skills]\nenabled = true",
+            true,
+        ),
+    ] {
+        let cfg: ConfigToml = toml::from_str(&format!(
+            "model = \"gpt-5.4\"\n{settings}\n[orchestrator.mcp]\nenabled = false"
+        ))
+        .expect("cloud skill settings should deserialize");
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await?;
+
+        assert_eq!(
+            (config.cloud_skill_enabled, config.orchestrator_mcp_enabled),
+            (expected, false),
+            "{settings}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn config_loads_orchestrator_settings_from_toml() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cfg: ConfigToml = toml::from_str(
@@ -10758,11 +10842,8 @@ enabled = false
     .await?;
 
     assert_eq!(
-        (
-            config.orchestrator_skills_enabled,
-            config.orchestrator_mcp_enabled
-        ),
-        (false, false)
+        (config.cloud_skill_enabled, config.orchestrator_mcp_enabled),
+        (true, false)
     );
     Ok(())
 }
@@ -10955,6 +11036,73 @@ async fn explicit_sandbox_mode_falls_back_when_disallowed_by_requirements() -> s
         config.legacy_sandbox_policy(),
         SandboxPolicy::new_read_only_policy()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_mxc_preference_preserves_configured_backend() -> anyhow::Result<()> {
+    use codex_sandboxing::SandboxType::WindowsMxc;
+    use codex_sandboxing::SandboxType::WindowsRestrictedToken;
+
+    let codex_home = TempDir::new()?;
+    for (prefer, resolved_preference, binding, mode, expected) in [
+        (true, true, true, "unelevated", WindowsMxc),
+        (true, false, true, "unelevated", WindowsRestrictedToken),
+        (true, false, false, "unelevated", WindowsRestrictedToken),
+        (false, false, true, "unelevated", WindowsRestrictedToken),
+        (false, false, false, "mxc", WindowsMxc),
+    ] {
+        let cfg: ConfigToml = toml::from_str(&format!(
+            "[windows]\nsandbox = {mode:?}\n[features]\nprefer_mxc = {prefer}\n\
+             [features.network_proxy]\nenabled = true\nallow_local_binding = {binding}\n"
+        ))?;
+        assert_eq!(
+            network_config_allows_mxc(
+                &EffectivePermissionSelection {
+                    profiles: None,
+                    selected_profile_id: None,
+                    persisted_profile_id_was_provided: false,
+                    requirements_force_profile_selection: false,
+                },
+                /*profiles_are_active*/ false,
+                /*permission_profile*/ None,
+                /*network_requirements*/ None,
+                cfg.features.as_ref(),
+                /*enable_network_proxy*/ true,
+            )?,
+            binding,
+        );
+        let mut config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides {
+                cwd: Some(codex_home.path().to_path_buf()),
+                ..Default::default()
+            },
+            codex_home.abs(),
+        )
+        .await?;
+        assert_eq!(
+            config.prefer_mxc,
+            prefer && binding && codex_sandboxing::windows_mxc_available(),
+        );
+        // Exercise both resolved decisions independently of the host's native support.
+        config.prefer_mxc = resolved_preference;
+        assert_eq!(
+            (
+                config.windows_sandbox_type_from_config(),
+                config.effective_local_windows_sandbox_type()
+            ),
+            (
+                if mode == "mxc" {
+                    WindowsMxc
+                } else {
+                    WindowsRestrictedToken
+                },
+                expected
+            ),
+            "prefer={prefer}, resolved={resolved_preference}, binding={binding}, mode={mode}"
+        );
+    }
     Ok(())
 }
 

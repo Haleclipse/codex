@@ -29,6 +29,8 @@ mod buffered_replay;
 mod connector_policy;
 #[path = "tests/disconnect_tests.rs"]
 mod disconnect;
+#[path = "tests/external_writer_fork_tests.rs"]
+mod external_writer_fork_tests;
 #[path = "tests/fork_workspace_roots_tests.rs"]
 mod fork_workspace_roots_tests;
 #[path = "tests/fresh_sparkle_tests.rs"]
@@ -71,6 +73,8 @@ mod realtime_start;
 mod reasoning_resume_tests;
 #[path = "tests/recap_generation_tests.rs"]
 mod recap_generation;
+#[path = "tests/resume_shutdown_tests.rs"]
+mod resume_shutdown_tests;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
@@ -428,6 +432,7 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
             name: "docs".to_string(),
             runtime_status: None,
             plugin_id: None,
+            http_origin: None,
             server_info: None,
             tools: HashMap::new(),
             resources: Vec::new(),
@@ -609,6 +614,31 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
     };
     *request_id = AppServerRequestId::Integer(2);
     params.thread_id = background_thread_id.to_string();
+    app.pending_app_server_requests
+        .note_server_request(&background_request);
+    app.enqueue_thread_request(background_thread_id, background_request.clone())
+        .await?;
+
+    crate::chatwidget::activate_voice_for_thread(&mut app.chat_widget, thread_id);
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    app.replace_chat_widget_with_app_server_thread(
+        &mut tui,
+        AppServerStartedThread {
+            session: test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf()),
+            turns: Vec::new(),
+            blocks_direct_input: false,
+            task_tools_available: false,
+        },
+        session_lifecycle::ThreadAttachPresentation::SessionLineage,
+        /*initial_user_message*/ None,
+    )
+    .await?;
+    Box::pin(app.select_agent_thread(&mut tui, &mut app_server, thread_id)).await?;
+
+    assert!(
+        !app.pending_app_server_requests
+            .contains_server_request(&background_request)
+    );
     app.pending_app_server_requests
         .note_server_request(&background_request);
     app.enqueue_thread_request(background_thread_id, background_request)
@@ -839,7 +869,7 @@ async fn reset_thread_event_state_aborts_listener_tasks() {
         .await
         .expect("listener task should report it started");
 
-    app.reset_thread_event_state();
+    app.reset_thread_event_state().await;
 
     assert_eq!(app.thread_event_listener_tasks.is_empty(), true);
     assert!(app.pending_server_profiles.is_empty());
@@ -5951,14 +5981,14 @@ async fn clear_ui_header_shows_fast_status_for_fast_capable_models() {
     assert_app_snapshot!("clear_ui_header_fast_status_fast_capable_models", rendered);
 }
 
-async fn make_test_app() -> App {
+async fn make_test_app() -> Box<App> {
     let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
-    App {
+    Box::new(App {
         feature_write_lock: Arc::default(),
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
@@ -6014,6 +6044,8 @@ async fn make_test_app() -> App {
         pending_realtime_speech_replay: HashMap::new(),
         pending_realtime_transcript_replay: HashMap::new(),
         realtime_replay_order: VecDeque::new(),
+        background_voice: None,
+        background_voice_error: None,
         temporary_structured_requests: HashMap::new(),
         pending_thread_titles: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
@@ -6047,11 +6079,11 @@ async fn make_test_app() -> App {
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
         recap: recap::RecapState::default(),
-    }
+    })
 }
 
 pub(super) async fn make_test_app_with_channels() -> (
-    App,
+    Box<App>,
     tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     tokio::sync::mpsc::UnboundedReceiver<Op>,
 ) {
@@ -6062,7 +6094,7 @@ pub(super) async fn make_test_app_with_channels() -> (
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
     (
-        App {
+        Box::new(App {
             feature_write_lock: Arc::default(),
             model_catalog: chat_widget.model_catalog(),
             session_telemetry,
@@ -6118,6 +6150,8 @@ pub(super) async fn make_test_app_with_channels() -> (
             pending_realtime_speech_replay: HashMap::new(),
             pending_realtime_transcript_replay: HashMap::new(),
             realtime_replay_order: VecDeque::new(),
+            background_voice: None,
+            background_voice_error: None,
             temporary_structured_requests: HashMap::new(),
             pending_thread_titles: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
@@ -6151,7 +6185,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
             recap: recap::RecapState::default(),
-        },
+        }),
         rx,
         op_rx,
     )
@@ -7880,6 +7914,8 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
                 crate::start_app_server_for_picker(
                     &config,
                     &crate::AppServerTarget::Embedded,
+                    Vec::new(),
+                    LoaderOverrides::without_managed_config_for_tests(),
                     /*state_db*/ None,
                     Arc::clone(&environment_manager),
                 )
@@ -8025,6 +8061,8 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
     let mut app_server = Box::pin(crate::start_app_server_for_picker(
         &config,
         &crate::AppServerTarget::Embedded,
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
         state_db.clone(),
         Arc::new(EnvironmentManager::default_for_tests()),
     ))
@@ -8366,7 +8404,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
     let transcript = buffer
         .content()
         .chunks(usize::from(size.width))
-        .take(usize::from(bottom.y.saturating_sub(/*rhs*/ 1)))
+        .take(usize::from(bottom.y))
         .map(|row| {
             row.iter()
                 .map(ratatui::buffer::Cell::symbol)

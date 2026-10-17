@@ -157,15 +157,11 @@ async fn interactive_startup_honors_codex_home_symlink_opt_out() -> Result<()> {
 }
 
 #[test]
-fn owned_screen_entry_paints_before_sync_ends_and_exit_clears_inline_draft() -> Result<()> {
+fn default_owned_screen_entry_paints_before_sync_ends_and_exit_clears_inline_draft() -> Result<()> {
     let repo_root = codex_utils_cargo_bin::repo_root()?;
     let codex_home = tempfile::tempdir()?;
     write_test_config(codex_home.path(), &repo_root)?;
-    let mut terminal = PtyCodex::start(
-        &repo_root,
-        codex_home,
-        &["-c", "tui.fullscreen_transcript=true"],
-    )?;
+    let mut terminal = PtyCodex::start(&repo_root, codex_home, &[])?;
     terminal.wait_for_startup()?;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     while !terminal.parser.screen().alternate_screen() && Instant::now() < deadline {
@@ -255,11 +251,15 @@ fn owned_screen_entry_paints_before_sync_ends_and_exit_clears_inline_draft() -> 
 }
 
 #[test]
-fn fullscreen_transcript_defaults_to_terminal_scrollback() -> Result<()> {
+fn fullscreen_transcript_can_opt_out_to_terminal_scrollback() -> Result<()> {
     let repo_root = codex_utils_cargo_bin::repo_root()?;
     let codex_home = tempfile::tempdir()?;
     write_test_config(codex_home.path(), &repo_root)?;
-    let mut terminal = PtyCodex::start(&repo_root, codex_home, &[])?;
+    let mut terminal = PtyCodex::start(
+        &repo_root,
+        codex_home,
+        &["-c", "tui.fullscreen_transcript=false"],
+    )?;
     terminal.wait_for_startup()?;
     terminal.wait_for_screen("GPT-5.6-Terra")?;
     ensure!(
@@ -267,7 +267,7 @@ fn fullscreen_transcript_defaults_to_terminal_scrollback() -> Result<()> {
             .output
             .windows(b"\x1b[?1049h".len())
             .any(|bytes| bytes == b"\x1b[?1049h"),
-        "default launch entered the alternate screen"
+        "fullscreen opt-out entered the alternate screen"
     );
     Ok(())
 }
@@ -535,6 +535,7 @@ pub(super) fn write_test_config(codex_home: &Path, repo_root: &Path) -> Result<(
     let config = format!(
         "model = \"gpt-5.6-terra\"\nmodel_provider = \"openai\"\n\
          suppress_unstable_features_warning = true\nanalytics.enabled = false\n\
+         features.daemon_auto_start = false\n\
          notice.model_migrations.\"gpt-5.6-terra\" = \"gpt-6-sol\"\n\n\
          [projects.\"{repo_root}\"]\ntrust_level = \"trusted\"\n"
     );
@@ -557,7 +558,7 @@ fn no_daemon_skips_startup_and_discovery() -> Result<()> {
         let contents = std::fs::read_to_string(&config)?;
         std::fs::write(
             config,
-            format!("features.daemon_auto_start = true\n{contents}"),
+            contents.replace("features.daemon_auto_start = false\n", ""),
         )?;
         let socket_path = codex_app_server_client::app_server_control_socket_path(home.path())?;
         std::fs::create_dir_all(socket_path.as_path().parent().unwrap())?;
@@ -605,7 +606,7 @@ fn auto_daemon_start_failure_exits_with_manual_fallback_hint() -> Result<()> {
     let contents = std::fs::read_to_string(&config)?;
     std::fs::write(
         config,
-        format!("features.daemon_auto_start = true\n{contents}"),
+        contents.replace("features.daemon_auto_start = false\n", ""),
     )?;
     // An incomplete selected package must fail without installing a replacement.
     std::fs::create_dir_all(home.path().join("packages/app-server-daemon/current"))?;
