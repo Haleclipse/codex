@@ -507,6 +507,78 @@ async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
 }
 
 #[tokio::test]
+async fn tool_suggestion_install_url_is_validated_before_opening() {
+    for install_url in [
+        "file:///tmp/connector",
+        "http://example.test/install",
+        "custom://example.test/install",
+        "not a URL",
+        "https://user:password@example.test/install",
+        "https://example.test/install",
+    ] {
+        let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+        let request_thread_id = ThreadId::new();
+        chat.thread_id = Some(ThreadId::new());
+        let initial_popup = render_bottom_popup(&chat, /*width*/ 80);
+
+        chat.handle_elicitation_request_now(
+            codex_app_server_protocol::RequestId::Integer(9),
+            codex_app_server_protocol::McpServerElicitationRequestParams {
+                thread_id: request_thread_id.to_string(),
+                turn_id: Some("turn-install".to_string()),
+                server_name: "connector-server".to_string(),
+                request: codex_app_server_protocol::McpServerElicitationRequest::Form {
+                    meta: Some(serde_json::json!({
+                        "codex_approval_kind": "tool_suggestion",
+                        "tool_type": "connector",
+                        "suggest_type": "install",
+                        "suggest_reason": "Install the connector to continue",
+                        "tool_id": "connector_test",
+                        "tool_name": "Test Connector",
+                        "install_url": install_url,
+                    })),
+                    message: "Install Test Connector".to_string(),
+                    requested_schema: serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                    }))
+                    .expect("valid schema"),
+                },
+            },
+        );
+
+        if install_url == "https://example.test/install" {
+            chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_matches!(
+                rx.try_recv(),
+                Ok(AppEvent::OpenUrlInBrowser { url }) if url == install_url
+            );
+        } else {
+            assert_matches!(
+                rx.try_recv(),
+                Ok(AppEvent::SubmitThreadOp {
+                    thread_id,
+                    op: Op::ResolveElicitation {
+                        server_name,
+                        request_id: codex_app_server_protocol::RequestId::Integer(9),
+                        decision: codex_app_server_protocol::McpServerElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    },
+                }) if thread_id == request_thread_id && server_name == "connector-server"
+            );
+            let popup = render_bottom_popup(&chat, /*width*/ 80);
+            assert_eq!(popup, initial_popup);
+            assert_chatwidget_snapshot!(
+                "declined_tool_suggestion",
+                normalize_snapshot_paths(popup)
+            );
+        }
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
 async fn invalid_url_elicitation_is_declined() {
     let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     let visible_thread_id = ThreadId::new();
@@ -1132,6 +1204,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             started_at_ms: 0,
             item: AppServerThreadItem::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "cmd-1".to_string(),
                 command: command.clone(),
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -1157,6 +1230,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             completed_at_ms: 0,
             item: AppServerThreadItem::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "cmd-1".to_string(),
                 command,
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -2010,4 +2084,29 @@ async fn permission_discovery_invalidates_on_thread_settings_and_uses_updated_cw
         panic!("expected discovery")
     };
     assert_eq!(thread_cwd, Some(test_path_buf("/tmp/thread-settings")));
+}
+
+#[tokio::test]
+async fn sqlite_log_write_warning_is_visible_in_warnings() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.warning_display_state.startup_complete = true;
+    chat.handle_server_notification(
+        ServerNotification::Warning(WarningNotification {
+            thread_id: None,
+            message: "Codex couldn't save diagnostic logs to its local database. Use /feedback with logs included before closing Codex, or run `codex doctor` for diagnostics.".to_string(),
+        }),
+        /*replay_kind*/ None,
+    );
+    let cells: Vec<Arc<dyn HistoryCell>> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(Arc::from(cell)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cells.len(), 1);
+    chat.open_warnings(&cells);
+    insta::assert_snapshot!(
+        "sqlite_log_write_warning",
+        super::helpers::render_bottom_popup(&chat, /*width*/ 80)
+    );
 }

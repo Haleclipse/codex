@@ -379,7 +379,8 @@ impl LocalProcess {
         #[cfg(unix)]
         let mut prepared = prepared;
         #[cfg(unix)]
-        self.inner
+        let snapshot_file = self
+            .inner
             .shell_snapshots
             .prepare(
                 &params,
@@ -413,6 +414,13 @@ impl LocalProcess {
             );
         }
 
+        #[cfg(unix)]
+        let inherited_fds = snapshot_file
+            .iter()
+            .map(std::os::fd::AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>();
+        #[cfg(not(unix))]
+        let inherited_fds = Vec::new();
         let spawned_result = codex_sandboxing::spawn_process(codex_sandboxing::SpawnRequest {
             command: &prepared.command,
             cwd: prepared.cwd.as_path(),
@@ -422,9 +430,11 @@ impl LocalProcess {
             windows_sandbox: prepared.windows_sandbox_spawn_request(),
             tty: params.tty,
             stdin_open: params.tty || params.pipe_stdin,
-            inherited_fds: &[],
+            inherited_fds: codex_utils_pty::ChildFds::Attached(&inherited_fds),
         })
         .await;
+        #[cfg(unix)]
+        drop(snapshot_file);
         let spawned = match spawned_result {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -827,6 +837,7 @@ impl ExecBackend for LocalProcess {
                     CapturePurpose::Prewarm,
                 )
                 .await
+                .map(|_| ())
                 .map_err(map_handler_error)
         })
     }
@@ -1250,6 +1261,20 @@ mod tests {
     use crate::protocol::NetworkPolicyRequestParams;
     #[cfg(not(target_os = "windows"))]
     use crate::protocol::NetworkPolicyRequestResponse;
+
+    #[cfg(target_os = "linux")]
+    #[ctor::ctor]
+    fn initialize_spawn_helper() {
+        use std::os::unix::ffi::OsStringExt;
+        let command_line = std::fs::read("/proc/self/cmdline").expect("test command line");
+        codex_utils_pty::init_spawn_helper(
+            command_line
+                .strip_suffix(&[0])
+                .unwrap_or(&command_line)
+                .split(|byte| *byte == 0)
+                .map(|arg| std::ffi::OsString::from_vec(arg.to_vec())),
+        );
+    }
 
     fn test_exec_params(env: HashMap<String, String>) -> ExecParams {
         ExecParams {

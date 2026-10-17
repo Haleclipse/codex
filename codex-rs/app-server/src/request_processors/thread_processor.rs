@@ -1481,7 +1481,15 @@ impl ThreadRequestProcessor {
             )
             .await?
         };
-        start_options.reserved_thread_id = reserved_thread_id;
+        let thread_id = reserved_thread_id
+            .unwrap_or_else(|| listener_task_context.thread_manager.reserve_thread_id());
+        start_options.reserved_thread_id = Some(thread_id);
+        // Startup can prewarm the Responses socket before start_thread returns.
+        // Register the creating client first so that handshake can request attestation.
+        listener_task_context
+            .thread_state_manager
+            .try_add_connection_to_thread(thread_id, request_id.connection_id)
+            .await;
         let create_thread_started_at = std::time::Instant::now();
         let new_thread = listener_task_context
             .thread_manager
@@ -1517,6 +1525,10 @@ impl ThreadRequestProcessor {
         } = match new_thread {
             Ok(new_thread) => new_thread,
             Err(err) => {
+                listener_task_context
+                    .thread_state_manager
+                    .remove_thread_state(thread_id)
+                    .await;
                 remove_pending_thread_metadata(thread_store.as_ref(), reserved_thread_id).await;
                 return Err(match err.details() {
                     CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
@@ -2123,6 +2135,11 @@ impl ThreadRequestProcessor {
         let (thread_id, thread) = self.load_thread(&thread_id).await?;
         ensure_direct_input_allowed(thread.as_ref()).await?;
         let config_snapshot = thread.config_snapshot().await;
+        if config_snapshot.ephemeral {
+            return Err(invalid_request(
+                "ephemeral threads do not support thread/revert",
+            ));
+        }
         if !matches!(config_snapshot.history_mode, ThreadHistoryMode::Paginated) {
             return Err(invalid_request(
                 "thread/revert only supports paginated threads",

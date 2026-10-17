@@ -65,11 +65,10 @@ pub(crate) const WSLG_DISTRO_ROOT: &str = "/mnt/wslg/distro";
 /// Options that control how bubblewrap is invoked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BwrapOptions {
-    /// Whether to mount a fresh `/proc` inside the sandbox.
-    ///
-    /// This is the secure default, but some restrictive container environments
-    /// deny `--proc /proc`.
+    /// Whether to mount a fresh `/proc`; disabled by `--no-proc` or mount fallback.
     pub mount_proc: bool,
+    /// Explicitly reuse the caller's PID namespace instead of creating one.
+    pub inherit_pid_namespace: bool,
     /// How networking should be configured inside the bubblewrap sandbox.
     pub network_mode: BwrapNetworkMode,
     /// Hide the WSL Windows interop socket from commands with restricted filesystem access.
@@ -88,6 +87,7 @@ impl Default for BwrapOptions {
     fn default() -> Self {
         Self {
             mount_proc: true,
+            inherit_pid_namespace: false,
             network_mode: BwrapNetworkMode::FullAccess,
             mask_wsl_interop: false,
             mask_wslg_distro: false,
@@ -295,9 +295,11 @@ fn create_bwrap_flags_full_filesystem(command: Vec<String>, options: BwrapOption
         // Always enter a fresh user namespace so root inside a container does
         // not need ambient CAP_SYS_ADMIN to create the remaining namespaces.
         "--unshare-user".to_string(),
-        "--unshare-pid".to_string(),
         "--unshare-ipc".to_string(),
     ];
+    if !options.inherit_pid_namespace {
+        args.push("--unshare-pid".to_string());
+    }
     if options.network_mode.should_unshare_network() {
         args.push("--unshare-net".to_string());
     }
@@ -371,7 +373,9 @@ fn create_bwrap_flags(
     // This also blocks host procfs root/cwd/fd links through ptrace permission
     // checks, including when a container requires retaining the host procfs.
     args.push("--unshare-user".to_string());
-    args.push("--unshare-pid".to_string());
+    if !options.inherit_pid_namespace {
+        args.push("--unshare-pid".to_string());
+    }
     args.push("--unshare-ipc".to_string());
     if options.network_mode.should_unshare_network() {
         args.push("--unshare-net".to_string());
@@ -538,6 +542,11 @@ fn create_filesystem_args(
                     .map(|path| PathBuf::from(*path))
                     .filter(|path| path.exists()),
             );
+            if options.inherit_pid_namespace {
+                // Reuse the caller's procfs, including its submount masks. Bind it
+                // with the other read roots so explicit deny rules still win.
+                readable_roots.insert(PathBuf::from("/proc"));
+            }
         }
 
         // A restricted policy can still explicitly request `/`, which is
@@ -646,24 +655,63 @@ fn create_filesystem_args(
             .filter(|path| !unreadable_paths.contains(path))
             .filter(|path| !missing_auto_metadata_read_only_project_root_subpaths.contains(path))
             .collect();
-        let protected_metadata_names = writable_root.protected_metadata_names.clone();
+        // Remember which mounts belong to a deeper writable root without dropping
+        // their paths: every path must still be remapped and validated below.
+        let mut deferred_read_only_subpaths: Vec<PathBuf> = read_only_subpaths
+            .iter()
+            .filter(|path| {
+                sorted_writable_roots.iter().any(|nested_root| {
+                    let nested_path = nested_root.root.as_path();
+                    nested_path != root
+                        && nested_path.starts_with(root)
+                        && path.starts_with(nested_path)
+                        && nested_root
+                            .read_only_subpaths
+                            .iter()
+                            .any(|nested_subpath| nested_subpath.as_path() == path.as_path())
+                })
+            })
+            .cloned()
+            .collect();
+        let protected_metadata_names = &writable_root.protected_metadata_names;
         append_metadata_path_masks_for_writable_root(
             &mut read_only_subpaths,
             root,
-            &protected_metadata_names,
+            protected_metadata_names,
         );
         if let Some(target) = &symlink_target {
             read_only_subpaths = remap_paths_for_symlink_target(read_only_subpaths, root, target);
+            deferred_read_only_subpaths =
+                remap_paths_for_symlink_target(deferred_read_only_subpaths, root, target);
         }
         append_protected_create_targets_for_writable_root(
             &mut bwrap_args,
-            &protected_metadata_names,
+            protected_metadata_names,
             root,
             symlink_target.as_deref(),
             &read_only_subpaths,
         );
         read_only_subpaths.sort_by_key(|path| path_depth(path));
         for subpath in read_only_subpaths {
+            if let Some(symlink) =
+                first_writable_symlink_component_in_path(&subpath, &allowed_write_paths)
+            {
+                /*
+                 * A read-only carveout under a writable symlink cannot be made reliable
+                 * with bwrap path arguments. Binding the symlink's current target would
+                 * only protect a startup-time snapshot; the sandboxed process could
+                 * replace the writable symlink before it reads through the logical path.
+                 */
+                return Err(CodexErr::Fatal(format!(
+                    "cannot enforce sandbox read-only path {} because it crosses writable symlink {}",
+                    subpath.display(),
+                    symlink.display()
+                )));
+            }
+            // Defer only the mount, after the same validation as an immediate mount.
+            if deferred_read_only_subpaths.contains(&subpath) {
+                continue;
+            }
             append_read_only_subpath_args(
                 &mut bwrap_args,
                 &subpath,
@@ -1141,26 +1189,13 @@ fn append_mount_target_parent_dir_args(args: &mut Vec<String>, mount_target: &Pa
     }
 }
 
+/// Append mounts for a read-only path after writable-symlink validation.
 fn append_read_only_subpath_args(
     bwrap_args: &mut BwrapArgs,
     subpath: &Path,
     allowed_write_paths: &[PathBuf],
     daemon_directories: &BTreeSet<PathBuf>,
 ) -> Result<()> {
-    if let Some(symlink) = first_writable_symlink_component_in_path(subpath, allowed_write_paths) {
-        /*
-         * A read-only carveout under a writable symlink cannot be made reliable
-         * with bwrap path arguments. Binding the symlink's current target would
-         * only protect a startup-time snapshot; the sandboxed process could
-         * replace the writable symlink before it reads through the logical path.
-         */
-        return Err(CodexErr::Fatal(format!(
-            "cannot enforce sandbox read-only path {} because it crosses writable symlink {}",
-            subpath.display(),
-            symlink.display()
-        )));
-    }
-
     if let Some(metadata) = transient_empty_metadata_path(subpath)
         && is_within_allowed_write_paths(subpath, allowed_write_paths)
     {
@@ -1457,6 +1492,7 @@ mod wslg_tests;
 mod tests {
     use super::*;
 
+    use codex_protocol::models::PermissionProfile;
     use codex_protocol::protocol::FileSystemAccessMode;
     use codex_protocol::protocol::FileSystemPath;
     use codex_protocol::protocol::FileSystemSandboxEntry;
@@ -1469,6 +1505,45 @@ mod tests {
     #[test]
     fn default_unreadable_glob_scan_has_no_depth_cap() {
         assert_eq!(BwrapOptions::default().glob_scan_max_depth, None);
+    }
+
+    #[test]
+    fn pid_inheritance_and_legacy_proc_modes_read_only() {
+        assert_pid_namespace_args(&PermissionProfile::read_only().file_system_sandbox_policy());
+    }
+
+    #[test]
+    fn pid_inheritance_and_legacy_proc_modes_full_filesystem() {
+        assert_pid_namespace_args(&FileSystemSandboxPolicy::unrestricted());
+    }
+
+    fn assert_pid_namespace_args(policy: &FileSystemSandboxPolicy) {
+        for (mount_proc, inherit_pid_namespace) in [(true, false), (false, false), (false, true)] {
+            let args = create_bwrap_command_args(
+                vec!["/bin/true".to_string()],
+                policy,
+                Path::new("/"),
+                Path::new("/"),
+                BwrapOptions {
+                    mount_proc,
+                    inherit_pid_namespace,
+                    network_mode: BwrapNetworkMode::Isolated,
+                    ..Default::default()
+                },
+            )
+            .expect("create bwrap args")
+            .args;
+
+            assert_eq!(
+                args.iter().any(|arg| arg == "--unshare-pid"),
+                !inherit_pid_namespace
+            );
+            assert_eq!(args.iter().any(|arg| arg == "--proc"), mount_proc);
+            assert!(args.iter().any(|arg| arg == "--unshare-user"));
+            assert!(args.iter().any(|arg| arg == "--unshare-ipc"));
+            assert!(args.iter().any(|arg| arg == "--unshare-net"));
+            assert!(args.windows(2).any(|args| args == ["--cap-drop", "ALL"]));
+        }
     }
 
     fn unreadable_glob_entry(pattern: String) -> FileSystemSandboxEntry {
@@ -1534,8 +1609,8 @@ mod tests {
                 "/dev/shm".to_string(),
                 "/dev/shm".to_string(),
                 "--unshare-user".to_string(),
-                "--unshare-pid".to_string(),
                 "--unshare-ipc".to_string(),
+                "--unshare-pid".to_string(),
                 "--unshare-net".to_string(),
                 "--proc".to_string(),
                 "/proc".to_string(),
@@ -2398,23 +2473,18 @@ mod tests {
         let docs = AbsolutePathBuf::from_absolute_path(&docs).expect("absolute docs");
         let docs_public =
             AbsolutePathBuf::from_absolute_path(&docs_public).expect("absolute docs/public");
-        let policy = FileSystemSandboxPolicy::restricted(vec![
-            FileSystemSandboxEntry {
-                path: writable_root.into(),
-                access: FileSystemAccessMode::Write,
-                missing_path_behavior: None,
-            },
-            FileSystemSandboxEntry {
-                path: docs.clone().into(),
-                access: FileSystemAccessMode::Read,
-                missing_path_behavior: None,
-            },
-            FileSystemSandboxEntry {
-                path: docs_public.clone().into(),
-                access: FileSystemAccessMode::Write,
-                missing_path_behavior: None,
-            },
-        ]);
+        let mut entries = vec![
+            FileSystemSandboxEntry::new(writable_root.into(), FileSystemAccessMode::Write),
+            FileSystemSandboxEntry::new(docs.clone().into(), FileSystemAccessMode::Read),
+            FileSystemSandboxEntry::new(docs_public.clone().into(), FileSystemAccessMode::Write),
+        ];
+        for name in [".git", ".agents", ".codex"] {
+            entries.push(FileSystemSandboxEntry::skip_missing_path(
+                docs_public.join(name).into(),
+                FileSystemAccessMode::Read,
+            ));
+        }
+        let policy = FileSystemSandboxPolicy::restricted(entries);
 
         let args = create_filesystem_args(&policy, temp_dir.path(), BwrapOptions::default())
             .expect("filesystem args");
@@ -2438,6 +2508,23 @@ mod tests {
             "expected read-only parent remount before nested writable bind: {:#?}",
             args.args
         );
+        for name in [".git", ".agents", ".codex"] {
+            let metadata_path = path_to_string(docs_public.join(name).as_path());
+            let mount_indices = args
+                .args
+                .windows(2)
+                .enumerate()
+                .filter_map(|(index, window)| {
+                    (window == ["--tmpfs", metadata_path.as_str()]).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(mount_indices.len(), 1, "one mount for {metadata_path}");
+            assert!(
+                docs_public_rw_index < mount_indices[0],
+                "metadata must be mounted after its writable root: {:#?}",
+                args.args
+            );
+        }
     }
 
     #[test]

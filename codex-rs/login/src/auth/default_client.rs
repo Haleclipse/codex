@@ -218,13 +218,28 @@ pub fn create_client() -> HttpClient {
     build_default_client(default_http_client_builder())
 }
 
-/// Creates the default client with configured ChatGPT cookies and no sensitive-response logging.
+/// Creates an API client retaining managed policy, ChatGPT cookies, and no request diagnostics.
 pub fn create_client_with_chatgpt_cookies(http_client_factory: &HttpClientFactory) -> HttpClient {
-    build_default_client(
-        default_http_client_builder()
-            .with_chatgpt_cookies(http_client_factory)
-            .without_request_logging(),
-    )
+    let builder = default_http_client_builder()
+        .with_chatgpt_cookies(http_client_factory)
+        .without_request_logging();
+    if !http_client_factory.network_policy().is_managed() {
+        return build_default_client(builder);
+    }
+    let mut pool = RouteAwareClientPool::with_builder(
+        http_client_factory.clone(),
+        ClientRouteClass::Api,
+        builder,
+    );
+    if is_sandboxed() {
+        pool = pool.with_legacy_direct_proxy_and_custom_ca_fallback();
+    } else if matches!(
+        http_client_factory.outbound_proxy_policy(),
+        OutboundProxyPolicy::ReqwestDefault
+    ) {
+        pool = pool.with_legacy_custom_ca_fallback();
+    }
+    pool.into_client()
 }
 
 /// Create the default HTTP client without request URL or response-header diagnostics.
@@ -359,7 +374,8 @@ async fn create_client_for_route_async_with_builder(
 /// Builds the default Codex transport without blocking the async runtime worker.
 ///
 /// Route-aware proxy handling resolves each request and redirect destination. When it is disabled,
-/// or the client is running inside the Codex sandbox, this preserves the default client's behavior.
+/// or the client is running inside the Codex sandbox, this preserves the default client's proxy
+/// behavior while retaining managed application network policy enforcement.
 pub async fn create_transport_for_routes_async(
     http_client_factory: HttpClientFactory,
     route_class: ClientRouteClass,
@@ -370,21 +386,28 @@ pub async fn create_transport_for_routes_async(
         .map_err(std::io::Error::other)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        if matches!(
+        let sandboxed = is_sandboxed();
+        let transport_default_proxy = matches!(
             http_client_factory.outbound_proxy_policy(),
             OutboundProxyPolicy::ReqwestDefault
-        ) || is_sandboxed()
+        );
+        if !http_client_factory.network_policy().is_managed()
+            && (transport_default_proxy || sandboxed)
         {
             return ReqwestTransport::from_http_client(create_client());
         }
 
-        ReqwestTransport::from_route_aware_client_pool(
-            RouteAwareClientPool::with_chatgpt_cloudflare_cookies_and_default_headers(
-                http_client_factory,
-                route_class,
-                default_headers(),
-            ),
-        )
+        let mut pool = RouteAwareClientPool::with_builder(
+            http_client_factory,
+            route_class,
+            default_http_client_builder(),
+        );
+        if sandboxed {
+            pool = pool.with_legacy_direct_proxy_and_custom_ca_fallback();
+        } else if transport_default_proxy {
+            pool = pool.with_legacy_custom_ca_fallback();
+        }
+        ReqwestTransport::from_route_aware_client_pool(pool)
     })
     .await
     .map_err(std::io::Error::other)

@@ -447,6 +447,32 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn agents_navigation_key_available(&self) -> bool {
+        let left = KeyEvent::from(KeyCode::Left);
+        self.composer.agents_navigation_key_available()
+            && !crate::keymap::keymap_action_ids()
+                .filter(|action| {
+                    matches!(
+                        action.context,
+                        KeymapContext::Global | KeymapContext::Chat | KeymapContext::Voice
+                    )
+                })
+                .any(|action| {
+                    crate::keymap::bindings_for_action(
+                        &self.keymap,
+                        action.context.config_name(),
+                        action.action,
+                    )
+                    .is_some_and(|bindings| bindings.is_pressed(left))
+                })
+            && !self.keymap.chords.bindings.iter().any(|binding| {
+                matches!(
+                    binding.action.context,
+                    KeymapContext::Global | KeymapContext::Chat | KeymapContext::Voice
+                ) && binding.chord.prefix.is_press(left)
+            })
+    }
+
     pub(crate) fn set_task_mentions_enabled(&mut self, enabled: bool) {
         self.composer.set_task_mentions_enabled(enabled);
         self.request_redraw();
@@ -512,6 +538,9 @@ impl BottomPane {
         if let Some(questions) = &mut self.questions {
             questions.set_keymap(keymap);
         }
+        // Show the first shortcut from the same keymap ChatWidget uses to handle queued edits.
+        self.pending_input_preview
+            .set_edit_binding(keymap.primary_hint(KeymapContext::Chat, "edit_queued_message"));
         let interrupt_binding = keymap.primary_hint(KeymapContext::Chat, "interrupt_turn");
         self.pending_input_preview
             .set_interrupt_binding(interrupt_binding);
@@ -604,19 +633,6 @@ impl BottomPane {
 
     pub(crate) fn set_parent_owned_thread(&mut self) {
         self.composer.set_parent_owned_thread();
-        self.request_redraw();
-    }
-
-    /// Update the key hint shown next to queued messages so it matches the
-    /// binding that `ChatWidget` actually listens for.
-    pub(crate) fn set_queued_message_edit_binding(
-        &mut self,
-        binding: Option<crate::key_hint::ShortcutHint>,
-    ) {
-        self.pending_input_preview.set_edit_binding(binding);
-        if let Some(questions) = &mut self.questions {
-            questions.next_hint = binding;
-        }
         self.request_redraw();
     }
 
@@ -1125,9 +1141,8 @@ impl BottomPane {
         self.composer.current_text()
     }
 
-    #[cfg(test)]
     pub(crate) fn composer_cursor(&self) -> usize {
-        self.composer.cursor()
+        self.composer.current_cursor()
     }
 
     #[cfg(test)]
@@ -1804,6 +1819,15 @@ impl BottomPane {
         self.composer.end_mouse_drag();
     }
 
+    pub(crate) fn finish_composer_copy(
+        &mut self,
+        completion: &(u64, crate::clipboard_copy::worker::CopyResult),
+        visible: bool,
+    ) -> Option<usize> {
+        let current = visible && !self.has_active_view();
+        self.composer.finish_copy(completion, current)
+    }
+
     pub(crate) fn copy_composer_selection(
         &mut self,
         event: &crate::tui::TuiEvent,
@@ -1813,6 +1837,10 @@ impl BottomPane {
             return None;
         }
         self.composer.copy_selection(event, copy)
+    }
+
+    pub(crate) fn can_paste_on_right_click(&self) -> bool {
+        self.no_modal_or_popup_active() && self.composer.can_paste_on_right_click()
     }
 
     pub(crate) fn prepare_composer_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
@@ -1927,6 +1955,20 @@ impl BottomPane {
         if let Some(tool_suggestion) = request.tool_suggestion()
             && let Some(install_url) = tool_suggestion.install_url.clone()
         {
+            let Some(install_url) = app_link_view::validate_external_url(
+                &install_url,
+                /*require_chatgpt_host*/ false,
+            ) else {
+                self.app_event_tx.resolve_elicitation(
+                    request.thread_id(),
+                    request.server_name().to_string(),
+                    request.request_id().clone(),
+                    codex_app_server_protocol::McpServerElicitationAction::Decline,
+                    /*content*/ None,
+                    /*meta*/ None,
+                );
+                return;
+            };
             let suggestion_type = match tool_suggestion.suggest_type {
                 mcp_server_elicitation::ToolSuggestionType::Install => {
                     AppLinkSuggestionType::Install
@@ -1956,7 +1998,7 @@ impl BottomPane {
                             "external actions use URL mode elicitation, not tool suggestion forms"
                         ),
                     },
-                    url: install_url,
+                    url: install_url.into(),
                     is_installed,
                     is_enabled: false,
                     suggest_reason: Some(tool_suggestion.suggest_reason.clone()),
@@ -2223,6 +2265,12 @@ impl BottomPane {
                 || self.hook_status_message.is_some()
                 || !self.unified_exec_footer.is_empty();
             let has_inline_previews = has_pending_thread_approvals || has_pending_input;
+            if !has_inline_previews
+                && self.status_widget().is_some()
+                && let Some(tip) = options.working_tip
+            {
+                flex.push(/*flex*/ 1, RenderableItem::Borrowed(tip));
+            }
             if has_inline_previews && has_status_or_footer {
                 flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
             }

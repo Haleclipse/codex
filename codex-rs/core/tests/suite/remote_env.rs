@@ -1,3 +1,6 @@
+#[path = "guardian_environments_tests.rs"]
+mod guardian_environments;
+
 use anyhow::Context;
 use anyhow::Result;
 use base64::Engine;
@@ -621,6 +624,7 @@ async fn environment_permissions_follow_configuration_ownership() -> Result<()> 
                 permission_profile: Some(PermissionProfile::workspace_write()),
                 ..Default::default()
             },
+            reply: None,
         })
         .await?;
     let persisted_settings = wait_for_event_match(&test.codex, |event| match event {

@@ -65,7 +65,10 @@ pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
     }
 
     /// Returns lazily cached Code Mode definitions owned by this runtime.
-    fn cached_code_mode_definitions(&self) -> Option<&[codex_code_mode::ToolDefinition]> {
+    fn cached_code_mode_definitions(
+        &self,
+        _code_mode_input_schema_max_bytes: Option<usize>,
+    ) -> Option<&[codex_code_mode::ToolDefinition]> {
         None
     }
 
@@ -430,6 +433,13 @@ impl ToolRegistry {
         self.tools.values_mut()
     }
 
+    /// Returns configured MCP server names and their registered callable namespaces.
+    pub(crate) fn mcp_namespaces(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.tools.iter().filter_map(|(name, tool)| {
+            Some((tool.runtime.mcp_server_name()?, name.namespace.as_deref()?))
+        })
+    }
+
     pub(crate) fn deferred_tool_namespaces(&self) -> BTreeMap<String, String> {
         let mut namespaces = BTreeMap::<String, String>::new();
         for (name, tool) in &self.tools {
@@ -520,7 +530,11 @@ impl ToolRegistry {
     ) -> Result<AnyToolResult, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
-        let otel = invocation.step_context.session_telemetry.clone();
+        let otel = invocation
+            .step_context
+            .session_telemetry
+            .clone()
+            .with_product_sku(invocation.turn.config.apps_mcp_product_sku.as_deref());
         // TODO(anp): Reconcile these tags with TurnEnvironment::sandbox_context
         // instead of reporting the thread-wide backend for environment-scoped tools.
         let sandbox_tags = invocation.turn.turn_metadata_state.sandbox_tags;

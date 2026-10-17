@@ -12,7 +12,6 @@ use crate::agent::api::AgentTurnOutcome;
 use crate::agent::api::DeliveryReceipt;
 use crate::agent::api::SendRequest;
 use crate::agent::api::SpawnRequest;
-use crate::agent::api::StatusSubscription;
 use crate::agent::types::AgentExecutionGuard;
 use crate::agent::types::LiveAgent;
 use crate::agent::types::MessageDeliveryMode;
@@ -20,7 +19,6 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::GuardianRootSnapshot;
 use crate::codex_thread::ThreadConfigSnapshot;
-use crate::config::Config;
 use crate::rollout_budget::RolloutBudgetReminder;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
@@ -32,10 +30,29 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::ThreadTraceContext;
 use futures::future::BoxFuture;
+use std::collections::HashSet;
 
 impl AgentControl for LocalAgentControl {
     fn identity(&self) -> SessionId {
         self.session_id()
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        caller: ThreadId,
+        parent: Option<ThreadId>,
+        source: &'a SessionSource,
+        target: &'a str,
+    ) -> BoxFuture<'a, Result<ThreadId>> {
+        Box::pin(async move {
+            self.runtime.register_session_root(caller, parent);
+            if let Ok(thread_id) = ThreadId::from_string(target) {
+                return Ok(thread_id);
+            }
+            self.runtime
+                .resolve_agent_reference(caller, source, target)
+                .await
+        })
     }
 
     fn spawn(
@@ -80,19 +97,6 @@ impl AgentControl for LocalAgentControl {
         })
     }
 
-    fn resume(
-        &self,
-        caller: ThreadId,
-        target: AgentTarget,
-        config: Config,
-        source: SessionSource,
-    ) -> BoxFuture<'_, Result<(LiveAgent, ThreadConfigSnapshot)>> {
-        Box::pin(async move {
-            let target = self.resolve_target(caller, &target)?;
-            self.resume_agent(config, target, source).await
-        })
-    }
-
     fn send(&self, request: SendRequest) -> BoxFuture<'_, Result<DeliveryReceipt>> {
         Box::pin(async move {
             let SendRequest {
@@ -114,8 +118,9 @@ impl AgentControl for LocalAgentControl {
                     (receiver.unwrap_or_default(), submission_id)
                 }
                 AgentInput::Message { message, mode } => {
-                    let receiver = self.ensure_agent_known(target)?;
+                    let receiver = self.runtime.ensure_agent_known(target)?;
                     let author = self
+                        .runtime
                         .ensure_agent_known(caller)?
                         .agent_path
                         .unwrap_or_else(AgentPath::root);
@@ -160,6 +165,15 @@ impl AgentControl for LocalAgentControl {
         })
     }
 
+    fn ensure_child_loaded(&self, parent: ThreadId, child: ThreadId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let parent = self.runtime.upgrade()?.get_thread(parent).await?;
+            let config = parent.session.get_config().await.as_ref().clone();
+            self.ensure_v2_agent_loaded(config, child, Some(parent))
+                .await
+        })
+    }
+
     fn interrupt(
         &self,
         caller: ThreadId,
@@ -179,36 +193,54 @@ impl AgentControl for LocalAgentControl {
         })
     }
 
-    fn close(&self, caller: ThreadId, target: AgentTarget) -> BoxFuture<'_, Result<AgentInfo>> {
-        Box::pin(async move {
-            let target = self.resolve_target(caller, &target)?;
-            self.close_agent(target).await
-        })
-    }
-
-    fn inspect(&self, caller: ThreadId, target: AgentTarget) -> BoxFuture<'_, Result<AgentInfo>> {
-        Box::pin(async move {
-            let target = self.resolve_target(caller, &target)?;
-            self.inspect_agent(target).await
-        })
-    }
-
     fn list<'a>(
         &'a self,
+        caller: ThreadId,
+        parent: Option<ThreadId>,
         source: &'a SessionSource,
         path_prefix: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Vec<LiveAgent>>> {
-        Box::pin(self.list_agents(source, path_prefix))
+        Box::pin(async move {
+            self.runtime.register_session_root(caller, parent);
+            self.list_agents(source, path_prefix).await
+        })
     }
 
-    fn watch(
-        &self,
-        caller: ThreadId,
-        target: AgentTarget,
-    ) -> BoxFuture<'_, Result<StatusSubscription>> {
+    fn child_agent_paths(&self, parent: ThreadId) -> BoxFuture<'_, Vec<AgentPath>> {
         Box::pin(async move {
-            let target = self.resolve_target(caller, &target)?;
-            self.subscribe_status(target).await
+            let Some(parent_path) = self
+                .runtime
+                .registry
+                .agent_metadata_for_thread(parent)
+                .and_then(|metadata| metadata.agent_path)
+            else {
+                return Vec::new();
+            };
+            let parent_prefix = format!("{parent_path}/");
+            let mut agent_paths = self
+                .runtime
+                .registry
+                .live_agents()
+                .into_iter()
+                .filter_map(|metadata| metadata.agent_path)
+                .filter(|path| {
+                    path.as_str()
+                        .strip_prefix(&parent_prefix)
+                        .is_some_and(|name| !name.contains('/'))
+                })
+                .collect::<Vec<_>>();
+            let loaded_paths = self
+                .runtime
+                .open_thread_spawn_children(parent)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(_, metadata)| metadata.agent_path)
+                .collect::<HashSet<_>>();
+            agent_paths.sort();
+            // Stable sorting preserves alphabetical order within each group.
+            agent_paths.sort_by_key(|path| !loaded_paths.contains(path));
+            agent_paths
         })
     }
 
@@ -223,9 +255,9 @@ impl AgentControl for LocalAgentControl {
     fn admit_turn(
         &self,
         version: MultiAgentVersion,
-        source: SessionSource,
-    ) -> BoxFuture<'_, Result<Option<AgentExecutionGuard>>> {
-        Box::pin(async move { Ok(self.execution_guard(version, &source)) })
+        source: &SessionSource,
+    ) -> Option<AgentExecutionGuard> {
+        self.execution_guard(version, source)
     }
 
     fn record_usage(&self, usage: TokenUsage) -> BoxFuture<'_, Result<()>> {
@@ -236,43 +268,30 @@ impl AgentControl for LocalAgentControl {
         &'a self,
         outcome: AgentTurnOutcome,
         trace: &'a ThreadTraceContext,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            self.notify_parent_of_terminal_turn(outcome, trace).await;
-            Ok(())
-        })
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.notify_parent_of_terminal_turn(outcome, trace))
     }
 
     fn service_tier(&self) -> Option<String> {
         self.root_service_tier()
     }
 
-    fn propagate_config_update(&self, update: AgentConfigUpdate) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            match update {
-                AgentConfigUpdate::ServiceTier(tier) => self.set_root_service_tier(tier),
-            }
-            Ok(())
-        })
+    fn propagate_config_update(&self, update: AgentConfigUpdate) {
+        match update {
+            AgentConfigUpdate::ServiceTier(tier) => self.set_root_service_tier(tier),
+        }
     }
 
-    fn get_guardian_package(
-        &self,
-        agent: ThreadId,
-    ) -> BoxFuture<'_, Result<Option<GuardianRootSnapshot>>> {
-        Box::pin(async move { Ok(self.root_user_authorization(agent).await) })
+    fn get_guardian_package(&self, agent: ThreadId) -> BoxFuture<'_, Option<GuardianRootSnapshot>> {
+        Box::pin(self.root_user_authorization(agent))
     }
 
     fn pending_budget_reminder<'a>(
         &'a self,
         agent: ThreadId,
         window: &'a str,
-    ) -> BoxFuture<'a, Result<Option<RolloutBudgetReminder>>> {
-        Box::pin(async move {
-            Ok(LocalAgentControl::pending_budget_reminder(
-                self, agent, window,
-            ))
-        })
+    ) -> BoxFuture<'a, Option<RolloutBudgetReminder>> {
+        Box::pin(async move { LocalAgentControl::pending_budget_reminder(self, agent, window) })
     }
 
     fn mark_budget_reminder_delivered<'a>(
@@ -280,10 +299,9 @@ impl AgentControl for LocalAgentControl {
         agent: ThreadId,
         window: &'a str,
         reminder: RolloutBudgetReminder,
-    ) -> BoxFuture<'a, Result<()>> {
+    ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             LocalAgentControl::mark_budget_reminder_delivered(self, agent, window, reminder);
-            Ok(())
         })
     }
 }

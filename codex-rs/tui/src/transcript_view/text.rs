@@ -4,7 +4,7 @@
 //! lines introduce hard breaks. Display wrapping and synthetic controls never enter `text`.
 //! Layout offsets use `usize`; terminal coordinates are narrowed only for visible rows.
 //! Disclosure controls follow their activity's source text without changing its indentation.
-//! Selected hard breaks highlight one trailing cell when space permits.
+//! Selected hard breaks on nonempty rows highlight one trailing cell when space permits.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -142,7 +142,16 @@ impl TextLayout {
 
     /// Add visual spacing between entries without changing any source position.
     pub(super) fn with_leading_separator(mut self) -> Self {
-        if !self.separated && !self.rows.is_empty() {
+        if !self.separated {
+            self = self.with_leading_spacer();
+            self.separated = !self.rows.is_empty();
+        }
+        self
+    }
+
+    /// Reserve one presentation-only row before existing spacing and source text.
+    pub(super) fn with_leading_spacer(mut self) -> Self {
+        if !self.rows.is_empty() {
             self.rows.insert(
                 /*index*/ 0,
                 TextRow {
@@ -158,7 +167,6 @@ impl TextLayout {
             if let Some(control) = &mut self.disclosure_control {
                 control.row += 1;
             }
-            self.separated = true;
         }
         self
     }
@@ -176,6 +184,29 @@ impl TextLayout {
             gap
         } else {
             "\n"
+        }
+    }
+
+    pub(super) fn copy_lines(
+        &self,
+        range: Range<usize>,
+        separator: &str,
+        output: &mut Vec<crate::markdown_copy::SelectedLine>,
+    ) {
+        let mut offset = 0;
+        for (index, line) in self.logical.iter().enumerate() {
+            let end = offset + line.origin.range.len();
+            if range.start <= end && range.end >= offset {
+                let selected = line.origin.range.start + range.start.saturating_sub(offset)
+                    ..line.origin.range.start + range.end.min(end) - offset;
+                crate::markdown_copy::SelectedLine::append(
+                    output,
+                    line.origin.clone(),
+                    selected,
+                    if index == 0 { separator } else { "\n" },
+                );
+            }
+            offset = end + 1;
         }
     }
 
@@ -287,7 +318,7 @@ impl TextLayout {
         }
     }
 
-    /// Add a trailing cell for selected hard breaks, including a copied separator to `next`.
+    /// Mark selected hard breaks on nonempty rows, including a copied separator to `next`.
     pub(super) fn highlight_selection(
         &self,
         range: Range<usize>,
@@ -298,6 +329,9 @@ impl TextLayout {
     ) {
         self.highlight(range.clone(), area, buf, start_row);
         for (screen_row, row) in self.visible_rows(area, start_row) {
+            if row.source.is_empty() {
+                continue;
+            }
             let Some(end) = row.line_end else { continue };
             let selected = range.contains(&end)
                 || (end == self.text.len()

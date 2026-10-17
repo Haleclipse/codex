@@ -562,6 +562,14 @@ impl App {
             && self.overlay.is_none()
             && self.chat_widget.no_modal_or_popup_active()
         {
+            if key_event.kind == KeyEventKind::Press
+                && key_event.code == KeyCode::Left
+                && key_event.modifiers == KeyModifiers::NONE
+                && self.chat_widget.agents_navigation_key_available()
+                && !matches!(self.app_server_target, AppServerTarget::Embedded)
+            {
+                self.open_agents_overview(app_server);
+            }
             return;
         }
 
@@ -586,7 +594,8 @@ impl App {
             } else if self.should_reject_side_backtrack_esc(key_event) {
                 self.reject_side_backtrack_esc();
             } else {
-                self.chat_widget.handle_key_event(key_event);
+                let action = self.chat_widget.handle_key_event(key_event);
+                self.handle_clipboard_key_action(tui, action);
             }
             return;
         }
@@ -620,7 +629,8 @@ impl App {
                         self.reset_backtrack_state();
                     }
                 }
-                self.chat_widget.handle_key_event(key_event);
+                let action = self.chat_widget.handle_key_event(key_event);
+                self.handle_clipboard_key_action(tui, action);
             }
             _ => {
                 self.chat_widget.handle_key_event(key_event);

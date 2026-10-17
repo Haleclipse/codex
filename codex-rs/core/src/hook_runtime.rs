@@ -725,14 +725,14 @@ pub(crate) async fn record_pending_input(
         TurnInput::UserInput {
             content,
             client_id,
-            acceptance_order,
+            metadata,
         } => {
             sess.record_user_prompt_and_emit_turn_item(
                 turn_context.as_ref(),
                 model_info,
                 content.as_slice(),
                 client_id,
-                acceptance_order,
+                metadata,
                 persist_context,
             )
             .await;
@@ -766,6 +766,7 @@ pub(crate) async fn record_pending_input(
         TurnInput::InterAgentCommunication(communication) => {
             sess.record_inter_agent_communication(turn_context, model_info, communication)
                 .await;
+            sess.ensure_rollout_materialized(persist_context).await;
         }
     }
     record_additional_contexts(sess, turn_context, additional_contexts).await;

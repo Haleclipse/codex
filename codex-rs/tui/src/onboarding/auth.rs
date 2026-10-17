@@ -129,8 +129,8 @@ pub(crate) struct ApiKeyInputState {
 #[derive(Clone)]
 /// Used to manage the lifecycle of SpawnedLogin and ensure it gets cleaned up.
 pub(crate) struct ContinueInBrowserState {
-    login_id: String,
-    auth_url: String,
+    pub(super) login_id: String,
+    pub(super) auth_url: String,
 }
 
 #[derive(Clone)]
@@ -256,6 +256,7 @@ pub(crate) struct AuthModeWidget {
     pub error: Arc<RwLock<Option<String>>>,
     pub sign_in_state: Arc<RwLock<SignInState>>,
     pub login_status: LoginStatus,
+    pub app_server_target: crate::AppServerTarget,
     pub app_server_request_handle: AppServerRequestHandle,
     pub auth_config: AuthConfig,
     pub bedrock_setup_enabled: bool,
@@ -553,7 +554,12 @@ impl AuthModeWidget {
             .render(area, buf);
     }
 
-    fn render_continue_in_browser(&self, area: Rect, buf: &mut Buffer) {
+    fn render_continue_in_browser(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        state: &ContinueInBrowserState,
+    ) {
         let mut spans = vec!["  ".into()];
         if self.animations_enabled && !self.animations_suppressed.get() {
             // Schedule a follow-up frame to keep the shimmer animation going.
@@ -568,11 +574,15 @@ impl AuthModeWidget {
         }
         let mut lines = vec![spans.into(), "".into()];
 
-        let sign_in_state = self.sign_in_state.read().unwrap();
-        let auth_url = if let SignInState::ChatGptContinueInBrowser(state) = &*sign_in_state
-            && !state.auth_url.is_empty()
-        {
-            lines.push("  If the link doesn't open automatically, open the following link to authenticate:".into());
+        let auth_url = if !state.auth_url.is_empty() {
+            lines.push(Line::from(vec![
+                "  If the link doesn't open automatically, press ".into(),
+                keys::COPY_LINK[0].into(),
+                " to copy it:".into(),
+            ]));
+            if let Some(message) = self.error_message() {
+                lines.push(format!("  {message}").dim().into());
+            }
             lines.push("".into());
             lines.push(Line::from(vec![
                 "  ".into(),
@@ -931,6 +941,7 @@ impl AuthModeWidget {
         }
 
         self.set_error(/*message*/ None);
+        let app_server_target = self.app_server_target.clone();
         let request_handle = self.app_server_request_handle.clone();
         let sign_in_state = self.sign_in_state.clone();
         let error = self.error.clone();
@@ -948,13 +959,14 @@ impl AuthModeWidget {
                 .await
             {
                 Ok(LoginAccountResponse::Chatgpt { login_id, auth_url }) => {
-                    maybe_open_auth_url_in_browser(&request_handle, &auth_url);
                     *error.write().unwrap() = None;
-                    *sign_in_state.write().unwrap() =
-                        SignInState::ChatGptContinueInBrowser(ContinueInBrowserState {
-                            login_id,
-                            auth_url,
-                        });
+                    show_chatgpt_login_in_browser(
+                        &app_server_target,
+                        &sign_in_state,
+                        &request_frame,
+                        ContinueInBrowserState { login_id, auth_url },
+                        webbrowser::open,
+                    );
                 }
                 Ok(other) => {
                     *sign_in_state.write().unwrap() = SignInState::PickMode;
@@ -1053,8 +1065,8 @@ impl WidgetRef for AuthModeWidget {
             SignInState::PickMode => {
                 self.render_pick_mode(area, buf);
             }
-            SignInState::ChatGptContinueInBrowser(_) => {
-                self.render_continue_in_browser(area, buf);
+            SignInState::ChatGptContinueInBrowser(state) => {
+                self.render_continue_in_browser(area, buf, state);
             }
             SignInState::ChatGptDeviceCode(state) => {
                 headless_chatgpt_login::render_device_code_login(self, area, buf, state);
@@ -1083,12 +1095,23 @@ impl WidgetRef for AuthModeWidget {
     }
 }
 
-pub(super) fn maybe_open_auth_url_in_browser(request_handle: &AppServerRequestHandle, url: &str) {
-    if !matches!(request_handle, AppServerRequestHandle::InProcess(_)) {
+fn show_chatgpt_login_in_browser(
+    target: &crate::AppServerTarget,
+    sign_in_state: &RwLock<SignInState>,
+    request_frame: &FrameRequester,
+    login: ContinueInBrowserState,
+    open: impl FnOnce(&str) -> std::io::Result<()>,
+) {
+    let url = login.auth_url.clone();
+    *sign_in_state.write().unwrap() = SignInState::ChatGptContinueInBrowser(login);
+    request_frame.schedule_frame();
+
+    // Local daemons use a remote request handle, but their callback is local.
+    if target.uses_remote_workspace() {
         return;
     }
 
-    if let Err(err) = webbrowser::open(url) {
+    if let Err(err) = open(&url) {
         tracing::warn!("failed to open browser for login URL: {err}");
     }
 }
@@ -1101,8 +1124,10 @@ mod tests {
     use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
     use codex_app_server_client::InProcessAppServerClient;
     use codex_app_server_client::InProcessClientStartArgs;
+    use codex_app_server_client::RemoteAppServerEndpoint;
     use codex_arg0::Arg0DispatchPaths;
     use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1121,6 +1146,78 @@ mod tests {
         "state=8cHjQ4nVx2Yp7Lm9Rk3Wf6Ta1Bs5Du0Ei4Go7Nz2PqM&",
         "originator=codex_cli_rs"
     );
+
+    #[test]
+    fn opens_login_browser_for_local_app_servers() -> color_eyre::Result<()> {
+        let endpoint = RemoteAppServerEndpoint::UnixSocket {
+            socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
+        };
+        let url = "https://example.test/authorize";
+        for (target, expected) in [
+            (crate::AppServerTarget::Embedded, true),
+            (
+                crate::AppServerTarget::LocalDaemon {
+                    endpoint: endpoint.clone(),
+                    allow_embedded_fallback: true,
+                },
+                true,
+            ),
+            (
+                crate::AppServerTarget::LocalDaemon {
+                    endpoint: endpoint.clone(),
+                    allow_embedded_fallback: false,
+                },
+                true,
+            ),
+            (crate::AppServerTarget::Remote { endpoint }, false),
+        ] {
+            let mut opened_url = None;
+            show_chatgpt_login_in_browser(
+                &target,
+                &RwLock::new(SignInState::PickMode),
+                &FrameRequester::test_dummy(),
+                ContinueInBrowserState {
+                    login_id: "login-1".to_string(),
+                    auth_url: url.to_string(),
+                },
+                |url| {
+                    opened_url = Some(url.to_owned());
+                    Ok(())
+                },
+            );
+            assert_eq!(opened_url.as_deref(), expected.then_some(url));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn login_can_complete_while_browser_is_opening() {
+        let (mut widget, _tmp) = widget_forced_chatgpt().await;
+        let sign_in_state = widget.sign_in_state.clone();
+        let request_frame = widget.request_frame.clone();
+        show_chatgpt_login_in_browser(
+            &crate::AppServerTarget::Embedded,
+            &sign_in_state,
+            &request_frame,
+            ContinueInBrowserState {
+                login_id: "login-1".to_string(),
+                auth_url: "https://example.test/authorize".to_string(),
+            },
+            |_| {
+                widget.on_account_login_completed(AccountLoginCompletedNotification {
+                    login_id: Some("login-1".to_string()),
+                    success: true,
+                    error: None,
+                    onboarding_entrypoint: None,
+                });
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            &*sign_in_state.read().unwrap(),
+            SignInState::ChatGptSuccessMessage
+        ));
+    }
 
     async fn widget_forced_chatgpt() -> (AuthModeWidget, TempDir) {
         let codex_home = TempDir::new().unwrap();
@@ -1170,6 +1267,7 @@ mod tests {
             error: Arc::new(RwLock::new(None)),
             sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
             login_status: LoginStatus::NotAuthenticated,
+            app_server_target: crate::AppServerTarget::Embedded,
             app_server_request_handle: AppServerRequestHandle::InProcess(client.request_handle()),
             auth_config,
             bedrock_setup_enabled: false,
@@ -1366,7 +1464,7 @@ mod tests {
         let height = 30;
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
-        widget.render_continue_in_browser(area, &mut buf);
+        widget.render_ref(area, &mut buf);
 
         let found = collect_osc8_chars(&buf, area, PRODUCTION_LENGTH_AUTH_URL);
         assert_eq!(
@@ -1381,7 +1479,7 @@ mod tests {
         terminal.set_viewport_area(area);
 
         terminal
-            .draw(|frame| widget.render_continue_in_browser(area, frame.buffer_mut()))
+            .draw(|frame| widget.render_ref(area, frame.buffer_mut()))
             .expect("draw");
 
         let contents = terminal.backend().to_string();

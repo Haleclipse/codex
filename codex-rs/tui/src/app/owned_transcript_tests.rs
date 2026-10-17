@@ -11,6 +11,7 @@ use crate::session_state::ThreadSessionState;
 use crate::test_support::test_path_buf;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::types::ApprovalsReviewer;
+use codex_config::types::CopyOnSelect;
 use codex_protocol::models::PermissionProfile;
 use crossterm::event::MouseButton::Left;
 use crossterm::event::MouseButton::Right;
@@ -22,7 +23,7 @@ use crossterm::event::MouseEventKind::Up;
 use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
 
-fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
+pub(in crate::app) fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
     Arc::new(UserHistoryCell {
         spoken: false,
         message: message.to_string(),
@@ -32,7 +33,7 @@ fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
     })
 }
 
-fn attach_thread(app: &mut App, thread_id: ThreadId) {
+pub(in crate::app) fn attach_thread(app: &mut App, thread_id: ThreadId) {
     app.chat_widget.handle_thread_session(ThreadSessionState {
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
@@ -58,7 +59,7 @@ fn attach_thread(app: &mut App, thread_id: ThreadId) {
     });
 }
 
-pub(super) fn buffer_text(buffer: &Buffer) -> String {
+pub(in crate::app) fn buffer_text(buffer: &Buffer) -> String {
     buffer
         .content()
         .chunks(usize::from(buffer.area.width))
@@ -284,11 +285,6 @@ async fn recap_spacing_belongs_to_the_transcript_tail() -> Result<()> {
                     .with_next_action(next_action.map(str::to_owned)),
             ),
         ];
-        crate::app::test_support::select_catalog_tip(
-            &mut app,
-            /*width*/ 80,
-            "Tip: Use /mcp to list configured MCP tools.",
-        );
         let mut tui = crate::tui::test_support::make_test_tui()?;
         tui.set_owned_screen(/*owned*/ true)?;
         let size = Size::new(width, height);
@@ -519,6 +515,7 @@ async fn owned_details_keep_the_composer_cursor_and_screen() -> Result<()> {
             /*footer*/ None,
             crate::bottom_pane::CommandPopupPlacement::Overlay,
             Some(&crate::bottom_pane::ComposerGap::default()),
+            /*working_tip*/ None,
         )
         .cursor_pos(bottom_area)
         .expect("composer cursor");
@@ -1349,6 +1346,7 @@ fn row_containing(tui: &tui::Tui, text: &str) -> u16 {
 #[tokio::test]
 async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
     let mut app = crate::app::test_support::make_test_app().await;
+    app.local_settings.tui.copy_on_select = CopyOnSelect::Never;
     let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     tui.set_owned_screen(/*owned*/ true)?;
@@ -1367,6 +1365,16 @@ async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
         assert!(app.handle_owned_transcript_event(&mut tui, &mut server, &event)?);
     }
     assert!(!app.transcript_view.has_active_interaction());
+    app.start_right_click_paste(
+        &mut tui,
+        crossterm::event::MouseEvent {
+            kind: Down(Right),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(!tui.clipboard.is_busy());
     app.render_owned_transcript(&mut tui, size)?;
     let cursor = tui.terminal.last_known_cursor_pos;
     let draft = app.chat_widget.capture_thread_input_state();
@@ -1381,10 +1389,21 @@ async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
     }
     let copy_events = [
         TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER)),
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
         mouse(Down(Right), x + 2, y),
     ];
     let mut selection_frames = Vec::new();
-    for event in &copy_events {
+    for (index, event) in copy_events.iter().enumerate() {
+        // Each confirmed copy clears the selection, so select again for the next gesture.
+        if index > 0 {
+            for event in [
+                mouse(Down(Left), x, y),
+                mouse(Drag(Left), x + 5, y),
+                mouse(Up(Left), x + 5, y),
+            ] {
+                assert!(app.handle_owned_transcript_event(&mut tui, &mut server, &event)?);
+            }
+        }
         for result in [
             Err("clipboard unavailable".to_string()),
             Ok(crate::clipboard_copy::CopyStatus::Unconfirmed),
@@ -1411,8 +1430,7 @@ async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
                     }
                 })
                 .collect::<String>();
-            let cleared = matches!(event, TuiEvent::Mouse(_))
-                && result == Ok(crate::clipboard_copy::CopyStatus::Confirmed);
+            let cleared = result == Ok(crate::clipboard_copy::CopyStatus::Confirmed);
             assert_eq!(
                 (
                     app.chat_widget.capture_thread_input_state(),
@@ -1429,10 +1447,10 @@ async fn fullscreen_composer_mouse_copy_and_input_ownership() -> Result<()> {
                     },
                 )
             );
-            let gesture = if matches!(event, TuiEvent::Mouse(_)) {
-                "right-click"
-            } else {
-                "keyboard"
+            let gesture = match event {
+                TuiEvent::Mouse(_) => "right-click",
+                TuiEvent::Key(key) if key.modifiers == KeyModifiers::SUPER => "cmd-c",
+                _ => "ctrl-c",
             };
             selection_frames.push(format!(
                 "{gesture} {result:?}\n{rendered_draft}\n{selection}"

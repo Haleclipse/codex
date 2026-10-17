@@ -21,7 +21,7 @@ use crate::UpdateStatus;
 #[cfg(unix)]
 use crate::managed_install::executable_identity;
 #[cfg(unix)]
-use crate::managed_install::executable_identity_from_bytes;
+use crate::managed_install::executable_identity_from_reader;
 
 #[tokio::test]
 async fn installer_fetch_uses_exact_url_and_preserves_bytes() {
@@ -301,6 +301,7 @@ fn manual_update_daemon(home: &TempDir) -> (Daemon, String) {
     std::fs::write(state.join("app-server.stderr.log"), b"").unwrap();
     (
         Daemon {
+            log_diagnostics: false,
             socket_path: home.path().join("app-server-control/server.sock"),
             pid_file: state.join("app-server.pid"),
             update_pid_file: state.join("app-server-updater.pid"),
@@ -772,7 +773,7 @@ async fn check_manual_update_restart(package_directory: &str) {
         super::run_with_http(
             &http,
             &updater_daemon,
-            &executable_identity_from_bytes(b"updater"),
+            &executable_identity_from_reader(&b"updater"[..]).expect("updater identity"),
             restore_release,
         )
         .await
@@ -849,7 +850,7 @@ async fn check_manual_update_restart(package_directory: &str) {
     let output = manual_update_once(
         &no_op,
         &daemon,
-        &executable_identity_from_bytes(b"updater"),
+        &executable_identity_from_reader(&b"updater"[..]).expect("updater identity"),
         &mut test_terminate(),
         super::UpdateTrigger::Manual,
     )

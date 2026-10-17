@@ -136,6 +136,7 @@ impl McpConnectionSet {
             McpServerView {
                 tool_filter: ToolFilter::default(),
                 protocol_mode: crate::McpProtocolMode::Legacy,
+                startup_readiness: Default::default(),
                 connection: Arc::new(McpServerConnection {
                     identity: None,
                     client,
@@ -4668,7 +4669,9 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                 enabled: true,
                 required: false,
+                startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
+                tool_input_schema_max_bytes: None,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4696,7 +4699,9 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                 environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                 enabled: true,
                 required: false,
+                startup_readiness: Default::default(),
                 supports_parallel_tool_calls: false,
+                tool_input_schema_max_bytes: None,
                 omit_tools_from: None,
                 disabled_reason: None,
                 startup_timeout_sec: None,
@@ -4807,7 +4812,9 @@ fn mcp_init_error_display_prompts_for_github_pat() {
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
         required: false,
+        startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
+        tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -4967,7 +4974,9 @@ fn mcp_init_error_display_reports_generic_errors() {
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
         required: false,
+        startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
+        tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5046,7 +5055,9 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
         required: false,
+        startup_readiness: Default::default(),
         supports_parallel_tool_calls: false,
+        tool_input_schema_max_bytes: None,
         omit_tools_from: None,
         disabled_reason: None,
         startup_timeout_sec: None,
@@ -5110,6 +5121,7 @@ async fn manager_with_reusable_ready_server(
         "docs".to_string(),
         McpServerView {
             protocol_mode: crate::McpProtocolMode::Legacy,
+            startup_readiness: Default::default(),
             connection: Arc::new(McpServerConnection {
                 identity: Some(reusable_server_identity("docs", config, runtime_context)),
                 client: create_ready_async_managed_client(tools).await,
@@ -5535,6 +5547,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
         "docs".to_string(),
         McpServerView {
             protocol_mode: crate::McpProtocolMode::Legacy,
+            startup_readiness: Default::default(),
             connection: Arc::new(McpServerConnection {
                 identity: Some(reusable_server_identity("docs", &config, &runtime_context)),
                 client: AsyncManagedClient {
@@ -5734,6 +5747,79 @@ async fn reconciliation_retries_non_oauth_authentication_failures() {
     let reconciled = reconcile_reusable_server(&previous, config, runtime_context).await;
 
     assert!(!previous.shares_test_connection_with(&reconciled, "docs"));
+}
+
+#[test]
+fn connection_identity_tracks_only_oauth_credentials_when_oauth_is_active() {
+    let runtime_context = reusable_server_runtime_context();
+    for authorization in [None, Some("Bearer configured-token")] {
+        let identity = |oauth: serde_json::Value| {
+            let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+                "url": "http://127.0.0.1:1",
+                "http_headers": authorization.map(|value| HashMap::from([
+                    ("Authorization", value)
+                ])),
+                "oauth": oauth
+            }))
+            .expect("valid OAuth configuration");
+            let debug = format!("{config:?}");
+            assert!(!debug.contains("old-secret"));
+            assert!(!debug.contains("new-secret"));
+            McpServerConnectionIdentity::new(
+                "docs",
+                &EffectiveMcpServer::configured(config),
+                /*host_plugin_root*/ None,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct,
+                McpOAuthRefreshMode::Legacy,
+                &Ok(None),
+                &runtime_context,
+                /*runtime_auth_provider*/ None,
+                /*auth*/ None,
+                /*codex_apps_cache_identity*/ None,
+                ElicitationCapability::default(),
+                ClientMcpExtensions::default(),
+                /*previous_identity*/ None,
+            )
+        };
+        let original_config = serde_json::json!({
+            "client_id": "client",
+            "client_secret": "old-secret",
+            "callback_url": "http://127.0.0.1:12799/callback/original",
+            "callback_port": 12799,
+        });
+        let original = identity(original_config.clone());
+        assert!(original.has_same_connection_config(&identity(original_config.clone())));
+        for (field, value) in [
+            ("client_secret", serde_json::json!("new-secret")),
+            ("client_id", serde_json::json!("new-client")),
+        ] {
+            let mut changed = original_config.clone();
+            changed[field] = value;
+            assert_eq!(
+                original.has_same_connection_config(&identity(changed)),
+                authorization.is_some(),
+            );
+        }
+        for (field, value) in [
+            (
+                "callback_url",
+                serde_json::json!("http://127.0.0.1:12799/callback/changed"),
+            ),
+            ("callback_port", serde_json::json!(12800)),
+        ] {
+            let mut changed = original_config.clone();
+            changed[field] = value.clone();
+            assert!(original.has_same_connection_config(&identity(changed)));
+
+            let mut callback_only = serde_json::json!({});
+            callback_only[field] = value;
+            assert!(
+                identity(serde_json::Value::Null)
+                    .has_same_connection_config(&identity(callback_only))
+            );
+        }
+    }
 }
 
 #[test]

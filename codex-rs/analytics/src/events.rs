@@ -314,6 +314,7 @@ pub enum GuardianReviewTerminalStatus {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardianReviewFailureReason {
+    StaleAuthorization,
     Timeout,
     Cancelled,
     PromptBuildError,
@@ -793,6 +794,7 @@ pub(crate) enum WebSearchActionKind {
 
 #[derive(Serialize)]
 pub(crate) struct CodexCommandExecutionEventParams {
+    pub(crate) sandbox_backend: Option<String>,
     pub(crate) model_slug: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     #[serde(flatten)]

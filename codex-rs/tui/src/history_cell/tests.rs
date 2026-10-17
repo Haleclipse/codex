@@ -798,6 +798,7 @@ async fn session_info_preserves_styled_tooltip_links() {
 
     let lines = cell.transcript_hyperlink_lines(/*width*/ 30);
     assert_eq!(lines, cell.display_hyperlink_lines(/*width*/ 30));
+    assert_eq!(lines, cell.compact_hyperlink_lines(/*width*/ 30));
     assert_eq!(
         visible_lines(lines.clone()),
         cell.transcript_lines(/*width*/ 30)
@@ -878,11 +879,29 @@ fn ps_output_multiline_snapshot() {
             recent_chunks: vec!["hello".to_string(), "done".to_string()],
         },
         UnifiedExecProcessDetails {
+            command_display: "(\n  sleep 120\n)".to_string(),
+            recent_chunks: Vec::new(),
+        },
+        UnifiedExecProcessDetails {
+            command_display: "sleep 1\r\nsleep 120".to_string(),
+            recent_chunks: Vec::new(),
+        },
+        UnifiedExecProcessDetails {
             command_display: "rg \"foo\" src".to_string(),
             recent_chunks: vec!["src/main.rs:12:foo".to_string()],
         },
     ]);
     let rendered = render_lines(&cell.display_lines(/*width*/ 40)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn ps_output_multiline_long_command_snapshot() {
+    let cell = new_unified_exec_processes_output(vec![UnifiedExecProcessDetails {
+        command_display: format!("(\n  {}\n)", "x".repeat(100)),
+        recent_chunks: Vec::new(),
+    }]);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 100)).join("\n");
     insta::assert_snapshot!(rendered);
 }
 

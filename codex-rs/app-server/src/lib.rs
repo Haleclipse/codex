@@ -42,7 +42,6 @@ use crate::transport::RemoteControlStartConfig;
 use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
 use crate::transport::app_server_startup_lock_path;
-use crate::transport::auth::policy_from_settings;
 use crate::transport::route_outgoing_envelope;
 use crate::transport::start_control_socket_acceptor;
 use crate::transport::start_remote_control;
@@ -68,6 +67,8 @@ use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout::state_db as rollout_state_db;
 use codex_state::log_db;
+use codex_websocket_auth::WebsocketAuthSettings;
+use codex_websocket_auth::policy_from_settings;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -119,6 +120,7 @@ mod fuzzy_file_search;
 mod gateway_oauth_notifications;
 mod image_url;
 pub mod in_process;
+mod log_write_warning;
 mod mcp_refresh;
 mod message_processor;
 mod model_catalog;
@@ -147,9 +149,6 @@ pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
-pub use crate::transport::auth::AppServerWebsocketAuthArgs;
-pub use crate::transport::auth::AppServerWebsocketAuthSettings;
-pub use crate::transport::auth::WebsocketAuthCliMode;
 pub use crate::transport::take_remote_control_disabled_env;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
@@ -444,7 +443,7 @@ pub async fn run_main(
         default_analytics_enabled,
         AppServerTransport::Stdio,
         SessionSource::VSCode,
-        AppServerWebsocketAuthSettings::default(),
+        WebsocketAuthSettings::default(),
         AppServerRuntimeOptions::default(),
     )
     .await
@@ -495,7 +494,7 @@ pub async fn run_main_with_transport_options(
     default_analytics_enabled: bool,
     transport: AppServerTransport,
     session_source: SessionSource,
-    auth: AppServerWebsocketAuthSettings,
+    auth: WebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<AppServerExit> {
     #[cfg(target_os = "windows")]
@@ -693,6 +692,12 @@ pub async fn run_main_with_transport_options(
         });
     }
 
+    let analytics_events_client =
+        analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
+    let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
+        outgoing_tx,
+        analytics_events_client.clone(),
+    ));
     let feedback = CodexFeedback::new();
 
     // Install a simple subscriber so `tracing` output is visible. Users can
@@ -712,9 +717,16 @@ pub async fn run_main_with_transport_options(
             .boxed(),
     };
 
+    let log_write_warning = log_write_warning::LogWriteWarningReporter::new(
+        feedback.clone(),
+        &outgoing_message_sender,
+        &config,
+    );
     let feedback_layer = feedback.logger_layer();
     let feedback_metadata_layer = feedback.metadata_layer();
-    let log_db = state_db.clone().map(log_db::start);
+    let log_db = state_db
+        .clone()
+        .map(|state_db| log_db::start(state_db, log_write_warning.clone()));
     let log_db_layer = log_db
         .clone()
         .map(|layer| layer.with_filter(log_db::default_filter()));
@@ -947,12 +959,6 @@ pub async fn run_main_with_transport_options(
     let recovery_file = daemon_recovery_file_path(&config.codex_home);
     let processor_handle = tokio::spawn({
         let auth_manager = Arc::clone(&auth_manager);
-        let analytics_events_client =
-            analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
-        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            analytics_events_client.clone(),
-        ));
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {

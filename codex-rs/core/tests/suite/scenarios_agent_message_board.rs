@@ -6,6 +6,7 @@ use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
@@ -130,8 +131,12 @@ async fn board_requires_persistent_v2_runtime(
     Ok(())
 }
 
+#[test_case::test_case(false; "disk")]
+#[test_case::test_case(true; "in_memory")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn board_post_and_reads_reach_model_context_without_self_notices() -> anyhow::Result<()> {
+async fn board_post_and_reads_reach_model_context_without_self_notices(
+    in_memory: bool,
+) -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
     let mock = responses::mount_sse_sequence(&server, vec![
         tool("post-decision", "post", json!({"new_channel_name":"design", "text":"A shared decision.", "agents_to_notify":["/root"]})),
@@ -139,8 +144,9 @@ async fn board_post_and_reads_reach_model_context_without_self_notices() -> anyh
         done(),
     ]).await;
     let test = test_codex()
-        .with_config(|config| {
+        .with_config(move |config| {
             configure(config);
+            config.multi_agent_v2.message_board_in_memory = in_memory;
             config.current_time_reminder = Some(codex_core::config::CurrentTimeReminderConfig {
                 clock_source: codex_features::CurrentTimeSource::External,
                 ..Default::default()
@@ -202,11 +208,18 @@ async fn board_post_and_reads_reach_model_context_without_self_notices() -> anyh
     Ok(())
 }
 
+#[test_case::test_case(false; "disk")]
+#[test_case::test_case(true; "in_memory")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn board_is_shared_with_children_survives_resume_and_skips_idle_notices() -> anyhow::Result<()>
-{
+async fn board_is_shared_with_children_and_skips_idle_notices(
+    in_memory: bool,
+) -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
-    let mut builder = test_codex().with_config(configure);
+    let mut builder = test_codex().with_config(move |config| {
+        configure(config);
+        config.multi_agent_v2.message_board_in_memory = in_memory;
+        config.ephemeral = in_memory;
+    });
     let root = builder.build_with_auto_env(&server).await?;
     responses::mount_sse_sequence(
         &server,
@@ -301,6 +314,17 @@ async fn board_is_shared_with_children_survives_resume_and_skips_idle_notices() 
         serde_json::from_str(&output).with_context(|| format!("root read result: {output}"))?;
     assert_eq!(result["results"][0]["message_id"], post["message_id"]);
     child.shutdown_and_wait().await?;
+    if in_memory {
+        assert!(
+            !root
+                .config
+                .sqlite_config()
+                .home()
+                .join("agent_message_board_1.sqlite")
+                .exists()
+        );
+        return Ok(());
+    }
     let resumed = test_codex()
         .with_config(configure)
         .restart(&server, &root)
@@ -328,11 +352,21 @@ async fn board_is_shared_with_children_survives_resume_and_skips_idle_notices() 
     Ok(())
 }
 
+#[test_case::test_case(false; "direct_messages")]
+#[test_case::test_case(true; "channels_only")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn board_unsubscribe_survives_post_and_resume_until_resubscribed() -> anyhow::Result<()> {
+async fn board_unsubscribe_survives_post_and_resume_until_resubscribed(
+    disable_direct_message: bool,
+) -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
     let root = test_codex()
-        .with_config(configure)
+        .with_config(move |config| {
+            configure(config);
+            config.multi_agent_v2.disable_direct_message = disable_direct_message;
+        })
+        .with_model_info_override("gpt-5.5", |model| {
+            model.multi_agent_version = Some(MultiAgentVersion::V2);
+        })
         .build_with_auto_env(&server)
         .await?;
     let posted = responses::mount_sse_sequence(
@@ -342,6 +376,11 @@ async fn board_unsubscribe_survives_post_and_resume_until_resubscribed() -> anyh
                 "start-discussion",
                 "post",
                 json!({"new_channel_name":"design","text":"A shared decision."}),
+            ),
+            tool(
+                "read-discussion",
+                "search_posts",
+                json!({"channel_name":"design"}),
             ),
             done(),
         ],
@@ -353,6 +392,12 @@ async fn board_unsubscribe_survives_post_and_resume_until_resubscribed() -> anyh
             .function_call_output_text("start-discussion")
             .context("initial post result")?,
     )?;
+    let read: Value = serde_json::from_str(
+        &posted
+            .function_call_output_text("read-discussion")
+            .context("read result")?,
+    )?;
+    assert_eq!(read["results"][0]["message_id"], post["message_id"]);
     let thread_id = &post["thread_id"];
     let opted_out = responses::mount_sse_sequence(
         &server,
@@ -450,11 +495,15 @@ async fn board_unsubscribe_survives_post_and_resume_until_resubscribed() -> anyh
     let resumed = test_codex()
         .with_config(move |config| {
             configure(config);
+            config.multi_agent_v2.disable_direct_message = disable_direct_message;
             config.model_provider.base_url = Some(base_url);
             config
                 .features
                 .disable(Feature::EnableRequestCompression)
                 .expect("read raw request bodies from the gated mock");
+        })
+        .with_model_info_override("gpt-5.5", |model| {
+            model.multi_agent_version = Some(MultiAgentVersion::V2);
         })
         .restart(&server, &root)
         .await?;
@@ -593,6 +642,29 @@ async fn board_unsubscribe_survives_post_and_resume_until_resubscribed() -> anyh
             Vec::new()
         };
         assert_eq!(notices, expected, "phase: {phase}");
+    }
+    let requests = streaming.requests().await;
+    for body in &requests {
+        let request: Value = serde_json::from_slice(body)?;
+        for name in ["send_message", "followup_task"] {
+            assert_eq!(
+                responses::namespace_child_tool(&request, "collaboration", name).is_some(),
+                !disable_direct_message,
+                "{name}",
+            );
+        }
+        for name in [
+            "spawn_agent",
+            "wait_agent",
+            "interrupt_agent",
+            "list_agents",
+            "post",
+        ] {
+            assert!(
+                responses::namespace_child_tool(&request, "collaboration", name).is_some(),
+                "{name}"
+            );
+        }
     }
     child.shutdown_and_wait().await?;
     resumed.codex.shutdown_and_wait().await?;

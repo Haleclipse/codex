@@ -35,13 +35,12 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
-use codex_protocol::items::TurnItem;
-use codex_protocol::mcp::is_node_repl_backed_server;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::GuardianScope;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -110,6 +109,7 @@ pub(crate) struct GuardianReviewSessionParams {
     pub(crate) spawn_config: Config,
     pub(crate) node_repl_policy: GuardianNodeReplPolicy,
     pub(crate) request: GuardianApprovalRequest,
+    pub(crate) category: GuardianScope,
     pub(crate) reasons: ApprovalRequestReasons,
     pub(crate) schema: Value,
     pub(crate) review_model: ReviewModel,
@@ -285,21 +285,28 @@ pub(crate) fn prompt_cache_key_override_for_review_session(
 
 impl GuardianReviewSession {
     async fn admit_node_repl_evidence(&self, event: &Event) {
-        let EventMsg::ItemCompleted(completed) = &event.msg else {
+        // Annotated review inputs are recorded as response items without UI turn
+        // items. Both input paths emit this event after history admission.
+        let EventMsg::RawResponseItem(recorded) = &event.msg else {
             return;
         };
-        let TurnItem::UserMessage(_) = &completed.item else {
+        let ResponseItem::Message { role, content, .. } = &recorded.item else {
             return;
         };
+        if role != "user"
+            || !content.iter().any(|item| {
+                matches!(item, ContentItem::InputText { text }
+                    if text == GUARDIAN_TRANSCRIPT_START || text == ">>> TRANSCRIPT DELTA START\n")
+            })
+        {
+            return;
+        }
 
         let mut state = self.state.lock().await;
         let Some(pending) = state.pending_node_repl_evidence_admission.as_ref() else {
             return;
         };
-        if completed.thread_id == self.session.thread_id()
-            && event.id == pending.turn_id
-            && completed.turn_id == pending.turn_id
-        {
+        if event.id == pending.turn_id {
             state.last_admitted_node_repl_response_sequence = state
                 .last_admitted_node_repl_response_sequence
                 .max(pending.response_sequence);
@@ -794,11 +801,7 @@ async fn ensure_guardian_node_repl_policy(
         .turn()
         .model_info()
         .computer_use_review_required()
-        || !matches!(
-            &params.request,
-            GuardianApprovalRequest::McpToolCall { server, tool_name, .. }
-                if is_node_repl_backed_server(server) && tool_name == "js"
-        )
+        || params.category != GuardianScope::ComputerUse
     {
         return Ok(());
     }

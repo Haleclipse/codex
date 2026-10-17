@@ -1,5 +1,4 @@
 use super::*;
-use crate::context::GuardianContextMode;
 
 use super::tests::build_world_state_from_turn_context;
 use super::tests::make_session_and_context;
@@ -33,12 +32,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn recorded_questions_share_queued_input_order_across_resume() {
-    let (mut session, turn) = make_session_and_context().await;
-    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
-    session.state.lock().await.history = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &SessionSource::default(),
-    );
+    let (session, turn) = make_session_and_context().await;
     let question = |call_id: &str| {
         serde_json::from_value::<ResponseItem>(json!({
             "type": "function_call", "call_id": call_id,
@@ -64,7 +58,7 @@ async fn recorded_questions_share_queued_input_order_across_resume() {
                 ResponseItemEnvelope {
                     item: user_message("Yes."),
                     metadata: Some(codex_history::CodexHarnessMetadata {
-                        user_input_order: reply_order,
+                        user_input_order: Some(reply_order),
                         ..Default::default()
                     }),
                 },
@@ -81,6 +75,18 @@ async fn recorded_questions_share_queued_input_order_across_resume() {
             ],
         )
         .await;
+    let sources = |items: &[ResponseItemEnvelope]| {
+        items
+            .iter()
+            .map(|item| {
+                item.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.retained_source.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let original_sources = sources(session.clone_history().await.annotated_items());
+    assert!(original_sources.iter().any(Option::is_some));
     let saved = session
         .clone_history()
         .await
@@ -97,6 +103,7 @@ async fn recorded_questions_share_queued_input_order_across_resume() {
         }))
         .await;
     let history = session.clone_history().await;
+    assert_eq!(sources(history.annotated_items()), original_sources);
     assert_eq!(
         history
             .annotated_items()
@@ -109,17 +116,14 @@ async fn recorded_questions_share_queued_input_order_across_resume() {
             .collect::<Vec<_>>(),
         vec![Some(0), Some(2), Some(1), None]
     );
-    assert_eq!(session.reserve_user_input_order().await, Some(3));
+    assert_eq!(session.reserve_user_input_order().await, 3);
 }
 
 #[tokio::test]
 async fn sender_context_follows_its_delivery_through_checkpoint_and_rollback() {
-    let (mut session, turn_context) = make_session_and_context().await;
-    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
-    let mut live = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &SessionSource::default(),
-    );
+    let (session, turn_context) = make_session_and_context().await;
+
+    let mut live = ContextManager::for_session(&SessionSource::default());
     let mut items = Vec::new();
     let mut snapshots = Vec::new();
     for index in 0..2 {
@@ -131,7 +135,7 @@ async fn sender_context_follows_its_delivery_through_checkpoint_and_rollback() {
             receiver_message_id: format!("delivery-{index}"),
             text: format!("Sender context {index}"),
         };
-        let input = [
+        let mut input = [
             ResponseItemEnvelope {
                 item: serde_json::from_value::<ResponseItem>(json!({
                     "type": "function_call_output", "id": snapshot.receiver_message_id,
@@ -152,7 +156,10 @@ async fn sender_context_follows_its_delivery_through_checkpoint_and_rollback() {
                 }),
             },
         ];
-        live.record_annotated_items(&input, turn_context.model_info().truncation_policy.into());
+        live.record_annotated_items(
+            &mut input,
+            turn_context.model_info().truncation_policy.into(),
+        );
         items.extend(input.into_iter().map(RolloutItem::ResponseItem));
         snapshots.push(snapshot);
     }
@@ -1761,6 +1768,8 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
     let mut retained = codex_history::RetainedContext::default();
     retained.record_user_message(
         codex_history::RetainedUserMessage {
+            phase: None,
+            origin: codex_history::UserInputOrigin::User,
             turn_id: String::new(),
             message_id: None,
             text: "before compact".to_owned(),

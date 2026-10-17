@@ -381,6 +381,7 @@ impl TestAuth {
 
 pub struct TestCodexBuilder {
     config_mutators: Vec<Box<ConfigMutator>>,
+    thread_manager_configurer: Option<Box<dyn FnOnce(ThreadManager) -> ThreadManager + Send>>,
     auth: TestAuth,
     analytics_events_client: Option<AnalyticsEventsClient>,
     pre_build_hooks: Vec<Box<PreBuildHook>>,
@@ -403,6 +404,14 @@ pub struct TestCodexBuilder {
 impl TestCodexBuilder {
     pub fn with_thread_store(mut self, thread_store: Arc<dyn ThreadStore>) -> Self {
         self.thread_store = Some(thread_store);
+        self
+    }
+
+    pub fn with_thread_manager(
+        mut self,
+        configure: impl FnOnce(ThreadManager) -> ThreadManager + Send + 'static,
+    ) -> Self {
+        self.thread_manager_configurer = Some(Box::new(configure));
         self
     }
 
@@ -449,8 +458,8 @@ impl TestCodexBuilder {
         })
     }
 
-    pub fn with_history_mode(mut self, history_mode: ThreadHistoryMode) -> Self {
-        self.history_mode = Some(history_mode);
+    pub fn with_history_mode(mut self, history_mode: impl Into<Option<ThreadHistoryMode>>) -> Self {
+        self.history_mode = history_mode.into();
         self
     }
 
@@ -818,6 +827,10 @@ impl TestCodexBuilder {
                 /*attestation_provider*/ None,
                 /*external_time_provider*/ self.external_time_provider.clone(),
             );
+            let thread_manager = match self.thread_manager_configurer.take() {
+                Some(configure) => configure(thread_manager),
+                None => thread_manager,
+            };
             if config.features.enabled(Feature::CodeModeHost)
                 && let Some(code_mode_host_program) = code_mode_host_program
             {
@@ -842,7 +855,7 @@ impl TestCodexBuilder {
             (Some(path), Some(user_shell_override)) => {
                 let auth_manager = self.auth.manager_for_home(config.codex_home.as_path());
                 Box::pin(
-                    codex_core::test_support::resume_thread_from_rollout_with_user_shell_override(
+                    codex_core::test_support::resume_legacy_thread_from_rollout_with_user_shell_override(
                         thread_manager.as_ref(),
                         config.clone(),
                         path,
@@ -855,7 +868,7 @@ impl TestCodexBuilder {
             }
             (Some(path), None) => {
                 let auth_manager = self.auth.manager_for_home(config.codex_home.as_path());
-                Box::pin(thread_manager.resume_thread_from_rollout(
+                Box::pin(thread_manager.resume_legacy_thread_from_rollout(
                     config.clone(),
                     path,
                     auth_manager,
@@ -1443,6 +1456,7 @@ fn function_call_output<'a>(bodies: &'a [Value], call_id: &str) -> &'a Value {
 
 pub fn test_codex() -> TestCodexBuilder {
     TestCodexBuilder {
+        thread_manager_configurer: None,
         config_mutators: vec![Box::new(|config| {
             config
                 .features
@@ -1467,7 +1481,8 @@ pub fn test_codex() -> TestCodexBuilder {
         supports_openai_form_elicitation: false,
         external_time_provider: None,
         code_mode_host_program: None,
-        history_mode: None,
+        // These fixtures exercise legacy-only resume/fork helpers; store-default tests opt out.
+        history_mode: Some(ThreadHistoryMode::Legacy),
         models_manager: None,
         thread_store: None,
         image_store: codex_core::passthrough_image_store(),

@@ -23,7 +23,9 @@ const LOCAL_RELEASE_PREFIX: &str = "local-";
 /// Returns true when the daemon package was replaced with this CLI's package.
 pub async fn sync_stopped_daemon_with_cli(cli_version: &str) -> Result<bool> {
     ensure_supported_platform()?;
-    let daemon = Daemon::from_environment()?;
+    let mut daemon = Daemon::from_environment()?;
+    // The TUI keeps its screen up while this runs; route progress to the log.
+    daemon.log_diagnostics = true;
     let selected = daemon.current_installation()?;
     if !selected.managed_codex_bin.is_file() {
         // Nothing installed yet; the next start seeds it from this CLI.
@@ -48,7 +50,9 @@ pub async fn sync_stopped_daemon_with_cli(cli_version: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    eprintln!("Updating the background server to Codex {cli_version}...");
+    daemon.diagnostic(format_args!(
+        "Updating the background server to Codex {cli_version}..."
+    ));
     let updated = prepare_install::update_from_cli(|request| Ok(!request.restart_required))
         .await?
         .is_some();

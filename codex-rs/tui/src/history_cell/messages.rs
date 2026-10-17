@@ -245,6 +245,7 @@ impl HistoryCell for UserHistoryCell {
         lines.push(HyperlinkLine::new(Line::from("")));
         for source in lines.iter_mut().filter_map(|line| line.source.as_mut()) {
             source.right_reserve = 1;
+            source.copy_as_prose = true;
         }
         lines
     }

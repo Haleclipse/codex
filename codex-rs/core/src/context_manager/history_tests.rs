@@ -170,10 +170,7 @@ fn conversation_history_snapshot_binds_review_mode_and_hash_to_the_latest_item(
             ..Default::default()
         }),
     };
-    let mut history = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &codex_protocol::protocol::SessionSource::Cli,
-    );
+    let mut history = ContextManager::for_session(&codex_protocol::protocol::SessionSource::Cli);
     history.replace_annotated(vec![checkpoint.clone()]);
     history.restore_review_context(
         /*retained_context*/ None,
@@ -249,11 +246,15 @@ fn conversation_history_snapshot_binds_review_mode_and_hash_to_the_latest_item(
         "text": "Only publish to a private repository.", "complete": true
     }]
 }); "retained instructions")]
+#[test_case(serde_json::json!({
+    "verified_answers": [], "incomplete": false, "next_order": 1,
+    "assistant_messages": [{
+        "turn_id": "turn", "message_id": "question",
+        "text": "May I publish to the private repository?", "complete": true
+    }]
+}); "retained assistant context")]
 fn checkpoint_retained_evidence_survives_legacy_review(saved_context: serde_json::Value) {
-    let mut history = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &codex_protocol::protocol::SessionSource::Cli,
-    );
+    let mut history = ContextManager::for_session(&codex_protocol::protocol::SessionSource::Cli);
     history.replace_annotated(vec![ResponseItemEnvelope::new(
         serde_json::from_value(serde_json::json!({
             "type": "compaction", "id": "unknown", "encrypted_content": "opaque checkpoint"
@@ -288,11 +289,8 @@ fn checkpoint_retained_evidence_survives_legacy_review(saved_context: serde_json
 }
 
 #[test]
-fn checkpoint_replayed_instructions_keep_legacy_review_when_the_source_survives() {
-    let mut history = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &codex_protocol::protocol::SessionSource::Cli,
-    );
+fn checkpoint_replayed_messages_keep_legacy_review_when_the_source_survives() {
+    let mut history = ContextManager::for_session(&codex_protocol::protocol::SessionSource::Cli);
     history.replace_annotated(vec![ResponseItemEnvelope::new(
         serde_json::from_value(serde_json::json!({
             "type": "compaction", "id": "unknown", "encrypted_content": "opaque checkpoint"
@@ -304,7 +302,10 @@ fn checkpoint_replayed_instructions_keep_legacy_review_when_the_source_survives(
         /*reviewer_compaction_hash*/ None,
     );
     history.record_items(
-        &[user_input_text_msg("Only publish privately.")],
+        &[
+            user_input_text_msg("Only publish privately."),
+            assistant_msg("May I publish to the private repository?"),
+        ],
         TruncationPolicy::Bytes(10_000),
     );
     let retained = history.retained_context().clone();
@@ -319,6 +320,120 @@ fn checkpoint_replayed_instructions_keep_legacy_review_when_the_source_survives(
         GuardianContextMode::Legacy,
     );
     assert_eq!(history.retained_context(), &retained);
+}
+
+#[test_case(None; "no retained checkpoint")]
+#[test_case(Some(serde_json::json!({
+    "verified_answers": [], "incomplete": false
+})); "legacy retained checkpoint without instructions")]
+fn plaintext_checkpoint_without_backup_preserves_root_instructions(
+    saved_context: Option<serde_json::Value>,
+) {
+    let instruction = serde_json::from_value(serde_json::json!({
+        "type": "message", "id": "original-restriction", "role": "user",
+        "content": [{"type": "input_text", "text": "Only publish privately."}]
+    }))
+    .expect("old instruction without ordering metadata");
+    let saved_context: Option<RetainedContext> =
+        saved_context.map(|value| serde_json::from_value(value).expect("legacy retained context"));
+    let mut history = ContextManager::for_session(&SessionSource::Cli);
+    history.replace(vec![instruction]);
+    history.restore_review_context(
+        saved_context.as_ref(),
+        /*checkpoint*/ None,
+        Some("reviewer"),
+    );
+
+    // Compaction removes the only plaintext copy. Resume must keep it available
+    // to worker authorization without adding it back to the reviewer's model window.
+    let compacted = vec![ResponseItemEnvelope {
+        item: serde_json::from_value(serde_json::json!({
+            "type": "compaction", "id": "new-checkpoint", "encrypted_content": "opaque"
+        }))
+        .expect("new checkpoint"),
+        metadata: Some(CodexHarnessMetadata {
+            compaction_model_hash: Some("reviewer".to_owned()),
+            ..Default::default()
+        }),
+    }];
+    history.replace_compacted(compacted.clone(), Some("reviewer"));
+    let mut resumed = ContextManager::for_session(&SessionSource::Cli);
+    resumed.replace_annotated(compacted.clone());
+    resumed.restore_review_context(
+        Some(history.retained_context()),
+        history.guardian_history_checkpoint().as_ref(),
+        Some("reviewer"),
+    );
+    let snapshot = resumed.conversation_history_snapshot();
+    assert_eq!(
+        (
+            GuardianContextMode::from_history(snapshot.as_ref()),
+            snapshot.review_items().cloned().collect::<Vec<_>>(),
+            resumed
+                .legacy_user_messages()
+                .map(|message| message.text)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            GuardianContextMode::ThreadOwned,
+            compacted
+                .into_iter()
+                .map(|envelope| envelope.item)
+                .collect::<Vec<_>>(),
+            vec!["Only publish privately.".to_owned()],
+        ),
+    );
+}
+
+#[test]
+fn legacy_checkpoint_rollback_keeps_answers_before_a_same_turn_steer() {
+    let mut checkpoint: codex_history::CompactedItem = serde_json::from_value(serde_json::json!({
+        "message": "Legacy checkpoint without accepted-input metadata.",
+        "replacement_history": [
+            {"type": "message", "id": "initial", "role": "user",
+             "content": [{"type": "input_text", "text": "Inspect the release."}]},
+            {"type": "function_call", "call_id": "before", "name": "request_user_input", "arguments": "{}"},
+            {"type": "message", "id": "steer", "role": "user",
+             "content": [{"type": "input_text", "text": "Inspect the README too."}]},
+            {"type": "function_call", "call_id": "after", "name": "request_user_input", "arguments": "{}"}
+        ],
+        "retained_context": {"verified_answers": [
+            {"turn_id": "shared-turn", "call_id": "before",
+             "questions": [{"question": "Publish?", "answer": "Only privately."}]},
+            {"turn_id": "shared-turn", "call_id": "after",
+             "questions": [{"question": "Publish the README?", "answer": "Never."}]}
+        ], "incomplete": false}
+    })).expect("legacy checkpoint");
+    for envelope in checkpoint.replacement_history.as_mut().unwrap() {
+        envelope.item.set_turn_id_if_missing("shared-turn");
+    }
+    let expected = checkpoint
+        .retained_context
+        .as_ref()
+        .unwrap()
+        .verified_answers()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut history = ContextManager::for_session(&SessionSource::Cli);
+    history.replace_annotated(checkpoint.replacement_history.take().unwrap());
+    history.restore_review_context(
+        checkpoint.retained_context.as_ref(),
+        /*checkpoint*/ None,
+        /*reviewer_compaction_hash*/ None,
+    );
+    // The old checkpoint has no acceptance order; use the surviving source calls
+    // to remove only the answer belonging to each rolled-back input.
+    for remaining in [1, 0] {
+        history.drop_last_n_user_turns(/*num_turns*/ 1);
+        assert_eq!(
+            history
+                .retained_context()
+                .verified_answers()
+                .cloned()
+                .collect::<Vec<_>>(),
+            expected[..remaining],
+        );
+    }
 }
 
 #[test]
@@ -601,7 +716,7 @@ fn retains_only_harness_authored_configuration_updates() {
     };
 
     history.record_annotated_items(
-        &[
+        &mut [
             ResponseItemEnvelope::new(update.clone()),
             ResponseItemEnvelope {
                 item: update,
@@ -657,7 +772,7 @@ fn drop_last_n_user_turns_removes_post_input_configuration_update_with_its_turn(
         updates[1].clone(),
         ResponseItemEnvelope::new(assistant_msg("removed answer")),
     ]);
-    history.record_annotated_items(&items, TruncationPolicy::Tokens(10_000));
+    history.record_annotated_items(&mut items, TruncationPolicy::Tokens(10_000));
 
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
@@ -793,7 +908,7 @@ fn record_annotated_items_preserves_metadata_while_processing_item(
     expected_token_limit: usize,
     expected_truncation: bool,
 ) {
-    let envelope = ResponseItemEnvelope {
+    let mut envelope = ResponseItemEnvelope {
         item: ResponseItem::FunctionCallOutput {
             id: None,
             call_id: Some("call-1".to_string()),
@@ -812,7 +927,10 @@ fn record_annotated_items_preserves_metadata_while_processing_item(
     };
     let mut history = ContextManager::new();
 
-    history.record_annotated_items(std::slice::from_ref(&envelope), TruncationPolicy::Tokens(4));
+    history.record_annotated_items(
+        std::slice::from_mut(&mut envelope),
+        TruncationPolicy::Tokens(4),
+    );
 
     assert_eq!(history.annotated_items().len(), 1);
     assert_eq!(history.annotated_items()[0].metadata, envelope.metadata);
@@ -1408,10 +1526,7 @@ fn drop_last_n_user_turns_preserves_prefix() {
 
     // A steered message shares its source turn, but rollback must keep the earlier
     // instruction and answer as complete evidence, including after the next compaction.
-    let mut history = ContextManager::with_guardian_context_mode(
-        GuardianContextMode::ThreadOwned,
-        &codex_protocol::protocol::SessionSource::Exec,
-    );
+    let mut history = ContextManager::for_session(&codex_protocol::protocol::SessionSource::Exec);
     let mut expected = None;
     for (id, text) in [
         ("restriction", "Never publish publicly."),
@@ -1457,6 +1572,38 @@ fn drop_last_n_user_turns_preserves_prefix() {
     // Rollback removes evidence, but does not reuse its arrival-order sequence numbers.
     expected["next_order"] = serde_json::json!(3);
     assert_eq!(serde_json::to_value(retained).unwrap(), expected);
+}
+
+#[test]
+fn rollback_removes_assistant_sources_recorded_ahead_of_queued_input() {
+    let mut history = ContextManager::for_session(&codex_protocol::protocol::SessionSource::Exec);
+    let original = user_msg("Staging only.");
+    let mut items = [
+        (original.clone(), 0),
+        (assistant_msg("Deploy staging?"), 2),
+        (user_msg("Also run tests."), 1),
+    ]
+    .map(|(item, order)| ResponseItemEnvelope {
+        item,
+        metadata: Some(CodexHarnessMetadata {
+            user_input_order: Some(order),
+            ..Default::default()
+        }),
+    });
+    history.record_annotated_items(&mut items, TruncationPolicy::Tokens(10_000));
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+    assert_eq!(raw_items(&history), vec![original]);
+    assert!(
+        !history
+            .retained_context()
+            .ordered_entries()
+            .any(|(_, entry)| {
+                matches!(
+                    entry,
+                    codex_history::RetainedContextEntry::AssistantMessage(_)
+                )
+            })
+    );
 }
 
 #[test]

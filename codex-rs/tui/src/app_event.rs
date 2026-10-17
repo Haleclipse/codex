@@ -443,7 +443,7 @@ pub(crate) enum AppEvent {
         destination: TranscriptExportDestination,
     },
 
-    /// Copy a picker selection while retaining its clipboard lease in the chat widget.
+    /// Copy text through the session clipboard worker.
     CopySelection {
         text: Arc<str>,
         label: String,
@@ -553,6 +553,8 @@ pub(crate) enum AppEvent {
 
     /// Clear history queued by the previous thread before the new thread's replay events.
     ResetTranscriptForThreadSwitch,
+    /// Reset queued history while keeping the startup draft visible until the next frame.
+    ResetTranscriptForThreadSwitchPreservingScreen,
 
     /// Re-render the transcript using the selected scrollback rendering mode.
     RawOutputModeChanged {
@@ -1091,6 +1093,11 @@ pub(crate) enum AppEvent {
     FollowTranscript,
 
     InsertHistoryCell(Box<dyn HistoryCell>),
+    /// FIFO barrier after the completed turn's history insertions.
+    TurnTipReady {
+        thread_id: ThreadId,
+        turn_id: String,
+    },
 
     /// Move visible completed voice captions into history in one app event.
     CommitRealtimeTranscriptHistory,

@@ -1,4 +1,5 @@
 use crate::agent::AgentStatus;
+use crate::agent::api::AgentControl;
 use crate::config::ConstraintResult;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianReviewEvidence;
@@ -44,6 +45,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -165,8 +167,6 @@ pub use codex_guardian_context::GuardianRootMessage;
 pub struct GuardianAuthorizationVersion {
     /// User-message/reset revision, preserved across compaction and internal context.
     pub user_message_revision: u64,
-    /// Successful host answers captured by the temporary legacy path.
-    pub user_input_response_count: usize,
     /// False when required retained answers or root instructions are unavailable.
     pub retained_context_complete: bool,
 }
@@ -176,6 +176,8 @@ pub struct GuardianAuthorizationVersion {
 pub struct GuardianRootSnapshot {
     /// Authoritative root from which this evidence was captured.
     pub root_thread_id: ThreadId,
+    /// Distinguishes a history reset from additional authorization in the same history.
+    pub(crate) history_reset_version: u64,
     pub authorization_version: GuardianAuthorizationVersion,
     pub messages: Vec<GuardianRootMessage>,
     pub trusted_skill_paths: Vec<String>,
@@ -238,6 +240,13 @@ impl CodexThread {
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
     pub fn session_telemetry(&self) -> SessionTelemetry {
         self.session.services.session_telemetry.clone()
+    }
+
+    /// Schedule the same background model warmup used at startup for an idle thread.
+    /// The next turn consumes the warmup through the existing startup handoff.
+    /// Call after installing host services such as the thread's attestation routing.
+    pub async fn prewarm(&self) {
+        self.session.schedule_startup_prewarm().await;
     }
 
     /// Whether analytics is enabled for this thread after configuration and host overrides.
@@ -397,10 +406,7 @@ impl CodexThread {
         &self,
         request: RecoverTurnRequest,
     ) -> CodexResult<StartIfIdleSubmission> {
-        self.session
-            .services
-            .agent_control
-            .ensure_execution_capacity_for_turn_start(self)
+        self.ensure_execution_capacity_for_turn_start(self.session.services.agent_control.as_ref())
             .await?;
         let RecoverTurnRequest {
             turn_id,
@@ -504,11 +510,10 @@ impl CodexThread {
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
         if !matches!(mode, TurnInputMode::Steer { .. }) {
-            self.session
-                .services
-                .agent_control
-                .ensure_execution_capacity_for_turn_start(self)
-                .await?;
+            self.ensure_execution_capacity_for_turn_start(
+                self.session.services.agent_control.as_ref(),
+            )
+            .await?;
         }
         self.io.submit_turn_input(request, mode).await
     }
@@ -528,6 +533,31 @@ impl CodexThread {
         items: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
         self.session.inject_if_running(items).await
+    }
+
+    /// Environment selections captured by the active turn, before later settings updates.
+    /// Includes environments that are still starting or have failed. Hosts use this snapshot
+    /// to authorize steering against every executor that the active turn selected.
+    pub async fn active_turn_environment_selections(
+        &self,
+    ) -> Option<Vec<TurnEnvironmentSelection>> {
+        let active = self.session.active_turn.lock().await;
+        let task = active.as_ref()?.task.as_ref()?;
+        Some(task.turn_context.initial_environments.all_selections())
+    }
+
+    /// Returns the named running turn's current selections, including environments that are
+    /// still starting or have failed. Returns `None` if that turn is no longer running.
+    pub async fn current_turn_environment_selections(
+        &self,
+        expected_turn_id: &str,
+    ) -> Option<Vec<TurnEnvironmentSelection>> {
+        let active = self.session.active_turn.lock().await;
+        let task = active.as_ref()?.task.as_ref()?;
+        if task.turn_context.sub_id != expected_turn_id || task.cancellation_token.is_cancelled() {
+            return None;
+        }
+        Some(self.session.services.turn_environments.selections())
     }
 
     /// Captures a regular turn only after its input is recorded. The caller must flush the rollout.
@@ -569,6 +599,21 @@ impl CodexThread {
     ) -> ConstraintResult<ThreadConfigSnapshot> {
         let updates = Self::thread_settings_update(overrides);
         self.session.preview_settings(&updates).await
+    }
+
+    /// Queues settings for future turns and waits for Core to accept or reject them.
+    /// Rejections are returned to the caller instead of emitted as thread errors.
+    pub async fn update_thread_settings(
+        &self,
+        thread_settings: ThreadSettingsOverrides,
+    ) -> CodexResult<()> {
+        let (reply, result) = oneshot::channel();
+        self.submit(Op::ThreadSettings {
+            thread_settings,
+            reply: Some(reply),
+        })
+        .await?;
+        result.await.unwrap_or(Err(CodexErr::InternalAgentDied))
     }
 
     /// Restores thread-owned mutable settings captured from another loaded runtime.
@@ -681,6 +726,16 @@ impl CodexThread {
         self.session
             .inject_no_new_turn(vec![item], /*current_turn_context*/ None)
             .await;
+    }
+
+    /// Records an explicit user goal mutation without scheduling a model response.
+    pub async fn record_user_goal_update(
+        &self,
+        update: crate::context::UserGoalUpdate,
+    ) -> CodexResult<()> {
+        self.session.record_user_goal_update(update).await;
+        self.checkpoint_preparation().await?;
+        Ok(())
     }
 
     /// Record raw Responses API items without starting a new turn.
@@ -914,7 +969,7 @@ impl CodexThread {
         self.session
             .services
             .agent_control
-            .root_user_authorization(self.session.thread_id)
+            .get_guardian_package(self.session.thread_id)
             .await
     }
 
@@ -1065,5 +1120,19 @@ impl CodexThread {
             elicitations.registration = None;
         }
         Ok(elicitations.count)
+    }
+
+    pub(crate) async fn ensure_execution_capacity_for_turn_start(
+        &self,
+        control: &dyn AgentControl,
+    ) -> CodexResult<()> {
+        if self.session.active_turn.lock().await.is_some() {
+            return Ok(());
+        }
+        let config = self.session.get_config().await;
+        let multi_agent_version = self
+            .multi_agent_version()
+            .unwrap_or_else(|| config.multi_agent_version_from_features());
+        control.check_turn_admission(multi_agent_version, &self.session_source)
     }
 }

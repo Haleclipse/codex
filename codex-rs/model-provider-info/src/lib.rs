@@ -8,8 +8,8 @@
 //! API provider construction applies the process-wide managed residency policy also
 //! used by default HTTP headers.
 
-use codex_api::Provider as ApiProvider;
-use codex_api::RetryConfig as ApiRetryConfig;
+use codex_client::Provider as ApiProvider;
+use codex_client::RetryConfig as ApiRetryConfig;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::error::CodexErr;
@@ -80,7 +80,6 @@ pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
 const AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME: &str = "Amazon Bedrock Runtime";
 pub const AMAZON_BEDROCK_RUNTIME_PROVIDER_ID: &str = "amazon-bedrock-runtime";
 pub const AMAZON_BEDROCK_GPT_5_5_MODEL_ID: &str = "openai.gpt-5.5";
-pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
 pub const AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID: &str = "openai.gpt-5.6-sol";
 pub const AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID: &str = "openai.gpt-6-sol";
 pub const AMAZON_BEDROCK_GPT_6_LUNA_MODEL_ID: &str = "openai.gpt-6-luna";
@@ -594,7 +593,6 @@ other non-default provider fields are not supported"
     ) -> ModelProviderInfo {
         let mut provider = Self::create_amazon_bedrock_provider(aws);
         provider.name = AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME.into();
-        provider.http_headers = None;
         provider
     }
 

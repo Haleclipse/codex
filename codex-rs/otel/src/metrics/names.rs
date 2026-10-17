@@ -1,6 +1,9 @@
 pub const TOOL_CALL_COUNT_METRIC: &str = "codex.tool.call";
 pub const TOOL_CALL_DURATION_METRIC: &str = "codex.tool.call.duration_ms";
 pub const TOOL_CALL_UNIFIED_EXEC_METRIC: &str = "codex.tool.unified_exec";
+pub const MULTI_AGENT_SPAWN_FAILURE_METRIC: &str = "codex.multi_agent.spawn.failure";
+pub const MULTI_AGENT_SPAWN_PHASE_DURATION_METRIC: &str =
+    "codex.multi_agent.spawn.phase.duration_ms";
 pub const ARTIFACT_OPERATION_STARTED_METRIC: &str = "codex.artifact.operation.started";
 pub const ARTIFACT_OPERATION_EXPECTED_OUTPUT_COUNT_METRIC: &str =
     "codex.artifact.operation.expected_output_count";
@@ -68,3 +71,10 @@ pub const THREAD_SKILLS_KEPT_TOTAL_METRIC: &str = "codex.thread.skills.kept_tota
 pub const THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC: &str =
     "codex.thread.skills.description_truncated_chars";
 pub const THREAD_SKILLS_TRUNCATED_METRIC: &str = "codex.thread.skills.truncated";
+// Tools measure the rendered block; kind=snapshot|delta distinguishes full catalogs from updates.
+pub const THREAD_TOOLS_NAMESPACES_TOTAL_METRIC: &str = "codex.thread.tools.namespaces_total";
+pub const THREAD_TOOLS_FRAGMENT_BYTES_METRIC: &str = "codex.thread.tools.fragment_bytes";
+
+/// Byte buckets for context-budget planning, with larger fragments in the overflow bucket.
+pub const CONTEXT_FRAGMENT_BYTES_BUCKETS: &[f64] =
+    &[256., 512., 1_024., 2_048., 4_096., 8_192., 16_384.];

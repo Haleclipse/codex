@@ -529,12 +529,10 @@ pub(super) async fn run_main_inner(
     daemon_features.retain(|_, enabled| *enabled);
     let mut managed_daemon = false;
     if auto_start_daemon && daemon_exclusion.is_none() {
-        startup_draft.flush_pending_events().await?;
         let output = startup_draft
-            .tui_mut()
-            .with_restored(|| async {
-                // Package installation may print progress; keep ordinary Ctrl+C handling.
-                crossterm::terminal::disable_raw_mode()?;
+            .run_until(async {
+                // Daemon startup needs no terminal input. Keep the composer visible and
+                // responsive while it checks the running server or prepares an installation.
                 // @cometix: carry a stopped daemon along to this CLI build before starting it.
                 if let Err(err) = codex_app_server_daemon::sync_stopped_daemon_with_cli(
                     crate::version::CODEX_CLI_VERSION,
@@ -545,18 +543,31 @@ pub(super) async fn run_main_inner(
                 }
                 let result = codex_app_server_daemon::start_with_features(&daemon_features).await;
                 daemon_telemetry::record_start(&config, &result).await;
-                result.map_err(|err| {
-                    std::io::Error::other(format!("{err:#}\n{}", daemon_startup::FAILURE_HINT))
-                })
+                match result {
+                    Ok(output) => Ok(Some(output)),
+                    #[cfg(windows)]
+                    Err(err) if err.is::<codex_app_server_daemon::DetachedLaunchRestricted>() => {
+                        Ok(None)
+                    }
+                    Err(err) => Err(std::io::Error::other(format!(
+                        "{err:#}\n{}",
+                        daemon_startup::FAILURE_HINT
+                    ))),
+                }
             })
-            .await?;
-        managed_daemon = output.backend.is_some();
-        app_server_target = AppServerTarget::LocalDaemon {
-            endpoint: RemoteAppServerEndpoint::UnixSocket {
-                socket_path: AbsolutePathBuf::from_absolute_path_checked(output.socket_path)?,
-            },
-            allow_embedded_fallback: false,
-        };
+            .await??;
+        if let Some(output) = output {
+            managed_daemon = output.backend.is_some();
+            app_server_target = AppServerTarget::LocalDaemon {
+                endpoint: RemoteAppServerEndpoint::UnixSocket {
+                    socket_path: AbsolutePathBuf::from_absolute_path_checked(output.socket_path)?,
+                },
+                allow_embedded_fallback: false,
+            };
+        } else {
+            app_server_target = AppServerTarget::Embedded;
+            daemon_exclusion = Some("this Windows launcher");
+        }
     }
     // The overview must inspect the shared server's agents regardless of local settings.
     let compatibility_warning = if cli.agents_overview {
@@ -842,7 +853,9 @@ pub(super) async fn run_main_inner(
 
     let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
 
-    let log_db = state_db.clone().map(log_db::start);
+    let log_db = state_db
+        .clone()
+        .map(|state_db| log_db::start(state_db, std::sync::Arc::new(feedback.clone())));
     let log_db_layer = log_db
         .clone()
         .map(|layer| layer.with_filter(log_db::default_filter()));

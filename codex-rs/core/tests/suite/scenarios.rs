@@ -82,8 +82,20 @@ const ONE_PIXEL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ
 #[path = "scenarios_agent_message_board.rs"]
 mod agent_message_board;
 
+#[path = "scenarios_mailbox_preemption_tests.rs"]
+mod mailbox_preemption;
+
 #[path = "scenarios_guardian_extra_policy.rs"]
 mod guardian_extra_policy;
+
+#[path = "scenarios_indirect_namespace_prefixes.rs"]
+mod indirect_namespace_prefixes;
+
+#[path = "scenarios_mcp_resource_messages.rs"]
+mod mcp_resource_messages;
+
+#[path = "scenarios_guardian_heartbeat.rs"]
+mod guardian_heartbeat;
 
 #[path = "scenarios_preparation.rs"]
 mod preparation;
@@ -210,10 +222,48 @@ fn configure_scenario_catalog(config: &mut Config) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_mcp_schema_limits_preserve_explicit_overrides() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let requests = super::code_mode::mcp_schema_max_bytes_scenario().await?;
+    insta::assert_snapshot!(
+        "code_mode_mcp_schema_limits",
+        context_snapshot::format_request_history_snapshot(
+            "Code Mode exposes explicit MCP schema limits in its prompt and runtime tool catalog.",
+            &requests,
+            &ContextSnapshotOptions::default()
+                .rewrite_known_segments()
+                .include_request_settings(),
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn astra_asks_an_async_question_and_receives_the_answer_while_working() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let question = "Who should receive the launch update?";
+    let parameters = json!({
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "description": "Catalog questions to ask while continuing work.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Catalog question title."},
+                        "options": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["title"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["questions"],
+        "additionalProperties": false
+    });
+    let catalog_parameters = parameters.to_string();
     let (release_continuation, continuation_gate) = oneshot::channel();
     let mut working_message = ev_assistant_message("working", "I drafted a short launch update.");
     working_message["item"]["phase"] = json!("commentary");
@@ -266,6 +316,23 @@ async fn astra_asks_an_async_question_and_receives_the_answer_while_working() ->
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             configure_scenario_catalog(config);
+            config
+                .model_catalog
+                .as_mut()
+                .expect("scenario model catalog")
+                .models
+                .iter_mut()
+                .find(|model| model.slug == "gpt-6-astra")
+                .expect("Astra model")
+                .model_messages
+                .as_mut()
+                .expect("model messages")
+                .tools
+                .get_or_insert_with(Default::default)
+                .send_user_message_async = Some(ToolMessage {
+                parameters: Some(catalog_parameters),
+                ..Default::default()
+            });
             config.model_provider.base_url = Some(base_url);
             // The gated mock records raw request bodies for the shared snapshot renderer.
             config
@@ -320,12 +387,22 @@ async fn astra_asks_an_async_question_and_receives_the_answer_while_working() ->
         .await
         .iter()
         .map(|body| serde_json::from_slice(body))
-        .collect::<serde_json::Result<Vec<_>>>()?;
+        .collect::<serde_json::Result<Vec<serde_json::Value>>>()?;
+    for request in &requests {
+        let tool = request["input"][0]["tools"]
+            .as_array()
+            .expect("Responses Lite tools")
+            .iter()
+            .flat_map(|namespace| namespace["tools"].as_array().into_iter().flatten())
+            .find(|tool| tool["name"] == "request_user_input_async")
+            .expect("the async question tool should be directly visible to the model");
+        assert_eq!(tool["parameters"], parameters);
+    }
     let entries = requests.iter().map(SnapshotEntry::body).collect::<Vec<_>>();
     insta::assert_snapshot!(
         "astra_async_question_and_answer",
         context_snapshot::format_context_snapshot(
-            "Astra asks who a launch update is for, keeps working, and receives the user's answer in the active turn.",
+            "Astra uses the catalog question schema to ask who a launch update is for, keeps working, and receives the user's answer in the active turn.",
             &entries,
             &ContextSnapshotOptions::default().rewrite_known_segments(),
         )
@@ -1155,14 +1232,22 @@ async fn guardian_checkpoint_migration_request_history() -> Result<()> {
     use super::guardian_checkpoint_migration::migration_scenario;
     let requests = migration_scenario().await?;
     let mut snapshot = context_snapshot::format_request_history_snapshot(
-        "An old checkpoint retains a user restriction and verified answer. Incompatible automatic compaction keeps legacy review across restart with its saved answer; compatible manual compaction immediately activates thread-owned review.",
+        "An old checkpoint retains a user restriction, assistant questions, and a verified answer. Incompatible automatic compaction keeps legacy review across restart with its saved answer; compatible manual compaction immediately activates thread-owned review.",
         &requests,
         &ContextSnapshotOptions::default()
             .rewrite_known_segments()
             .include_request_settings(),
     );
-    // Normalize executor paths and shell wrappers in the reviewed actions.
+    // Normalize executor IDs, paths and shell wrappers in the reviewed actions.
     for (pattern, replacement) in [
+        (
+            r#"(?m)^(\s*"environment_id": )"(?:local|remote)""#,
+            "$1\"<ENVIRONMENT>\"",
+        ),
+        (
+            r#"(The active permission profile for environment )"(?:local|remote)""#,
+            "$1\"<ENVIRONMENT>\"",
+        ),
         (r#"(?m)^(\s*"cwd": )"[^"]*""#, "$1\"<CWD>\""),
         (
             r#""command": \[\s*(?:"[^"]*",\s*)*"exit 0"\s*\]"#,

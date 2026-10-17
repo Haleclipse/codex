@@ -3,7 +3,6 @@
 //! This crate defines the feature registry plus the logic used to resolve an
 //! effective feature set from config-like inputs.
 
-use codex_otel::SessionTelemetry;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
@@ -206,6 +205,9 @@ pub enum Feature {
     Collab,
     /// Enable task-path-based multi-agent routing.
     MultiAgentV2,
+    /// Keep sampling through reasoning and commentary boundaries when agent mail arrives.
+    /// Pending mail is delivered at the next normal input boundary instead.
+    DeferMailboxPreemption,
     /// Enable shared discussion tools for an agent tree.
     AgentMessageBoard,
     /// Removed compatibility flag retained as a no-op.
@@ -320,8 +322,7 @@ pub enum Feature {
     SendMessageToUserAsync,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
-    /// Select thread-owned context for both Guardian reviewers.
-    /// Read once from the thread's fixed feature set when Guardian evidence is initialized.
+    /// Removed compatibility flag for always-on thread-owned Guardian context.
     GuardianThreadContext,
     /// Reuse encrypted parent compaction when restarting Guardian review sessions.
     GuardianReuseParentCompaction,
@@ -563,24 +564,6 @@ impl Features {
         self.legacy_usages.iter()
     }
 
-    pub fn emit_metrics(&self, otel: &SessionTelemetry) {
-        for feature in FEATURES {
-            if matches!(feature.stage, Stage::Removed) {
-                continue;
-            }
-            if self.enabled(feature.id) != feature.default_enabled {
-                otel.counter(
-                    "codex.feature.state",
-                    /*inc*/ 1,
-                    &[
-                        ("feature", feature.key),
-                        ("value", &self.enabled(feature.id).to_string()),
-                    ],
-                );
-            }
-        }
-    }
-
     /// Apply a table of key -> bool toggles (e.g. from TOML).
     pub fn apply_map(&mut self, m: &BTreeMap<String, bool>) {
         for (k, v) in m {
@@ -639,6 +622,13 @@ impl Features {
                         "features.use_legacy_landlock",
                         Feature::UseLegacyLandlock,
                     );
+                }
+                "guardianv2.thread_context" => {
+                    self.record_legacy_usage_force(
+                        "features.guardianv2.thread_context",
+                        Feature::GuardianThreadContext,
+                    );
+                    continue;
                 }
                 _ => {}
             }
@@ -705,6 +695,10 @@ impl Features {
 fn legacy_usage_notice(alias: &str, feature: Feature) -> (String, Option<String>) {
     let canonical = feature.key();
     match feature {
+        Feature::GuardianThreadContext => (
+            "`[features.guardianv2].thread_context` is deprecated and ignored.".to_string(),
+            Some("Thread-owned Guardian context is always enabled. Remove `thread_context` from [features.guardianv2] in config.toml, including profile overrides.".to_string()),
+        ),
         Feature::TranscriptV2 => (
             "`[features].transcript_v2` is deprecated and ignored.".to_string(),
             Some("Use `[tui].fullscreen_transcript` in config.toml instead.".to_string()),
@@ -1205,8 +1199,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::WriteStdinApproval,
         key: "write_stdin_approval",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CodexHooks,
@@ -1324,6 +1318,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::MultiAgentV2,
         key: "multi_agent_v2",
         stage: Stage::Stable,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::DeferMailboxPreemption,
+        key: "defer_mailbox_preemption",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1635,8 +1635,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianThreadContext,
         key: "guardianv2.thread_context",
-        stage: Stage::Stable,
-        default_enabled: true,
+        stage: Stage::Removed,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::GuardianReuseParentCompaction,

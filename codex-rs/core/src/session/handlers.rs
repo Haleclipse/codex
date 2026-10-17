@@ -23,6 +23,7 @@ use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
+use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
@@ -284,7 +285,13 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
-    if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
+    let startup_prewarm = {
+        let mut state = sess.state.lock().await;
+        // Stop admission and take the current warmup together so resume cannot replace it.
+        state.shutting_down = true;
+        state.take_session_startup_prewarm()
+    };
+    if let Some(startup_prewarm) = startup_prewarm {
         startup_prewarm.abort().await;
     }
     let _ = sess.conversation.shutdown().await;
@@ -510,8 +517,36 @@ pub(super) async fn submission_loop(
                     let _ = reply.send(result);
                     should_exit
                 }
-                Op::ThreadSettings { thread_settings } => {
-                    thread_settings::update(&sess, sub.id.clone(), thread_settings).await;
+                Op::ThreadSettings {
+                    thread_settings,
+                    reply,
+                } => {
+                    let _settings_guard = thread_settings::acquire_persistence_lock(&sess).await;
+                    match thread_settings::update(&sess, thread_settings).await {
+                        Ok(snapshot) => {
+                            // Reply first: the caller may hold a lock its event consumer needs.
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Ok(()));
+                            }
+                            thread_settings::emit_applied(&sess, sub.id.clone(), snapshot).await;
+                        }
+                        Err(error) => {
+                            let message = format!("invalid thread settings override: {error}");
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Err(CodexErr::InvalidRequest(message)));
+                            } else {
+                                sess.send_event_raw(Event {
+                                    id: sub.id.clone(),
+                                    msg: EventMsg::Error(ErrorEvent {
+                                        misalignment: None,
+                                        message,
+                                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                                    }),
+                                })
+                                .await;
+                            }
+                        }
+                    }
                     false
                 }
                 Op::TurnSettings {

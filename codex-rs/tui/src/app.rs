@@ -103,7 +103,6 @@ use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteResponse;
 use codex_app_server_protocol::FeedbackUploadParams;
-use codex_app_server_protocol::FeedbackUploadResponse;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::HooksListEntry;
 use codex_app_server_protocol::ListMcpServerStatusParams;
@@ -169,7 +168,6 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
-use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::layout::Size;
 use ratatui::style::Stylize;
@@ -180,7 +178,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -223,6 +220,7 @@ mod empty_state_policy;
 mod event_dispatch;
 mod exit_summary;
 mod experimental_features;
+mod feedback_upload;
 mod file_change_approvals;
 mod history_pagination;
 mod history_ui;
@@ -232,7 +230,9 @@ mod managed_worktree_creation;
 mod misalignment_policy;
 mod model_defaults;
 mod new_session;
+mod turn_tips;
 pub(crate) use new_session::has_launch_setting;
+mod clipboard;
 mod native_history;
 mod owned_transcript;
 mod pending_interactive_replay;
@@ -249,6 +249,7 @@ mod reconnect;
 mod replay_filter;
 mod resize_reflow;
 mod resume_config;
+mod right_click_paste;
 mod safety_buffering;
 mod server_version_notice;
 mod session_lifecycle;
@@ -579,8 +580,8 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
-    composer_tips: composer_hints::ComposerTips,
     native_history: native_history::NativeHistory,
+    turn_tips: turn_tips::TurnTips,
     pub(crate) transcript_view: crate::transcript_view::TranscriptView,
     last_rendered_history_tail: Option<history_ui::RenderedHistoryTail>,
     last_thread_usage_status_cell: Option<history_ui::ThreadUsageStatusHistory>,
@@ -620,6 +621,8 @@ pub(crate) struct App {
     environment_manager: Arc<EnvironmentManager>,
     app_server_target: AppServerTarget,
     reconnect: reconnect::ReconnectState,
+    pending_right_click_paste: Option<right_click_paste::PendingPaste>,
+    right_click_paste_environment: right_click_paste::PasteEnvironment,
     /// Set when the user confirms an update; propagated on exit.
     daemon_cli_executable: Option<AbsolutePathBuf>,
     pub(crate) pending_update_action: Option<UpdateAction>,
@@ -691,6 +694,9 @@ pub(crate) struct App {
     // persist an older toggle after a newer one.
     pending_hook_enabled_writes: HashMap<String, Option<bool>>,
     recap: recap::RecapState,
+    // App fixtures keep their home alive across widget replacement; drop it last.
+    #[cfg(test)]
+    _test_codex_home: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -862,8 +868,13 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        self.invalidate_right_click_paste(&event);
+        self.finish_clipboard(tui);
+        let event = self.finish_right_click_paste(tui, event);
         if matches!(&event, TuiEvent::Key(_))
-            && self.handle_composer_copy_event(tui, &event, tui::Tui::copy_transcript_selection)
+            && self.handle_composer_copy_event(tui, &event, |tui, text| {
+                tui.copy_transcript_selection(text, crate::clipboard_copy::CopyFormat::PlainText)
+            })
         {
             return Ok(AppRunControl::Continue);
         }
@@ -1014,7 +1025,9 @@ impl App {
             if self.overlay.is_none()
                 && self.chat_widget.no_modal_or_popup_active()
                 && self.chat_widget.is_external_writer_view()
-                && crate::key_hint::plain(KeyCode::Esc).is_press(*key)
+                && (crate::key_hint::plain(KeyCode::Esc).is_press(*key)
+                    || (crate::key_hint::plain(KeyCode::Left).is_press(*key)
+                        && self.chat_widget.agents_navigation_key_available()))
             {
                 self.open_agents_overview(app_server);
             } else if self.reconnect.presentation == reconnect::ReconnectPresentation::Overview {
@@ -1152,7 +1165,8 @@ impl App {
                         self.app_event_tx.send(AppEvent::LaunchExternalEditor);
                     }
                 }
-                TuiEvent::FocusLost | TuiEvent::Mouse(_) => {}
+                TuiEvent::Mouse(mouse) => self.start_right_click_paste(tui, mouse),
+                TuiEvent::FocusLost => {}
             }
         }
         Ok(AppRunControl::Continue)

@@ -94,7 +94,11 @@ pub(crate) fn preferred_tooltip<R: Rng + ?Sized>(
             Some(plan_type)
                 if matches!(
                     plan_type,
-                    PlanType::Plus | PlanType::Enterprise | PlanType::Pro | PlanType::ProLite
+                    PlanType::Plus
+                        | PlanType::Enterprise
+                        | PlanType::Pro
+                        | PlanType::ProLite
+                        | PlanType::ProMax
                 ) || plan_type.is_team_like()
                     || plan_type.is_business_like() =>
             {
@@ -201,9 +205,13 @@ pub(crate) fn resolved_tooltips(
         .filter_map(move |tip| render_tooltip(tip, keymap))
 }
 
+pub(crate) fn tooltip_templates() -> impl Iterator<Item = &'static str> {
+    ALL_TOOLTIPS.iter().copied()
+}
+
 /// Substitute `{key:context.action}` with the current primary shortcut in a Markdown code span.
 /// Skip the tip if a placeholder is invalid or its action has no binding.
-fn render_tooltip(mut template: &str, keymap: Option<&RuntimeKeymap>) -> Option<String> {
+pub(crate) fn render_tooltip(mut template: &str, keymap: Option<&RuntimeKeymap>) -> Option<String> {
     let mut rendered = String::new();
     while let Some((prefix, rest)) = template.split_once("{key:") {
         let (action, suffix) = rest.split_once('}')?;

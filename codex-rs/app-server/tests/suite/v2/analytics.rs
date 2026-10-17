@@ -808,8 +808,8 @@ async fn assert_plugin_measurement_analytics(remote: bool, background: bool) -> 
     let model = bundled_models_response()?
         .models
         .into_iter()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("bundled gpt-5.4 model");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("bundled gpt-5.5 model");
     let models = [
         ("initial-model", ReasoningEffort::Low),
         ("invoking-model", ReasoningEffort::High),
@@ -963,6 +963,7 @@ enabled = true
     assert_eq!(
         json!({
             "model_slug": command_event["event_params"]["model_slug"],
+            "sandbox_backend": command_event["event_params"]["sandbox_backend"],
             "reasoning_effort": command_event["event_params"]["reasoning_effort"],
             "plugin_id": command_event["event_params"]["plugin_id"],
             "script_path": command_event["event_params"]["script_path"],
@@ -971,6 +972,7 @@ enabled = true
         }),
         json!({
             "model_slug": "invoking-model",
+            "sandbox_backend": if cfg!(target_os = "macos") { "seatbelt" } else { "seccomp" },
             "reasoning_effort": "high",
             "plugin_id": METRICS_PLUGIN_ID,
             "script_path": "scripts/run.sh",

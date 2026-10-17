@@ -1,8 +1,10 @@
 //! Old encrypted checkpoints keep legacy review while newly captured answers survive migration.
+//! A retired managed opt-out cannot disable capture or later checkpoint promotion.
 
 use std::sync::Arc;
 
 use anyhow::Result;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::CodexThread;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
@@ -63,7 +65,7 @@ pub(super) async fn resume(
     test.thread_manager.remove_thread(&thread_id).await;
     let mut config = test.config.clone();
     config.model = Some(model);
-    config.features.enable(Feature::GuardianThreadContext)?;
+
     Ok(test
         .thread_manager
         .start_thread(StartThreadOptions {
@@ -84,6 +86,14 @@ pub(super) async fn migration_scenario() -> Result<Vec<responses::ResponsesReque
     let test = test_codex()
         .with_history_mode(ThreadHistoryMode::Paginated)
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"
+[features]
+"guardianv2.thread_context" = false
+"#,
+            ),
+        )
         .with_model_info_override("gpt-5.5", |model| {
             model.comp_hash = Some("previous-model".to_owned());
             model.auto_review_model_override = Some(model.slug.clone());
@@ -145,6 +155,10 @@ pub(super) async fn migration_scenario() -> Result<Vec<responses::ResponsesReque
         &server,
         vec![
             responses::sse(vec![
+                responses::ev_assistant_message(
+                    "ordinary-question",
+                    "May I publish after these checks?",
+                ),
                 responses::ev_function_call(
                     "ask",
                     "request_user_input",
@@ -289,6 +303,17 @@ pub(super) async fn migration_scenario() -> Result<Vec<responses::ResponsesReque
     // The answer has survived suffix replay, both compactions, and checkpoint replay.
     let thread = resume(&test, &thread, after_compaction).await?;
     let history = thread.conversation_history_snapshot().await;
+    assert!(
+        history
+            .retained_context()
+            .expect("retained context")
+            .ordered_entries()
+            .any(|(_, entry)| {
+                matches!(entry, codex_history::RetainedContextEntry::AssistantMessage(message)
+            if message.message_id.as_deref() == Some("ordinary-question")
+                && message.text == "May I publish after these checks?")
+            })
+    );
     let answers = history
         .retained_context()
         .expect("retained answer evidence")
