@@ -280,10 +280,11 @@ impl App {
             tui.frame_requester()
                 .schedule_frame_in(Duration::from_millis(/*millis*/ 50));
         }
+        self.refresh_link_hover(tui)?;
         Ok(bottom_area)
     }
 
-    /// Consume transcript gestures only when a modal or another overlay does not own input.
+    /// Keep modal input ownership while allowing wheel scrolling over the visible transcript.
     pub(super) fn handle_owned_transcript_event(
         &mut self,
         tui: &mut tui::Tui,
@@ -364,7 +365,19 @@ impl App {
         }
         if !self.chat_widget.no_modal_or_popup_active() {
             self.chat_widget.end_composer_drag();
-            return Ok(false);
+            let is_modal_scroll = self.chat_widget.has_active_modal()
+                && matches!(
+                    event,
+                    TuiEvent::Mouse(mouse)
+                        if matches!(
+                            mouse.kind,
+                            crossterm::event::MouseEventKind::ScrollUp
+                                | crossterm::event::MouseEventKind::ScrollDown
+                        )
+                );
+            if !is_modal_scroll {
+                return Ok(false);
+            }
         }
         if matches!(event, TuiEvent::Key(key) if key.kind != KeyEventKind::Release) {
             let size = tui.prepare_draw_size()?;

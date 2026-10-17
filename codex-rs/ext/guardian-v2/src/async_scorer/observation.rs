@@ -303,8 +303,8 @@ impl GuardianV2Extension {
             Vec::new()
         };
         // Capture root evidence before background metadata resolution or model I/O.
-        // Later root changes invalidate this sample through its captured authorization version.
-        let root_snapshot = if context_mode == GuardianContextMode::ThreadOwned {
+        // Later root authorization or review-context changes invalidate this sample.
+        let root_snapshot = if context_mode != GuardianContextMode::Legacy {
             thread.guardian_root_snapshot().await
         } else {
             None

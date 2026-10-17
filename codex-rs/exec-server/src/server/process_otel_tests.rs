@@ -37,7 +37,7 @@ use wiremock::matchers::method;
 use super::ExecServerHandler;
 use super::registry::build_router;
 use super::session_registry::SessionRegistry;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ExecServerTelemetry;
 use crate::connection::JsonRpcConnectionEvent;
 use crate::protocol::EXEC_METHOD;
@@ -739,7 +739,7 @@ fn new_handler(
     let mut handler = ExecServerHandler::new(
         Arc::clone(sessions),
         RpcNotificationSender::new(outgoing),
-        ExecServerRuntimePaths::new(
+        ExecServerRuntimeOptions::new(
             std::env::current_exe().expect("test executable"),
             /*codex_linux_sandbox_exe*/ None,
         )

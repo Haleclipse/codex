@@ -11,6 +11,7 @@ use codex_features::Feature;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
+use codex_login::CodexAuth;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ImageReference;
@@ -196,6 +197,88 @@ async fn guardian_history_survives_restart_and_user_fork(
         if let ThreadStoreConfig::InMemory { id } = &initial.config.experimental_thread_store {
             InMemoryThreadStore::remove_id(id);
         }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardian_history_preserves_reviewer_across_parent_compaction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model("gpt-5.5")
+        .with_model_info_override("gpt-5.5", |model| {
+            model.comp_hash = Some("same-model".to_owned());
+            model.auto_review_model_override = Some(model.slug.clone());
+        })
+        .with_config(|config| {
+            config.features.disable(Feature::TokenBudget).unwrap();
+            config
+                .features
+                .disable(Feature::GuardianReuseParentCompaction)
+                .unwrap();
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let review_turn = |prefix: &str| {
+        vec![
+            sse(vec![
+                ev_function_call(
+                    &format!("{prefix}check"),
+                    "exec_command",
+                    r#"{"cmd":"exit 0","sandbox_permissions":"require_escalated"}"#,
+                ),
+                ev_completed(&format!("{prefix}action")),
+            ]),
+            sse(vec![
+                ev_assistant_message(&format!("{prefix}decision"), r#"{"outcome":"deny"}"#),
+                ev_completed(&format!("{prefix}review")),
+            ]),
+            sse(vec![ev_completed(&format!("{prefix}done"))]),
+        ]
+    };
+    let mut events = review_turn("before-");
+    events.push(sse(vec![
+        json!({"type": "response.output_item.done", "item": {
+            "type": "compaction", "id": "parent-checkpoint", "encrypted_content": "parent summary"
+        }}),
+        ev_completed("compacted"),
+    ]));
+    events.extend(review_turn(""));
+    let mock = mount_sse_sequence(&server, events).await;
+    test.submit_text_turn("Keep files private. Run a check before compaction.")
+        .await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.submit_text_turn("Run a check after compaction.")
+        .await?;
+    let requests = mock.requests();
+    let reviews = requests
+        .iter()
+        .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
+        .collect::<Vec<_>>();
+    assert_eq!(reviews.len(), 2);
+    assert!(reviews[0].body_json()["client_metadata"]["thread_id"].is_string());
+    assert_eq!(
+        reviews[0].body_json()["client_metadata"]["thread_id"],
+        reviews[1].body_json()["client_metadata"]["thread_id"]
+    );
+    assert!(reviews[1].input().starts_with(&reviews[0].input()));
+    assert!(
+        reviews[1]
+            .message_input_texts("user")
+            .join("\n")
+            .contains(">>> TRANSCRIPT DELTA START")
+    );
+    for review in reviews {
+        assert!(review.inputs_of_type("compaction").is_empty());
+        assert!(review.inputs_of_type("context_compaction").is_empty());
     }
     Ok(())
 }

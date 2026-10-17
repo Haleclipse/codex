@@ -22,7 +22,11 @@ fn exec_server_help_documents_remote_options() {
     let command = MultitoolCli::command()
         .term_width(80)
         .mut_subcommand("exec-server", |command| {
-            command.mut_arg("exit_on_stdin_close", |arg| arg.hide_env_values(true))
+            command
+                .mut_arg("exit_on_stdin_close", |arg| arg.hide_env_values(true))
+                .mut_arg("proxy_private_ips_via_upstream", |arg| {
+                    arg.hide_env_values(true)
+                })
         });
     let help = command
         .try_get_matches_from(["codex", "exec-server", "--help"])

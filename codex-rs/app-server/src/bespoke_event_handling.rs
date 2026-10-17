@@ -1544,7 +1544,12 @@ async fn handle_turn_interrupted(
         event_turn_id,
         TurnCompletionMetadata {
             status: TurnStatus::Interrupted,
-            error: None,
+            error: turn_aborted_event.error.map(|error| TurnError {
+                message: error.message,
+                codex_error_info: error.codex_error_info.map(Into::into),
+                misalignment: error.misalignment.map(Into::into),
+                additional_details: None,
+            }),
             last_agent_message: None,
             started_at: turn_summary.started_at,
             completed_at: turn_aborted_event.completed_at,
@@ -2189,6 +2194,7 @@ mod tests {
             turn_id: Some(turn_id.to_string()),
             started_at: None,
             reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+            error: None,
             completed_at: Some(TEST_TURN_COMPLETED_AT),
             duration_ms: Some(TEST_TURN_DURATION_MS),
         }

@@ -3,8 +3,10 @@
 
 use super::*;
 use crate::codex_thread::GuardianAuthorizationVersion;
+use codex_config::config_toml::CircuitBreakAction;
 use codex_guardian_reviewer::ReviewHost;
 use codex_protocol::approvals::GuardianReviewReason;
+use codex_protocol::protocol::ErrorEvent;
 
 pub(in crate::guardian) struct PreparedApproval {
     request: GuardianApprovalRequest,
@@ -16,7 +18,9 @@ pub(in crate::guardian) struct PreparedApproval {
 pub(in crate::guardian) struct ApprovalEvidence {
     store: Arc<GuardianReviewEvidence>,
     authorization_version: GuardianAuthorizationVersion,
+    review_context_revision: u64,
     root_authorization_version: Option<GuardianAuthorizationVersion>,
+    root_review_context_revision: Option<u64>,
 }
 
 impl ReviewHost for super::super::runtime::ReviewRuntime {
@@ -168,19 +172,25 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
                 None,
             );
         }
-        let root_authorization_version =
-            root_snapshot.map(|snapshot| snapshot.authorization_version);
+        let root_authorization_version = root_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.authorization_version);
+        let root_review_context_revision =
+            root_snapshot.map(|snapshot| snapshot.review_context_revision);
         // Keep the authorization revision even when no cacheable review evidence exists.
         let history = session.conversation_history_snapshot().await;
         let user_message_revision = history.user_message_revision();
+        let review_context_revision = history.guardian_review_context_revision();
         let review_evidence = session
             .services
             .thread_extension_data
             .get::<GuardianReviewEvidence>()
             .map(|store| ApprovalEvidence {
                 authorization_version: store.authorization_version(history.as_ref()),
+                review_context_revision,
                 store,
                 root_authorization_version,
+                root_review_context_revision,
             });
         drop(history);
         let (mut outcome, analytics) = run_guardian_review_session_before_deadline(
@@ -204,17 +214,22 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
                 != root_snapshot
                     .as_ref()
                     .map(|snapshot| (snapshot.root_thread_id, snapshot.history_reset_version));
+            let root_review_changed = root_review_context_revision
+                != root_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.review_context_revision);
             let authorization_changed = root_authorization_version
-                != root_snapshot.map(|snapshot| snapshot.authorization_version)
-                || user_message_revision
-                    != session
-                        .conversation_history_snapshot()
-                        .await
-                        .user_message_revision();
+                != root_snapshot.map(|snapshot| snapshot.authorization_version);
+            let history = session.conversation_history_snapshot().await;
+            let authorization_changed =
+                authorization_changed || user_message_revision != history.user_message_revision();
+            let review_context_changed = root_review_changed
+                || review_context_revision != history.guardian_review_context_revision();
             // An actual stop or history reset wins over a concurrent authorization change.
             if self.history_reset.is_cancelled()
                 || cancellation.is_cancelled()
                 || root_history_changed
+                || review_context_changed
             {
                 outcome = GuardianReviewOutcome::Error(GuardianReviewError::Cancelled);
             } else if authorization_changed {
@@ -253,14 +268,21 @@ impl ReviewHost for super::super::runtime::ReviewRuntime {
                 event,
                 action,
                 evidence.authorization_version,
+                evidence.review_context_revision,
                 evidence.root_authorization_version,
+                evidence.root_review_context_revision,
             );
         }
     }
 
-    async fn interrupt(&self, turn_id: &str, warning: EventMsg) {
+    async fn interrupt(&self, turn_id: &str, warning: EventMsg, error: ErrorEvent) {
+        let Some(turn) = self.session.turn_context_for_sub_id(turn_id).await else {
+            return;
+        };
+        let error = (turn.config.guardian_circuit_break_action == CircuitBreakAction::Strict)
+            .then_some(error);
         self.session
-            .interrupt_turn_with_warning(turn_id, warning)
+            .interrupt_turn_with_warning(turn_id, warning, error)
             .await;
     }
 }

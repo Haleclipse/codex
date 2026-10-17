@@ -74,7 +74,6 @@ pub(crate) fn startup_test_pump_with_input(text: &str) -> StartupDraftPump {
 
 #[test]
 fn startup_draft_renders_full_empty_and_multiline_composer_frames() {
-    let mut pump = startup_test_pump(std::iter::empty());
     let mut snapshots = Vec::new();
 
     for (label, width, text, session_action) in [
@@ -99,7 +98,15 @@ fn startup_draft_renders_full_empty_and_multiline_composer_frames() {
             StartupDraftSessionAction::New,
         ),
     ] {
+        let mut pump = startup_test_pump(std::iter::empty());
         pump.session_action = session_action;
+        // Resume and fork have no fresh-thread greeting. Exercise the real initial state.
+        if matches!(
+            session_action,
+            StartupDraftSessionAction::Resume | StartupDraftSessionAction::Fork
+        ) {
+            pump.header = startup_session_header(/*config*/ None);
+        }
         pump.bottom_pane
             .set_composer_text(text.to_string(), Vec::new(), Vec::new());
         let renderable =

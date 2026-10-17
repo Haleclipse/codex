@@ -31,6 +31,7 @@ use crate::ExecServerClient;
 use crate::ExecServerError;
 use crate::client::NoiseInitializeContext;
 use crate::client::accepted::AcceptedConnectionSource;
+use crate::client::is_environment_offline_error;
 use crate::client::is_retryable_registry_error;
 use crate::client::registry_recovery_retry_delay;
 use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT;
@@ -56,6 +57,7 @@ const ENVIRONMENT_CLIENT_NAME: &str = "codex-environment";
 const INITIAL_REGISTRY_MAX_RETRIES: u32 = 4;
 const INITIAL_REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 const INITIAL_REGISTRY_OPERATION_TIMEOUT: Duration = Duration::from_secs(14);
+const PROVISIONED_ENVIRONMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub(crate) async fn connect_websocket_request(
     request: http::Request<()>,
@@ -337,7 +339,7 @@ impl ExecServerClient {
             transport_params => (transport_params, None),
         };
 
-        if let Some(mut readiness) = deferred_readiness {
+        let provisioning_deadline = if let Some(mut readiness) = deferred_readiness {
             let provisioning_result = readiness
                 .wait_for(Option::is_some)
                 .await
@@ -355,7 +357,10 @@ impl ExecServerClient {
                     )
                 })?;
             provisioning_result.map_err(ExecServerError::ProvisioningFailed)?;
-        }
+            Some(Instant::now() + PROVISIONED_ENVIRONMENT_CONNECT_TIMEOUT)
+        } else {
+            None
+        };
 
         let websocket = match transport_params {
             ExecServerTransportParams::Deferred(_) => {
@@ -379,6 +384,7 @@ impl ExecServerClient {
                     &provider,
                     &identity,
                     http_client_factory.clone(),
+                    provisioning_deadline,
                 )
                 .await?;
                 let reconnect_strategy = ExecServerReconnectStrategy::NoiseRendezvous {
@@ -431,6 +437,7 @@ impl ExecServerClient {
         provider: &Arc<dyn NoiseRendezvousConnectProvider>,
         identity: &NoiseChannelIdentity,
         http_client_factory: HttpClientFactory,
+        provisioning_deadline: Option<Instant>,
     ) -> Result<(ReadyNoiseRendezvousConnection, crate::NoiseChannelPublicKey), ExecServerError>
     {
         let open_connection = |bundle: NoiseRendezvousConnectBundle| {
@@ -464,14 +471,22 @@ impl ExecServerClient {
         loop {
             let bundle = match result {
                 Ok(bundle) => bundle,
-                Err(error)
-                    if is_retryable_registry_error(&error)
-                        && retries < INITIAL_REGISTRY_MAX_RETRIES =>
-                {
+                Err(error) => {
+                    // A provisioned executor may be resuming after an earlier ready
+                    // report. Only offline responses get the longer, fixed deadline.
+                    let retry_deadline = match provisioning_deadline {
+                        Some(deadline) if is_environment_offline_error(&error) => deadline,
+                        _ if is_retryable_registry_error(&error)
+                            && retries < INITIAL_REGISTRY_MAX_RETRIES =>
+                        {
+                            deadline
+                        }
+                        _ => return Err(error),
+                    };
                     // Session resumption owns its separate recovery deadline.
                     let delay = registry_recovery_retry_delay(&retry_key, retries);
                     retries += 1;
-                    result = match timeout_at(deadline, async {
+                    result = match timeout_at(retry_deadline, async {
                         sleep(delay).await;
                         connect_bundle().await
                     })
@@ -482,7 +497,6 @@ impl ExecServerClient {
                     };
                     continue;
                 }
-                Err(error) => return Err(error),
             };
             let executor_public_key = bundle.executor_public_key.clone();
             match open_connection(bundle).await {

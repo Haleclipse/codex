@@ -14,6 +14,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 static PENDING_MAILBOX_MESSAGES: Gauge = Gauge::new("core.mailbox.pending");
 
@@ -118,19 +120,44 @@ impl InputQueue {
         Option<InputQueueActivity>,
     ) {
         let activity_rx = self.activity_tx.subscribe();
-        let has_pending_steer = if let Some(turn_state) = turn_state {
-            turn_state.lock().await.pending_input.has_pending_input()
+        let turn_activity = if let Some(turn_state) = turn_state {
+            turn_state.lock().await.pending_input.pending_activity()
         } else {
-            false
+            None
         };
-        let pending_activity = if has_pending_steer {
-            Some(InputQueueActivity::Steer)
+        let pending_activity = if let Some(activity) = turn_activity {
+            Some(activity)
         } else if self.has_pending_mailbox_items().await {
             Some(InputQueueActivity::Mailbox)
         } else {
             None
         };
         (activity_rx, pending_activity)
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state updates must remain atomic"
+    )]
+    pub(crate) async fn deliver_mailbox_communication_to_current_turn(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        communication: InterAgentCommunication,
+    ) -> bool {
+        let active = active_turn.lock().await;
+        let Some(active_turn) = active.as_ref().filter(|turn| turn.task.is_some()) else {
+            return false;
+        };
+        let mut turn_state = active_turn.turn_state.lock().await;
+        if !turn_state.accepts_mailbox_delivery_for_current_turn() {
+            return false;
+        }
+        turn_state
+            .pending_input
+            .items
+            .push(TurnInput::InterAgentCommunication(communication));
+        self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+        true
     }
 
     pub(crate) async fn enqueue_mailbox_communication(
@@ -213,6 +240,29 @@ impl InputQueue {
                 .is_some_and(|task| task.turn_context.sub_id == sub_id)
                 .then(|| Arc::clone(&active_turn.turn_state))
         })
+    }
+
+    /// Signal once a user message is queued for this sampling request.
+    pub(crate) async fn watch_user_input(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        sub_id: &str,
+        interrupt: CancellationToken,
+    ) -> Option<AbortOnDropHandle<()>> {
+        let turn_state = self.turn_state_for_sub_id(active_turn, sub_id).await?;
+        // Subscribe before inspecting the queue so an arrival cannot be missed.
+        let mut activity = self.activity_tx.subscribe();
+        Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                if turn_state.lock().await.pending_input.has_user_input() {
+                    interrupt.cancel();
+                    return;
+                }
+                if activity.changed().await.is_err() {
+                    return;
+                }
+            }
+        })))
     }
 
     /// Clear any pending waiters and input buffered for the current turn.
@@ -363,17 +413,33 @@ impl InputQueue {
 }
 
 impl TurnInputQueue {
+    fn has_user_input(&self) -> bool {
+        self.items
+            .iter()
+            .any(|input| matches!(input, TurnInput::UserInput { .. }))
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
-    fn has_pending_input(&self) -> bool {
-        self.items.iter().any(|input| {
+    fn pending_activity(&self) -> Option<InputQueueActivity> {
+        if self.items.iter().any(|input| {
             matches!(
                 input,
                 TurnInput::UserInput { .. } | TurnInput::FunctionCallOutput(_)
             )
-        })
+        }) {
+            Some(InputQueueActivity::Steer)
+        } else if self
+            .items
+            .iter()
+            .any(|input| matches!(input, TurnInput::InterAgentCommunication(_)))
+        {
+            Some(InputQueueActivity::Mailbox)
+        } else {
+            None
+        }
     }
 }
 
@@ -525,6 +591,22 @@ mod tests {
         assert_eq!(
             input_queue.subscribe_activity(Some(&turn_state)).await.1,
             None
+        );
+        let communication = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "already pending mail",
+            /*trigger_turn*/ false,
+        );
+        input_queue
+            .extend_pending_input_for_turn_state(
+                &turn_state,
+                vec![TurnInput::InterAgentCommunication(communication)],
+            )
+            .await;
+        assert_eq!(
+            input_queue.subscribe_activity(Some(&turn_state)).await.1,
+            Some(InputQueueActivity::Mailbox)
         );
         input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(

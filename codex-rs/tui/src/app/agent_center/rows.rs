@@ -1,5 +1,5 @@
 //! Grouped live tasks with shared identity colors and stable title, status and age columns.
-//! Current-task labels and full titles share the flexible column; metadata drops at narrow widths.
+//! Full titles use the flexible column; metadata drops at narrow widths.
 //! The final cell stays blank inside the full-width selection highlight.
 
 use super::navigation::CenterRow;
@@ -173,16 +173,6 @@ impl AgentsOverviewView {
                 buf,
             );
             let (mut title, status_area, updated) = columns(rect);
-            if task.is_current && title.width >= 14 {
-                let badge = Rect::new(
-                    title.right() - 10,
-                    title.y,
-                    /*width*/ 10,
-                    /*height*/ 1,
-                );
-                title.width -= 10;
-                line(Line::from("  current").style(style), badge, buf);
-            }
             if task.has_voice && title.width >= 8 {
                 let badge = Rect::new(
                     title.right() - 8,

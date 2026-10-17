@@ -80,7 +80,6 @@ mod resume_shutdown_tests;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
-mod session_summary;
 mod startup;
 #[path = "tests/startup_frame_tests.rs"]
 mod startup_frame_tests;
@@ -4730,13 +4729,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
     app.enqueue_primary_thread_session(session, Vec::new())
         .await
         .expect("switch to read thread");
-    let header =
-        lines_to_single_string(&app.clear_ui_header_lines_with_version(/*width*/ 80, "<VERSION>"));
-    let model_line = header
-        .lines()
-        .find(|line| line.contains("model:"))
-        .expect("rendered model line");
-    assert_app_snapshot!("thread_read_model_after_switch", model_line);
+    assert_eq!(app.chat_widget.current_model(), "server-reported-model");
 }
 
 #[test]
@@ -5934,7 +5927,9 @@ async fn ctrl_l_clears_owned_history_and_preserves_the_draft() -> Result<()> {
             .is::<history_cell::SessionHeaderHistoryCell>()
     );
     let header = lines_to_single_string(&app.transcript_cells[0].display_lines(/*width*/ 80));
-    assert!(header.contains("gpt-test"));
+    assert!(header.contains("OpenAI Codex"));
+    let raw_header = lines_to_single_string(&app.transcript_cells[0].raw_lines());
+    assert!(raw_header.contains("gpt-test"));
     assert!(!header.contains("old transcript row"));
     assert_eq!(
         app.chat_widget.composer_text_with_pending(),
@@ -5944,41 +5939,6 @@ async fn ctrl_l_clears_owned_history_and_preserves_the_draft() -> Result<()> {
     tui.set_owned_screen(/*owned*/ false)?;
     app_server.shutdown().await?;
     Ok(())
-}
-
-#[tokio::test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "snapshot path rendering differs on Windows"
-)]
-async fn clear_ui_header_shows_fast_status_for_fast_capable_models() {
-    let mut app = make_test_app().await;
-    app.config.cwd = test_path_buf("/tmp/project").abs();
-    app.chat_widget.set_model("gpt-5.4");
-    set_fast_mode_test_catalog(&mut app.chat_widget);
-    app.chat_widget
-        .set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
-    app.chat_widget.set_service_tier(Some(
-        codex_protocol::config_types::ServiceTier::Fast
-            .request_value()
-            .to_string(),
-    ));
-    set_chatgpt_auth(&mut app.chat_widget);
-    set_fast_mode_test_catalog(&mut app.chat_widget);
-
-    let rendered = app
-        .clear_ui_header_lines_with_version(/*width*/ 80, "<VERSION>")
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert_app_snapshot!("clear_ui_header_fast_status_fast_capable_models", rendered);
 }
 
 async fn make_test_app() -> Box<App> {
@@ -6534,8 +6494,8 @@ async fn app_server_thread_replacement_clears_previous_transcript_before_replay(
         .iter()
         .map(|line| {
             let text = rendered_line_text(line);
-            if text.contains("│ directory: ") {
-                "│ directory: <thread cwd>                │".to_string()
+            if text.trim() == test_path_buf("/tmp/next").display().to_string() {
+                "     <thread cwd>".to_string()
             } else {
                 text
             }
@@ -7747,7 +7707,7 @@ async fn remote_exec_resume_current_cwd_is_rejected() -> Result<()> {
     app.environment_manager = Arc::new(
         EnvironmentManager::create_for_tests(
             Some("ws://127.0.0.1:8765".to_string()),
-            Some(codex_exec_server::ExecServerRuntimePaths::new(
+            Some(codex_exec_server::ExecServerRuntimeOptions::new(
                 std::env::current_exe()?,
                 /*codex_linux_sandbox_exe*/ None,
             )?),
@@ -7994,7 +7954,7 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
             Arc::new(
                 EnvironmentManager::create_for_tests(
                     Some("ws://127.0.0.1:8765".to_string()),
-                    Some(codex_exec_server::ExecServerRuntimePaths::new(
+                    Some(codex_exec_server::ExecServerRuntimeOptions::new(
                         std::env::current_exe()?,
                         /*codex_linux_sandbox_exe*/ None,
                     )?),

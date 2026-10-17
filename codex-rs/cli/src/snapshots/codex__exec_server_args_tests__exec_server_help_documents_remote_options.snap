@@ -1,6 +1,5 @@
 ---
 source: cli/src/exec_server_args_tests.rs
-assertion_line: 36
 expression: help_text
 ---
 [EXPERIMENTAL] Run the standalone exec-server service
@@ -39,6 +38,14 @@ Options:
           dedicated environment
 
           [default: isolate]
+
+      --proxy-private-ips-via-upstream
+          Allow permitted private IP destinations to use the configured upstream
+          proxy. If no valid upstream proxy applies to the request protocol,
+          connect directly. Loopback stays local. This flag does not require
+          upstream routing
+
+          [env: CODEX_EXEC_SERVER_PROXY_PRIVATE_IPS_VIA_UPSTREAM]
 
       --concurrent-requests <COUNT>
           Maximum number of requests to process concurrently on each connection

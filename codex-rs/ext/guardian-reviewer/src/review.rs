@@ -12,6 +12,8 @@ use codex_extension_api::ExtensionFuture;
 use codex_extension_api::SynchronousApprovalReviewer;
 use codex_protocol::approvals::GuardianReviewReason;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::GuardianAssessmentOutcome;
@@ -62,7 +64,12 @@ pub trait ReviewHost: Send + Sync {
         evidence: Self::Evidence,
         event: &GuardianAssessmentEvent,
     ) -> impl Future<Output = ()> + Send;
-    fn interrupt(&self, turn_id: &str, warning: EventMsg) -> impl Future<Output = ()> + Send;
+    fn interrupt(
+        &self,
+        turn_id: &str,
+        warning: EventMsg,
+        error: ErrorEvent,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
@@ -137,7 +144,14 @@ impl<H: ReviewHost> SynchronousApprovalReviewer for ReviewRequest<'_, H> {
                         self.host
                             .interrupt(
                                 &turn_id,
-                                EventMsg::GuardianWarning(WarningEvent { message }),
+                                EventMsg::GuardianWarning(WarningEvent {
+                                    message: message.clone(),
+                                }),
+                                ErrorEvent {
+                                    message,
+                                    codex_error_info: Some(CodexErrorInfo::TooManyDenials),
+                                    misalignment: None,
+                                },
                             )
                             .await;
                     }

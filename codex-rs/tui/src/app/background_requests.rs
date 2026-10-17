@@ -768,6 +768,7 @@ pub(super) async fn fetch_all_mcp_server_statuses(
                     limit: Some(100),
                     detail: Some(detail),
                     thread_id: thread_id.clone(),
+                    server_name: None,
                 },
             })
             .await

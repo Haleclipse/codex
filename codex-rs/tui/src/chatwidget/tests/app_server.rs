@@ -936,7 +936,10 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         .iter()
         .map(|lines| lines_to_single_string(lines).trim().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(completion_cells, vec!["[completion time]"]);
+    assert_eq!(
+        completion_cells,
+        vec!["Worked for [duration] • [completion time]"]
+    );
     assert!(!chat.bottom_pane.is_task_running());
     assert!(chat.bottom_pane.status_widget().is_none());
     assert_eq!(

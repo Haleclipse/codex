@@ -150,7 +150,7 @@ impl MarkdownStyles {
             emphasis: Style::new().italic(),
             strong: Style::new().bold(),
             strikethrough: Style::new().crossed_out(),
-            ordered_list_marker: Style::new().fg(accent_color()),
+            ordered_list_marker: Style::new().light_blue(),
             unordered_list_marker: Style::new(),
             link: Style::new().fg(accent_color()).underlined(),
             blockquote: Style::new().green(),
@@ -620,7 +620,17 @@ impl<'a, 'policy> Writer<'a, 'policy> {
                 };
                 self.start_codeblock(lang, indent)
             }
-            Tag::List(start) => self.start_list(start),
+            Tag::List(start) => {
+                if self.pending_marker_line
+                    && self.input[..range.start]
+                        .rsplit('\n')
+                        .next()
+                        .is_some_and(|line| line.trim_matches(['>', ' ', '\t']).is_empty())
+                {
+                    self.push_line(Line::default());
+                }
+                self.start_list(start);
+            }
             Tag::Item => {
                 self.start_item();
                 if let Some((next, next_range)) = iter.next() {
@@ -685,6 +695,9 @@ impl<'a, 'policy> Writer<'a, 'policy> {
             TagEnd::CodeBlock => self.end_codeblock(range),
             TagEnd::List(_) => self.end_list(),
             TagEnd::Item => {
+                if self.pending_marker_line {
+                    self.push_line(Line::default());
+                }
                 self.flush_current_line();
                 let start_line_count = self.list_item_start_line_counts.pop().unwrap_or_default();
                 if let Some(list) = self.uniform_lists.last_mut() {

@@ -287,8 +287,12 @@ impl TranscriptView {
         expanded: bool,
         lines: impl FnOnce(u16) -> Option<ActivityTranscriptLines>,
     ) -> bool {
+        let shortcut = self
+            .disclosure
+            .keymap
+            .primary_hint(crate::keymap::KeymapContext::Global, "open_transcript");
         self.sync_live_layout(width, key, |width| {
-            lines(width).map(|lines| layout::activity_layout(lines, width, expanded))
+            lines(width).map(|lines| layout::activity_layout(lines, width, expanded, shortcut))
         })
     }
 

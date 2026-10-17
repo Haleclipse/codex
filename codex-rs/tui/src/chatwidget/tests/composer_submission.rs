@@ -1670,7 +1670,7 @@ fn interrupted_history(
     }
     let history = history.join("\n");
     assert!(
-        history.contains("Conversation interrupted - tell the model what to do differently."),
+        history.contains("Conversation interrupted"),
         "expected normal interruption notice, got {history:?}"
     );
     (saw_prompt, history)
@@ -1809,6 +1809,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
     });
     let input_state = ThreadInputState {
         questions: None,
+        pending_thread_settings: None,
         composer: Some(ThreadComposerState {
             text: "composer draft".to_string(),
             ..Default::default()

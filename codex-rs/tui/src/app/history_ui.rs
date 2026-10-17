@@ -307,7 +307,8 @@ impl App {
         width: u16,
         version: &'static str,
     ) -> Vec<Line<'static>> {
-        self.clear_ui_header_cell(version).display_lines(width)
+        self.clear_ui_header_cell(version)
+            .display_lines_for_mode(width, self.chat_widget.history_render_mode())
     }
 
     /// Share the source-backed header between retained drawing and legacy terminal insertion.
@@ -318,10 +319,6 @@ impl App {
         let mut header = history_cell::SessionHeaderHistoryCell::new(
             self.chat_widget.model_display_name().to_string(),
             self.chat_widget.current_reasoning_effort(),
-            self.chat_widget.should_show_fast_status(
-                self.chat_widget.current_model(),
-                self.chat_widget.current_service_tier(),
-            ),
             self.config.cwd.to_path_buf(),
             version,
         )
@@ -355,7 +352,10 @@ impl App {
             .history_wrap_width(tui.terminal.last_known_screen_size.width);
         let header_lines = self.clear_ui_header_lines(width);
         if !header_lines.is_empty() {
-            tui.insert_history_lines(header_lines);
+            tui.insert_history_lines_with_wrap_policy(
+                header_lines,
+                self.history_line_wrap_policy(),
+            );
             self.has_emitted_history_lines = true;
         }
     }
@@ -401,6 +401,9 @@ impl App {
         self.overlay = None;
         self.transcript_cells.clear();
         self.turn_tips.dismiss();
+        self.chat_widget.warning_display_state.dismissed.clear();
+        self.chat_widget.warning_display_state.transcript = Arc::default();
+        self.chat_widget.warning_display_state.synced_cells = None;
         self.native_history = Default::default();
         self.cancel_pending_key_chord();
         self.transcript_view = Default::default();

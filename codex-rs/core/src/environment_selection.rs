@@ -1183,7 +1183,7 @@ mod tests {
 
     use crate::config::PermissionProfileSnapshot;
     use codex_exec_server::Environment;
-    use codex_exec_server::ExecServerRuntimePaths;
+    use codex_exec_server::ExecServerRuntimeOptions;
     use codex_exec_server::LOCAL_ENVIRONMENT_ID;
     use codex_exec_server::REMOTE_ENVIRONMENT_ID;
     use codex_exec_server_test_support::environment_manager_without_environments;
@@ -1246,8 +1246,8 @@ mod tests {
         turn_environments
     }
 
-    fn test_runtime_paths() -> ExecServerRuntimePaths {
-        ExecServerRuntimePaths::new(
+    fn test_runtime_paths() -> ExecServerRuntimeOptions {
+        ExecServerRuntimeOptions::new(
             std::env::current_exe().expect("current exe"),
             /*codex_linux_sandbox_exe*/ None,
         )

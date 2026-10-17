@@ -80,6 +80,15 @@ impl JumpTarget {
 }
 
 impl TranscriptView {
+    /// Resolve links in the last rendered transcript, sharing geometry with click activation.
+    pub(crate) fn link_at(&self, column: u16, row: u16) -> Option<String> {
+        if !self.area.contains(ScreenPosition::new(column, row)) {
+            return None;
+        }
+        let visible = self.visible.get(usize::from(row - self.area.y))?;
+        visible.layout.link_at(visible.row, column - self.area.x)
+    }
+
     pub(crate) fn navigate_pager(
         &mut self,
         key: KeyEvent,
@@ -243,15 +252,7 @@ impl TranscriptView {
                     .flatten()
                 });
                 let link = link.filter(|destination| {
-                    self.visible
-                        .get(usize::from(event.row - self.area.y))
-                        .and_then(|visible| {
-                            visible
-                                .layout
-                                .link_at(visible.row, event.column - self.area.x)
-                        })
-                        .as_ref()
-                        == Some(destination)
+                    self.link_at(event.column, event.row).as_ref() == Some(destination)
                 });
                 if self
                     .selection
@@ -358,9 +359,8 @@ impl TranscriptView {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         {
-            return visible
-                .layout
-                .link_at(visible.row, event.column.saturating_sub(self.area.x))
+            return self
+                .link_at(event.column, event.row)
                 .map(ViewAction::OpenLink);
         }
         if event.modifiers == KeyModifiers::SHIFT && self.has_selection_range() {
@@ -383,11 +383,7 @@ impl TranscriptView {
             return None;
         }
         let link = (clicks == 1 && event.modifiers.is_empty())
-            .then(|| {
-                visible
-                    .layout
-                    .link_at(visible.row, event.column.saturating_sub(self.area.x))
-            })
+            .then(|| self.link_at(event.column, event.row))
             .flatten();
         self.begin_selection(cells, event.column, event.row, clicks);
         if let Some(selection) = &mut self.selection {

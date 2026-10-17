@@ -175,7 +175,12 @@ impl EmptyStateAnimation {
         let phase =
             self.spin_elapsed.min(sequence::SPIN_DURATION).as_secs_f64() / sequence::LOOP_SECONDS;
         let settling = !finished && static_mark && self.fade_elapsed < sequence::STATIC_FADE;
-        self.opacity = if finished {
+        self.opacity = if finished && self.replaying {
+            sequence::static_opacity(
+                self.spin_elapsed - sequence::SPIN_DURATION,
+                /*from*/ 1.0,
+            )
+        } else if finished {
             1.0
         } else if static_mark {
             sequence::static_opacity(self.fade_elapsed, self.fade_from)
@@ -188,7 +193,10 @@ impl EmptyStateAnimation {
                     * sequence::progress(self.fade_elapsed, sequence::STATIC_FADE) as f32;
         }
         self.paint_frame(area, buffer, phase, self.opacity);
-        (!finished && (!static_mark || settling)).then_some(FRAME_INTERVAL)
+        ((!finished && (!static_mark || settling))
+            || (self.replaying
+                && self.spin_elapsed < sequence::SPIN_DURATION + sequence::STATIC_FADE))
+            .then_some(FRAME_INTERVAL)
     }
 
     /// Draw only in space the caller has cleared and owns. The centered blossom returns
@@ -228,7 +236,7 @@ impl EmptyStateAnimation {
             if let Some(delay) = self.render_in(stage, buffer, Presentation::Animated) {
                 return Some(delay);
             }
-            // Paint the idle pose over the final full-color frame in the same update.
+            // The replay has faded back to the idle pose and no longer needs redraws.
             self.replaying = false;
         }
         self.paint_frame(stage, buffer, SETTLED_BLOSSOM, sequence::STATIC_OPACITY);

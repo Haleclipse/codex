@@ -437,6 +437,12 @@ pub(crate) enum AppEvent {
     OpenWarnings,
     /// Copy a diagnostic and acknowledge in the footer, without appending history.
     CopyWarning(String),
+    /// Apply the user's decisions for the frozen warning details, in viewer-close order.
+    UpdateWarnings {
+        transcript: Arc<()>,
+        dismissed: Vec<crate::history_cell::WarningEntry>,
+        kept: Vec<crate::history_cell::WarningEntry>,
+    },
 
     /// Export all current-thread history to the selected destination.
     ExportTranscript {

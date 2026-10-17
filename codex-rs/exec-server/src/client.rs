@@ -150,7 +150,6 @@ mod recovery;
 #[path = "client_refresh.rs"]
 mod refresh;
 pub(crate) use connection_failure::can_retry_connection_attempt;
-#[cfg(test)]
 pub(crate) use recovery::is_environment_offline_error;
 pub(crate) use recovery::is_retryable_recovery_error;
 

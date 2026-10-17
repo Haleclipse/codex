@@ -84,7 +84,7 @@ pub use codex_exec_server::EnvironmentRegistryHarnessKeyValidationResponse;
 pub use codex_exec_server::EnvironmentRegistryRegistrationRequest;
 pub use codex_exec_server::EnvironmentRegistryRegistrationResponse;
 pub use codex_exec_server::ExecServerError;
-pub use codex_exec_server::ExecServerRuntimePaths;
+pub use codex_exec_server::ExecServerRuntimeOptions;
 pub use codex_exec_server::NoiseChannelIdentity;
 pub use codex_exec_server::NoiseChannelPublicKey;
 pub use codex_exec_server::NoiseRendezvousConnectBundle;

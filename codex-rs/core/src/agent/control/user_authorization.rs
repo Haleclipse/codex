@@ -1,7 +1,7 @@
 //! Projects bounded retained root evidence for worker reviewers.
 //! Retained root instructions stay authoritative while old checkpoints use legacy review.
-//! Selects recent user and assistant evidence together, excluding explicit assistant commentary.
-//! Recovery preserves phase filtering and confirmed messaging context across compaction.
+//! Selects recent user and assistant evidence together by source order.
+//! Explicit assistant commentary is excluded; confirmed messaging survives compaction.
 //! Projection omissions keep missing authorization and assistant context explicit.
 //! Retained-history reconciliation owns recovery order and missing-instruction provenance.
 //! Known positions preserve host order, not delivery order or inferred question-answer pairs.
@@ -19,6 +19,7 @@ use crate::context::ContextualUserFragment;
 use crate::context::GuardianReviewEvidence;
 use crate::context::UserGoalUpdate;
 use crate::context::is_contextual_user_fragment;
+use crate::context::render_retained_assistant_context;
 use crate::event_mapping::parse_turn_item;
 use crate::guardian::GUARDIAN_MAX_ROOT_MESSAGE_TOKENS;
 use crate::guardian::guardian_truncate_text;
@@ -221,10 +222,9 @@ impl LocalAgentControl {
                         .map(|_| (order, message))
                 });
                 if let Some((order, message)) = retained
-                    && let Some(message) =
-                        codex_guardian_context::retained_assistant_message(message)
+                    && let Some(text) = render_retained_assistant_context(message)
                 {
-                    return Some((id, Some(order), message));
+                    return Some((id, Some(order), GuardianRootMessage::Assistant(text)));
                 }
                 let order = envelope
                     .metadata
@@ -268,7 +268,8 @@ impl LocalAgentControl {
                 }) {
                     return None;
                 }
-                let rendered = codex_guardian_context::retained_assistant_message(message);
+                let rendered =
+                    render_retained_assistant_context(message).map(GuardianRootMessage::Assistant);
                 missing_assistant_context |= rendered.is_none();
                 rendered.map(|message| (Some(order), message))
             })
@@ -281,8 +282,8 @@ impl LocalAgentControl {
         messages.extend(assistant_messages);
         // Unknown order cannot establish recency; prune these assistants first.
         messages.sort_by_key(|(order, _)| *order);
-        // Apply one shared cap after ordering eligible messages. User records must
-        // not consume the entire window before assistant questions are considered.
+        // Apply one shared cap so user records and confirmed questions compete
+        // while keeping omissions explicit for authorization and assistant context.
         let removed = messages.len().saturating_sub(MAX_ROOT_MESSAGES);
         missing_root_instructions |= messages[..removed].iter().any(|(_, message)| {
             matches!(
@@ -342,6 +343,7 @@ impl LocalAgentControl {
             root_thread_id,
             history_reset_version: root_history.reset_version,
             authorization_version,
+            review_context_revision: history.guardian_review_context_revision(),
             messages,
             trusted_skill_paths,
         })

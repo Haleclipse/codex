@@ -556,12 +556,4 @@ impl ChatWidget {
         self.refresh_status_surfaces();
         self.add_to_history(history_cell::new_plan_update(update));
     }
-
-    pub(super) fn interrupted_turn_message(&self, reason: TurnAbortReason) -> String {
-        if reason == TurnAbortReason::BudgetLimited {
-            return "Goal budget reached - the turn was stopped.".to_string();
-        }
-
-        "Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.".to_string()
-    }
 }

@@ -193,6 +193,7 @@ fn turn_aborted_event(turn_id: &str) -> Event {
             turn_id: Some(turn_id.to_string()),
             started_at: None,
             reason: TurnAbortReason::Interrupted,
+            error: None,
             completed_at: None,
             duration_ms: None,
         }),

@@ -62,7 +62,10 @@ pub(crate) fn source_order_labels(
 
 /// Renders bounded originals even when transcript selection also includes their source messages.
 /// Presence in parent history alone cannot prove complete delivery to a reviewer.
-fn render_retained_instructions(context: &RetainedContext) -> Vec<Budgeted<String>> {
+fn render_retained_instructions(
+    context: &RetainedContext,
+    render_assistant: impl Fn(&RetainedUserMessage) -> Option<GuardianRootMessage>,
+) -> Vec<Budgeted<String>> {
     // Legacy positional labels can shift after eviction. Keep resending their full
     // section instead of treating a previously delivered label as stable evidence.
     let stable_order = !has_legacy_order(context);
@@ -75,7 +78,10 @@ fn render_retained_instructions(context: &RetainedContext) -> Vec<Budgeted<Strin
             RetainedContextEntry::UserMessage(message) => message,
             RetainedContextEntry::VerifiedAnswer(_) => continue,
             RetainedContextEntry::AssistantMessage(message) => {
-                if let Some(text) = retained_assistant_message(message)
+                if message.complete && message.text.is_empty() {
+                    continue;
+                }
+                if let Some(text) = render_assistant(message)
                     .map(|message| format!("Retained source order: {order}\n{}", message.render()))
                     .filter(|text| {
                         text.len() <= TruncationPolicy::Tokens(MAX_INSTRUCTION_TOKENS).byte_budget()
@@ -137,7 +143,9 @@ impl SectionContributor for RetainedUserInstructionsSection {
         let Some(context) = input.history.retained_context() else {
             return Ok(None);
         };
-        let rendered = render_retained_instructions(context);
+        let rendered = render_retained_instructions(context, |message| {
+            input.history.render_retained_assistant(message)
+        });
         if rendered.is_empty() {
             return Ok(None);
         }
@@ -183,7 +191,7 @@ impl ComposedContext {
         }) {
             self.sections.retain(|section| {
             section.id != "retained_user_instructions" || match &section.delivery {
-                SectionDelivery::UserContent(items) => !items.iter().all(|item| matches!(&item.content, ContentItem::InputText { text } if text == START || text == LEGACY_START || text == END)),
+                SectionDelivery::UserContent(items) => !items.iter().all(|item| matches!(&item.content, ContentItem::InputText { text } if text.strip_suffix('\n').is_some_and(|text| text == START || text == LEGACY_START || text == END))),
                 SectionDelivery::Message(_) => true,
             }
         });

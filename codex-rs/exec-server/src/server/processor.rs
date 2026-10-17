@@ -9,7 +9,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::debug;
 use tracing::warn;
 
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::LocalFileSystem;
 use crate::connection::CHANNEL_CAPACITY;
 use crate::connection::JsonRpcConnection;
@@ -38,7 +38,7 @@ pub(crate) struct ConnectionProcessor {
     capability_manager: Arc<CapabilityManager>,
     capability_prewarm: Arc<AbortOnDropHandle<()>>,
     session_registry: Arc<SessionRegistry>,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
     request_dispatch_mode: RequestDispatchMode,
@@ -46,7 +46,7 @@ pub(crate) struct ConnectionProcessor {
 
 impl ConnectionProcessor {
     #[cfg(test)]
-    pub(crate) fn new(runtime_paths: ExecServerRuntimePaths) -> Self {
+    pub(crate) fn new(runtime_paths: ExecServerRuntimeOptions) -> Self {
         Self::new_with_location_request(
             runtime_paths,
             ExecServerTelemetry::default(),
@@ -62,7 +62,7 @@ impl ConnectionProcessor {
     }
 
     pub(crate) fn new_with_telemetry(
-        runtime_paths: ExecServerRuntimePaths,
+        runtime_paths: ExecServerRuntimeOptions,
         telemetry: ExecServerTelemetry,
         http_client_factory: HttpClientFactory,
         request_dispatch_mode: RequestDispatchMode,
@@ -83,7 +83,7 @@ impl ConnectionProcessor {
     }
 
     fn new_with_location_request(
-        runtime_paths: ExecServerRuntimePaths,
+        runtime_paths: ExecServerRuntimeOptions,
         telemetry: ExecServerTelemetry,
         http_client_factory: HttpClientFactory,
         request_dispatch_mode: RequestDispatchMode,
@@ -342,7 +342,7 @@ mod tests {
 
     use super::complete_queued_client_responses;
     use super::run_connection;
-    use crate::ExecServerRuntimePaths;
+    use crate::ExecServerRuntimeOptions;
     use crate::ProcessId;
     use crate::connection::JsonRpcConnection;
     use crate::connection::JsonRpcConnectionEvent;
@@ -372,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_prewarms_without_a_client_connection() -> anyhow::Result<()> {
-        let paths = ExecServerRuntimePaths::new(
+        let paths = ExecServerRuntimeOptions::new(
             std::env::current_exe()?,
             /*codex_linux_sandbox_exe*/ None,
         )?;
@@ -637,8 +637,8 @@ mod tests {
         (client_writer, BufReader::new(client_reader).lines(), task)
     }
 
-    fn test_runtime_paths() -> ExecServerRuntimePaths {
-        ExecServerRuntimePaths::new(
+    fn test_runtime_paths() -> ExecServerRuntimeOptions {
+        ExecServerRuntimeOptions::new(
             std::env::current_exe().expect("current exe"),
             /*codex_linux_sandbox_exe*/ None,
         )

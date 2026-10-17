@@ -99,12 +99,13 @@ impl App {
         let was_pending = self.key_chord_matcher.is_pending();
         if !was_pending
             && contexts.is_warnings()
-            && !crate::key_hint::is_plain_text_key_event(key_event)
-            && self
-                .keymap
-                .list
-                .action_for(key_event)
-                .is_some_and(|action| action != crate::keymap::ListAction::Accept)
+            && (crate::key_hint::plain(KeyCode::Char('k')).is_press(key_event)
+                || (!crate::key_hint::is_plain_text_key_event(key_event)
+                    && self
+                        .keymap
+                        .list
+                        .action_for(key_event)
+                        .is_some_and(|action| action != crate::keymap::ListAction::Accept)))
         {
             return Some(key_event);
         }
@@ -260,7 +261,7 @@ impl App {
         let config = self.chat_widget.config_ref();
         let file_system_policy = config.permissions.file_system_sandbox_policy();
         let editor_result = tui
-            .with_restored(|| async {
+            .with_restored(tui::TerminalHandoff::KeepScreen, || async {
                 external_editor::run_editor(
                     &seed,
                     &editor_cmd,

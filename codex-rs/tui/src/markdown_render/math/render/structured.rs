@@ -1,7 +1,7 @@
 //! Small, bounded layouts for aligned equations and common optimization notation.
 //! Cell parsing shares the parent parser's depth budget and preserves nested groups.
 //! Aligned blocks compose with surrounding math at their first row's baseline.
-//! Display annotations and sum limits are centered above or below their base.
+//! Display annotations and operator limits are centered above or below their base.
 
 use super::Layout;
 use super::MAX_COLUMNS;
@@ -48,7 +48,7 @@ impl MathParser<'_> {
         argument
     }
 
-    pub(super) fn display_sum(&mut self) -> Option<Layout> {
+    pub(super) fn display_operator(&mut self, symbol: &str) -> Option<Layout> {
         let mut lower = None;
         let mut upper = None;
         loop {
@@ -72,7 +72,7 @@ impl MathParser<'_> {
             .max()
             .unwrap_or(1)
             .max(1);
-        let mut base = Layout::text(format!("{:^width$}", "∑"));
+        let mut base = Layout::text(format!("{symbol:^width$}"));
         if let Some(lower) = lower {
             base = base.annotated(lower, AnnotationPosition::Below)?;
         }

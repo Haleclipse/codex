@@ -14,6 +14,8 @@ enum SnapshotSandbox {
 #[cfg_attr(target_os = "macos", test_case("zsh", false, SnapshotSandbox::None; "zsh"))]
 #[cfg_attr(target_os = "macos", test_case("zsh", true, SnapshotSandbox::None; "zsh_tty"))]
 #[test_case("bash", false, SnapshotSandbox::DenyFdPath; "blocked_descriptor_path")]
+#[cfg_attr(target_os = "macos", test_case("zsh", false, SnapshotSandbox::DenyFdPath; "zsh_blocked_descriptor_path"))]
+#[cfg_attr(target_os = "macos", test_case("zsh", true, SnapshotSandbox::DenyFdPath; "zsh_blocked_descriptor_path_tty"))]
 #[test_case("bash", false, SnapshotSandbox::WorkspaceWrite; "bash_protected_transport")]
 #[test_case("bash", true, SnapshotSandbox::WorkspaceWrite; "bash_protected_transport_tty")]
 #[cfg_attr(target_os = "macos", test_case("zsh", false, SnapshotSandbox::WorkspaceWrite; "zsh_protected_transport"))]
@@ -38,7 +40,7 @@ async fn shell_snapshot_concurrent_replays_keep_independent_readers(
         let (exe, linux_sandbox) = current_test_binary_helper_paths()?;
         let environment = Environment::create(
             /*exec_server_url*/ None,
-            codex_exec_server::ExecServerRuntimePaths::new(exe, linux_sandbox)?,
+            codex_exec_server::ExecServerRuntimeOptions::new(exe, linux_sandbox)?,
             codex_http_client::HttpClientFactory::new(
                 codex_http_client::OutboundProxyPolicy::ReqwestDefault,
             ),
@@ -66,10 +68,15 @@ async fn shell_snapshot_concurrent_replays_keep_independent_readers(
     } else {
         format!("case \"{source}\" in /dev/fd/*) ;; *) return 42 ;; esac; ")
     };
+    let aliases = if shell == "zsh" {
+        "module_path=()\nsetopt RC_QUOTES\nalias snapshot_quoted=\"printf '%s|' 'one''two'\"\nalias eval='exit 44'\nalias case='exit 45'\n"
+    } else {
+        ""
+    };
     std::fs::write(
         home.path().join(format!(".{shell}rc")),
         format!(
-            "printf x >> \"$HOME/captures\"\nprofile_helper() {{ {source_check}local payload='{payload}'; [ \"${{#payload}}\" = {payload_len} ] || return 43; printf 'restored:%s' \"$1\"; }}\nexec() {{ exit 41; }}\nset -u\n"
+            "printf x >> \"$HOME/captures\"\nprofile_helper() {{ {source_check}local payload='{payload}'; [ \"${{#payload}}\" = {payload_len} ] || return 43; printf 'restored:%s' \"$1\"; }}\nexec() {{ exit 41; }}\nset -u\n{aliases}"
         ),
     )?;
     let protected_file =
@@ -81,7 +88,13 @@ async fn shell_snapshot_concurrent_replays_keep_independent_readers(
     } else {
         ""
     };
-    let command = format!("{command}IFS= read -r line; profile_helper \"$line\"; exit 7");
+    let replay_checks = if shell == "zsh" {
+        "eval snapshot_quoted\n[[ -o rcquotes ]] || exit 46\n"
+    } else {
+        ""
+    };
+    let command =
+        format!("{command}IFS= read -r line\n{replay_checks}profile_helper \"$line\"; exit 7");
     let sandbox = if use_sandbox {
         let mut policy = FileSystemSandboxPolicy::read_only();
         policy.entries.push(FileSystemSandboxEntry::new(
@@ -161,6 +174,12 @@ async fn shell_snapshot_concurrent_replays_keep_independent_readers(
                 output.ends_with(&format!("restored:input-{index}")),
                 "{output:?}"
             );
+            if shell == "zsh" {
+                assert!(
+                    output.ends_with(&format!("one'two|restored:input-{index}")),
+                    "{output:?}"
+                );
+            }
             assert_eq!((errors, status, closed), (String::new(), Some(7), true));
             Ok::<_, anyhow::Error>(())
         }

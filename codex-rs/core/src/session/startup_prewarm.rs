@@ -2,6 +2,7 @@
 //! One scheduled task owns the prepared client session until the next regular
 //! turn consumes it; shutdown and turn cancellation use the same handoff.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -30,6 +31,21 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PrewarmInput {
+    Base,
+    History,
+}
+
+impl PrewarmInput {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::History => "history",
+        }
+    }
+}
 
 pub(crate) struct SessionStartupPrewarmHandle {
     task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
@@ -190,7 +206,7 @@ impl SessionStartupPrewarmHandle {
 }
 
 impl Session {
-    pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>) {
+    pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, input: PrewarmInput) {
         let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
         let mut state = self.state.lock().await;
         if state.shutting_down {
@@ -242,7 +258,7 @@ impl Session {
         let startup_prewarm_session = Arc::clone(self);
         let startup_prewarm = tokio::spawn(
             async move {
-                let result = schedule_startup_prewarm_inner(startup_prewarm_session).await;
+                let result = schedule_startup_prewarm_inner(startup_prewarm_session, input).await;
                 let status = if result.is_ok() { "ready" } else { "failed" };
                 session_telemetry.record_startup_phase(
                     "startup_prewarm_total",
@@ -252,7 +268,7 @@ impl Session {
                 session_telemetry.record_duration(
                     STARTUP_PREWARM_DURATION_METRIC,
                     started_at.elapsed(),
-                    &[("status", status)],
+                    &[("status", status), ("input", input.as_str())],
                 );
                 result
             }
@@ -260,6 +276,7 @@ impl Session {
                 "startup_prewarm",
                 otel.name = "startup_prewarm",
                 thread.id = %self.thread_id(),
+                prewarm.input = input.as_str(),
             )),
         );
         state.set_session_startup_prewarm(SessionStartupPrewarmHandle::new(
@@ -285,7 +302,10 @@ impl Session {
     }
 }
 
-async fn schedule_startup_prewarm_inner(session: Arc<Session>) -> CodexResult<ModelClientSession> {
+async fn schedule_startup_prewarm_inner(
+    session: Arc<Session>,
+    input: PrewarmInput,
+) -> CodexResult<ModelClientSession> {
     let prewarm_started_at = Instant::now();
     let mut client_session = session.services.model_client.new_session();
     let websocket_ready = client_session.is_websocket_prewarmed().await;
@@ -293,14 +313,17 @@ async fn schedule_startup_prewarm_inner(session: Arc<Session>) -> CodexResult<Mo
     session.services.session_telemetry.counter(
         "codex.startup_prewarm.websocket_check",
         /*inc*/ 1,
-        &[(
-            "outcome",
-            if websocket_ready {
-                "ready"
-            } else {
-                "needs_prewarm"
-            },
-        )],
+        &[
+            (
+                "outcome",
+                if websocket_ready {
+                    "ready"
+                } else {
+                    "needs_prewarm"
+                },
+            ),
+            ("input", input.as_str()),
+        ],
     );
     if websocket_ready {
         return Ok(client_session);
@@ -372,8 +395,24 @@ async fn schedule_startup_prewarm_inner(session: Arc<Session>) -> CodexResult<Mo
         ),
     )?;
     let build_prompt_started_at = Instant::now();
+    let prompt_input = match input {
+        PrewarmInput::Base => Vec::new(),
+        PrewarmInput::History => {
+            // Use the same history projection and tool metadata as a sampling request.
+            // The real turn still checks this prefix before reusing the prepared response.
+            let mut history = session
+                .clone_history()
+                .await
+                .for_prompt(&step_context.settings.model_info.input_modalities);
+            session
+                .services
+                .executed_tool_calls
+                .attach_to_prompt(&mut history, &mut HashMap::new());
+            history
+        }
+    };
     let startup_prompt = build_prompt(
-        Vec::new(),
+        prompt_input,
         step_context.as_ref(),
         BaseInstructions {
             text: base_instructions,

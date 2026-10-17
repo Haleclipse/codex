@@ -186,6 +186,16 @@ pub trait SectionHistory: Send + Sync {
     fn retained_context(&self) -> Option<&codex_history::RetainedContext> {
         None
     }
+
+    /// Renders one bounded retained assistant message through the host's
+    /// contextual-fragment boundary. Hosts with no fragment layer use the
+    /// shared role-labeled rendering while preserving the same size limit.
+    fn render_retained_assistant(
+        &self,
+        message: &codex_history::RetainedUserMessage,
+    ) -> Option<GuardianRootMessage> {
+        retained_assistant_message(message)
+    }
 }
 
 impl SectionHistory for Vec<ResponseItem> {

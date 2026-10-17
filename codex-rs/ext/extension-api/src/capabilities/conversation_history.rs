@@ -15,6 +15,12 @@ pub trait ConversationHistorySnapshot: Send + Sync {
     /// history resets, but stays unchanged for compaction and internal context.
     fn user_message_revision(&self) -> u64;
 
+    /// Changes when host-confirmed assistant evidence can change how Guardian interprets input.
+    /// Hosts without out-of-band assistant evidence may retain the default.
+    fn guardian_review_context_revision(&self) -> u64 {
+        0
+    }
+
     /// Returns the snapshot's response items in conversation order.
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_>;
 
@@ -28,6 +34,12 @@ pub trait ConversationHistorySnapshot: Send + Sync {
     /// Checkpoint compatibility is independent of access to retained user evidence.
     fn uses_parent_context_for_review(&self) -> bool {
         self.retained_context().is_some()
+    }
+
+    /// Whether the host retains a bounded review transcript independently of parent compaction.
+    /// Such snapshots must never seed reviewers with the parent's opaque checkpoint.
+    fn uses_independent_review_history(&self) -> bool {
+        false
     }
 
     /// Latest opaque checkpoint, including unusable items, with its recorded producer.

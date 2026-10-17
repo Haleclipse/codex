@@ -17,7 +17,6 @@ use crate::bottom_pane::CommandPopupPlacement;
 use crate::bottom_pane::ComposerRenderOptions;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableItem;
-use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::HyperlinkParagraph;
 
 pub(super) struct OwnedStartupLayout<'a> {
@@ -41,17 +40,6 @@ impl<'a> OwnedStartupLayout<'a> {
         }
     }
 
-    fn header_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        match self.pump.session_action {
-            StartupDraftSessionAction::New | StartupDraftSessionAction::NewFromCommandCenter => {
-                self.pump.header.compact_hyperlink_lines(width)
-            }
-            StartupDraftSessionAction::Resume | StartupDraftSessionAction::Fork => {
-                self.pump.header.display_hyperlink_lines(width)
-            }
-        }
-    }
-
     pub(super) fn bottom_area(&self, area: Rect) -> Rect {
         let height = self.bottom.desired_height(area.width).min(area.height);
         Rect {
@@ -65,7 +53,7 @@ impl<'a> OwnedStartupLayout<'a> {
 impl Renderable for OwnedStartupLayout<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let bottom = self.bottom_area(area);
-        let lines = self.header_lines(area.width);
+        let lines = self.pump.header.display_hyperlink_lines(area.width);
         let paragraph = HyperlinkParagraph::new(&lines, Style::default());
         let header = Rect {
             height: u16::try_from(paragraph.line_count(area.width))
@@ -111,7 +99,7 @@ impl Renderable for OwnedStartupLayout<'_> {
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        let lines = self.header_lines(width);
+        let lines = self.pump.header.display_hyperlink_lines(width);
         u16::try_from(HyperlinkParagraph::new(&lines, Style::default()).line_count(width))
             .unwrap_or(u16::MAX)
             .saturating_add(self.bottom.desired_height(width))

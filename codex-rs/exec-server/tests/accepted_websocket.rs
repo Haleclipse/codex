@@ -24,7 +24,7 @@ use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::ExecResponse;
 use codex_exec_server::ExecServerClientConnectOptions;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_exec_server::InitializeParams;
 use codex_exec_server::InitializeResponse;
 use codex_exec_server::ProcessId;
@@ -174,7 +174,7 @@ async fn accepted_websocket_interoperates_and_recovers_with_real_direct_executor
         http_client_factory.clone(),
     )?;
     let (codex_exe, codex_linux_sandbox_exe) = common::current_test_binary_helper_paths()?;
-    let runtime_paths = ExecServerRuntimePaths::new(codex_exe, codex_linux_sandbox_exe)?;
+    let runtime_paths = ExecServerRuntimeOptions::new(codex_exe, codex_linux_sandbox_exe)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let executor_task = AbortOnDropHandle::new(tokio::spawn(
         codex_exec_server::run_remote_environment_until_shutdown(

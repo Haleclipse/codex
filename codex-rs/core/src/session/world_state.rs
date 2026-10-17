@@ -218,7 +218,9 @@ impl Session {
                         .iter()
                         .any(|tool| tool == "send_user_message_async");
             world_state.add_section(PersistentModeState::new(
-                step_context.settings.effective_reasoning_effort().as_ref(),
+                turn_context.config.features.persistent_execution_enabled(
+                    step_context.settings.effective_reasoning_effort().as_ref(),
+                ),
                 model_messages.persistent_instructions(),
                 send_user_message_async_available,
             ));
@@ -290,6 +292,7 @@ impl Session {
             .iter()
             .map(|root| root.selected_root().clone())
             .collect::<Vec<_>>();
+        let previous_world_state = self.state.lock().await.history.world_state_checkpoint();
         for contributor in self.services.extensions.context_contributors() {
             for section in contributor
                 .contribute_world_state(WorldStateContributionInput {
@@ -305,6 +308,7 @@ impl Session {
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
+                    previous_world_state: previous_world_state.as_ref().map(|state| &state.state),
                 })
                 .await
             {

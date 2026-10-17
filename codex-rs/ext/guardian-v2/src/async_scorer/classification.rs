@@ -1,5 +1,5 @@
 //! Builds context and samples a captured observation in the background.
-//! Successful results require current authorization and a newer sample timestamp.
+//! Successful results require current authorization and review context and a newer sample timestamp.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -134,7 +134,7 @@ impl Classification {
             }
             None => None,
         };
-        let root_snapshot = if context_mode == GuardianContextMode::ThreadOwned {
+        let root_snapshot = if context_mode != GuardianContextMode::Legacy {
             root_snapshot
         } else {
             thread.guardian_root_snapshot().await
@@ -149,13 +149,19 @@ impl Classification {
             trusted_skills.record(path.clone());
         }
         let trusted_skill_paths = trusted_skills.into_paths();
+        let review_context_revision = history.guardian_review_context_revision();
         let root_authorization_version = root_snapshot
             .as_ref()
             .map(|snapshot| snapshot.authorization_version);
+        let root_review_context_revision = root_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.review_context_revision);
         let root_conversation = root_snapshot.map(|snapshot| snapshot.messages);
         let score_authorization = ScoreAuthorization {
             local: authorization_version,
+            review_context_revision,
             root: root_authorization_version,
+            root_review_context_revision,
             model: parent_model.clone(),
             ..score_authorization
         };
@@ -169,7 +175,9 @@ impl Classification {
             .iter()
             .filter(|review| {
                 review.authorization_version == authorization_version
+                    && review.review_context_revision == review_context_revision
                     && review.root_authorization_version == root_authorization_version
+                    && review.root_review_context_revision == root_review_context_revision
             })
             .map(|review| {
                 let review = render_review_evidence(ReviewEvidence {

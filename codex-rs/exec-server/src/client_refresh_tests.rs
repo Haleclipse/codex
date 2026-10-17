@@ -1,5 +1,8 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -13,7 +16,7 @@ use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::*;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::NoiseChannelIdentity;
 use crate::ProcessId;
 use crate::noise_relay::stream_handler::NoiseOutboundMessage;
@@ -49,6 +52,8 @@ struct Registry {
     target: Mutex<Target>,
     next_lookup: Mutex<Option<oneshot::Receiver<()>>>,
     lookup_started: Notify,
+    offline: AtomicBool,
+    calls: AtomicUsize,
 }
 
 impl Registry {
@@ -65,6 +70,14 @@ impl NoiseRendezvousConnectProvider for Registry {
         _: NoiseChannelPublicKey,
     ) -> BoxFuture<'_, Result<NoiseRendezvousConnectBundle, ExecServerError>> {
         Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.offline.load(Ordering::Relaxed) {
+                return Err(ExecServerError::EnvironmentRegistryHttp {
+                    status: http::StatusCode::CONFLICT,
+                    code: Some("environment_offline".to_owned()),
+                    message: "executor is still starting".to_owned(),
+                });
+            }
             let target = self.target.lock().unwrap().clone();
             let block = self.next_lookup.lock().unwrap().take();
             if let Some(block) = block {
@@ -148,7 +161,7 @@ impl Executor {
         validator: Validator,
         identity: NoiseChannelIdentity,
     ) -> Result<Self> {
-        let processor = ConnectionProcessor::new(ExecServerRuntimePaths::new(
+        let processor = ConnectionProcessor::new(ExecServerRuntimeOptions::new(
             std::env::current_exe()?,
             /*codex_linux_sandbox_exe*/ None,
         )?);
@@ -203,6 +216,8 @@ impl Executor {
             target: Mutex::new(self.target.clone()),
             next_lookup: Mutex::new(None),
             lookup_started: Notify::new(),
+            offline: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
         });
         let client = LazyRemoteExecServerClient::new(
             ExecServerTransportParams::NoiseRendezvous {
@@ -632,6 +647,63 @@ async fn superseded_refresh_lookup_does_not_retire_a_newer_session() -> Result<(
     assert!(Arc::ptr_eq(&replacement.inner, &client.get().await?.inner));
     assert!(!replacement.inner.retired.is_cancelled());
     replacement.environment_status().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provisioned_environment_waits_for_offline_executor_on_the_same_handle() -> Result<()> {
+    let _clock = freeze_clock();
+    let executor = Executor::start(Validator::default()).await?;
+    let (_, registry) = executor.client()?;
+    registry.offline.store(true, Ordering::Relaxed);
+    let manager = crate::EnvironmentManager::from_snapshot(
+        crate::environment_provider::EnvironmentProviderSnapshot {
+            environments: Vec::new(),
+            default: crate::environment_provider::EnvironmentDefault::Disabled,
+            include_local: false,
+        },
+        /*local_runtime_paths*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )?;
+    let environment = manager
+        .report_environment_provisioning_status(
+            "environment".to_owned(),
+            Ok(crate::EnvironmentReadyInfo::default()),
+            registry.clone(),
+        )?
+        .expect("provisioned environment");
+    let ready = environment.wait_until_ready();
+    let info = environment.info();
+    tokio::pin!(ready, info);
+    assert!(futures::poll!(ready.as_mut()).is_pending());
+    assert!(futures::poll!(info.as_mut()).is_pending());
+    assert_eq!(registry.calls.load(Ordering::Relaxed), 1);
+
+    // A restore can outlast both the ordinary registry retry count and deadline.
+    for _ in 0..35 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(futures::poll!(ready.as_mut()).is_pending());
+        assert!(futures::poll!(info.as_mut()).is_pending());
+    }
+    assert!(registry.calls.load(Ordering::Relaxed) > 5);
+    let reported = manager
+        .report_environment_provisioning_status(
+            "environment".to_owned(),
+            Ok(crate::EnvironmentReadyInfo::default()),
+            registry.clone(),
+        )?
+        .expect("same provisioned environment");
+    assert!(Arc::ptr_eq(&environment, &reported));
+    assert!(futures::poll!(ready.as_mut()).is_pending());
+    assert!(futures::poll!(info.as_mut()).is_pending());
+
+    registry.offline.store(false, Ordering::Relaxed);
+    tokio::time::advance(Duration::from_secs(8)).await;
+    let ((), _) = tokio::try_join!(ready, info)?;
+    assert_eq!(
+        environment.cached_executor_registration_id(),
+        Some(executor.target.registration.clone())
+    );
     Ok(())
 }
 

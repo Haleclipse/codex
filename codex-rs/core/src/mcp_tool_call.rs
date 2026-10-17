@@ -135,6 +135,7 @@ pub(crate) async fn handle_mcp_tool_call(
     prepared_call: Option<PreparedMcpCall>,
     hook_tool_name: HookToolName,
     invocation_tool_name: ToolName,
+    source: &crate::tools::context::ToolCallSource,
     arguments: String,
 ) -> HandledMcpToolCall {
     let turn_context = &step_context.turn;
@@ -306,6 +307,7 @@ pub(crate) async fn handle_mcp_tool_call(
                     prepared_call,
                     metadata,
                     item_metadata,
+                    source,
                     McpToolApprovalApplication::Apply {
                         decision,
                         policy: approval_policy,
@@ -383,6 +385,7 @@ pub(crate) async fn handle_mcp_tool_call(
         prepared_call,
         metadata,
         item_metadata,
+        source,
         McpToolApprovalApplication::NotRequired,
     )
     .await
@@ -397,6 +400,7 @@ pub(crate) struct HandledMcpToolCall {
 struct McpToolCallItemMetadata {
     connector_id: Option<String>,
     link_id: Option<String>,
+    mcp_app_resource_uri: Option<String>,
     mcp_app_ui: Option<McpAppUi>,
     app_name: Option<String>,
     action_name: Option<String>,
@@ -415,6 +419,8 @@ impl McpToolCallItemMetadata {
             connector_id: trusted_mcp_app_metadata
                 .and_then(|metadata| metadata.connector_id.clone()),
             link_id: trusted_mcp_app_metadata.and_then(|metadata| metadata.link_id.clone()),
+            mcp_app_resource_uri: metadata
+                .and_then(|metadata| metadata.mcp_app_resource_uri.clone()),
             mcp_app_ui: metadata.and_then(|metadata| metadata.mcp_app_ui.clone()),
             app_name: trusted_mcp_app_metadata.and_then(|metadata| metadata.connector_name.clone()),
             action_name: trusted_mcp_app_metadata
@@ -445,6 +451,7 @@ async fn handle_approved_mcp_tool_call(
     prepared_call: PreparedMcpCall,
     metadata: McpToolApprovalMetadata,
     item_metadata: McpToolCallItemMetadata,
+    source: &crate::tools::context::ToolCallSource,
     approval_application: McpToolApprovalApplication,
 ) -> HandledMcpToolCall {
     let turn_context = step_context.turn.as_ref();
@@ -542,6 +549,15 @@ async fn handle_approved_mcp_tool_call(
                 })
                 .await
                 .map_err(|error| format!("tool call error: {error:?}"))?;
+            crate::tools::record_confirmed_code_mode_send(
+                sess,
+                &turn_context.sub_id,
+                call_id,
+                source,
+                &prepared_call,
+                &tool_input,
+                &result,
+            );
             // Capture trusted server metadata before result callbacks or model-facing rewrites.
             elicitation_type = mcp_tool_call_auth_elicitation_type(&server, connector_id, &result);
             let mcp_tool = McpToolContext::from_prepared_call(
@@ -1025,10 +1041,7 @@ async fn notify_mcp_tool_call_started(
         tool,
         arguments: arguments.unwrap_or(JsonValue::Null),
         connector_id: item_metadata.connector_id,
-        mcp_app_resource_uri: item_metadata
-            .mcp_app_ui
-            .as_ref()
-            .map(|ui| ui.resource_uri.clone()),
+        mcp_app_resource_uri: item_metadata.mcp_app_resource_uri,
         mcp_app_ui: item_metadata.mcp_app_ui,
         link_id: item_metadata.link_id,
         app_name: item_metadata.app_name,
@@ -1074,10 +1087,7 @@ async fn notify_mcp_tool_call_completed(
         tool,
         arguments: arguments.unwrap_or(JsonValue::Null),
         connector_id: item_metadata.connector_id,
-        mcp_app_resource_uri: item_metadata
-            .mcp_app_ui
-            .as_ref()
-            .map(|ui| ui.resource_uri.clone()),
+        mcp_app_resource_uri: item_metadata.mcp_app_resource_uri,
         mcp_app_ui: item_metadata.mcp_app_ui,
         link_id: item_metadata.link_id,
         app_name: item_metadata.app_name,
@@ -1201,6 +1211,7 @@ pub(crate) struct McpToolApprovalMetadata {
     plugin_id: Option<String>,
     tool_title: Option<String>,
     tool_description: Option<String>,
+    mcp_app_resource_uri: Option<String>,
     mcp_app_ui: Option<McpAppUi>,
     codex_apps_meta: Option<serde_json::Map<String, serde_json::Value>>,
     openai_file_input_optional_fields: Option<HashMap<String, Vec<String>>>,
@@ -1664,6 +1675,7 @@ pub(crate) async fn request_mcp_tool_user_approval(
             plugin_id: None,
             tool_title: tool_title.clone(),
             tool_description: tool_description.clone(),
+            mcp_app_resource_uri: None,
             mcp_app_ui: None,
             codex_apps_meta: None,
             openai_file_input_optional_fields: None,
@@ -1821,7 +1833,8 @@ fn mcp_tool_metadata(
         None
     };
 
-    let mcp_app_ui = get_mcp_app_resource_uri(tool_info.tool.meta.as_deref()).map(|resource_uri| {
+    let mcp_app_resource_uri = get_mcp_app_resource_uri(tool_info.tool.meta.as_deref());
+    let mcp_app_ui = mcp_app_resource_uri.as_ref().and_then(|resource_uri| {
         let preferred_model_display_mode = match tool_info
             .tool
             .meta
@@ -1830,13 +1843,14 @@ fn mcp_tool_metadata(
             .and_then(|ui| ui.get("preferredModelDisplayMode"))
             .and_then(serde_json::Value::as_str)
         {
+            Some("inline") => McpAppDisplayMode::Inline,
             Some("fullscreen") => McpAppDisplayMode::Fullscreen,
-            _ => McpAppDisplayMode::Inline,
+            _ => return None,
         };
-        McpAppUi {
-            resource_uri,
+        Some(McpAppUi {
+            resource_uri: resource_uri.clone(),
             preferred_model_display_mode,
-        }
+        })
     });
 
     Ok(McpToolApprovalMetadata {
@@ -1849,6 +1863,7 @@ fn mcp_tool_metadata(
         plugin_id: plugin_id.map(str::to_string),
         tool_title: tool_info.tool.title,
         tool_description: tool_info.tool.description.map(std::borrow::Cow::into_owned),
+        mcp_app_resource_uri,
         mcp_app_ui,
         codex_apps_meta,
         // Disallow custom MCPs from uploading files via fileParams.

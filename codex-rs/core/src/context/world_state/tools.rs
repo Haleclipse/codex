@@ -1,18 +1,25 @@
+//! Bounded deferred namespace summaries that reserve names before descriptions.
+//! Rendering allocations do not change the persisted namespace snapshot.
+
+use self::budget::DESCRIPTION_TRUNCATION_SUFFIX;
+use self::budget::truncate_namespace_rows;
 use super::PreviousSectionState;
 use super::WorldStateContextFragment;
 use super::WorldStateSection;
 use crate::context::ContextualUserFragment;
-use crate::context::environment_context::push_xml_escaped_text;
 use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::RenderedWorldStateFragment;
-use codex_otel::CONTEXT_FRAGMENT_BYTES_BUCKETS;
 use codex_otel::THREAD_TOOLS_FRAGMENT_BYTES_METRIC;
+use codex_otel::THREAD_TOOLS_METRIC_BUCKETS;
 use codex_otel::THREAD_TOOLS_NAMESPACES_TOTAL_METRIC;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::protocol::TOOLS_CLOSE_TAG;
 use codex_protocol::protocol::TOOLS_OPEN_TAG;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+#[path = "tools_budget.rs"]
+mod budget;
 
 const MAX_RENDERED_FRAGMENT_BYTES: usize = 4 * 1024;
 const MAX_NAMESPACE_DESCRIPTION_CHARS: usize = 250;
@@ -44,14 +51,27 @@ impl ToolsState {
             deferred_namespaces: deferred_namespaces
                 .into_iter()
                 .map(|(namespace, description)| {
-                    let description = description
+                    let mut characters = description
                         .lines()
                         .next()
                         .unwrap_or_default()
                         .trim()
-                        .chars()
+                        .chars();
+                    let mut description = characters
+                        .by_ref()
                         .take(MAX_NAMESPACE_DESCRIPTION_CHARS)
-                        .collect();
+                        .collect::<String>();
+                    if characters.next().is_some() {
+                        let prefix_bytes = description
+                            .char_indices()
+                            .nth(
+                                MAX_NAMESPACE_DESCRIPTION_CHARS
+                                    - DESCRIPTION_TRUNCATION_SUFFIX.len(),
+                            )
+                            .map_or(description.len(), |(index, _)| index);
+                        description.truncate(prefix_bytes);
+                        description.push_str(DESCRIPTION_TRUNCATION_SUFFIX);
+                    }
                     (namespace, description)
                 })
                 .collect(),
@@ -141,10 +161,17 @@ fn render_namespace_groups(
         + groups
             .iter()
             .filter(|(_, namespaces)| !namespaces.is_empty())
-            .map(|(label, _)| label.len() + ":\n".len() + OMITTED_LINE_RESERVE_BYTES)
+            .map(|(label, _)| label.len() + ":\n".len())
             .sum::<usize>()
         + empty_state.map_or(0, str::len);
-    let mut remaining_entry_bytes = body_budget.saturating_sub(fixed_bytes);
+    let entry_budget = body_budget.saturating_sub(fixed_bytes);
+    let omission_reserve_bytes = groups
+        .iter()
+        .filter(|(_, namespaces)| !namespaces.is_empty())
+        .count()
+        * OMITTED_LINE_RESERVE_BYTES;
+    let mut entries =
+        truncate_namespace_rows(groups, entry_budget, omission_reserve_bytes).into_iter();
     let mut rendered = "\n".to_string();
     let mut before = FragmentSize {
         namespaces: 0,
@@ -161,11 +188,12 @@ fn render_namespace_groups(
         before.namespaces += namespaces.len();
         before.bytes += label.len() + ":\n".len();
         let mut omitted = 0usize;
-        for (namespace, description) in *namespaces {
-            let entry = rendered_namespace(namespace, description);
-            before.bytes += entry.len();
-            if entry.len() <= remaining_entry_bytes {
-                remaining_entry_bytes -= entry.len();
+        for ((namespace, description), entry) in namespaces.iter().zip(entries.by_ref()) {
+            before.bytes += "- ".len() + namespace.len() + "\n".len();
+            if !description.is_empty() {
+                before.bytes += ": ".len() + description.len();
+            }
+            if let Some(entry) = entry {
                 rendered.push_str(&entry);
             } else {
                 omitted += 1;
@@ -191,17 +219,6 @@ fn render_namespace_groups(
     }
 }
 
-fn rendered_namespace(namespace: &str, description: &str) -> String {
-    let mut rendered = "- ".to_string();
-    push_xml_escaped_text(&mut rendered, namespace);
-    if !description.is_empty() {
-        rendered.push_str(": ");
-        push_xml_escaped_text(&mut rendered, description);
-    }
-    rendered.push('\n');
-    rendered
-}
-
 // Measures the rendered namespace block before/after the byte cap, after description normalization.
 fn record_fragment_metrics(
     metrics: &dyn ExtensionMetrics,
@@ -214,15 +231,16 @@ fn record_fragment_metrics(
     };
     for (stage, size) in [("before", &rendered.before), ("after", &rendered.after)] {
         let tags = [("stage", stage), ("kind", kind)];
-        metrics.histogram(
+        metrics.histogram_with_boundaries(
             THREAD_TOOLS_NAMESPACES_TOTAL_METRIC,
             i64::try_from(size.namespaces).unwrap_or(i64::MAX),
+            THREAD_TOOLS_METRIC_BUCKETS.as_slice(),
             &tags,
         );
         metrics.histogram_with_boundaries(
             THREAD_TOOLS_FRAGMENT_BYTES_METRIC,
             i64::try_from(size.bytes).unwrap_or(i64::MAX),
-            CONTEXT_FRAGMENT_BYTES_BUCKETS,
+            THREAD_TOOLS_METRIC_BUCKETS.as_slice(),
             &tags,
         );
     }

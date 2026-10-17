@@ -60,6 +60,9 @@ pub struct ListMcpServerStatusParams {
     pub detail: Option<McpServerStatusDetail>,
     #[ts(optional = nullable)]
     pub thread_id: Option<String>,
+    /// Limit discovery to one server. With a thread ID, reuse that thread's MCP connection.
+    #[ts(optional = nullable)]
+    pub server_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]

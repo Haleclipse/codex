@@ -4,7 +4,7 @@ expression: "normalize_snapshot_paths(normalize_agent_center_snapshot(snapshots.
 ---
 80 columns
 
-  >_ OpenAI Codex (v0.158.0)
+  >_ OpenAI Codex (v0.159.0)
      /tmp/project
 
   Pull up a prompt.
@@ -26,7 +26,7 @@ expression: "normalize_snapshot_paths(normalize_agent_center_snapshot(snapshots.
 
 32 columns
 
-  >_ OpenAI Codex (v0.158.0)
+  >_ OpenAI Codex (v0.159.0)
      /tmp/project
 
   Pull up a prompt.

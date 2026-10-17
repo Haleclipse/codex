@@ -68,6 +68,7 @@ enum EvidenceSize {
 enum CheckpointReuse {
     Enabled,
     Disabled,
+    Independent,
 }
 
 #[derive(Clone, Copy)]
@@ -79,6 +80,8 @@ enum ReviewCheckpoint {
     EmptyReviewerHash,
 }
 
+#[test_case(CheckpointReuse::Independent, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "independent transcript ignores incompatible checkpoints")]
+#[test_case(CheckpointReuse::Independent, Some("matching"), Some("matching"), 0, EvidenceSize::Normal, ReviewCheckpoint::Valid; "independent transcript overrides Luna checkpoint reuse")]
 #[test_case(CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::EmptyContent; "empty checkpoint fails closed")]
 #[test_case(CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::DifferentReviewerHash; "different sync hash preserves retained evidence")]
 #[test_case(CheckpointReuse::Enabled, Some("matching"), Some("different"), 0, EvidenceSize::Normal, ReviewCheckpoint::UnknownReviewer; "unknown sync hash preserves retained evidence")]
@@ -107,10 +110,11 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
     const RESTRICTION: &str = "Only publish to a private repository.";
     const EVIDENCE: &str = "repository is private";
     const SUMMARY: &str = "Repository inspection was summarized.";
-    let reuse_parent_compaction = matches!(checkpoint_reuse, CheckpointReuse::Enabled);
+    let reuse_parent_compaction = !matches!(checkpoint_reuse, CheckpointReuse::Disabled);
     let compatible =
         reuse_parent_compaction && parent_hash == Some("matching") && luna_hash == parent_hash;
-    let requires_sync = !compatible;
+    let independent = matches!(checkpoint_reuse, CheckpointReuse::Independent);
+    let requires_sync = !compatible && !independent;
     let oversized_instruction = matches!(evidence_size, EvidenceSize::OversizedInstruction);
     let reviewer_hash = match review_checkpoint {
         ReviewCheckpoint::DifferentReviewerHash => Some("different-reviewer"),
@@ -260,10 +264,14 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
         .enable_feature(Feature::GuardianApproval)
         .disable_feature(Feature::EnableRequestCompression)
         .disable_feature(Feature::TokenBudget)
-        .disable_feature(Feature::GuardianReuseParentCompaction)
         .with_extra_config(&format!(
             "[mcp_servers.{TEST_SERVER_NAME}]\nurl = \"{mcp_url}/mcp\"\ndefault_tools_approval_mode = \"prompt\"\n\n[features.guardianv2]\nenabled = true\npersist_scores = true\nreuse_parent_compaction = {reuse_parent_compaction}\n\n[features.guardianv2.review_scope]\ncomputer_use_only = false"
         ));
+    let mock_config = if independent {
+        mock_config.disable_feature(Feature::GuardianReuseParentCompaction)
+    } else {
+        mock_config
+    };
     mock_config.write(codex_home.path())?;
     let config = load_default_config_for_test(&codex_home).await;
     let models = [
@@ -524,8 +532,11 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
             let review = &reviews[index];
             let sync_input = review["input"].as_array().expect("request input array");
             let async_input = request["input"].as_array().expect("request input array");
-            assert_eq!(sync_input.contains(&checkpoint), index > 0);
-            assert_eq!(async_input.contains(&checkpoint), index > 0 && compatible);
+            assert_eq!(sync_input.contains(&checkpoint), index > 0 && !independent);
+            assert_eq!(
+                async_input.contains(&checkpoint),
+                index > 0 && compatible && !independent
+            );
             let sync_text = sync_input
                 .iter()
                 .filter(|item| item["role"] == "user")
@@ -560,9 +571,10 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                 }));
                 {
                     assert!(sync_text.contains(RESTRICTION));
-                    assert!(
-                        !sync_text.contains(&expected_output),
-                        "raw tool result must not survive the parent checkpoint"
+                    assert_eq!(
+                        sync_text.contains(&expected_output),
+                        independent,
+                        "only independent review retains raw tool evidence"
                     );
                     assert!(sync_text.contains(">>> TRANSCRIPT START"));
                     assert!(!sync_text.contains(">>> TRANSCRIPT DELTA START"));
@@ -590,9 +602,10 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                         content.contains(RESTRICTION),
                         "retained instruction must survive"
                     );
-                    assert!(
-                        !transcript.contains(&expected_output),
-                        "raw tool result must not survive the parent checkpoint"
+                    assert_eq!(
+                        transcript.contains(&expected_output),
+                        independent,
+                        "only independent scoring retains raw tool evidence"
                     );
                     assert!(transcript.contains(RESTRICTION));
                     assert!(!transcript.contains(SUMMARY));
@@ -681,7 +694,11 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
     {
         if line["type"] == "compacted" {
-            assert!(line["payload"]["guardian_history"].is_null());
+            let saved_review = &line["payload"]["guardian_history"];
+            assert_eq!(saved_review.is_null(), !independent);
+            if independent {
+                assert!(saved_review.to_string().contains(EVIDENCE));
+            }
         }
     }
     let items = rollout

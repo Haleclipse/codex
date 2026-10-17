@@ -1,13 +1,15 @@
 //! Reviewer policy carried by each history snapshot.
-//! Unknown or incompatible checkpoints keep legacy review alongside retained user evidence.
+//! Independent review retains its own transcript; other modes select checkpoint compatibility.
 
 use codex_extension_api::ConversationHistorySnapshot;
 use codex_history::ResponseItemEnvelope;
 
-/// Selects checkpoint compatibility review or thread-owned evidence.
+/// Selects checkpoint-based, legacy, or independent reviewer history.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum GuardianContextMode {
     Legacy,
+    /// Thread-owned authorization with a transcript independent of parent compaction.
+    Independent,
     #[default]
     ThreadOwned,
 }
@@ -15,7 +17,9 @@ pub enum GuardianContextMode {
 impl GuardianContextMode {
     /// Read reviewer policy from the same snapshot as its evidence, including delayed reviews.
     pub fn from_history(history: &dyn ConversationHistorySnapshot) -> Self {
-        if history.uses_parent_context_for_review() {
+        if history.uses_independent_review_history() {
+            Self::Independent
+        } else if history.uses_parent_context_for_review() {
             Self::ThreadOwned
         } else {
             Self::Legacy

@@ -1,5 +1,6 @@
 use crate::connect_policy::TargetCheckedTcpConnector;
 use crate::connect_policy::is_non_public_target;
+use crate::policy::is_private_network_ip;
 use crate::state::NetworkProxyState;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use rama_core::Layer;
@@ -18,6 +19,7 @@ use rama_http::layer::version_adapter::RequestVersionAdapter;
 use rama_http_backend::client::HttpClientService;
 use rama_http_backend::client::HttpConnector;
 use rama_http_backend::client::proxy::layer::HttpProxyConnectorLayer;
+use rama_net::address::Host;
 use rama_net::address::HostWithPort;
 use rama_net::address::ProxyAddress;
 use rama_net::client::EstablishedClientConnection;
@@ -39,14 +41,20 @@ struct ProxyConfig {
     http: Option<ProxyAddress>,
     https: Option<ProxyAddress>,
     all: Option<ProxyAddress>,
+    proxy_private_ips_via_upstream: bool,
 }
 
 impl ProxyConfig {
-    fn from_env() -> Self {
+    fn from_env(proxy_private_ips_via_upstream: bool) -> Self {
         let http = read_proxy_env(&["HTTP_PROXY", "http_proxy"]);
         let https = read_proxy_env(&["HTTPS_PROXY", "https_proxy"]);
         let all = read_proxy_env(&["ALL_PROXY", "all_proxy"]);
-        Self { http, https, all }
+        Self {
+            http,
+            https,
+            all,
+            proxy_private_ips_via_upstream,
+        }
     }
 
     fn proxy_for_protocol(&self, is_secure: bool) -> Option<ProxyAddress> {
@@ -61,7 +69,9 @@ impl ProxyConfig {
     }
 
     fn proxy_for_target(&self, target: &HostWithPort, is_secure: bool) -> Option<ProxyAddress> {
-        if is_non_public_target(&target.host) {
+        let proxy_private_ip = self.proxy_private_ips_via_upstream
+            && matches!(&target.host, Host::Address(ip) if is_private_network_ip(*ip));
+        if is_non_public_target(&target.host) && !proxy_private_ip {
             return None;
         }
         self.proxy_for_protocol(is_secure)
@@ -97,8 +107,12 @@ fn read_proxy_env(keys: &[&str]) -> Option<ProxyAddress> {
     None
 }
 
-pub(crate) fn proxy_for_connect(target: &HostWithPort) -> Option<ProxyAddress> {
-    ProxyConfig::from_env().proxy_for_target(target, /*is_secure*/ true)
+pub(crate) fn proxy_for_connect(
+    target: &HostWithPort,
+    state: &NetworkProxyState,
+) -> Option<ProxyAddress> {
+    ProxyConfig::from_env(state.proxy_private_ips_via_upstream)
+        .proxy_for_target(target, /*is_secure*/ true)
 }
 
 #[derive(Clone)]
@@ -122,7 +136,7 @@ impl UpstreamClient {
 
     pub(crate) fn from_env_proxy(state: Arc<NetworkProxyState>) -> Self {
         Self::new(
-            ProxyConfig::from_env(),
+            ProxyConfig::from_env(state.proxy_private_ips_via_upstream),
             TargetCheckedTcpConnector::new(state),
             client_root_certs(),
         )
@@ -144,7 +158,7 @@ impl UpstreamClient {
         tls_root_store: Arc<rustls::RootCertStore>,
     ) -> Self {
         Self::new(
-            ProxyConfig::from_env(),
+            ProxyConfig::from_env(state.proxy_private_ips_via_upstream),
             TargetCheckedTcpConnector::new(state),
             tls_root_store,
         )

@@ -72,6 +72,103 @@ use wiremock::matchers::path;
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Selected status reads return the thread's tools without repeating MCP discovery.
+#[tokio::test]
+async fn mcp_server_status_list_reuses_thread_connection() -> Result<()> {
+    let server = MockServer::start().await;
+    let tool = json!({
+        "name": "open_widget",
+        "title": "Open widget",
+        "inputSchema": { "type": "object" },
+        "_meta": { "ui": { "resourceUri": "ui://widget.html" } }
+    });
+    let response_tool = tool.clone();
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(move |request: &wiremock::Request| {
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match request["method"].as_str() {
+                Some("initialize") => json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "widget", "version": "1.0.0" }
+                }),
+                Some("tools/list") => json!({ "tools": [response_tool.clone()] }),
+                Some("resources/list") => json!({ "resources": [] }),
+                Some("resources/templates/list") => json!({ "resourceTemplates": [] }),
+                _ => return ResponseTemplate::new(202),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": request["id"], "result": result
+            }))
+        })
+        .mount(&server)
+        .await;
+    let codex_home = TempDir::new()?;
+    mock_responses_config(&server.uri())
+        .with_extra_config(&format!(
+            "[mcp_servers.widget]\nurl = \"{}/mcp\"",
+            server.uri()
+        ))
+        .write(codex_home.path())?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let thread = app.start_thread(ThreadStartParams::default()).await?.thread;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        app.read_stream_until_matching_notification("widget MCP ready", |notification| {
+            notification.method == "mcpServer/startupStatus/updated"
+                && notification.params.as_ref().is_some_and(|params| {
+                    params["threadId"] == thread.id
+                        && params["name"] == "widget"
+                        && params["status"] == "ready"
+                })
+        }),
+    )
+    .await??;
+
+    for detail in [
+        McpServerStatusDetail::ToolsAndAuthOnly,
+        McpServerStatusDetail::Full,
+    ] {
+        let response: ListMcpServerStatusResponse = app
+            .request(|request_id| ClientRequest::McpServerStatusList {
+                request_id,
+                params: ListMcpServerStatusParams {
+                    thread_id: Some(thread.id.clone()),
+                    server_name: Some("widget".to_string()),
+                    detail: Some(detail),
+                    cursor: None,
+                    limit: None,
+                },
+            })
+            .await?;
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].name, "widget");
+        assert_eq!(
+            response.data[0].tools,
+            std::collections::HashMap::from([(
+                "open_widget".to_string(),
+                serde_json::from_value(tool.clone())?
+            )])
+        );
+        assert_eq!(response.next_cursor, None);
+    }
+    let discovery_methods: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter_map(|request| request["method"].as_str().map(str::to_owned))
+        .filter(|method| matches!(method.as_str(), "initialize" | "tools/list"))
+        .collect();
+    assert_eq!(discovery_methods, ["initialize", "tools/list"]);
+    Ok(())
+}
+
 #[test_case(false, None, None, None, None, true; "legacy callback")]
 #[test_case(
     false,
@@ -555,6 +652,7 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(McpServerStatusDetail::Full),
@@ -644,6 +742,7 @@ async fn mcp_server_status_list_returns_raw_server_and_tool_names(plugin: bool) 
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: None,
@@ -750,6 +849,7 @@ MCP_TEST_PID_FILE = {}
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
@@ -763,6 +863,7 @@ MCP_TEST_PID_FILE = {}
     std::fs::remove_file(&barrier_file)?;
     let second_request_id = mcp
         .send_list_mcp_server_status_request(ListMcpServerStatusParams {
+            server_name: None,
             cursor: None,
             limit: None,
             detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
@@ -826,6 +927,7 @@ url = "{mcp_server_url}/mcp"
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
@@ -839,6 +941,7 @@ url = "{mcp_server_url}/mcp"
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
@@ -894,6 +997,7 @@ async fn mcp_server_status_list_reports_thread_runtime_connections() -> Result<(
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
@@ -932,6 +1036,7 @@ async fn mcp_server_status_list_reports_thread_runtime_connections() -> Result<(
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
@@ -1015,6 +1120,7 @@ async fn mcp_server_status_list_reports_disconnected_stdio_transport() -> Result
                     .request(|request_id| ClientRequest::McpServerStatusList {
                         request_id,
                         params: ListMcpServerStatusParams {
+                            server_name: None,
                             cursor: None,
                             limit: None,
                             detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
@@ -1062,6 +1168,7 @@ async fn mcp_server_status_retains_capabilities_when_tool_discovery_fails() -> R
             .request(|request_id| ClientRequest::McpServerStatusList {
                 request_id,
                 params: ListMcpServerStatusParams {
+                    server_name: None,
                     cursor: None,
                     limit: None,
                     detail,
@@ -1216,6 +1323,7 @@ async fn mcp_server_status_list_tools_and_auth_only_skips_slow_inventory_calls()
 
     let request_id = mcp
         .send_list_mcp_server_status_request(ListMcpServerStatusParams {
+            server_name: None,
             cursor: None,
             limit: None,
             detail: Some(McpServerStatusDetail::ToolsAndAuthOnly),
@@ -1270,6 +1378,7 @@ url = "{underscore_server_url}/mcp"
         .request(|request_id| ClientRequest::McpServerStatusList {
             request_id,
             params: ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: None,

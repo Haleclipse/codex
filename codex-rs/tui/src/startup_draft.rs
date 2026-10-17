@@ -11,8 +11,6 @@ use tokio::time::Instant;
 
 use crossterm::SynchronizedUpdate;
 use ratatui::layout::Size;
-use ratatui::style::Modifier;
-use ratatui::style::Style;
 use ratatui::style::Stylize;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::unbounded_channel;
@@ -468,17 +466,14 @@ impl StartupDraftPump {
 }
 
 fn startup_session_header(config: Option<&Config>) -> Box<dyn HistoryCell> {
-    let placeholder_style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
     let directory = config.map_or_else(
         || PathBuf::from("loading"),
         |config| config.cwd.to_path_buf(),
     );
     Box::new(
-        history_cell::SessionHeaderHistoryCell::new_with_style(
+        history_cell::SessionHeaderHistoryCell::new(
             "loading".to_string(),
-            placeholder_style,
             /*reasoning_effort*/ None,
-            /*show_fast_status*/ false,
             directory,
             CODEX_CLI_VERSION,
         )

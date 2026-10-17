@@ -33,7 +33,7 @@ use crate::EnvironmentRegistryHarnessKeyValidationResponse;
 use crate::EnvironmentRegistryRegistrationRequest;
 use crate::EnvironmentRegistryRegistrationResponse;
 use crate::ExecServerError;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ExecServerTelemetry;
 use crate::NoiseChannelIdentity;
 use crate::NoiseChannelPublicKey;
@@ -603,7 +603,7 @@ impl RemoteEnvironmentConfig {
 /// conflict refreshes the registration; other permanent client errors stop the runner.
 pub async fn run_remote_environment(
     config: RemoteEnvironmentConfig,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
 ) -> Result<(), ExecServerError> {
     run_remote_environment_until_shutdown(config, runtime_paths, std::future::pending()).await
 }
@@ -613,7 +613,7 @@ pub async fn run_remote_environment(
 /// Active sessions and their processes are drained before this function returns.
 pub async fn run_remote_environment_until_shutdown<F>(
     config: RemoteEnvironmentConfig,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     shutdown: F,
 ) -> Result<(), ExecServerError>
 where

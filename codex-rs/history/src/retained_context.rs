@@ -152,6 +152,12 @@ pub enum RetainedContextEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         acceptance_order: Option<u64>,
     },
+    /// Assistant context confirmed by a messaging tool and never user authorization.
+    DeliveredAssistantMessage {
+        #[serde(flatten)]
+        message: RetainedUserMessage,
+        acceptance_order: u64,
+    },
 }
 
 /// Bounded snapshot of retained families, persisted with the parent compaction checkpoint.
@@ -226,6 +232,7 @@ impl RetainedContextEvent {
                         .truncate(answer.call_id.floor_char_boundary(1_024));
                 }
             }
+            Self::DeliveredAssistantMessage { message, .. } => message.bound(),
         }
     }
 }
@@ -460,9 +467,27 @@ impl RetainedContext {
                     &mut self.verified_answers,
                     &mut self.verified_answers_incomplete,
                 );
+                true
+            }
+            RetainedContextEvent::DeliveredAssistantMessage {
+                message,
+                acceptance_order,
+            } => {
+                if self.assistant_messages.iter().any(|entry| {
+                    message.message_id.is_some()
+                        && entry.value.message_id == message.message_id
+                        && entry.value == message
+                        && !entry.inherited
+                }) {
+                    return false;
+                }
+                self.record_assistant_message(
+                    message,
+                    RetainedInputSource::Local(Some(acceptance_order)),
+                );
+                true
             }
         }
-        true
     }
 
     /// Restoring a saved thread must not bypass the live storage limits.
@@ -479,7 +504,9 @@ impl RetainedContext {
                 acceptance_order: Some(entry.order),
             };
             event.bound();
-            let RetainedContextEvent::VerifiedAnswer { answer, .. } = event;
+            let RetainedContextEvent::VerifiedAnswer { answer, .. } = event else {
+                unreachable!("verified answer constructed above");
+            };
             entry.value = answer;
             self.next_order = self.next_order.max(entry.order.saturating_add(1));
         }

@@ -3,6 +3,9 @@
 //! Mutable cells refresh each frame, then share that frame's layout across measurement and paint.
 //! Stable cells also invalidate when animation ticks, syntax themes, or terminal colors change.
 
+use crate::history_cell::ActivityDisclosure;
+use crate::key_hint::ShortcutHint;
+use crate::keymap::KeymapContext;
 use std::sync::Weak;
 
 use super::*;
@@ -14,7 +17,7 @@ const MAX_CACHED_TEXT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) struct ActivityTranscriptLines {
     pub(crate) activity: Vec<HyperlinkLine>,
     pub(crate) auxiliary: Vec<HyperlinkLine>,
-    pub(crate) has_hidden_details: bool,
+    pub(crate) disclosure: Option<ActivityDisclosure>,
 }
 
 /// Keep disclosure controls outside selectable source without rendering hidden details.
@@ -22,8 +25,9 @@ pub(super) fn activity_layout(
     mut lines: ActivityTranscriptLines,
     width: u16,
     expanded: bool,
+    shortcut: Option<ShortcutHint>,
 ) -> TextLayout {
-    let has_details = !lines.activity.is_empty() && (expanded || lines.has_hidden_details);
+    let has_details = !lines.activity.is_empty() && (expanded || lines.disclosure.is_some());
     let source_offset = (!lines.auxiliary.is_empty())
         .then(|| TextLayout::new(lines.activity.clone(), width).text().len());
     lines.activity.extend(lines.auxiliary);
@@ -31,12 +35,22 @@ pub(super) fn activity_layout(
     if !has_details {
         return layout;
     }
-    let label = if expanded {
-        "− Show less"
-    } else {
-        "+ Show details"
-    }
-    .to_owned();
+    let label = match (expanded, lines.disclosure) {
+        (true, _) => "− Show less".to_owned(),
+        (false, Some(ActivityDisclosure::OutputLines(count))) => {
+            let noun = if count == 1 { "line" } else { "lines" };
+            let mut label = format!("+ {count} {noun}");
+            if let Some(shortcut) = shortcut {
+                let hint = format!(" ({} to expand)", shortcut.display_label());
+                let indent = usize::from(width / 4).min(/*other*/ 4);
+                if Line::from(format!("{label}{hint}")).width() + indent <= usize::from(width) {
+                    label.push_str(&hint);
+                }
+            }
+            label
+        }
+        (false, Some(ActivityDisclosure::Generic) | None) => "+ Show details".to_owned(),
+    };
     match source_offset {
         Some(offset) => layout.with_disclosure_control_at(label, offset),
         None => layout.with_disclosure_control(label),
@@ -141,6 +155,10 @@ impl TranscriptView {
             expanded,
             disclosure,
         };
+        let shortcut = self
+            .disclosure
+            .keymap
+            .primary_hint(KeymapContext::Global, "open_transcript");
         Some(self.cache.get(cell, width, presentation, || {
             if disclosure {
                 activity_layout(
@@ -151,10 +169,11 @@ impl TranscriptView {
                             cell.compact_hyperlink_lines(width)
                         },
                         auxiliary: Vec::new(),
-                        has_hidden_details: cell.has_hidden_activity_details(width),
+                        disclosure: cell.activity_disclosure(width),
                     },
                     width,
                     expanded,
+                    shortcut,
                 )
             } else {
                 TextLayout::new(

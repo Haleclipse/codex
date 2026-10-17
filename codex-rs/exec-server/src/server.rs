@@ -20,14 +20,14 @@ pub use request_dispatcher::RequestDispatchMode;
 pub use transport::DEFAULT_LISTEN_URL;
 pub use transport::ExecServerListenUrlParseError;
 
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ExecServerTelemetry;
 use codex_http_client::HttpClientFactory;
 use codex_websocket_auth::WebsocketAuthSettings;
 
 pub async fn run_main(
     listen_url: &str,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     http_client_factory: HttpClientFactory,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     run_main_with_telemetry(
@@ -48,7 +48,7 @@ pub async fn run_main(
 )]
 pub async fn run_main_with_telemetry(
     listen_url: &str,
-    runtime_paths: ExecServerRuntimePaths,
+    runtime_paths: ExecServerRuntimeOptions,
     telemetry: ExecServerTelemetry,
     http_client_factory: HttpClientFactory,
     request_dispatch_mode: RequestDispatchMode,
@@ -77,7 +77,7 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::run_main_with_telemetry;
-    use crate::ExecServerRuntimePaths;
+    use crate::ExecServerRuntimeOptions;
     use crate::ExecServerTelemetry;
 
     #[tokio::test]
@@ -93,7 +93,7 @@ mod tests {
             tracing::callsite::rebuild_interest_cache();
             run_main_with_telemetry(
                 "invalid",
-                ExecServerRuntimePaths::new(
+                ExecServerRuntimeOptions::new(
                     std::env::current_exe().expect("current executable"),
                     /*codex_linux_sandbox_exe*/ None,
                 )

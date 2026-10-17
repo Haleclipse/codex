@@ -222,7 +222,9 @@ impl MathParser<'_> {
         let name = &self.remaining[..length];
         self.remaining = &self.remaining[length..];
         match name {
-            "sum" if self.stack_annotations => self.display_sum(),
+            "sum" | "bigwedge" if self.stack_annotations => {
+                self.display_operator(if name == "sum" { "∑" } else { "⋀" })
+            }
             "begin" | "boxed" | "underset" | "overset" | "substack" | "mathcal" => {
                 self.structured_command(name)
             }
@@ -313,7 +315,7 @@ impl MathParser<'_> {
                 self.remaining = &self.remaining[end + 1..];
                 Some(Layout::text(text))
             }
-            "left" | "right" => {
+            "left" | "right" | "bigl" | "bigr" => {
                 self.remaining = self.remaining.trim_start();
                 match self.take()? {
                     '.' => Some(Layout::text("")),
@@ -443,6 +445,7 @@ fn symbol(name: &str) -> Option<&'static str> {
         "cap" => "∩",
         "bigcup" => "⋃",
         "bigcap" => "⋂",
+        "bigwedge" => "⋀",
         "setminus" => "∖",
         "emptyset" | "varnothing" => "∅",
         "land" | "wedge" => "∧",

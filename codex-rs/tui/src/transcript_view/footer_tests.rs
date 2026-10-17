@@ -414,7 +414,7 @@ fn activity_focus_keeps_controls_without_passive_hints() {
                     cell.compact_hyperlink_lines(width)
                 },
                 auxiliary: Vec::new(),
-                has_hidden_details: true,
+                disclosure: cell.activity_disclosure(width),
             })
         });
         render(view, &[])

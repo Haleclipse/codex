@@ -1,6 +1,6 @@
 ---
 source: tui/src/startup_draft_tests.rs
-assertion_line: 148
+assertion_line: 154
 expression: "snapshots.join(\"\\n---\\n\")"
 ---
 empty (48 columns):
@@ -19,8 +19,6 @@ resuming (48 columns):
 
   >_ OpenAI Codex (v<VERSION>)
      loading
-
-  Pull up a prompt.
   Resuming session…
 
 › Ask Codex to do anything
@@ -31,8 +29,6 @@ forking (48 columns):
 
   >_ OpenAI Codex (v<VERSION>)
      loading
-
-  Pull up a prompt.
   Forking session…
 
 › draft while loading

@@ -569,12 +569,26 @@ pub enum ThreadStoreToml {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct AutoReviewToml {
+    /// Controls whether circuit-breaker interruptions include a structured error.
+    /// Strict mode writes structured errors that older clients may not
+    /// recognize when reading shared history. Defaults to `default`.
+    pub circuit_break_action: Option<CircuitBreakAction>,
     /// Additional policy instructions inserted into the guardian prompt.
     pub policy: Option<String>,
     /// Additional policy text inserted into the Guardian template's `{{ extra_policy }}` slot.
     pub extra_policy: Option<String>,
     /// Experimental full Guardian prompt template containing the tenant policy placeholder.
     pub experimental_policy_template: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitBreakAction {
+    /// Emit the warning and interrupt without structured error details.
+    #[default]
+    Default,
+    /// Emit the same warning and interruption, with structured error details.
+    Strict,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]

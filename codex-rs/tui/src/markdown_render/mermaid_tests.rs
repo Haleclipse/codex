@@ -21,6 +21,7 @@ fn mermaid_fences_use_native_renderer_for_every_family() {
     for source in [
         "%% heading\nflowchart TD; A --> B",
         "graph LR; A --> B",
+        "flowchart; A -- send --> B & C; B <-.-> C",
         "sequenceDiagram; A->>B: request; B-->>A: response",
         "stateDiagram-v2; [*] --> Active; Active --> [*]",
         "stateDiagram; [*] --> Active; Active --> [*]",
@@ -112,6 +113,16 @@ fn mermaid_fallback_notices_preserve_source() {
     for (name, source, width) in [
         ("invalid", "```mermaid\nflowchart LR\nA[unfinished\n```", 80),
         ("unsupported", "```mermaid\npie\n\"Cats\": 2\n```", 80),
+        (
+            "unsupported shape after supported edges",
+            "```mermaid\nflowchart TD\nP --> Q\nA[(Database)]\n```",
+            80,
+        ),
+        (
+            "Markdown string after supported edges",
+            "```mermaid\nflowchart TD\nP --> Q\nA[\"`hello **world**`\"]\n```",
+            80,
+        ),
         (
             "too wide",
             "```mermaid\nflowchart LR\nA[Request] --> B[Reply]\n```",

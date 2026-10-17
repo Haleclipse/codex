@@ -76,14 +76,16 @@ use wiremock::matchers::method;
 use wiremock::matchers::path_regex;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}, "openai/ui": {"preferredModelDisplayMode": "fullscreen"}}), Some(McpAppDisplayMode::Fullscreen); "fullscreen")]
-#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}}), Some(McpAppDisplayMode::Inline); "missing preference")]
-#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}, "openai/ui": {"preferredModelDisplayMode": "unsupported"}}), Some(McpAppDisplayMode::Inline); "unsupported preference")]
-#[test_case(json!({"openai/outputTemplate": "ui://calendar/widget"}), Some(McpAppDisplayMode::Inline); "legacy uri")]
-#[test_case(json!({}), None; "result only ui")]
+#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}, "openai/ui": {"preferredModelDisplayMode": "fullscreen"}}), Some(McpAppDisplayMode::Fullscreen), Some("ui://calendar/widget"); "fullscreen")]
+#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}, "openai/ui": {"preferredModelDisplayMode": "inline"}}), Some(McpAppDisplayMode::Inline), Some("ui://calendar/widget"); "inline")]
+#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}}), None, Some("ui://calendar/widget"); "missing preference")]
+#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}, "openai/ui": {"preferredModelDisplayMode": "unsupported"}}), None, Some("ui://calendar/widget"); "unsupported preference")]
+#[test_case(json!({"openai/outputTemplate": "ui://calendar/widget"}), None, Some("ui://calendar/widget"); "legacy uri")]
+#[test_case(json!({}), None, None; "result only ui")]
 async fn mcp_app_ui_survives_tool_events_and_resume(
     mut metadata: Value,
     expected_mode: Option<McpAppDisplayMode>,
+    expected_uri: Option<&str>,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -165,7 +167,7 @@ async fn mcp_app_ui_survives_tool_events_and_resume(
         resource_uri: "ui://calendar/widget".to_string(),
         preferred_model_display_mode,
     });
-    let expected_uri = expected_ui.as_ref().map(|ui| ui.resource_uri.clone());
+    let expected_uri = expected_uri.map(str::to_string);
     let mut observed = Vec::new();
     let mut completed = None;
     wait_for_event(&test.codex, |event| {

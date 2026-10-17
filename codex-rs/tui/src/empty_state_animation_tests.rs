@@ -134,6 +134,52 @@ fn first_screen_single_click_replays_the_visible_blossom() {
         Some(FRAME_INTERVAL)
     );
     assert_eq!(buffer, static_frame);
+    let finished_at =
+        animation.last_frame.unwrap() + sequence::SPIN_DURATION - animation.spin_elapsed;
+    let mut fade_frames = Vec::new();
+    for elapsed in [
+        Duration::ZERO,
+        sequence::STATIC_FADE / 2,
+        sequence::STATIC_FADE,
+    ] {
+        buffer.reset();
+        crate::terminal_palette::with_test_default_colors(
+            crate::terminal_probe::DefaultColors {
+                fg: (210, 221, 235),
+                bg: (15, 20, 37),
+            },
+            || {
+                assert_eq!(
+                    animation.render_in_at(
+                        stage,
+                        &mut buffer,
+                        Presentation::Animated,
+                        finished_at + elapsed,
+                    ),
+                    (elapsed < sequence::STATIC_FADE).then_some(FRAME_INTERVAL)
+                );
+            },
+        );
+        let painted = buffer
+            .content
+            .iter()
+            .find(|cell| cell.symbol() != " ")
+            .unwrap();
+        fade_frames.push(format!(
+            "{}ms: {} {:?}",
+            elapsed.as_millis(),
+            painted.symbol(),
+            painted.fg,
+        ));
+    }
+    insta::assert_snapshot!("first_screen_replay_fade", fade_frames.join("\n"));
+    assert_eq!(
+        draw(&mut animation, &mut buffer, Some(ComposerState::Empty)),
+        None
+    );
+    assert_eq!(buffer, static_frame);
+    assert!(!animation.replaying);
+    assert!(animation.handle_mouse(click));
     assert_eq!(
         draw(&mut animation, &mut buffer, Some(ComposerState::Draft)),
         None

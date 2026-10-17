@@ -40,7 +40,7 @@ use crate::ExecProcessEvent;
 use crate::ExecProcessEventReceiver;
 use crate::ExecProcessFuture;
 use crate::ExecServerError;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ProcessId;
 use crate::StartedExecProcess;
 use crate::network_policy_decisions::network_policy_decider;
@@ -174,7 +174,7 @@ struct Inner {
 #[derive(Clone)]
 pub(crate) struct LocalProcess {
     inner: Arc<Inner>,
-    runtime_paths: Option<ExecServerRuntimePaths>,
+    runtime_paths: Option<ExecServerRuntimeOptions>,
 }
 
 struct LocalExecProcess {
@@ -191,11 +191,11 @@ impl Default for LocalProcess {
 }
 
 impl LocalProcess {
-    pub(crate) fn with_local_runtime_paths(runtime_paths: ExecServerRuntimePaths) -> Self {
+    pub(crate) fn with_local_runtime_paths(runtime_paths: ExecServerRuntimeOptions) -> Self {
         Self::with_discarded_notifications(Some(runtime_paths))
     }
 
-    fn with_discarded_notifications(runtime_paths: Option<ExecServerRuntimePaths>) -> Self {
+    fn with_discarded_notifications(runtime_paths: Option<ExecServerRuntimeOptions>) -> Self {
         let (outgoing_tx, mut outgoing_rx) =
             mpsc::channel::<RpcServerOutboundMessage>(NOTIFICATION_CHANNEL_CAPACITY);
         tokio::spawn(async move { while outgoing_rx.recv().await.is_some() {} });
@@ -209,7 +209,7 @@ impl LocalProcess {
     pub(crate) fn new(
         notifications: RpcNotificationSender,
         telemetry: ExecServerTelemetry,
-        runtime_paths: ExecServerRuntimePaths,
+        runtime_paths: ExecServerRuntimeOptions,
     ) -> Self {
         Self::with_runtime_paths(notifications, telemetry, Some(runtime_paths))
     }
@@ -217,7 +217,7 @@ impl LocalProcess {
     fn with_runtime_paths(
         notifications: RpcNotificationSender,
         telemetry: ExecServerTelemetry,
-        runtime_paths: Option<ExecServerRuntimePaths>,
+        runtime_paths: Option<ExecServerRuntimeOptions>,
     ) -> Self {
         let requests = notifications.request_sender();
         Self {

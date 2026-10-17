@@ -179,49 +179,57 @@ impl McpConnectionSet {
 
     /// Returns all tools with model-visible names normalized.
     pub async fn list_all_tools(&self) -> Vec<ToolInfo> {
-        self.list_tools_with_errors().await.0
+        Box::pin(self.list_tools_with_errors(|_| true)).await.0
     }
 
     #[instrument(level = "trace", skip_all, fields(mcp_server_count = self.servers.len()))]
-    pub(crate) async fn list_tools_with_errors(&self) -> (Vec<ToolInfo>, HashMap<String, String>) {
+    pub(crate) async fn list_tools_with_errors(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+    ) -> (Vec<ToolInfo>, HashMap<String, String>) {
         let mut tools = Vec::new();
         let mut errors = HashMap::new();
         let mut available_server_count = 0;
         let mut unavailable_server_count = 0;
-        let server_results = join_all(self.servers.iter().map(|(server_name, view)| async move {
-            view.connection.client.reconnect_failed_startup().await;
-            let has_cached_tools = view.connection.client.has_cached_tools();
-            let startup_complete = view
-                .connection
-                .client
-                .startup_complete
-                .load(Ordering::Acquire);
-            let server_tools = view
-                .listed_tools(&self.tool_plugin_context)
-                .instrument(trace_span!(
-                    "list_tools_for_server",
-                    server_name = %server_name,
-                    has_cached_tools,
-                    startup_complete
-                ))
-                .await;
-            let result = match server_tools {
-                Ok(server_tools) => Ok(server_tools
-                    .into_iter()
-                    .map(|tool| Self::with_server_metadata(tool, &view.metadata))
-                    .collect::<Vec<_>>()),
-                Err(error) => {
-                    trace!(
-                        server_name = %server_name,
-                        has_cached_tools,
-                        startup_complete,
-                        "MCP server tools unavailable while building tool list"
-                    );
-                    Err(error)
-                }
-            };
-            (server_name, result)
-        }))
+        let server_results = join_all(
+            self.servers
+                .iter()
+                .filter(|(name, _)| include_server(name))
+                .map(|(server_name, view)| async move {
+                    view.connection.client.reconnect_failed_startup().await;
+                    let has_cached_tools = view.connection.client.has_cached_tools();
+                    let startup_complete = view
+                        .connection
+                        .client
+                        .startup_complete
+                        .load(Ordering::Acquire);
+                    let server_tools = view
+                        .listed_tools(&self.tool_plugin_context)
+                        .instrument(trace_span!(
+                            "list_tools_for_server",
+                            server_name = %server_name,
+                            has_cached_tools,
+                            startup_complete
+                        ))
+                        .await;
+                    let result = match server_tools {
+                        Ok(server_tools) => Ok(server_tools
+                            .into_iter()
+                            .map(|tool| Self::with_server_metadata(tool, &view.metadata))
+                            .collect::<Vec<_>>()),
+                        Err(error) => {
+                            trace!(
+                                server_name = %server_name,
+                                has_cached_tools,
+                                startup_complete,
+                                "MCP server tools unavailable while building tool list"
+                            );
+                            Err(error)
+                        }
+                    };
+                    (server_name, result)
+                }),
+        )
         .await;
         for (server_name, server_tools) in server_results {
             match server_tools {

@@ -809,16 +809,51 @@ async fn command_center_new_restores_blank_drafts_and_builtin_permissions() -> R
     .await?;
     let mut tui = make_test_tui()?;
     tui.pause_events();
+    let started = server.start_thread(&app.config).await?;
+    let startup = started.session.thread_id;
+    app.pending_startup_thread_start = true;
+    app.handle_startup_thread_started(&mut server, Ok(started))
+        .await?;
     app.new_agents_overview_session(&mut tui, &mut server, /*cwd*/ None)
         .await?;
+    app.select_agents_overview_thread(&mut tui, &mut server, startup)
+        .await?;
+    assert_eq!(app.chat_widget.thread_id(), Some(startup));
+    app.chat_widget.set_model("gpt-local-choice");
+    app.start_fresh_session(
+        &mut tui,
+        &mut server,
+        /*session_start_source*/ None,
+        /*initial_user_message*/ None,
+        /*new_thread_name*/ None,
+    )
+    .await;
     let first = app.chat_widget.thread_id().unwrap();
+    server
+        .thread_set_name(first, "Blank session".into())
+        .await?;
     app.chat_widget.insert_str("Keep this unsent draft");
     app.new_agents_overview_session(&mut tui, &mut server, /*cwd*/ None)
         .await?;
     let other = app.chat_widget.thread_id().unwrap();
+    app.select_agents_overview_thread(&mut tui, &mut server, startup)
+        .await?;
+    assert_eq!(app.chat_widget.current_model(), "gpt-local-choice");
     app.select_agents_overview_thread(&mut tui, &mut server, first)
         .await?;
     assert_eq!(app.chat_widget.thread_id(), Some(first));
+    assert_eq!(
+        app.chat_widget.thread_name().as_deref(),
+        Some("Blank session")
+    );
+    assert!(recorded_params(&requests, "thread/resume").is_empty());
+    assert!(
+        recorded_params(&requests, "thread/unsubscribe")
+            .iter()
+            .all(|params| {
+                params["threadId"] != startup.to_string() && params["threadId"] != first.to_string()
+            })
+    );
     assert_eq!(
         app.chat_widget.composer_text_with_pending(),
         "Keep this unsent draft"
@@ -897,6 +932,57 @@ async fn command_center_new_restores_blank_drafts_and_builtin_permissions() -> R
         "Keep this unsent draft"
     );
     assert!(recorded_params(&requests, "turn/start").is_empty());
+    app.select_agents_overview_thread(&mut tui, &mut server, startup)
+        .await?;
+    app.chat_widget.insert_str("Background draft");
+    app.select_agents_overview_thread(&mut tui, &mut server, first)
+        .await?;
+    assert!(
+        server
+            .thread_settings_update(codex_app_server_protocol::ThreadSettingsUpdateParams {
+                thread_id: startup.to_string(),
+                approval_policy: Some(AskForApproval::OnRequest),
+                approvals_reviewer: Some(codex_app_server_protocol::ApprovalsReviewer::User),
+                permissions: Some(":read-only".into()),
+                model: Some("gpt-5.5".into()),
+                ..Default::default()
+            })
+            .await?
+    );
+    let settings = next_thread_settings_updated(&mut server, startup).await;
+    app.handle_app_server_event(
+        &server,
+        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ThreadSettingsUpdated(settings),
+        )),
+    )
+    .await;
+    app.select_agents_overview_thread(&mut tui, &mut server, startup)
+        .await?;
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "Background draft"
+    );
+    assert_eq!(app.chat_widget.current_model(), "gpt-5.5");
+    let op = app
+        .chat_widget
+        .submit_user_message_as_plain_user_turn(crate::chatwidget::UserMessage::from("Hello"))
+        .expect("submit the first turn");
+    app.submit_thread_op(&mut server, startup, op).await?;
+    let turns = recorded_params(&requests, "turn/start");
+    let params = turns.last().expect("turn/start was sent");
+    assert_eq!(
+        (
+            &params["permissions"],
+            &params["approvalPolicy"],
+            &params["model"]
+        ),
+        (
+            &serde_json::json!(":read-only"),
+            &serde_json::json!("on-request"),
+            &serde_json::json!("gpt-5.5")
+        )
+    );
     server.shutdown().await?;
     proxy.await??;
     Ok(())

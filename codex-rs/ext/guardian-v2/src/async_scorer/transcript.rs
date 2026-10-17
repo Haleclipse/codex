@@ -163,6 +163,14 @@ impl SectionHistory for SnapshotHistory<'_> {
     {
         self.0.review_items_with_sources()
     }
+
+    fn render_retained_assistant(
+        &self,
+        message: &codex_history::RetainedUserMessage,
+    ) -> Option<GuardianRootMessage> {
+        codex_core::context::render_retained_assistant_context(message)
+            .map(GuardianRootMessage::Assistant)
+    }
 }
 
 #[cfg(test)]

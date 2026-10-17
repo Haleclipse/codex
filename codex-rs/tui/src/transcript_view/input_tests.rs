@@ -25,6 +25,50 @@ fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
 }
 
 #[test]
+fn hover_links_match_wrapped_click_targets_and_refresh_after_scrolling() {
+    let (mut view, cells) = transcript(
+        "before [wide 界 wrapped label](https://example.com) after\n\nplain\n\nmore\n\nlast",
+        /*width*/ 12,
+    );
+    let area = view.area;
+    view.jump_to_beginning(&cells);
+    view.render(area, &mut Buffer::empty(area), &cells);
+    let mut targets = Vec::new();
+    for row in area.y..area.bottom() {
+        for column in area.x..area.right() {
+            if let Some(url) = view.link_at(column, row) {
+                targets.push((column, row, url));
+            }
+        }
+    }
+    assert!(!targets.is_empty());
+    assert!(targets.iter().any(|(_, row, _)| *row != targets[0].1));
+    for (column, row, url) in &targets {
+        let action = view.handle_mouse(
+            MouseEvent {
+                modifiers: KeyModifiers::CONTROL,
+                ..mouse(MouseEventKind::Down(MouseButton::Left), *column, *row)
+            },
+            &cells,
+        );
+        let actual = match action {
+            Some(ViewAction::OpenLink(url)) => Some(url),
+            _ => None,
+        };
+        assert_eq!(actual.as_ref(), Some(url));
+    }
+    assert_eq!(view.link_at(area.x - 1, area.y), None);
+    assert_eq!(view.link_at(area.right(), area.y), None);
+    view.scroll(&cells, /*rows*/ 20);
+    view.render(area, &mut Buffer::empty(area), &cells);
+    assert!(
+        targets
+            .iter()
+            .any(|(column, row, _)| view.link_at(*column, *row).is_none())
+    );
+}
+
+#[test]
 fn shift_click_extends_a_double_clicked_word_in_both_directions() {
     let (mut view, cells) = transcript("alpha beta gamma", /*width*/ 24);
     let area = view.area;

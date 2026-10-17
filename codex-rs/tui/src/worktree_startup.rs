@@ -139,7 +139,7 @@ pub(super) async fn prepare(
             color_eyre::eyre::bail!("`--worktree` is only supported for local sessions");
         }
         let environment = prepared.build(
-            Some(ExecServerRuntimePaths::from_optional_paths(
+            Some(ExecServerRuntimeOptions::from_optional_paths(
                 arg0_paths.codex_self_exe.clone(),
                 arg0_paths.codex_linux_sandbox_exe.clone(),
             )?),

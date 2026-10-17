@@ -131,9 +131,7 @@ async fn non_startup_history_dismisses_logo_until_a_new_thread() -> Result<()> {
     app.insert_history_cell(
         &mut tui,
         Box::new(history_cell::SessionNoticeCell(
-            history_cell::PlainHistoryCell::new(vec![
-                "Previous session usage and resume hint".into(),
-            ]),
+            history_cell::PlainHistoryCell::new(vec!["Rate limit reset notice".into()]),
         )),
     );
     draw(&mut app, &mut tui, size)?;

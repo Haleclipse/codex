@@ -225,6 +225,7 @@ mod file_change_approvals;
 mod history_pagination;
 mod history_ui;
 mod input;
+mod link_hover;
 mod loaded_threads;
 mod managed_worktree_creation;
 mod misalignment_policy;
@@ -487,25 +488,6 @@ pub enum ExitReason {
     Fatal(String),
 }
 
-fn session_summary(
-    token_usage: TokenUsage,
-    thread_id: Option<ThreadId>,
-    thread_name: Option<String>,
-    rollout_path: Option<&Path>,
-) -> Option<SessionSummary> {
-    let usage_line = (!token_usage.is_zero()).then(|| token_usage.to_string());
-    let resume_hint = resume_hint_for_resumable_thread(thread_id, thread_name, rollout_path);
-
-    if usage_line.is_none() && resume_hint.is_none() {
-        return None;
-    }
-
-    Some(SessionSummary {
-        usage_line,
-        resume_hint,
-    })
-}
-
 fn resumable_thread(
     thread_id: Option<ThreadId>,
     thread_name: Option<String>,
@@ -519,15 +501,6 @@ fn resumable_thread(
     })
 }
 
-fn resume_hint_for_resumable_thread(
-    thread_id: Option<ThreadId>,
-    thread_name: Option<String>,
-    rollout_path: Option<&Path>,
-) -> Option<String> {
-    let thread = resumable_thread(thread_id, thread_name, rollout_path)?;
-    codex_utils_cli::resume_hint(thread.thread_name.as_deref(), Some(thread.thread_id))
-}
-
 fn rollout_path_is_resumable(rollout_path: &Path) -> bool {
     std::fs::metadata(rollout_path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
@@ -539,12 +512,6 @@ fn errors_for_cwd(cwd: &Path, response: &SkillsListResponse) -> Vec<SkillErrorIn
         .find(|entry| entry.cwd.as_path() == cwd)
         .map(|entry| entry.errors.clone())
         .unwrap_or_default()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionSummary {
-    usage_line: Option<String>,
-    resume_hint: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -868,6 +835,8 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
+        tui.link_hover.observe(&event);
+        self.refresh_link_hover(tui)?;
         self.invalidate_right_click_paste(&event);
         self.finish_clipboard(tui);
         let event = self.finish_right_click_paste(tui, event);

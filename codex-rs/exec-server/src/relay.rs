@@ -1116,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn multiplexed_environment_sends_keepalive() -> anyhow::Result<()> {
         let (client_websocket, mut server_websocket) = websocket_pair().await?;
-        let runtime_paths = crate::ExecServerRuntimePaths::new(
+        let runtime_paths = crate::ExecServerRuntimeOptions::new(
             std::env::current_exe()?,
             /*codex_linux_sandbox_exe*/ None,
         )

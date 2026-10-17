@@ -28,7 +28,7 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 use super::*;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::RemoteEnvironmentTransport;
 
 #[derive(Debug)]
@@ -324,7 +324,7 @@ async fn direct_registration_handles_policy_outages_and_permanent_failures() -> 
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
                 .with_network_policy(policy.clone().for_current_account()),
         )?;
-        let runtime_paths = ExecServerRuntimePaths::new(
+        let runtime_paths = ExecServerRuntimeOptions::new(
             std::env::current_exe()?,
             /*codex_linux_sandbox_exe*/ None,
         )?;
@@ -414,7 +414,7 @@ async fn direct_websocket_reuses_registration_and_stops_on_permanent_errors() ->
             Arc::new(StaticAuthProvider),
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         )?;
-        let runtime_paths = ExecServerRuntimePaths::new(
+        let runtime_paths = ExecServerRuntimeOptions::new(
             std::env::current_exe()?,
             /*codex_linux_sandbox_exe*/ None,
         )?;

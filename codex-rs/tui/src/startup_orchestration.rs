@@ -318,7 +318,7 @@ pub(super) async fn run_main_inner(
         .clone()
         .filter(|_| app_server_target.uses_remote_workspace());
 
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
@@ -388,7 +388,7 @@ pub(super) async fn run_main_inner(
                     startup_draft.flush_pending_events().await?;
                     startup_draft
                         .tui_mut()
-                        .with_restored(|| {
+                        .with_restored(crate::tui::TerminalHandoff::Restore, || {
                             oss_selection::select_oss_provider(lmstudio_status, ollama_status)
                         })
                         .await?
@@ -627,7 +627,7 @@ pub(super) async fn run_main_inner(
             startup_draft.flush_pending_events().await?;
             startup_draft
                 .tui_mut()
-                .with_restored(|| async {
+                .with_restored(crate::tui::TerminalHandoff::Restore, || async {
                     #[allow(clippy::print_stderr)]
                     {
                         eprintln!("Could not create otel exporter: {e}");
@@ -840,7 +840,7 @@ pub(super) async fn run_main_inner(
         startup_draft.flush_pending_events().await?;
         startup_draft
             .tui_mut()
-            .with_restored(|| async {
+            .with_restored(crate::tui::TerminalHandoff::Restore, || async {
                 // Provider setup may print progress or block in an external downloader.
                 // Restore ordinary signal handling so Ctrl+C can interrupt that process.
                 crossterm::terminal::disable_raw_mode()?;

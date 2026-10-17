@@ -1,6 +1,5 @@
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
-use codex_core::McpManager;
 use codex_mcp::McpServerSource;
 use codex_mcp::ReadResourceRequestParams;
 use codex_mcp::resolve_oauth_callback;
@@ -273,59 +272,23 @@ impl McpRequestProcessor {
         let request = request_id.clone();
 
         let outgoing = Arc::clone(&self.outgoing);
-        let (config, thread) = match params.thread_id.as_deref() {
-            Some(thread_id) => {
-                let (_, thread) = self.load_thread(thread_id).await?;
-                let thread_config = thread.config().await;
-                let config = self
-                    .config_manager
-                    .load_latest_config_with_session_layers(
-                        &thread_config.config_layer_stack,
-                        &thread_config.cwd,
-                    )
-                    .await
-                    .map_err(|err| internal_error(format!("failed to reload config: {err}")))?;
-                (config, Some(thread))
-            }
-            None => (self.load_latest_config(/*fallback_cwd*/ None).await?, None),
+        let thread = match params.thread_id.as_deref() {
+            Some(thread_id) => Some(self.load_thread(thread_id).await?.1),
+            None => None,
         };
-        let mcp_manager = self.thread_manager.mcp_manager();
-        let auth = self.auth_manager.auth().await;
-        let environment_manager = self.thread_manager.environment_manager();
-
+        let processor = self.clone();
         tokio::spawn(async move {
-            let (mcp_config, runtime_context) = match thread.as_ref() {
-                Some(thread) => thread.runtime_mcp_config_and_context(&config).await,
-                None => {
-                    let mcp_config = mcp_manager.runtime_config(&config).await;
-                    let runtime_context =
-                        McpRuntimeContext::new(environment_manager, config.cwd.to_path_buf());
-                    (mcp_config, runtime_context)
-                }
-            };
-
-            let result = Self::list_mcp_server_status_response(
-                request.request_id.to_string(),
-                params,
-                mcp_config,
-                auth,
-                runtime_context,
-                mcp_manager,
-                thread,
-            )
-            .await;
+            let result = processor
+                .list_mcp_server_status_response(params, thread)
+                .await;
             outgoing.send_result(request, result).await;
         });
         Ok(())
     }
 
     async fn list_mcp_server_status_response(
-        request_id: String,
+        &self,
         params: ListMcpServerStatusParams,
-        mcp_config: codex_mcp::McpConfig,
-        auth: Option<CodexAuth>,
-        runtime_context: McpRuntimeContext,
-        mcp_manager: Arc<McpManager>,
         thread: Option<Arc<codex_core::CodexThread>>,
     ) -> Result<ListMcpServerStatusResponse, JSONRPCErrorError> {
         let detail = match params.detail.unwrap_or(McpServerStatusDetail::Full) {
@@ -333,16 +296,53 @@ impl McpRequestProcessor {
             McpServerStatusDetail::ToolsAndAuthOnly => McpSnapshotDetail::ToolsAndAuthOnly,
         };
 
-        let snapshot = collect_mcp_server_status_snapshot_with_detail(
-            &mcp_config,
-            auth.as_ref(),
-            request_id,
-            runtime_context,
-            mcp_manager.codex_apps_tools_cache(),
-            mcp_manager.tool_catalog_cache(),
-            detail,
-        )
-        .await;
+        let (mcp_config, snapshot) = if let (Some(thread), Some(server)) =
+            (thread.as_ref(), params.server_name.as_deref())
+        {
+            thread
+                .mcp_server_status_snapshot(server, detail)
+                .await
+                .map_err(|error| {
+                    internal_error(format!("failed to read MCP server status: {error:#}"))
+                })?
+        } else {
+            let config = match thread.as_ref() {
+                Some(thread) => {
+                    let thread_config = thread.config().await;
+                    self.config_manager
+                        .load_latest_config_with_session_layers(
+                            &thread_config.config_layer_stack,
+                            &thread_config.cwd,
+                        )
+                        .await
+                        .map_err(|err| internal_error(format!("failed to reload config: {err}")))?
+                }
+                None => self.load_latest_config(/*fallback_cwd*/ None).await?,
+            };
+            let mcp_manager = self.thread_manager.mcp_manager();
+            let auth = self.auth_manager.auth().await;
+            let (mcp_config, runtime_context) = match thread.as_ref() {
+                Some(thread) => thread.runtime_mcp_config_and_context(&config).await,
+                None => (
+                    mcp_manager.runtime_config(&config).await,
+                    McpRuntimeContext::new(
+                        self.thread_manager.environment_manager(),
+                        config.cwd.to_path_buf(),
+                    ),
+                ),
+            };
+            let snapshot = collect_mcp_server_status_snapshot_with_detail(
+                &mcp_config,
+                auth.as_ref(),
+                runtime_context,
+                mcp_manager.codex_apps_tools_cache(),
+                mcp_manager.tool_catalog_cache(),
+                detail,
+                params.server_name.as_deref(),
+            )
+            .await;
+            (Arc::new(mcp_config), snapshot)
+        };
 
         let runtime_statuses = match thread {
             Some(thread) => thread.mcp_connection_statuses(&mcp_config).await,
@@ -368,6 +368,12 @@ impl McpRequestProcessor {
         );
         server_names.sort();
         server_names.dedup();
+        server_names.retain(|name| {
+            params
+                .server_name
+                .as_deref()
+                .is_none_or(|server| name == server)
+        });
 
         let total = server_names.len();
         let limit = params.limit.unwrap_or(total as u32).max(1) as usize;

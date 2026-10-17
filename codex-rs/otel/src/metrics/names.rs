@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 pub const TOOL_CALL_COUNT_METRIC: &str = "codex.tool.call";
 pub const TOOL_CALL_DURATION_METRIC: &str = "codex.tool.call.duration_ms";
 pub const TOOL_CALL_UNIFIED_EXEC_METRIC: &str = "codex.tool.unified_exec";
@@ -75,6 +77,25 @@ pub const THREAD_SKILLS_TRUNCATED_METRIC: &str = "codex.thread.skills.truncated"
 pub const THREAD_TOOLS_NAMESPACES_TOTAL_METRIC: &str = "codex.thread.tools.namespaces_total";
 pub const THREAD_TOOLS_FRAGMENT_BYTES_METRIC: &str = "codex.thread.tools.fragment_bytes";
 
-/// Byte buckets for context-budget planning, with larger fragments in the overflow bucket.
-pub const CONTEXT_FRAGMENT_BYTES_BUCKETS: &[f64] =
-    &[256., 512., 1_024., 2_048., 4_096., 8_192., 16_384.];
+/// Logarithmic boundaries up to 32,768 for tools bytes and namespace counts.
+pub static THREAD_TOOLS_METRIC_BUCKETS: LazyLock<[f64; 511]> =
+    LazyLock::new(|| context_log_buckets(/*max_exponent*/ 15.0));
+
+pub static THREAD_SKILLS_COUNT_METRIC_BUCKETS: LazyLock<[f64; 513]> =
+    LazyLock::new(|| std::array::from_fn(|index| index as f64));
+
+/// Logarithmic boundaries up to 131,072 removed description characters.
+pub static THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_BUCKETS: LazyLock<[f64; 511]> =
+    LazyLock::new(|| context_log_buckets(/*max_exponent*/ 17.0));
+
+pub const THREAD_SKILLS_TRUNCATED_BUCKETS: &[f64] = &[0.0, 1.0];
+
+fn context_log_buckets(max_exponent: f64) -> [f64; 511] {
+    std::array::from_fn(|index| {
+        if index == 0 {
+            0.0
+        } else {
+            2.0_f64.powf(max_exponent * (index - 1) as f64 / 509.0)
+        }
+    })
+}

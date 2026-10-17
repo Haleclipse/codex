@@ -64,12 +64,148 @@ pub(super) fn text(buffer: &Buffer) -> String {
 }
 
 #[test]
+fn terminal_output_disclosure_follows_live_history_and_keymap() {
+    use crate::exec_cell::CommandOutput;
+    use crate::exec_cell::new_active_exec_command;
+    use crate::keymap::RuntimeKeymap;
+    use codex_app_server_protocol::CommandExecutionSource;
+
+    let mut cell = new_active_exec_command(
+        "output-test".into(),
+        vec!["echo".into()],
+        Vec::new(),
+        CommandExecutionSource::Agent,
+        /*interaction_input*/ None,
+        /*animations_enabled*/ false,
+    );
+    cell.complete_call(
+        "output-test",
+        CommandOutput::new(/*exit_code*/ 0, "1\n2\n3\n4\n5\n6\n7\n8\n".into()),
+        std::time::Duration::ZERO,
+    );
+    let cell: Arc<dyn HistoryCell> = Arc::new(cell);
+    let mut view = TranscriptView::default();
+    view.sync_live_activity(&[], cell.activity_ids());
+    view.sync_live_activity_tail(
+        /*width*/ 72,
+        /*key*/ None,
+        /*expanded*/ false,
+        |width| {
+            Some(ActivityTranscriptLines {
+                activity: cell.compact_hyperlink_lines(width),
+                auxiliary: Vec::new(),
+                disclosure: cell.activity_disclosure(width),
+            })
+        },
+    );
+    let live = text(&render(
+        &mut view,
+        &[],
+        /*width*/ 72,
+        /*height*/ 6,
+    ));
+    let cells = [cell];
+    view.sync_live_activity(&cells, Vec::new());
+    view.sync_live_tail(/*width*/ 72, /*key*/ None, |_| None);
+    let committed = text(&render(
+        &mut view, &cells, /*width*/ 72, /*height*/ 6,
+    ));
+    assert_eq!(live, committed);
+    let hint = " (ctrl+t to expand)";
+    assert!(live.contains(&format!("+ 5 lines{hint}")));
+    // Check where the hint is visible, so the copy/search exclusion cannot pass vacuously.
+    assert!(
+        !view
+            .layout(&cells, /*index*/ 0)
+            .unwrap()
+            .text()
+            .contains(hint)
+    );
+    // Warm layouts must follow config changes, including chords and disabling the action.
+    for (configured, expected) in [
+        (serde_json::json!("f12"), " (f12 to expand)"),
+        (serde_json::json!("ctrl-x t"), " (ctrl+x t to expand)"),
+        (serde_json::json!([]), ""),
+    ] {
+        let config = serde_json::from_value(serde_json::json!({
+            "global": {"open_transcript": configured}
+        }))
+        .unwrap();
+        let keymap = RuntimeKeymap::from_config(&config).unwrap();
+        view.set_keymap_bindings(&keymap);
+        assert_eq!(
+            text(&render(
+                &mut view, &cells, /*width*/ 72, /*height*/ 6,
+            )),
+            live.replace(hint, expected),
+        );
+    }
+}
+
+#[test]
+fn terminal_output_disclosure_counts_only_revealable_lines() {
+    use crate::exec_cell::CommandOutput;
+    use crate::exec_cell::new_active_exec_command;
+    use codex_app_server_protocol::CommandExecutionSource;
+
+    let mut frames = Vec::new();
+    for (name, command, output, width, streamed) in [
+        ("three visible", "echo", "a\nb\nc\n".to_owned(), 64, false),
+        ("one hidden", "echo", "a\nb\nc\nd\n".to_owned(), 64, false),
+        (
+            "clipped line",
+            "echo",
+            "abcdefghijklmnopqrstuvwxyz\n".to_owned(),
+            20,
+            false,
+        ),
+        ("command only", "echo a\necho b", String::new(), 64, false),
+        (
+            "storage truncated",
+            "echo",
+            "x\n".repeat(/*n*/ 530_000),
+            64,
+            true,
+        ),
+    ] {
+        let mut cell = new_active_exec_command(
+            "output-test".into(),
+            vec!["sh".into(), "-c".into(), command.into()],
+            Vec::new(),
+            CommandExecutionSource::Agent,
+            /*interaction_input*/ None,
+            /*animations_enabled*/ false,
+        );
+        if streamed {
+            cell.append_output("output-test", &output);
+        } else {
+            cell.complete_call(
+                "output-test",
+                CommandOutput::new(/*exit_code*/ 0, output),
+                std::time::Duration::from_secs(/*secs*/ 1),
+            );
+        }
+        let cells: [Arc<dyn HistoryCell>; 1] = [Arc::new(cell)];
+        frames.push(format!(
+            "{name}\n{}",
+            text(&render(
+                &mut TranscriptView::default(),
+                &cells,
+                width,
+                /*height*/ 6,
+            ))
+            .trim_end()
+        ));
+    }
+    insta::assert_snapshot!(frames.join("\n\n"));
+}
+
+#[test]
 fn startup_warning_keeps_first_visible_header_in_place() {
     let header: Arc<dyn HistoryCell> =
         Arc::new(crate::history_cell::SessionHeaderHistoryCell::new(
             "gpt-test".into(),
             /*reasoning_effort*/ None,
-            /*show_fast_status*/ false,
             crate::test_support::test_path_buf("/project"),
             "test",
         ));

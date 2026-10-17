@@ -737,7 +737,7 @@ impl TestCodexBuilder {
         );
         #[cfg(not(target_os = "linux"))]
         let codex_linux_sandbox_exe = None;
-        let local_runtime_paths = codex_exec_server::ExecServerRuntimePaths::new(
+        let local_runtime_paths = codex_exec_server::ExecServerRuntimeOptions::new(
             std::env::current_exe()?,
             codex_linux_sandbox_exe,
         )?;

@@ -1,5 +1,6 @@
 use super::mcp_refresh::McpRefreshInvalidationGuard;
 use super::*;
+use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::combine_selected_capability_roots;
 use codex_exec_server::ExecutorCapabilityDiscoveryCache;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
@@ -147,19 +148,33 @@ impl Session {
             .project_selected_environment_mcp_servers(config, &environments, mcp_projection)
             .await
             .config;
+        let runtime_context = self.mcp_runtime_context(&environments, &host_fallback_cwd);
+        (mcp_config, runtime_context)
+    }
+
+    pub(crate) async fn current_mcp_runtime_context(&self) -> McpRuntimeContext {
+        let host_fallback_cwd = self.state.lock().await.session_configuration.cwd().clone();
+        let environments = self.services.turn_environments.snapshot().await;
+        self.mcp_runtime_context(&environments, &host_fallback_cwd)
+    }
+
+    fn mcp_runtime_context(
+        &self,
+        environments: &TurnEnvironmentSnapshot,
+        host_fallback_cwd: &std::path::Path,
+    ) -> McpRuntimeContext {
         let local_process_cwd = environments
             .local_environment_cwd()
             .map(|cwd| cwd.to_path_buf())
             .unwrap_or_else(|| host_fallback_cwd.to_path_buf());
-        let runtime_context = McpRuntimeContext::new(
+        McpRuntimeContext::new(
             self.services.turn_environments.environment_manager(),
             local_process_cwd,
         )
         .with_selected_environments(
-            environment_selections.into(),
+            environments.all_selections().into(),
             environments.ready_environment_handles(),
-        );
-        (mcp_config, runtime_context)
+        )
     }
 
     pub(crate) async fn runtime_mcp_servers(

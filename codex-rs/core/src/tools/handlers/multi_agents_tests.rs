@@ -2185,6 +2185,7 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
                 turn_id: Some(aborted_turn.sub_id.clone()),
                 started_at: None,
                 reason: TurnAbortReason::Interrupted,
+                error: None,
                 completed_at: None,
                 duration_ms: None,
             }),

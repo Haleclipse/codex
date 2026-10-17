@@ -57,6 +57,21 @@ $$\beta$$";
 }
 
 #[test]
+fn issue_48403_renders_zero_and_multiline_display() {
+    insta::assert_snapshot!(plain(
+        r"Inline math: $0$; inline operator: $\bigwedge_{j=0}^{n}$
+
+$$
+F_{n}(s)\land
+\bigwedge_{j=0}^{n}
+\bigl(R(\land T \bigr)
+\Rightarrow R.
+$$",
+        /*width*/ 80
+    ));
+}
+
+#[test]
 fn unicode_math_schrodinger_equation_snapshot() {
     insta::assert_snapshot!(plain(
         r"\[

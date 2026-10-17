@@ -40,7 +40,7 @@ use test_case::test_case;
 use super::image_rollout::RecordingFileAttachmentStore;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_checkpoint_review_preserves_oversized_instruction_order() -> Result<()> {
+async fn independent_review_preserves_oversized_instruction_order() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
         Ok(()),
@@ -85,7 +85,7 @@ async fn legacy_checkpoint_review_preserves_oversized_instruction_order() -> Res
         GuardianContextMode::from_history(
             test.codex.conversation_history_snapshot().await.as_ref()
         ),
-        GuardianContextMode::Legacy,
+        GuardianContextMode::Independent,
     );
     let command = json!({
         "cmd": "echo complete-instructions",

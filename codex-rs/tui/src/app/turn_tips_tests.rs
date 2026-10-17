@@ -4,6 +4,12 @@ use super::*;
 use crate::app::owned_transcript::tests::attach_thread;
 use crate::app::owned_transcript::tests::buffer_text;
 use crate::app::owned_transcript::tests::user_cell;
+use codex_config::types::CopyOnSelect;
+use crossterm::event::MouseButton::Left;
+use crossterm::event::MouseEvent;
+use crossterm::event::MouseEventKind::Down;
+use crossterm::event::MouseEventKind::Drag;
+use crossterm::event::MouseEventKind::Up;
 use pretty_assertions::assert_eq;
 
 fn notification(method: &str, thread: ThreadId, turn: usize, status: &str) -> ServerNotification {
@@ -11,7 +17,7 @@ fn notification(method: &str, thread: ThreadId, turn: usize, status: &str) -> Se
         "method": method,
         "params": { "threadId": thread.to_string(), "turn": {
             "id": turn.to_string(), "items": [], "itemsView": "full", "status": status,
-            "error": null, "startedAt": null, "completedAt": null, "durationMs": null,
+            "error": null, "startedAt": null, "completedAt": null, "durationMs": 500,
         }},
     }))
     .unwrap()
@@ -343,5 +349,131 @@ async fn turn_tip_placements_and_completion_barrier() -> Result<()> {
         "turn_tip_placements",
         crate::chatwidget::tests::helpers::normalize_snapshot_paths(screens.join("\n\n"))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn working_tip_stays_put_through_mouse_selection() -> Result<()> {
+    let (mut app, _events, _ops) = crate::app::tests::make_test_app_with_channels().await;
+    let thread = ThreadId::new();
+    attach_thread(&mut app, thread);
+    app.local_settings.tui.show_tooltips = true;
+    app.local_settings.tui.animations = false;
+    app.local_settings.tui.copy_on_select = CopyOnSelect::Never;
+    app.transcript_cells = vec![Arc::new(history_cell::PlainHistoryCell::new(
+        (0..10)
+            .map(|row| format!("Response row {row}").into())
+            .collect(),
+    ))];
+    let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = tui.terminal.size()?;
+    deliver(
+        &mut app,
+        notification("turn/started", thread, /*turn*/ 1, "inProgress"),
+    );
+    app.turn_tips.current.as_mut().unwrap().template = Some("Try /help.");
+    let initial_area = app.render_owned_transcript(&mut tui, size)?;
+    let initial = buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+        &tui.terminal,
+    ));
+    let row = initial
+        .lines()
+        .position(|line| line.contains("Response row 9"))
+        .unwrap() as u16;
+    // A deadline reached while the mouse is held must not introduce a new row.
+    app.handle_owned_transcript_event(
+        &mut tui,
+        &mut server,
+        &TuiEvent::Mouse(MouseEvent {
+            kind: Down(Left),
+            column: 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    )?;
+    app.turn_tips.current.as_mut().unwrap().started_at = Instant::now() - WORKING_DELAY;
+    assert_eq!(app.render_owned_transcript(&mut tui, size)?, initial_area);
+    assert!(!app.turn_tips.current.as_ref().unwrap().shown);
+    app.handle_owned_transcript_event(
+        &mut tui,
+        &mut server,
+        &TuiEvent::Mouse(MouseEvent {
+            kind: Up(Left),
+            column: 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    )?;
+    let tip_area = app.render_owned_transcript(&mut tui, size)?;
+    assert!(app.turn_tips.current.as_ref().unwrap().shown);
+    let before = buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+        &tui.terminal,
+    ));
+    let response_row = before
+        .lines()
+        .position(|line| line.contains("Response row 9"))
+        .unwrap() as u16;
+    for (kind, column) in [(Down(Left), 3), (Drag(Left), 8), (Up(Left), 8)] {
+        app.handle_owned_transcript_event(
+            &mut tui,
+            &mut server,
+            &TuiEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row: response_row,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )?;
+        assert_eq!(app.render_owned_transcript(&mut tui, size)?, tip_area);
+        let screen = buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+            &tui.terminal,
+        ));
+        assert_eq!(
+            screen
+                .lines()
+                .position(|line| line.contains("Response row 9")),
+            Some(usize::from(response_row)),
+        );
+        assert!(screen.contains("└ Tip: Try /help."), "{screen}");
+        if kind == Down(Left) {
+            insta::assert_snapshot!(
+                "working_tip_mouse_down",
+                crate::chatwidget::tests::helpers::normalize_snapshot_paths(screen)
+            );
+        }
+    }
+    assert_eq!(
+        app.transcript_view.selected_text(&app.transcript_cells),
+        Some("ponse".into()),
+    );
+    app.transcript_view.jump_to_latest();
+    app.chat_widget
+        .on_rate_limit_snapshot(Some(serde_json::from_value(serde_json::json!({
+            "primary": {"usedPercent": 92, "windowDurationMins": 300},
+        }))?));
+    assert!(app.composer_hint(size.width).is_some());
+    app.render_owned_transcript(&mut tui, size)?;
+    app.handle_owned_transcript_event(
+        &mut tui,
+        &mut server,
+        &TuiEvent::Mouse(MouseEvent {
+            kind: Down(Left),
+            column: 1,
+            row: response_row,
+            modifiers: KeyModifiers::NONE,
+        }),
+    )?;
+    assert!(app.composer_hint(size.width).is_none());
+    app.render_owned_transcript(&mut tui, size)?;
+    assert!(
+        !buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+            &tui.terminal,
+        ))
+        .contains("└ Tip:")
+    );
+    server.shutdown().await?;
+    tui.set_owned_screen(/*owned*/ false)?;
     Ok(())
 }

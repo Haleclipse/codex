@@ -296,6 +296,14 @@ impl SectionHistory for GuardianReviewHistory<'_> {
     {
         self.0.review_items_with_sources()
     }
+
+    fn render_retained_assistant(
+        &self,
+        message: &codex_history::RetainedUserMessage,
+    ) -> Option<GuardianRootMessage> {
+        crate::context::render_retained_assistant_context(message)
+            .map(GuardianRootMessage::Assistant)
+    }
 }
 
 struct FilteredGuardianHistory<'a>(&'a dyn SectionHistory);
@@ -318,6 +326,13 @@ impl SectionHistory for FilteredGuardianHistory<'_> {
 
     fn items(&self) -> Box<dyn Iterator<Item = &ResponseItem> + Send + '_> {
         Box::new(self.items_with_sources().map(|(item, _)| item))
+    }
+
+    fn render_retained_assistant(
+        &self,
+        message: &codex_history::RetainedUserMessage,
+    ) -> Option<GuardianRootMessage> {
+        self.0.render_retained_assistant(message)
     }
 }
 

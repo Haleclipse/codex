@@ -6,6 +6,59 @@ use codex_config::types::TuiRendering;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn empty_list_item_stays_mutable_until_finalization() {
+    let cwd = std::env::temp_dir();
+    for (marker, continuation) in [
+        ("8.", ""),
+        ("8.\n", "   answer\n"),
+        ("> 8.\n", ">    answer\n"),
+    ] {
+        let mut stream = StreamCore::new(
+            Some(24),
+            &cwd,
+            HistoryRenderMode::Rich,
+            /*inline_visualization_context*/ None,
+        );
+        stream.push_delta(marker);
+        let mut emitted = stream.tick_batch(usize::MAX);
+        stream.push_delta(continuation);
+        let (remaining, source) = stream.finalize_remaining();
+        emitted.extend(remaining);
+        assert_eq!(
+            emitted,
+            render_source(
+                &source,
+                Some(24),
+                &cwd,
+                HistoryRenderMode::Rich,
+                /*inline_visualization_context*/ None,
+            ),
+            "marker={marker:?}"
+        );
+    }
+}
+
+#[test]
+fn resizing_does_not_drop_held_list_marker() {
+    let cwd = std::env::temp_dir();
+    let mut stream = StreamCore::new(
+        Some(10),
+        &cwd,
+        HistoryRenderMode::Rich,
+        /*inline_visualization_context*/ None,
+    );
+    stream.push_delta("Long prose with enough words to wrap.\n\n");
+    assert!(stream.tick_batch(usize::MAX).len() > 1);
+    stream.push_delta("8.\n");
+    stream.set_width(Some(40));
+    let (remaining, _) = stream.finalize_remaining();
+    assert_eq!(
+        remaining.last().map(|line| line.line.to_string()),
+        Some("8. ".to_string())
+    );
+}
+
+#[test]
 fn lists_match_incremental_and_emitted_responses() {
     let cwd = std::env::temp_dir();
     let source = concat!(

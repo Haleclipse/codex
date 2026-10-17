@@ -14,7 +14,7 @@ use codex_core::config::ConfigLoadOptions;
 use codex_core::config::bootstrap_auth_config;
 use codex_core::config::find_codex_home;
 use codex_core::config::load_config_toml_with_layer_stack;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthManager;
@@ -47,6 +47,16 @@ pub(super) struct ExecServerCommand {
     /// other same-UID processes; enable only when provisioning a dedicated environment.
     #[arg(long, value_name = "MODE", default_value = "isolate", global = true)]
     linux_sandbox_pid_namespace: codex_sandboxing::LinuxSandboxPidNamespace,
+
+    /// Allow permitted private IP destinations to use the configured upstream proxy.
+    /// If no valid upstream proxy applies to the request protocol, connect directly.
+    /// Loopback stays local. This flag does not require upstream routing.
+    #[arg(
+        long,
+        env = "CODEX_EXEC_SERVER_PROXY_PRIVATE_IPS_VIA_UPSTREAM",
+        global = true
+    )]
+    proxy_private_ips_via_upstream: bool,
 
     /// Maximum number of requests to process concurrently on each connection.
     #[arg(
@@ -164,11 +174,12 @@ impl ExecServerCommand {
             .codex_self_exe
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Codex executable path is not configured"))?;
-        let runtime_paths = ExecServerRuntimePaths::new(
+        let runtime_paths = ExecServerRuntimeOptions::new(
             codex_self_exe,
             arg0_paths.codex_linux_sandbox_exe.clone(),
         )?
-        .with_linux_sandbox_pid_namespace(self.linux_sandbox_pid_namespace);
+        .with_linux_sandbox_pid_namespace(self.linux_sandbox_pid_namespace)
+        .with_proxy_private_ips_via_upstream(self.proxy_private_ips_via_upstream);
         if let Some(base_url) = self.remote.take() {
             let environment_id = self.environment_id.take().ok_or_else(|| {
                 anyhow::anyhow!("--environment-id is required when --remote is set")
