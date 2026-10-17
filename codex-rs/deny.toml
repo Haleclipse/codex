@@ -79,6 +79,13 @@ ignore = [
     # TODO(fcoury): remove this exception when syntect drops yaml-rust and bincode, or updates to versions that have fixed the vulnerabilities.
     { id = "RUSTSEC-2024-0320", reason = "yaml-rust is unmaintained; pulled in via syntect v5.3.0 used by codex-tui for syntax highlighting; no fixed release yet" },
     { id = "RUSTSEC-2025-0141", reason = "bincode is unmaintained; pulled in via syntect v5.3.0 used by codex-tui for syntax highlighting; no fixed release yet" },
+    # @cometix: zip >= 9 is a breaking upgrade upstream has not taken (still 2.4.2 through
+    # 0.163.0-alpha.13). These advisories target ZipArchive::extract; codex-core-plugins
+    # never calls it. Its own loop uses enclosed_name(), writes symlink entries as regular
+    # files, and masks modes to 0o777 (see startup_sync.rs). Drop once zip is upgraded.
+    { id = "RUSTSEC-2026-0367", reason = "zip SUID/SGID preservation in ZipArchive::extract; unused, and codex-core-plugins masks extracted modes to 0o777" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() applies permissions through symlinks; codex-core-plugins does not use extract() or create symlinks" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract() creates symlinks outside the destination; codex-core-plugins does not use extract() or create symlinks" },
     # @cometix: upstream (through 0.159.3) still depends on the deprecated serde_yaml; drop once it migrates off.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained; pulled in via serde_yaml v0.9.34+deprecated used by codex-core-plugins; no maintained release" },
     { id = "RUSTSEC-2026-0097", reason = "rand 0.8.5 is pulled in via age v0.11.2/codex-secrets and zbus v4.4.0/keyring; no compatible rand 0.8 fixed release, remove when transitive dependencies move to rand >=0.9.3" },

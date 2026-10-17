@@ -1112,6 +1112,9 @@ fn apply_zip_permissions(entry: &zip::read::ZipFile<'_>, output_path: &Path) -> 
     let Some(mode) = entry.unix_mode() else {
         return Ok(());
     };
+    // @cometix: keep only rwx bits; never let an archive set setuid/setgid/sticky
+    // (the RUSTSEC-2026-0367 class of issue, here in our own extraction loop).
+    let mode = mode & 0o777;
     std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(mode)).map_err(|err| {
         format!(
             "failed to set permissions on curated plugins file {}: {err}",
