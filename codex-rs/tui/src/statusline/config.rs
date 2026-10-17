@@ -46,7 +46,7 @@ fn default_theme() -> String {
 }
 
 fn default_separator() -> String {
-    " │ ".to_string()
+    " | ".to_string()
 }
 
 /// 各 segment 的配置

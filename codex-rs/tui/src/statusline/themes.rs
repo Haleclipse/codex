@@ -112,7 +112,7 @@ impl ThemePresets {
             enabled: true,
             theme: "default".to_string(),
             style: StyleMode::Plain,
-            separator: " │ ".to_string(),
+            separator: " | ".to_string(),
             segments: SegmentsConfig {
                 model: SegmentItemConfig {
                     id: super::segment::SegmentId::Model,
@@ -164,7 +164,7 @@ impl ThemePresets {
             enabled: true,
             theme: "cometix".to_string(),
             style: StyleMode::NerdFont,
-            separator: " │ ".to_string(),
+            separator: " | ".to_string(),
             segments: SegmentsConfig {
                 model: SegmentItemConfig {
                     id: super::segment::SegmentId::Model,
@@ -216,7 +216,7 @@ impl ThemePresets {
             enabled: true,
             theme: "minimal".to_string(),
             style: StyleMode::Plain,
-            separator: " │ ".to_string(),
+            separator: " | ".to_string(),
             segments: SegmentsConfig {
                 model: SegmentItemConfig {
                     id: super::segment::SegmentId::Model,
@@ -272,7 +272,7 @@ impl ThemePresets {
             enabled: true,
             theme: "gruvbox".to_string(),
             style: StyleMode::NerdFont,
-            separator: " │ ".to_string(),
+            separator: " | ".to_string(),
             segments: SegmentsConfig {
                 model: SegmentItemConfig {
                     id: super::segment::SegmentId::Model,

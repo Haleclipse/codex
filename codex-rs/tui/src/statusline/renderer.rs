@@ -166,11 +166,13 @@ impl<'a> StatusLineRenderer<'a> {
         Line::from(spans)
     }
 
-    /// 获取分隔符
-    fn get_separator(&self) -> &'static str {
+    /// 获取分隔符：Plain / NerdFont 使用配置中的分隔符（分隔符编辑器写入的值），
+    /// 为空时回退到默认分隔符。
+    fn get_separator(&self) -> &'a str {
         match self.config.style {
             StyleMode::Powerline => separators::POWERLINE_THIN,
-            _ => separators::SIMPLE,
+            _ if self.config.separator.is_empty() => separators::SIMPLE,
+            _ => self.config.separator.as_str(),
         }
     }
 
@@ -212,5 +214,43 @@ impl WidgetRef for StatusLineWidget<'_> {
         // 渲染状态栏内容
         let line = self.line.clone();
         buf.set_line(area.x, area.y, &line, area.width);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::statusline::themes::ThemePresets;
+    use pretty_assertions::assert_eq;
+
+    fn plain_line(separator: &str) -> String {
+        let mut config = ThemePresets::get_builtin("default").expect("default theme");
+        config.style = StyleMode::Plain;
+        config.separator = separator.to_string();
+        config.segments.model.enabled = true;
+        config.segments.directory.enabled = true;
+        let mut renderer = StatusLineRenderer::new(&config);
+        renderer.add_segment(SegmentId::Model, SegmentData::new("model"));
+        renderer.add_segment(SegmentId::Directory, SegmentData::new("dir"));
+        renderer
+            .render_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn plain_mode_uses_configured_separator() {
+        let line = plain_line(" ~ ");
+        assert!(line.contains("model ~ "), "{line:?}");
+        assert!(!line.contains('│') && !line.contains(" | "), "{line:?}");
+    }
+
+    #[test]
+    fn empty_separator_falls_back_to_pipe() {
+        let line = plain_line("");
+        assert_eq!(line.matches(separators::SIMPLE).count(), 1, "{line:?}");
+        assert_eq!(separators::SIMPLE, " | ");
     }
 }

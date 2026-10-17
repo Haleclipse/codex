@@ -241,7 +241,7 @@ pub mod colors {
 /// 分隔符
 pub mod separators {
     /// 简单分隔符
-    pub const SIMPLE: &str = " │ ";
+    pub const SIMPLE: &str = " | ";
     /// Powerline 箭头
     pub const POWERLINE: &str = "\u{e0b0}";
     /// Powerline 细箭头
