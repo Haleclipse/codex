@@ -4,6 +4,7 @@ use crate::cache::ModelsCacheEntry;
 use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::config::ModelsManagerConfig;
 use crate::model_info;
+use chrono::DateTime;
 use chrono::Utc;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
@@ -21,6 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::sync::MutexGuard;
 use tokio::sync::RwLock;
 use tokio::sync::TryLockError;
 use tracing::Instrument as _;
@@ -144,7 +147,7 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     ) -> ModelsManagerFuture<'_, ModelsResponse>;
 
     /// Best-effort refresh when the in-memory catalog belongs to different credentials.
-    /// Static catalogs need no refresh. Failures leave the existing cache/default fallback.
+    /// Static catalogs need no refresh. Failures follow the catalog's fallback policy.
     fn refresh_after_auth_change(
         &self,
         _http_client_factory: HttpClientFactory,
@@ -254,12 +257,37 @@ pub type ModelsManagerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a
 /// Shared model manager handle used across runtime services.
 pub type SharedModelsManager = Arc<dyn ModelsManager>;
 
+/// Only explicit catalogs serialize refresh and suppress bundled fallback. Auth and discovery
+/// settings are still evaluated when models are requested.
+#[derive(Debug)]
+enum CatalogSource {
+    Default,
+    ExplicitProvider(Mutex<()>),
+}
+
+impl CatalogSource {
+    fn fallback_models(&self) -> Option<Vec<ModelInfo>> {
+        match self {
+            Self::Default => Some(load_remote_models_from_file().unwrap_or_default()),
+            Self::ExplicitProvider(_) => None,
+        }
+    }
+
+    async fn refresh_lock(&self) -> Option<MutexGuard<'_, ()>> {
+        match self {
+            Self::Default => None,
+            Self::ExplicitProvider(lock) => Some(lock.lock().await),
+        }
+    }
+}
+
 /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
     remote_models: RwLock<ModelsCacheEntry>,
     cache: Option<Arc<dyn ModelsCache>>,
     endpoint_client: SharedModelsEndpointClient,
+    catalog_source: CatalogSource,
     api_key_model_discovery_enabled: AtomicBool,
     auth_manager: Option<Arc<AuthManager>>,
 }
@@ -314,20 +342,28 @@ impl OpenAiModelsManager {
         endpoint_client: Arc<dyn ModelsEndpointClient>,
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
-        let remote_models = load_remote_models_from_file().unwrap_or_default();
         Self {
             remote_models: RwLock::new(ModelsCacheEntry {
                 fetched_at: Utc::now(),
                 etag: None,
                 client_version: Some(crate::client_version_to_whole()),
                 identity: endpoint_client.identity(),
-                models: remote_models,
+                models: load_remote_models_from_file().unwrap_or_default(),
             }),
             cache,
             api_key_model_discovery_enabled: AtomicBool::new(false),
             endpoint_client,
+            catalog_source: CatalogSource::Default,
             auth_manager,
         }
+    }
+
+    /// Configure a newly constructed manager to use only the provider's explicit catalog.
+    /// Clear the bundled seed before sharing it; the existing auth identity must be retained.
+    pub fn with_provider_catalog(mut self) -> Self {
+        self.catalog_source = CatalogSource::ExplicitProvider(Mutex::new(()));
+        self.remote_models.get_mut().models.clear();
+        self
     }
 }
 
@@ -395,7 +431,7 @@ impl ModelsManager for OpenAiModelsManager {
             if entry.identity.is_some() && entry.identity == self.endpoint_client.identity() {
                 entry.models.clone()
             } else {
-                load_remote_models_from_file().unwrap_or_default()
+                self.catalog_source.fallback_models().unwrap_or_default()
             }
         })
     }
@@ -406,13 +442,34 @@ impl ModelsManager for OpenAiModelsManager {
             if entry.identity.is_some() && entry.identity == self.endpoint_client.identity() {
                 entry.models.clone()
             } else {
-                load_remote_models_from_file().unwrap_or_default()
+                self.catalog_source.fallback_models().unwrap_or_default()
             },
         )
     }
 
     fn auth_manager(&self) -> Option<&AuthManager> {
         self.auth_manager.as_deref()
+    }
+
+    #[tracing::instrument(skip_all, fields(model))]
+    fn get_model_info<'a>(
+        &'a self,
+        model: &'a str,
+        config: &'a ModelsManagerConfig,
+    ) -> ModelsManagerFuture<'a, ModelInfo> {
+        Box::pin(async move {
+            let models = self.get_remote_models().await;
+            match &self.catalog_source {
+                CatalogSource::Default => {
+                    construct_model_info_from_candidates(model, &models, config)
+                }
+                CatalogSource::ExplicitProvider(_) => construct_model_info(
+                    model,
+                    models.into_iter().find(|candidate| candidate.slug == model),
+                    config,
+                ),
+            }
+        })
     }
 
     fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
@@ -450,6 +507,7 @@ impl OpenAiModelsManager {
     }
 
     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
+        let refresh_guard = self.catalog_source.refresh_lock().await;
         let (identity, current_etag) = {
             let entry = self.remote_models.read().await;
             (entry.identity.clone(), entry.etag.clone())
@@ -467,6 +525,7 @@ impl OpenAiModelsManager {
             }
             return;
         }
+        drop(refresh_guard);
         if let Err(err) = self
             .refresh_available_models(RefreshStrategy::Online, &http_client_factory)
             .await
@@ -481,6 +540,7 @@ impl OpenAiModelsManager {
         refresh_strategy: RefreshStrategy,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
+        let _refresh_guard = self.catalog_source.refresh_lock().await;
         // API-key discovery must be enabled and supported before reusing a remote catalog.
         // Otherwise even a matching cache from an earlier run would bypass bundled-only behavior.
         // Command-auth providers retain their existing discovery behavior.
@@ -520,14 +580,54 @@ impl OpenAiModelsManager {
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
         let client_version = crate::client_version_to_whole();
+        let request_identity = self.endpoint_client.identity();
         let ModelsEndpointResponse {
             models,
             etag,
             identity,
-        } = self
+        } = match self
             .endpoint_client
             .list_models(&client_version, http_client_factory.clone())
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if matches!(&self.catalog_source, CatalogSource::ExplicitProvider(_)) {
+                    {
+                        let mut current = self.remote_models.write().await;
+                        if request_identity != self.endpoint_client.identity() {
+                            return Err(error);
+                        }
+                        // Keep this failure in memory even if persistent invalidation fails.
+                        current.fetched_at = DateTime::<Utc>::MIN_UTC;
+                        current.models.clear();
+                        current.etag = None;
+                        current.identity.clone_from(&request_identity);
+                    }
+                    if let Some(identity) = request_identity
+                        && let Some(cache) = self.cache.as_ref()
+                    {
+                        let invalidation = async {
+                            if let Some(mut entry) = cache.load(&client_version).await?
+                                && entry.identity.as_deref() == Some(&identity)
+                                && entry.client_version.as_deref() == Some(&client_version)
+                            {
+                                // Preserve backend lookup keys, but force a cache miss after restart.
+                                entry.fetched_at = DateTime::<Utc>::MIN_UTC;
+                                entry.etag = None;
+                                entry.models.clear();
+                                cache.store(&entry).await?;
+                            }
+                            Ok::<_, crate::cache::ModelsCacheError>(())
+                        };
+                        if let Err(err) = invalidation.await {
+                            error!("failed to invalidate models cache: {err}");
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
         if Some(&identity) != self.endpoint_client.identity().as_ref() {
             return Ok(());
         }
@@ -573,26 +673,28 @@ impl OpenAiModelsManager {
     /// models absent from the remote response must be retained. Upstream lets an
     /// authoritative remote catalog (visible ChatGPT / API-key discovery) replace the
     /// bundled list outright; this fork always merges into the bundled list so cometix
-    /// visibility overrides survive server refreshes.
+    /// visibility overrides survive server refreshes. Explicit provider catalogs have no
+    /// bundled fallback and are published as-is, as upstream does.
     async fn apply_remote_models(&self, mut entry: ModelsCacheEntry) -> bool {
         let mut current = self.remote_models.write().await;
         if entry.identity != self.endpoint_client.identity() {
             return false;
         }
-        let mut models = load_remote_models_from_file().unwrap_or_default();
-        for model in entry.models {
-            if let Some(index) = models
-                .iter()
-                .position(|existing| existing.slug == model.slug)
-            {
-                let bundled_visibility = models[index].visibility;
-                models[index] = model;
-                models[index].visibility = bundled_visibility;
-            } else {
-                models.push(model);
+        if let Some(mut models) = self.catalog_source.fallback_models() {
+            for model in entry.models {
+                if let Some(index) = models
+                    .iter()
+                    .position(|existing| existing.slug == model.slug)
+                {
+                    let bundled_visibility = models[index].visibility;
+                    models[index] = model;
+                    models[index].visibility = bundled_visibility;
+                } else {
+                    models.push(model);
+                }
             }
+            entry.models = models;
         }
-        entry.models = models;
         *current = entry;
         true
     }
@@ -609,6 +711,15 @@ impl OpenAiModelsManager {
         let Some(identity) = self.endpoint_client.identity() else {
             return false;
         };
+        {
+            let current = self.remote_models.read().await;
+            // A failed fetch must not be replaced by stale cache data even if invalidation failed.
+            if current.fetched_at == DateTime::<Utc>::MIN_UTC
+                && current.identity.as_ref() == Some(&identity)
+            {
+                return false;
+            }
+        }
         let cache_entry = match cache.load(&client_version).await {
             Ok(Some(cache_entry)) => cache_entry,
             Ok(None) => {
@@ -620,6 +731,9 @@ impl OpenAiModelsManager {
                 return false;
             }
         };
+        if cache_entry.fetched_at == DateTime::<Utc>::MIN_UTC {
+            return false;
+        }
         if cache_entry.client_version.as_deref() != Some(client_version.as_str()) {
             info!(
                 expected_version = client_version,
@@ -782,6 +896,14 @@ pub(crate) fn construct_model_info_from_candidates(
     // retry for namespaced slugs like `custom/gpt-5.3-codex`.
     let remote = find_model_by_longest_prefix(model, candidates)
         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
+    construct_model_info(model, remote, config)
+}
+
+fn construct_model_info(
+    model: &str,
+    remote: Option<ModelInfo>,
+    config: &ModelsManagerConfig,
+) -> ModelInfo {
     let model_info = if let Some(remote) = remote {
         ModelInfo {
             slug: model.to_string(),

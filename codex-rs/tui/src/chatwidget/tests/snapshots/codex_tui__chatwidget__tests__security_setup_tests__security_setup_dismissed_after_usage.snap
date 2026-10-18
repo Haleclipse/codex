@@ -2,7 +2,6 @@
 source: tui/src/chatwidget/tests/security_setup_tests.rs
 expression: rendered
 ---
-──────────────────────────────────────────────────────────────────────
-❯ Ask Codex to do anything
-──────────────────────────────────────────────────────────────────────
-   test-model-a | 󰉋 project |  - · - tokens
+› Ask Codex to do anything
+
+  test-model-a default · /tmp/project

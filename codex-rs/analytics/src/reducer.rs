@@ -157,7 +157,7 @@ use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::WebSearchAction;
 use codex_git_utils::SanitizedGitUrl;
-use codex_git_utils::collect_git_info;
+use codex_git_utils::get_git_origin_url;
 use codex_git_utils::get_git_repo_root;
 use codex_login::default_client::originator;
 use codex_protocol::config_types::ModeKind;
@@ -1155,6 +1155,14 @@ impl AnalyticsReducer {
         }
     }
 
+    pub(crate) fn flush_thread(&mut self, thread_id: &str, out: &mut Vec<TrackEventRequest>) {
+        for ((pending_thread_id, _), state) in &mut self.tool_response_states {
+            if pending_thread_id == thread_id {
+                out.extend(state.pending_tool_events.drain(..));
+            }
+        }
+    }
+
     fn ingest_initialize(
         &mut self,
         connection_id: u64,
@@ -1348,9 +1356,7 @@ impl AnalyticsReducer {
                     };
                     let repo_root = get_git_repo_root(path.as_path());
                     let repo_url = if let Some(root) = repo_root.as_ref() {
-                        collect_git_info(root)
-                            .await
-                            .and_then(|info| info.repository_url)
+                        get_git_origin_url(root).await
                     } else {
                         None
                     };

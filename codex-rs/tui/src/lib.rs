@@ -188,9 +188,11 @@ mod pager_overlay;
 // @cometix: statusline, translation, and overlay modules
 #[allow(dead_code, unused_imports, clippy::all)]
 mod cxline_overlay;
+mod projectless;
 pub(crate) mod public_widgets;
 mod render;
 mod resize_reflow_cap;
+mod resume_permissions;
 mod resume_picker;
 mod screen_reader;
 mod service_tier_resolution;
@@ -216,6 +218,7 @@ mod status_indicator_widget;
 mod statusline;
 mod streaming;
 mod style;
+mod subscription;
 mod system_motion;
 mod task_mentions;
 mod temporary_structured_request;
@@ -819,15 +822,14 @@ async fn lookup_session_target_with_app_server(
         };
     }
 
-    let model_provider =
-        (!app_server.uses_remote_workspace()).then_some(config.model_provider_id.as_str());
+    let model_provider = app_server.history_model_provider(config).await?;
     Ok(named_session_lookup::lookup(
         app_server,
         config.codex_home.as_path(),
         id_or_name,
         &[named_session_lookup::SessionCollection::Active],
         &[resume_source_kinds(/*include_non_interactive*/ false)],
-        model_provider,
+        model_provider.as_deref(),
     )
     .await?
     .and_then(session_target_from_app_server_thread))
@@ -841,6 +843,7 @@ async fn lookup_latest_session_target_with_app_server(
     include_non_interactive: bool,
 ) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
     let uses_remote_workspace = app_server.uses_remote_workspace();
+    let model_provider = app_server.history_model_provider(config).await?;
     for lookup_mode in [
         LatestSessionLookupMode::StateDbOnly,
         LatestSessionLookupMode::ScanAndRepair,
@@ -848,7 +851,7 @@ async fn lookup_latest_session_target_with_app_server(
         let response = app_server
             .thread_list(latest_session_lookup_params(
                 uses_remote_filesystem,
-                uses_remote_workspace,
+                model_provider.clone(),
                 config,
                 cwd_filter,
                 include_non_interactive,
@@ -876,7 +879,7 @@ enum LatestSessionLookupMode {
 
 fn latest_session_lookup_params(
     uses_remote_filesystem: bool,
-    uses_remote_workspace: bool,
+    model_provider: Option<String>,
     config: &Config,
     cwd_filter: Option<&Path>,
     include_non_interactive: bool,
@@ -888,11 +891,7 @@ fn latest_session_lookup_params(
         limit: Some(1),
         sort_key: Some(AppServerThreadSortKey::UpdatedAt),
         sort_direction: None,
-        model_providers: if uses_remote_workspace {
-            None
-        } else {
-            Some(vec![config.model_provider_id.clone()])
-        },
+        model_providers: model_provider.map(|provider| vec![provider]),
         source_kinds: Some(resume_source_kinds(include_non_interactive)),
         archived: Some(false),
         section_id: None,
@@ -1225,7 +1224,7 @@ async fn run_ratatui_app(
         )
         .await;
     launch_telemetry.record(&app_server_target, matches!(&startup_app_server, Ok(Ok(_))));
-    let app_server_session = match startup_app_server {
+    let mut app_server_session = match startup_app_server {
         Ok(Ok(app_server)) => {
             AppServerSession::new(app_server, app_server_target.thread_params_mode())
                 .with_local_codex_home(&initial_config.codex_home)
@@ -1268,6 +1267,7 @@ async fn run_ratatui_app(
             }
         }
     }
+    app_server_session.model_provider_override = overrides.model_provider.clone();
     let mut app_server = Some(app_server_session);
     // Folder consent runs after the picker resolves the actual destination.
     let should_show_trust_screen_flag = false;
@@ -1841,7 +1841,10 @@ async fn run_ratatui_app(
             &config,
             &app_server_target,
             trust_cwd,
-            resumed_thread.as_ref(),
+            onboarding::DirectoryTrustOptions {
+                resumed_thread: resumed_thread.as_ref(),
+                ..Default::default()
+            },
             Some(&mut startup_draft),
         )
         .await?;
@@ -1965,7 +1968,7 @@ async fn run_ratatui_app(
     }
 
     set_default_client_residency_requirement(config.enforce_residency.value());
-    let should_show_trust_screen = should_show_trust_screen(&config);
+    let is_first_run = config.active_project.trust_level.is_none();
     #[cfg(target_os = "windows")]
     let should_prompt_windows_sandbox_nux_at_startup = trust_decision_was_made;
     #[cfg(not(target_os = "windows"))]
@@ -2054,7 +2057,7 @@ async fn run_ratatui_app(
         images,
         session_selection,
         feedback,
-        should_show_trust_screen, // Proxy to: is it a first run in this directory?
+        is_first_run,
         should_prompt_windows_sandbox_nux_at_startup,
         app_server_target,
         state_db,
@@ -2290,11 +2293,6 @@ async fn load_bootstrap_config_or_exit(
     }
 }
 
-/// Determine if the user has decided whether to trust the current directory.
-fn should_show_trust_screen(config: &Config) -> bool {
-    config.active_project.trust_level.is_none()
-}
-
 fn should_show_onboarding(
     login_status: LoginStatus,
     requires_openai_auth: bool,
@@ -2356,10 +2354,8 @@ pub(crate) mod tests {
     use codex_app_server_protocol::RequestId;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
-    use codex_config::config_toml::ProjectConfig;
     use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
-    use serial_test::serial;
     use tempfile::TempDir;
 
     #[test]
@@ -3222,17 +3218,14 @@ requires_openai_auth = {requires_openai_auth}
 
         let params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ false,
-            /*uses_remote_workspace*/ false,
+            /*model_provider*/ None,
             &config,
             Some(cwd.as_path()),
             /*include_non_interactive*/ false,
             LatestSessionLookupMode::StateDbOnly,
         );
 
-        assert_eq!(
-            params.model_providers,
-            Some(vec![config.model_provider_id.clone()])
-        );
+        assert_eq!(params.model_providers, None);
         assert_eq!(
             params.cwd,
             Some(ThreadListCwdFilter::One(cwd.to_string_lossy().to_string()))
@@ -3241,7 +3234,7 @@ requires_openai_auth = {requires_openai_auth}
 
         let scan_params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ false,
-            /*uses_remote_workspace*/ false,
+            /*model_provider*/ None,
             &config,
             Some(cwd.as_path()),
             /*include_non_interactive*/ false,
@@ -3252,28 +3245,23 @@ requires_openai_auth = {requires_openai_auth}
     }
 
     #[tokio::test]
-    async fn latest_session_lookup_params_keep_local_filters_for_local_daemon_sessions()
-    -> color_eyre::Result<()> {
+    async fn latest_session_lookup_params_honor_explicit_provider() -> color_eyre::Result<()> {
         let temp_dir = TempDir::new()?;
         let config = build_config(&temp_dir).await?;
         let cwd = temp_dir.path().join("project");
-        let target = AppServerTarget::LocalDaemon {
-            allow_embedded_fallback: true,
-            endpoint: RemoteAppServerEndpoint::UnixSocket {
-                socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
-            },
-        };
-
         let params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ false,
-            target.uses_remote_workspace(),
+            Some("selected-provider".to_string()),
             &config,
             Some(cwd.as_path()),
             /*include_non_interactive*/ false,
             LatestSessionLookupMode::StateDbOnly,
         );
 
-        assert_eq!(params.model_providers, Some(vec![config.model_provider_id]));
+        assert_eq!(
+            params.model_providers,
+            Some(vec!["selected-provider".to_string()])
+        );
         assert_eq!(
             params.cwd,
             Some(ThreadListCwdFilter::One(cwd.to_string_lossy().to_string()))
@@ -3289,7 +3277,7 @@ requires_openai_auth = {requires_openai_auth}
 
         let params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ true,
-            /*uses_remote_workspace*/ true,
+            /*model_provider*/ None,
             &config,
             /*cwd_filter*/ None,
             /*include_non_interactive*/ false,
@@ -3309,7 +3297,7 @@ requires_openai_auth = {requires_openai_auth}
 
         let params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ true,
-            /*uses_remote_workspace*/ true,
+            /*model_provider*/ None,
             &config,
             /*cwd_filter*/ None,
             /*include_non_interactive*/ true,
@@ -3337,7 +3325,7 @@ requires_openai_auth = {requires_openai_auth}
 
         let params = latest_session_lookup_params(
             /*uses_remote_filesystem*/ true,
-            /*uses_remote_workspace*/ true,
+            /*model_provider*/ None,
             &config,
             Some(cwd),
             /*include_non_interactive*/ false,
@@ -3667,6 +3655,12 @@ requires_openai_auth = {requires_openai_auth}
         )?;
 
         assert_eq!(config_cwd, None);
+        assert!(!projectless::has_only_local_environments(
+            &environment_manager
+        ));
+        assert!(projectless::has_only_local_environments(
+            &EnvironmentManager::default_for_tests()
+        ));
         assert!(uses_remote_workspace_or_environment(
             &target,
             &environment_manager
@@ -3681,22 +3675,6 @@ requires_openai_auth = {requires_openai_auth}
             &local_daemon,
             &environment_manager
         ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn windows_shows_trust_prompt_without_sandbox() -> std::io::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let mut config = build_config(&temp_dir).await?;
-        config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(/*value*/ false);
-
-        let should_show = should_show_trust_screen(&config);
-        assert!(
-            should_show,
-            "Trust prompt should be shown when project trust is undecided"
-        );
         Ok(())
     }
 
@@ -3931,45 +3909,6 @@ requires_openai_auth = {requires_openai_auth}
             codex_state::sqlite_error_detail_is_corruption(startup_error.detail()),
             "startup error should preserve the SQLite corruption cause, got: {}",
             startup_error.detail()
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn windows_shows_trust_prompt_with_sandbox() -> std::io::Result<()> {
-        let temp_dir = TempDir::new()?;
-        let mut config = build_config(&temp_dir).await?;
-        config.active_project = ProjectConfig { trust_level: None };
-        config.set_windows_sandbox_enabled(/*value*/ true);
-
-        let should_show = should_show_trust_screen(&config);
-        if cfg!(target_os = "windows") {
-            assert!(
-                should_show,
-                "Windows trust prompt should be shown on native Windows with sandbox enabled"
-            );
-        } else {
-            assert!(
-                should_show,
-                "Non-Windows should still show trust prompt when project is untrusted"
-            );
-        }
-        Ok(())
-    }
-    #[tokio::test]
-    async fn untrusted_project_skips_trust_prompt() -> std::io::Result<()> {
-        use codex_protocol::config_types::TrustLevel;
-        let temp_dir = TempDir::new()?;
-        let mut config = build_config(&temp_dir).await?;
-        config.active_project = ProjectConfig {
-            trust_level: Some(TrustLevel::Untrusted),
-        };
-
-        let should_show = should_show_trust_screen(&config);
-        assert!(
-            !should_show,
-            "Trust prompt should not be shown for projects explicitly marked as untrusted"
         );
         Ok(())
     }

@@ -273,6 +273,7 @@ pub(crate) struct AgentsOverviewThreadRefresh {
     pub(crate) threads: std::collections::HashMap<ThreadId, Option<Thread>>,
     pub(crate) last_messages: std::collections::HashMap<ThreadId, String>,
     pub(crate) recent_seed_complete: bool,
+    pub(crate) discovery: Option<crate::app::agents_overview_discovery::AgentsOverviewDiscovery>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -291,6 +292,7 @@ pub(crate) enum AppEvent {
     CloseMisalignmentReview,
     /// Open the live command center for recent and locally retained root sessions.
     OpenAgentsOverview,
+    ShowMoreAgentsOverview,
     /// Create an empty thread from the command center.
     NewAgentsOverviewSession {
         cwd: Option<AbsolutePathBuf>,

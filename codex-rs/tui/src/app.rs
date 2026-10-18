@@ -202,6 +202,7 @@ mod agent_status_feed;
 mod agents_overview;
 mod agents_overview_actions;
 mod agents_overview_details;
+pub(crate) mod agents_overview_discovery;
 mod agents_overview_threads;
 mod agents_overview_usage;
 mod agents_overview_view;
@@ -540,6 +541,7 @@ pub(crate) struct App {
     loader_overrides: LoaderOverrides,
     cloud_config_bundle: CloudConfigBundleLoader,
     runtime_approval_policy_override: Option<RuntimeApprovalPolicyOverride>,
+    runtime_approvals_reviewer_override: Option<ApprovalsReviewer>,
     runtime_permission_profile_override: Option<RuntimePermissionProfileOverride>,
     /// In-flight remote selections; confirmed settings live in each task's server snapshot.
     pending_server_profiles: HashMap<ThreadId, PermissionProfileSelection>,
@@ -671,7 +673,6 @@ struct RuntimePermissionProfileOverride {
     permission_profile: PermissionProfile,
     active_permission_profile: Option<ActivePermissionProfile>,
     network: Option<crate::legacy_core::config::NetworkProxySpec>,
-    approvals_reviewer: ApprovalsReviewer,
     turn_override: RuntimePermissionProfileTurnOverride,
 }
 
@@ -708,7 +709,6 @@ impl RuntimePermissionProfileOverride {
             permission_profile: config.permissions.permission_profile().clone(),
             active_permission_profile: config.permissions.active_permission_profile(),
             network: config.permissions.network.clone(),
-            approvals_reviewer: config.approvals_reviewer,
             turn_override: RuntimePermissionProfileTurnOverride::LegacySandbox,
         }
     }
@@ -724,7 +724,6 @@ impl RuntimePermissionProfileOverride {
         self.permission_profile == *config.permissions.permission_profile()
             && self.active_permission_profile == config.permissions.active_permission_profile()
             && self.network == config.permissions.network
-            && self.approvals_reviewer == config.approvals_reviewer
     }
 
     fn turn_permission_profile(&self) -> Option<&PermissionProfile> {
@@ -838,8 +837,9 @@ impl App {
         tui.link_hover.observe(&event);
         self.refresh_link_hover(tui)?;
         self.invalidate_right_click_paste(&event);
-        self.finish_clipboard(tui);
+        self.finish_clipboard(tui, &event);
         let event = self.finish_right_click_paste(tui, event);
+        let idle_draw = matches!(event, TuiEvent::Draw);
         if matches!(&event, TuiEvent::Key(_))
             && self.handle_composer_copy_event(tui, &event, |tui, text| {
                 tui.copy_transcript_selection(text, crate::clipboard_copy::CopyFormat::PlainText)
@@ -1137,6 +1137,10 @@ impl App {
                 TuiEvent::Mouse(mouse) => self.start_right_click_paste(tui, mouse),
                 TuiEvent::FocusLost => {}
             }
+        }
+        // Both transcript owners must consume completions before automatic work advances.
+        if idle_draw {
+            tui.clipboard.advance(tui.frame_requester());
         }
         Ok(AppRunControl::Continue)
     }

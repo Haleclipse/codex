@@ -330,10 +330,14 @@ pub enum Feature {
     /// Reuse encrypted parent compaction when restarting Guardian review sessions.
     /// When disabled, retain an independent review transcript across parent compaction.
     GuardianReuseParentCompaction,
+    /// Limit worker Guardian root evidence to preceding root communication windows.
+    GuardianRootHandoffContext,
     /// Include completed node_repl or cua_repl Code Mode responses in Guardian reviews.
     GuardianEnhancedNodeReplTranscripts,
     /// Include completed node_repl or cua_repl Code Mode response images in Guardian reviews.
     GuardianNodeReplTranscriptImages,
+    /// Give Guardian access to the root conversation's message history tools.
+    GuardianConversationHistoryTools,
     /// Enable Guardian V2 automatic approval reviews.
     GuardianV2,
     /// Removed compatibility flag for the unused Guardian extension prototype.
@@ -1660,6 +1664,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::GuardianRootHandoffContext,
+        key: "guardian_root_handoff_context",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::GuardianEnhancedNodeReplTranscripts,
         key: "guardian_enhanced_node_repl_transcripts",
         stage: Stage::UnderDevelopment,
@@ -1668,6 +1678,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianNodeReplTranscriptImages,
         key: "guardian_node_repl_transcript_images",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianConversationHistoryTools,
+        key: "guardian_conversation_history_tools",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

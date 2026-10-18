@@ -1,5 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/security_setup_tests.rs
+assertion_line: 43
 expression: "normalize_snapshot_paths(render_bottom_popup(&chat, 48))"
 ---
   Set up security for Daybreak mode
@@ -9,11 +10,11 @@ expression: "normalize_snapshot_paths(render_bottom_popup(&chat, 48))"
   skip re-verification. You can keep using
   Codex while you finish setup.
 
-❯ 1. Set up security
+› 1. Set up security
 
   Press a number to choose · esc to dismiss ·
   type to continue
-────────────────────────────────────────────────
-❯ Ask Codex to do anything
-────────────────────────────────────────────────
-   test-model-a | 󰉋 project |  - · - tokens
+
+› Ask Codex to do anything
+
+  test-model-a default · /tmp/project

@@ -398,6 +398,16 @@
           ],
           "description": "Controls whether circuit-breaker interruptions include a structured error. Strict mode writes structured errors that older clients may not recognize when reading shared history. Defaults to `default`."
         },
+        "conversation_history_max_output_tokens": {
+          "description": "Maximum estimated tokens per Guardian history-tool response, before the standard serialization allowance. Defaults to 4,000; stricter parent tool limits still apply.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "experimental_conversation_history_prompt": {
+          "description": "Experimental replacement for the history-retrieval instructions when history tools and Apps are enabled. Omitted or blank values use the built-in prompt.",
+          "type": "string"
+        },
         "experimental_policy_template": {
           "description": "Experimental full Guardian prompt template containing the tenant policy placeholder.",
           "type": "string"
@@ -875,6 +885,9 @@
             "guardian_approval": {
               "type": "boolean"
             },
+            "guardian_conversation_history_tools": {
+              "type": "boolean"
+            },
             "guardian_enhanced_node_repl_transcripts": {
               "type": "boolean"
             },
@@ -885,6 +898,9 @@
               "type": "boolean"
             },
             "guardian_reuse_parent_compaction": {
+              "type": "boolean"
+            },
+            "guardian_root_handoff_context": {
               "type": "boolean"
             },
             "guardianv2": {
@@ -2698,7 +2714,7 @@
         },
         "requires_openai_auth": {
           "default": false,
-          "description": "Does this provider require an OpenAI API Key or ChatGPT login token? If true, user is presented with login screen on first run, and login preference and token/key are stored in auth.json. If false (which is the default), login screen is skipped, and API key (if needed) comes from the \"env_key\" environment variable.",
+          "description": "Does this provider require an OpenAI API key or ChatGPT login token? If true, the user is presented with a login screen on first run, and credentials are stored using the backend selected by `cli_auth_credentials_store`. If false (the default), the login screen is skipped, and the API key (if needed) comes from the environment variable specified by `env_key`.",
           "type": "boolean"
         },
         "stream_idle_timeout_ms": {
@@ -6905,6 +6921,9 @@
         "guardian_approval": {
           "type": "boolean"
         },
+        "guardian_conversation_history_tools": {
+          "type": "boolean"
+        },
         "guardian_enhanced_node_repl_transcripts": {
           "type": "boolean"
         },
@@ -6915,6 +6934,9 @@
           "type": "boolean"
         },
         "guardian_reuse_parent_compaction": {
+          "type": "boolean"
+        },
+        "guardian_root_handoff_context": {
           "type": "boolean"
         },
         "guardianv2": {

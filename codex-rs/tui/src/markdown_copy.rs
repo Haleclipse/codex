@@ -93,6 +93,13 @@ impl CopyLine {
         }
     }
 
+    fn is_inline_code(&self, range: &Range<usize>) -> bool {
+        !range.is_empty()
+            && self.runs.iter().any(|(run, inline)| {
+                run.start <= range.start && range.end <= run.end && inline.contains(&Inline::Code)
+            })
+    }
+
     fn render(&self, text: &str, range: Range<usize>, depth: usize) -> String {
         if self.rule && range == (0..text.len()) {
             return "***".to_owned();
@@ -254,6 +261,65 @@ impl SelectedLine {
 }
 
 pub(crate) fn selection(lines: &[SelectedLine], plain: &str) -> (String, CopyFormat) {
+    // Soft wraps and streamed fragments of the same logical line are already coalesced.
+    if let [line] = lines
+        && line
+            .source
+            .copy
+            .as_ref()
+            .is_some_and(|copy| copy.is_inline_code(&line.range))
+    {
+        return (plain.to_owned(), CopyFormat::PlainText);
+    }
+    // Quote-only selections omit quote markers. Tables and task lists still need their
+    // semantic metadata to reconstruct cell fragments and preserve checkbox state.
+    let mut content = lines
+        .iter()
+        .filter(|line| {
+            !line.range.is_empty() && !line.source.copy.as_ref().is_some_and(|copy| copy.omit)
+        })
+        .peekable();
+    let quote_only = content.peek().is_some()
+        && content.all(|line| {
+            line.source
+                .copy
+                .as_ref()
+                .is_some_and(|copy| copy.prefix.contains("> "))
+        });
+    let unquoted;
+    let lines = if quote_only {
+        if !lines.iter().any(|line| {
+            (!line.range.is_empty() || line.source.text.is_empty())
+                && line.source.copy.as_ref().is_some_and(|copy| {
+                    !copy.omit
+                        && (copy.table.is_some()
+                            || copy.item_prefix.contains("[x] ")
+                            || copy.item_prefix.contains("[ ] "))
+                })
+        }) {
+            return (plain.to_owned(), CopyFormat::PlainText);
+        }
+        unquoted = lines
+            .iter()
+            .map(|line| {
+                let mut source = line.source.clone();
+                if let Some(copy) = source.copy.as_mut() {
+                    let copy = Arc::make_mut(copy);
+                    copy.prefix = copy.prefix.replace("> ", "");
+                    copy.continuation = copy.continuation.replace("> ", "");
+                    copy.item_prefix = copy.item_prefix.replace("> ", "");
+                }
+                SelectedLine {
+                    source,
+                    range: line.range.clone(),
+                    separator: line.separator.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        &unquoted
+    } else {
+        lines
+    };
     let rich = lines.iter().any(|line| {
         !line.range.is_empty()
             && line
@@ -315,7 +381,12 @@ pub(crate) fn selection(lines: &[SelectedLine], plain: &str) -> (String, CopyFor
             {
                 selected.extend(lines.next());
             }
-            let body = table::render(&selected, table);
+            let entire_selection = first && lines.peek().is_none();
+            let (mut body, format) = table::render(&selected, table, entire_selection);
+            if format == CopyFormat::PlainText {
+                body.retain(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'));
+                return (body, format);
+            }
             let continuation = line
                 .source
                 .copy
