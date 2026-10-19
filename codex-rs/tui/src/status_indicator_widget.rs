@@ -115,6 +115,11 @@ impl StatusIndicatorWidget {
         self.app_event_tx.interrupt();
     }
 
+    pub(crate) fn set_motion_preferences(&mut self, tui: &codex_config::types::Tui) {
+        self.animations_enabled = tui.animations;
+        self.effects = tui.effects;
+    }
+
     /// Update the animated header label (left of the brackets).
     pub(crate) fn update_header(&mut self, header: String) {
         if self.header != header {

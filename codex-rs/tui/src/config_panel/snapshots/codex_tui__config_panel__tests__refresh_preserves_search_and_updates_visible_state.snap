@@ -1,0 +1,20 @@
+---
+source: tui/src/config_panel/config_panel_tests.rs
+expression: "render(&panel, 140)"
+---
+
+  Configuration
+  Test sent · check terminal/system settings
+
+   Appearance   Notifications   Input   Sessions   Text selection
+
+  Search › tips
+
+❯ Tips                  [x] On               Appearance · Show helpful shortcuts and suggestions
+
+
+
+
+
+
+  enter toggle · esc clear search

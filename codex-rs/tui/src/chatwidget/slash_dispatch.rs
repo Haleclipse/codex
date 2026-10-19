@@ -592,6 +592,9 @@ impl ChatWidget {
             SlashCommand::Translate => {
                 self.app_event_tx.send(AppEvent::OpenTranslateConfig);
             }
+            SlashCommand::Config => {
+                self.open_config_panel();
+            }
             SlashCommand::Theme => {
                 self.open_theme_picker();
             }
@@ -1342,6 +1345,7 @@ impl ChatWidget {
             | SlashCommand::Statusline
             | SlashCommand::Cxline
             | SlashCommand::Translate
+            | SlashCommand::Config
             | SlashCommand::Theme
             | SlashCommand::Tui
             | SlashCommand::Pets => QueueDrain::Stop,

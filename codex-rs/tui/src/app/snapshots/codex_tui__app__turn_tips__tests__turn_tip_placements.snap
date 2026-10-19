@@ -38,6 +38,58 @@ working=false, response rows=1, 80x12
    gpt-test | 󰉋 project |  - · - tokens
 
 
+working=false, response rows=1, 80x24
+
+› Show a response.
+
+
+Response row 0
+
+• Done.
+  └ Tip: Try /help.
+
+  Worked for [duration] • [completion time]
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+❯ Ask Codex to do anything
+────────────────────────────────────────────────────────────────────────────────
+   gpt-test | 󰉋 project |  - · - tokens
+
+
+Completion tip selected, 80x24
+
+› Show a response.
+
+
+Response row 0
+
+• Done.
+  └ Tip: Try /help.
+
+  Worked for [duration] • [completion time]
+
+
+
+
+
+
+
+
+                                                               Copying 5 chars…
+────────────────────────────────────────────────────────────────────────────────
+❯ Ask Codex to do anything
+────────────────────────────────────────────────────────────────────────────────
+   gpt-test | 󰉋 project |  - · - tokens
+
+
 working=false, response rows=30, 80x12
 › Show a response.
 
