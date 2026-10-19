@@ -18,6 +18,7 @@ use super::session::SessionSettingsUpdate;
 use super::thread_settings;
 use super::turn_context::NewTurnContextOptions;
 use super::turn_context::TurnContext;
+use crate::WithTurnExtensionData;
 use crate::state::ActiveTurn;
 use crate::state::TurnState;
 use crate::tasks::RegularTask;
@@ -96,10 +97,14 @@ impl PreparedTurnInputSettings {
     /// leaves the thread unchanged.
     async fn prepare(
         session: &Session,
-        thread_settings: ThreadSettingsOverrides,
+        thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
         start_options: TurnStartOptions,
     ) -> CodexResult<Self> {
-        let thread_settings_update = if thread_settings == ThreadSettingsOverrides::default() {
+        let thread_settings = thread_settings.into();
+        let thread_settings_update = if thread_settings.request
+            == ThreadSettingsOverrides::default()
+            && thread_settings.turn_extension_init.is_none()
+        {
             None
         } else {
             let updates = thread_settings::prepare_update(thread_settings);
@@ -202,16 +207,23 @@ impl PreparedTurnInputSettings {
     }
 }
 
+#[tracing::instrument(
+    name = "codex.turn_input",
+    level = "trace",
+    skip_all,
+    fields(conversation.id = %session.thread_id, turn.id)
+)]
 pub(super) async fn handle(
     session: &Arc<Session>,
-    request: TurnInputRequest,
+    request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
     mode: TurnInputMode,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
-    match mode {
+    let request = request.into();
+    let result = match mode {
         TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
         TurnInputMode::StartIfIdle => {
-            let kind = match &request.input {
+            let kind = match &request.request.input {
                 SubmittedTurnInput::UserInput { content, .. } if !content.is_empty() => {
                     TurnStartKind::User
                 }
@@ -231,7 +243,7 @@ pub(super) async fn handle(
         TurnInputMode::ContinueIfIdle {
             expected_previous_turn_id,
         } => {
-            if !matches!(&request.input, SubmittedTurnInput::ResponseItem(_)) {
+            if !matches!(&request.request.input, SubmittedTurnInput::ResponseItem(_)) {
                 return Err(CodexErr::InvalidRequest(
                     "continuation requires internal response input".to_string(),
                 ));
@@ -248,36 +260,64 @@ pub(super) async fn handle(
         TurnInputMode::Steer { expected_turn_id } => {
             steer(session, request, expected_turn_id, submission_id).await
         }
+    };
+    // Link this request's trace to the accepted turn, which may have an older trace.
+    if let Ok(TurnInputSubmission::Started { turn_id } | TurnInputSubmission::Steered { turn_id }) =
+        &result
+    {
+        tracing::Span::current().record("turn.id", turn_id);
     }
+    result
 }
 
+#[tracing::instrument(
+    name = "codex.turn_input",
+    level = "trace",
+    skip_all,
+    fields(conversation.id = %session.thread_id, turn.id)
+)]
 pub(super) async fn handle_recovery(
     session: &Arc<Session>,
-    thread_settings: ThreadSettingsOverrides,
+    thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
     start_options: TurnStartOptions,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    let WithTurnExtensionData {
+        request: thread_settings,
+        turn_extension_init,
+    } = thread_settings.into();
     let request = TurnInputRequest::user_input(Vec::new())
         .with_thread_settings(thread_settings)
         .on_start(TurnStartOptions {
             turn_trigger: Some("retry".to_string()),
             ..start_options
         });
-    start_if_idle(
+    let result = start_if_idle(
         session,
-        request,
+        WithTurnExtensionData {
+            request,
+            turn_extension_init,
+        },
         submission_id,
         TurnStartKind::Recovery,
         /*expected_previous_turn_id*/ None,
     )
-    .await
+    .await;
+    if let Ok(TurnInputSubmission::Started { turn_id }) = &result {
+        tracing::Span::current().record("turn.id", turn_id);
+    }
+    result
 }
 
 async fn start_or_steer(
     session: &Arc<Session>,
-    request: TurnInputRequest,
+    request: WithTurnExtensionData<TurnInputRequest>,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    let WithTurnExtensionData {
+        request,
+        turn_extension_init,
+    } = request;
     let TurnInputRequest {
         mut input,
         thread_settings,
@@ -300,7 +340,15 @@ async fn start_or_steer(
             ));
         }
     };
-    let settings = PreparedTurnInputSettings::prepare(session, thread_settings, start).await?;
+    let settings = PreparedTurnInputSettings::prepare(
+        session,
+        WithTurnExtensionData {
+            request: thread_settings,
+            turn_extension_init,
+        },
+        start,
+    )
+    .await?;
     match session
         .steer_input(
             &mut input,
@@ -378,11 +426,15 @@ async fn start_or_steer(
 )]
 async fn start_if_idle(
     session: &Arc<Session>,
-    request: TurnInputRequest,
+    request: WithTurnExtensionData<TurnInputRequest>,
     submission_id: String,
     kind: TurnStartKind,
     expected_previous_turn_id: Option<String>,
 ) -> CodexResult<TurnInputSubmission> {
+    let WithTurnExtensionData {
+        request,
+        turn_extension_init,
+    } = request;
     let TurnInputRequest {
         input,
         thread_settings,
@@ -454,7 +506,16 @@ async fn start_if_idle(
         });
     }
 
-    let settings = match PreparedTurnInputSettings::prepare(session, thread_settings, start).await {
+    let settings = match PreparedTurnInputSettings::prepare(
+        session,
+        WithTurnExtensionData {
+            request: thread_settings,
+            turn_extension_init,
+        },
+        start,
+    )
+    .await
+    {
         Ok(settings) => settings,
         Err(error) => {
             session.clear_reserved_idle_turn(&turn_state).await;
@@ -520,10 +581,14 @@ async fn start_if_idle(
 
 async fn steer(
     session: &Arc<Session>,
-    request: TurnInputRequest,
+    request: WithTurnExtensionData<TurnInputRequest>,
     expected_turn_id: String,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    let WithTurnExtensionData {
+        request,
+        turn_extension_init,
+    } = request;
     let TurnInputRequest {
         mut input,
         thread_settings,
@@ -538,7 +603,15 @@ async fn steer(
             "only user input can steer a turn".to_string(),
         ));
     }
-    let settings = PreparedTurnInputSettings::prepare(session, thread_settings, start).await?;
+    let settings = PreparedTurnInputSettings::prepare(
+        session,
+        WithTurnExtensionData {
+            request: thread_settings,
+            turn_extension_init,
+        },
+        start,
+    )
+    .await?;
     match session
         .steer_input(
             &mut input,

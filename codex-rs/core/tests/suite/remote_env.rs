@@ -1,3 +1,5 @@
+#[path = "remote_env_capability_roots_tests.rs"]
+mod capability_roots;
 #[path = "guardian_environments_tests.rs"]
 mod guardian_environments;
 #[path = "remote_env_spawn_tests.rs"]
@@ -195,13 +197,15 @@ impl ContextContributor for ReadyCapabilityRootsTestExtension {
             let body = root_ids.join(",");
             vec![WorldStateSectionContribution::new(
                 "ready_capability_roots_test",
-                json!(root_ids),
                 move |_| {
-                    Some(RenderedWorldStateFragment::new(
-                        "user",
-                        ("<ready_capability_roots>", "</ready_capability_roots>"),
-                        body.clone(),
-                    ))
+                    (
+                        Some(json!(root_ids)),
+                        Some(RenderedWorldStateFragment::new(
+                            "user",
+                            ("<ready_capability_roots>", "</ready_capability_roots>"),
+                            body.clone(),
+                        )),
+                    )
                 },
             )]
         })
@@ -1444,6 +1448,19 @@ async fn serve_environment_with_agents_md(
     listener: TcpListener,
     contents: &str,
     attach: tokio::sync::oneshot::Receiver<()>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> usize {
+    serve_environment_with_instruction_files(
+        listener, contents, /*skill*/ None, attach, shutdown,
+    )
+    .await
+}
+
+async fn serve_environment_with_instruction_files(
+    listener: TcpListener,
+    contents: &str,
+    skill: Option<&str>,
+    attach: tokio::sync::oneshot::Receiver<()>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> usize {
     let mut websocket = accept_initialized_exec_server(listener).await;
@@ -1459,6 +1476,10 @@ async fn serve_environment_with_agents_md(
         let is_agents_md = request["params"]["path"]
             .as_str()
             .is_some_and(|path| path.ends_with("/AGENTS.md"));
+        let is_skill_root = skill.is_some()
+            && request["params"]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("/.agents/skills"));
         let response = match request["method"].as_str() {
             Some("environment/info") => json!({
                 "id": request["id"],
@@ -1468,16 +1489,38 @@ async fn serve_environment_with_agents_md(
                 "id": request["id"],
                 "result": { "path": request["params"]["path"] }
             }),
-            Some("fs/walk") => json!({
-                "id": request["id"],
-                "result": { "entries": [], "errors": [], "truncated": false }
-            }),
-            Some("fs/getMetadata") if is_agents_md => {
+            Some("fs/walk") => {
+                let root = request["params"]["path"].as_str().expect("walk root");
+                let entries = if is_skill_root {
+                    vec![json!({
+                        "path": format!("{root}/guardian-fixture-skill/SKILL.md"),
+                        "kind": "file",
+                    })]
+                } else {
+                    Vec::new()
+                };
+                json!({
+                    "id": request["id"],
+                    "result": { "entries": entries, "errors": [], "truncated": false }
+                })
+            }
+            Some("fs/readFile")
+                if skill.is_some()
+                    && request["params"]["path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("/guardian-fixture-skill/SKILL.md")) =>
+            {
+                json!({
+                    "id": request["id"],
+                    "result": { "dataBase64": BASE64_STANDARD.encode(skill.expect("skill contents")) }
+                })
+            }
+            Some("fs/getMetadata") if is_agents_md || is_skill_root => {
                 json!({
                     "id": request["id"],
                     "result": {
-                        "isDirectory": false,
-                        "isFile": true,
+                        "isDirectory": is_skill_root,
+                        "isFile": is_agents_md,
                         "isSymlink": false,
                         "size": contents.len(),
                         "createdAtMs": 0,

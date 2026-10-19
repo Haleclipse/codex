@@ -242,6 +242,7 @@ async fn new_config(
         startup_warnings: Vec::new(),
         bypass_hook_trust: false,
         model,
+        daybreak_enabled: false,
         service_tier: None,
         review_model: None,
         model_context_window: None,
@@ -380,6 +381,8 @@ async fn new_config(
         sleep_tool_mode: Default::default(),
         features: Default::default(),
         prefer_mxc: false,
+
+        runtime_feature_defaults: Default::default(),
         suppress_unstable_features_warning: false,
         active_project: ProjectConfig { trust_level: None },
         notices: Notice::default(),

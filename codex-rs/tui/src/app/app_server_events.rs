@@ -1,4 +1,5 @@
 //! App-server event stream handling for the TUI app.
+//! Hidden structured threads reject requests instead of entering interactive routing.
 
 use super::App;
 use super::ThreadBufferedEvent;
@@ -278,6 +279,25 @@ impl App {
             ServerNotification::McpServerStatusUpdated(_) => {
                 self.refresh_mcp_startup_expected_servers_from_config();
             }
+            ServerNotification::McpServerOauthLoginCompleted(notification) => {
+                // The start response identifies the new attempt. Hold completions until then
+                // so a replacement's cancellation cannot appear as a fresh login failure.
+                if let Some(pending) = self.pending_mcp_login_start.as_mut()
+                    && pending.name == notification.name
+                {
+                    pending.completions.push(notification.clone());
+                    return;
+                }
+                if notification.login_id.is_some() {
+                    if notification.login_id.as_ref()
+                        != self.active_mcp_login_ids.get(&notification.name)
+                    {
+                        return;
+                    }
+                    self.active_mcp_login_ids.remove(&notification.name);
+                }
+            }
+
             ServerNotification::AccountRateLimitsUpdated(notification) => {
                 let workspace_hard_stop = matches!(
                     notification.rate_limits.rate_limit_reached_type,
@@ -306,7 +326,6 @@ impl App {
                 self.agents_overview.pending_usage = None;
                 self.agents_overview.usage_disabled = false;
                 self.repaint_agents_overview();
-                self.chat_widget.cyber_policy_notice = Default::default();
                 self.chat_widget.invalidate_security_setup();
                 if let Some(crate::pager_overlay::Overlay::Analytics(view)) = &mut self.overlay {
                     view.refresh();
@@ -347,11 +366,6 @@ impl App {
                         app_server_client,
                         self.app_event_tx.clone(),
                         self.chat_widget.security_setup_request_id,
-                    );
-                    crate::daybreak::prefetch_notice(
-                        &self.config,
-                        app_server_client,
-                        self.chat_widget.cyber_policy_notice.clone(),
                     );
                 }
                 return;
@@ -537,6 +551,23 @@ impl App {
         app_server_client: &AppServerSession,
         request: ServerRequest,
     ) {
+        let thread_id = server_request_thread_id(&request);
+        if thread_id
+            .is_some_and(|thread_id| self.temporary_structured_requests.contains_key(&thread_id))
+        {
+            if let Err(err) = self
+                .reject_app_server_request(
+                    app_server_client,
+                    request.id().clone(),
+                    "temporary structured threads cannot request tools or user interaction"
+                        .to_string(),
+                )
+                .await
+            {
+                tracing::debug!("{err}");
+            }
+            return;
+        }
         if let ServerRequest::DynamicToolCall { request_id, params } = &request {
             if self.dynamic_tool_tasks.contains_key(request_id)
                 || (params.namespace.as_deref() != Some(crate::dynamic_tools::NAMESPACE)
@@ -592,11 +623,13 @@ impl App {
             app_server_client
                 .thread_tool_transport()
                 .configure(&mut thread_start_params);
+            let features = self.config.features.get().clone();
             let task = tokio::spawn(async move {
                 let response = crate::dynamic_tools::execute(
                     request_handle,
                     params,
                     thread_start_params,
+                    features,
                     status_updates,
                     Some(&app_event_tx),
                 )
@@ -625,7 +658,6 @@ impl App {
             return;
         }
 
-        let thread_id = server_request_thread_id(&request);
         let background_voice = self.background_voice.as_ref().is_some_and(|owner| {
             owner.realtime_conversation_is_running()
                 && owner.thread_id().is_some()
@@ -669,6 +701,7 @@ impl App {
         }
         if let Some(thread_id) = thread_id
             && self.primary_thread_id != Some(thread_id)
+            && self.active_thread_id != Some(thread_id)
             && !unsupported_request
             && !background_voice
             && let Some(requests) = self.agents_overview.dispatched_requests.get_mut(&thread_id)

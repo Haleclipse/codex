@@ -12,4 +12,4 @@ expression: "render_snapshot(&overlay, area)"
                                                                                                                         
                                                                                                                         
   ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
-  enter to submit all | ctrl+p / ctrl+n change question | esc to interrupt
+  enter to submit all | ⌃p / ⌃n change question | esc to interrupt

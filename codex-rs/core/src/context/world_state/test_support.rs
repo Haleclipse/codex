@@ -50,7 +50,7 @@ fn render_diff<S: WorldStateSection>(
             PreviousSectionState::Known(&previous_snapshot)
         }
     };
-    ErasedWorldStateSection::render_diff(*after, previous)
+    ErasedWorldStateSection::render_diff(*after, previous).1
 }
 
 fn render_snapshot<S: WorldStateSection>(section: &S) -> String {
@@ -78,6 +78,7 @@ fn sort_json(value: serde_json::Value) -> serde_json::Value {
 }
 
 fn snapshot_value<S: WorldStateSection>(section: &S) -> serde_json::Value {
-    ErasedWorldStateSection::snapshot(section)
+    ErasedWorldStateSection::render_diff(section, PreviousSectionState::Absent)
+        .0
         .expect("world-state section snapshot should serialize to a non-null value")
 }

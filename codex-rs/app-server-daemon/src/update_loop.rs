@@ -220,13 +220,17 @@ async fn run_with_http(
                     }
                     continue;
                 }
+                let started = std::time::Instant::now();
                 match update_once(http, daemon, running_updater_identity, &mut terminate, UpdateTrigger::Scheduled).await {
                     Ok((UpdateLoopControl::Continue, Some(_))) => {
                         manual_handoff_pending = true;
                         next_check = Instant::now();
                         continue;
                     }
-                    Ok((UpdateLoopControl::Continue, None)) | Err(_) => {}
+                    Ok((UpdateLoopControl::Continue, None)) => {}
+                    Err(err) => {
+                        let _ = crate::diagnostics::result::<()>("scheduled_update", started, Err(err));
+                    }
                     Ok((UpdateLoopControl::Stop, _)) => return Ok(()),
                 }
                 let Some(delay) = next_update_delay(daemon).await else {
@@ -261,7 +265,14 @@ async fn adopt_managed_updater(
     #[cfg(unix)]
     {
         let _ = listener;
-        reexec_managed_updater(&managed_bin).map(|_| UpdateLoopControl::Stop)
+        reexec_managed_updater(
+            &managed_bin,
+            daemon
+                .update_pid_file
+                .parent()
+                .context("updater pid path has no parent")?,
+        )
+        .map(|_| UpdateLoopControl::Stop)
     }
     #[cfg(windows)]
     {
@@ -343,8 +354,9 @@ async fn update_once(
                 "CODEX_INSTALL_IF_LATEST",
             )
         };
+    let started = std::time::Instant::now();
     let script = tokio::select! {
-        result = fetch_installer_script(http) => result?,
+        result = fetch_installer_script(http) => crate::diagnostics::result("installer_fetch", started, result)?,
         _ = terminate.recv() => return Ok((UpdateLoopControl::Stop, None)),
     };
     anyhow::ensure!(
@@ -375,16 +387,21 @@ async fn update_once(
         crate::managed_install::package_root(codex_home) == package_root,
         "daemon package root changed during the update; retry the command"
     );
+    let started = std::time::Instant::now();
     #[cfg(unix)]
     if matches!(
-        run_installer_script(&script, installer_mode, &package_root, terminate.recv()).await?,
+        crate::diagnostics::result(
+            "installer_run",
+            started,
+            run_installer_script(&script, installer_mode, &package_root, terminate.recv()).await
+        )?,
         UpdateLoopControl::Stop
     ) {
         return Ok((UpdateLoopControl::Stop, None));
     }
     #[cfg(windows)]
     tokio::select! {
-        result = run_installer_script(&script, installer_mode, &package_root) => { result?; },
+        result = run_installer_script(&script, installer_mode, &package_root) => { crate::diagnostics::result("installer_run", started, result)?; },
         _ = terminate.recv() => return Ok((UpdateLoopControl::Stop, None)),
     }
     anyhow::ensure!(
@@ -397,6 +414,13 @@ async fn update_once(
 
     let managed_codex_bin =
         resolved_managed_codex_bin(&daemon.current_managed_codex_bin()?).await?;
+    crate::diagnostics::event(
+        "package_selected",
+        serde_json::json!({
+            "release": selected_release(daemon).ok().map(|(_, _, release)| release),
+            "trigger": if trigger == UpdateTrigger::Scheduled { "scheduled" } else { "manual" },
+        }),
+    );
     let restart_mode = match trigger {
         // The package can contain different resources even when its CLI binary
         // is identical. A release change must also replace the running process.
@@ -511,10 +535,11 @@ async fn current_updater_identity() -> Result<ExecutableIdentity> {
 }
 
 #[cfg(unix)]
-pub(crate) fn reexec_managed_updater(managed_codex_bin: &std::path::Path) -> Result<()> {
-    let err = StdCommand::new(managed_codex_bin)
-        .args(["app-server", "daemon", "pid-update-loop"])
-        .exec();
+pub(crate) fn reexec_managed_updater(managed_codex_bin: &Path, state_dir: &Path) -> Result<()> {
+    let mut command = StdCommand::new(managed_codex_bin);
+    command.args(["app-server", "daemon", "pid-update-loop"]);
+    crate::background_command::set_working_directory(&mut command, state_dir)?;
+    let err = command.exec();
     Err(err).with_context(|| {
         format!(
             "failed to replace updater with managed Codex binary {}",

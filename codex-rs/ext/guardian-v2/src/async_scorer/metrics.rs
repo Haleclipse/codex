@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use codex_api::ApiError;
 use codex_api::TransportError;
+use codex_core::context::GuardianContextMode;
 use codex_extension_api::ExtensionMetrics;
 
 use super::sampler::LunaSamplerError;
@@ -26,6 +27,7 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
         LunaSamplerError::Superseded => "superseded",
         LunaSamplerError::IncompatibleCompaction => "incompatible_compaction",
         LunaSamplerError::InputTooLarge => "input_too_large",
+        LunaSamplerError::QueueFull => "queue_full",
         LunaSamplerError::Api(error) => match error {
             ApiError::Transport(TransportError::Http { status, .. })
             | ApiError::Api { status, .. } => match status.as_u16() {
@@ -61,6 +63,7 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
 
 pub(super) fn record_classification(
     metrics: Option<&dyn ExtensionMetrics>,
+    context_mode: GuardianContextMode,
     duration: Duration,
     outcome: &str,
     failure_reason: Option<&str>,
@@ -68,7 +71,10 @@ pub(super) fn record_classification(
     let Some(metrics) = metrics else {
         return;
     };
-    let mut tags = vec![("outcome", outcome)];
+    let mut tags = vec![
+        ("outcome", outcome),
+        ("context_mode", context_mode.as_str()),
+    ];
     if let Some(reason) = failure_reason {
         tags.push(("failure_reason", reason));
     }
@@ -104,4 +110,49 @@ pub(super) fn record_fast_decision(
         /*inc*/ 1,
         &[("decision", decision), ("reason", reason)],
     );
+}
+
+pub(super) fn record_section_costs(
+    metrics: Option<&dyn ExtensionMetrics>,
+    costs: impl IntoIterator<Item = (&'static str, codex_guardian_context::SectionCost)>,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    for (section, cost) in costs {
+        for (measurement, value) in cost.measurements() {
+            metrics.histogram_with_boundaries(
+                codex_guardian_context::SECTION_COST_METRIC,
+                i64::try_from(value).unwrap_or(i64::MAX),
+                codex_guardian_context::SECTION_COST_BOUNDARIES,
+                &[
+                    ("target", "async"),
+                    ("section", section),
+                    ("measurement", measurement),
+                ],
+            );
+        }
+    }
+}
+
+pub(super) fn record_request_tokens(
+    metrics: Option<&dyn ExtensionMetrics>,
+    existing: usize,
+    total: usize,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    for (component, tokens) in [
+        ("existing_context", existing),
+        ("new_input", total.saturating_sub(existing)),
+        ("total", total),
+    ] {
+        metrics.histogram_with_boundaries(
+            codex_guardian_context::REQUEST_TOKENS_METRIC,
+            i64::try_from(tokens).unwrap_or(i64::MAX),
+            codex_guardian_context::REQUEST_TOKENS_BOUNDARIES,
+            &[("target", "async"), ("component", component)],
+        );
+    }
 }

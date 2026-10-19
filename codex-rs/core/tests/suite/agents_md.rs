@@ -279,6 +279,7 @@ pub(super) async fn persisted_resume_history(
     Ok((
         thread_id,
         InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: thread_id,
             history: Arc::new(
                 store
@@ -729,18 +730,26 @@ async fn runtime_trust_reload_refreshes_project_instructions() -> Result<()> {
         vec![global_agents.clone(), project_agents.clone()]
     );
 
-    let mut untrusted_config = (*test.codex.config().await).clone();
+    let current_config = test.codex.config().await;
+    let mut untrusted_config = current_config.as_ref().clone();
     untrusted_config.active_project.trust_level = Some(TrustLevel::Untrusted);
-    test.codex.refresh_runtime_config(untrusted_config).await;
+    let _ = test
+        .codex
+        .refresh_runtime_config(current_config, untrusted_config)
+        .await;
     test.submit_turn("untrusted project").await?;
     assert_eq!(
         test.codex.instruction_sources().await,
         vec![global_agents.clone()]
     );
 
-    let mut trusted_config = (*test.codex.config().await).clone();
+    let current_config = test.codex.config().await;
+    let mut trusted_config = current_config.as_ref().clone();
     trusted_config.active_project.trust_level = Some(TrustLevel::Trusted);
-    test.codex.refresh_runtime_config(trusted_config).await;
+    let _ = test
+        .codex
+        .refresh_runtime_config(current_config, trusted_config)
+        .await;
     test.submit_turn("trusted again").await?;
     assert_eq!(
         test.codex.instruction_sources().await,
@@ -1580,6 +1589,7 @@ async fn fork_preserves_thread_instructions(
                 })
                 .await?;
             let history = InitialHistory::Resumed(ResumedHistory {
+                history_revision: None,
                 conversation_id: parent_id,
                 history: Arc::new(stored.items),
                 rollout_path: None,

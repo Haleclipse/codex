@@ -86,11 +86,11 @@ pub use runtime::SqliteIntegrityCheck;
 pub use runtime::SqliteQueueStore;
 pub use runtime::ThreadFilterOptions;
 pub use runtime::backup_runtime_db_for_fresh_start;
+pub use runtime::collect_runtime_db_backups;
 pub use runtime::is_sqlite_corruption_error;
 pub use runtime::open_thread_history_db;
 pub use runtime::recovery::RuntimeDbBackup;
 pub use runtime::runtime_db_path_for_corruption_error;
-pub use runtime::sqlite_error_detail_is_corruption;
 pub use runtime::sqlite_error_detail_is_lock;
 pub use runtime::sqlite_integrity_check;
 pub use sqlite::RuntimeDbPath;
@@ -133,6 +133,8 @@ pub const DB_ERROR_METRIC: &str = "codex.db.error";
 pub const DB_METRIC_BACKFILL: &str = "codex.db.backfill";
 /// Metrics on backfill duration. Tags: [status]
 pub const DB_METRIC_BACKFILL_DURATION_MS: &str = "codex.db.backfill.duration_ms";
+/// Confirmed SQLite quick-check corruption findings. Tags: [db]
+pub const DB_CORRUPTION_METRIC: &str = "codex.sqlite.corruption.count";
 /// SQLite initialization attempts. Tags: [status, phase, db, error]
 pub const DB_INIT_METRIC: &str = "codex.sqlite.init.count";
 /// SQLite initialization latency. Tags: [status, phase, db, error]

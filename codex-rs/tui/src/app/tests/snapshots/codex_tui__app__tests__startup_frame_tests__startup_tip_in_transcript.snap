@@ -4,10 +4,8 @@ expression: "normalize_snapshot_paths(normalize_agent_center_snapshot(snapshots.
 ---
 80 columns
 
-  >_ OpenAI Codex (v0.159.0)
+  >_ OpenAI Codex (v0.0.0)
      /tmp/project
-
-  Pull up a prompt.
 
 • Conversation continues here.
 
@@ -18,18 +16,18 @@ expression: "normalize_snapshot_paths(normalize_agent_center_snapshot(snapshots.
 
 
 
-────────────────────────────────────────────────────────────────────────────────
-❯ Ask Codex to do anything
-────────────────────────────────────────────────────────────────────────────────
-   gpt-5.6-sol | 󰉋 project |  - · - tokens
 
+
+
+› Ask Codex to do anything
+
+  GPT-5.6-Sol default · /tmp/project
+  ? for shortcuts
 
 32 columns
 
-  >_ OpenAI Codex (v0.159.0)
+  >_ OpenAI Codex (v0.0.0)
      /tmp/project
-
-  Pull up a prompt.
 
 • Conversation continues here.
 
@@ -40,7 +38,10 @@ expression: "normalize_snapshot_paths(normalize_agent_center_snapshot(snapshots.
 
 
 
-────────────────────────────────
-❯ Ask Codex to do anything
-────────────────────────────────
-   gpt-5.6-sol | 󰉋 project | …
+
+
+
+› Ask Codex to do anything
+
+  GPT-5.6-Sol default · /tmp/pr…
+  ? for shortcuts

@@ -1347,6 +1347,7 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
         .await
         .expect("read parent history");
     let initial_history = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
         conversation_id: parent_thread_id,
         history: Arc::new(stored_parent.history.expect("parent history").items),
         rollout_path: stored_parent.rollout_path,
@@ -4341,6 +4342,33 @@ async fn completion_watcher_notifies_parent_when_child_is_missing() {
         history_contains_text(history.raw_items(), "\"status\":\"not_found\""),
         true
     );
+}
+
+#[tokio::test]
+async fn completion_watcher_does_not_hide_tree_shutdown_failure() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (child_thread_id, _child_thread) = harness.start_thread().await;
+
+    harness.control.maybe_start_completion_watcher(
+        child_thread_id,
+        Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("explorer".to_string()),
+        })),
+        child_thread_id.to_string(),
+        /*child_agent_path*/ None,
+    );
+    harness.control.runtime.record_shutdown_failure();
+    let shutdown = harness.control.runtime.request_shutdown();
+
+    timeout(Duration::from_secs(5), shutdown.wait())
+        .await
+        .expect("completion watcher should stop during tree shutdown")
+        .expect_err("recorded tree shutdown failure should be returned");
 }
 
 #[tokio::test]

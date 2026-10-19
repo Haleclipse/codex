@@ -1,4 +1,7 @@
 use anyhow::Context;
+use codex_config::types::ApprovalsReviewer;
+use codex_core::TurnInputRequest;
+use codex_core::config::Constrained;
 use codex_core::exec::ExecCapturePolicy;
 use codex_core::exec::ExecParams;
 use codex_core::exec::process_exec_tool_call;
@@ -17,6 +20,12 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::user_input::UserInput;
+use codex_windows_sandbox_test_support::WindowsSandboxAccountTestGuard;
 use core_test_support::PathExt;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -26,6 +35,8 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use serial_test::serial;
@@ -34,6 +45,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 use tempfile::TempDir;
 
 struct EnvVarGuard {
@@ -77,6 +89,7 @@ impl TestCodexHome {
 }
 
 fn codex_home_for_windows_sandbox_test(name: &str) -> anyhow::Result<TestCodexHome> {
+    // Only tests that use the elevated accounts also take the shared account guard.
     if let Some(test_tmpdir) = std::env::var_os("TEST_TMPDIR") {
         // The elevated backend provisions machine-local sandbox users. Bazel
         // retries run in the same Windows VM, so keep CODEX_HOME stable within
@@ -181,6 +194,7 @@ fn assert_managed_deny_probe(output: &std::process::Output, launch: usize) -> an
 #[test]
 #[serial(codex_home)]
 fn windows_sandbox_cli_preserves_managed_deny_reads_across_launches() -> anyhow::Result<()> {
+    let _account_guard = WindowsSandboxAccountTestGuard::acquire()?;
     let codex_home =
         codex_home_for_windows_sandbox_test("windows-cli-managed-deny-read-codex-home")?;
 
@@ -391,6 +405,7 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
 #[tokio::test]
 #[serial(codex_home)]
 async fn windows_elevated_does_not_create_missing_workspace_metadata() -> anyhow::Result<()> {
+    let _account_guard = WindowsSandboxAccountTestGuard::acquire()?;
     let codex_home =
         codex_home_for_windows_sandbox_test("windows-elevated-missing-metadata-codex-home")?;
     let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
@@ -516,6 +531,7 @@ $rules = foreach ($name in @('codex_sandbox_offline_block_inbound', 'codex_sandb
 #[tokio::test]
 #[serial(codex_home)]
 async fn windows_elevated_enforces_deny_read_and_protects_setup_marker() -> anyhow::Result<()> {
+    let _account_guard = WindowsSandboxAccountTestGuard::acquire()?;
     let codex_home = codex_home_for_windows_sandbox_test("windows-elevated-deny-read-codex-home")?;
     let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
     stage_windows_sandbox_helpers()?;
@@ -653,9 +669,138 @@ async fn windows_elevated_enforces_deny_read_and_protects_setup_marker() -> anyh
     Ok(())
 }
 
+#[tokio::test]
+#[serial(codex_home)]
+async fn windows_elevated_powershell_preserves_relative_paths() -> anyhow::Result<()> {
+    let _account_guard = WindowsSandboxAccountTestGuard::acquire()?;
+    let codex_home = codex_home_for_windows_sandbox_test(
+        "windows-elevated-powershell-relative-paths-codex-home",
+    )?;
+    let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
+    stage_windows_sandbox_helpers()?;
+    // The refresh caller must own the helper directory after provisioning protects its DACL.
+    std::fs::create_dir_all(codex_windows_sandbox::sandbox_bin_dir(codex_home.path()))?;
+
+    let profile_dir = TempDir::new()?;
+    let fake_profile = dunce::canonicalize(profile_dir.path())?;
+    // Exclude inherited sandbox permissions so this reproduces an inaccessible profile root.
+    let profile_acl_setup = std::process::Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(
+            r#"$ErrorActionPreference = 'Stop'
+$owner = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$security = [System.Security.AccessControl.DirectorySecurity]::new()
+$security.SetSecurityDescriptorSddlForm("D:P(A;OICI;FA;;;${owner})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", [System.Security.AccessControl.AccessControlSections]::Access)
+[System.IO.DirectoryInfo]::new($env:CODEX_TEST_PROFILE).SetAccessControl($security)"#,
+        )
+        .env("CODEX_TEST_PROFILE", &fake_profile)
+        .output()
+        .context("configure protected synthetic user-profile ACL")?;
+    assert!(
+        profile_acl_setup.status.success(),
+        "synthetic profile ACL setup failed: {profile_acl_setup:?}"
+    );
+    let workspace = fake_profile.join("project");
+    std::fs::create_dir(&workspace)?;
+    let cwd = dunce::canonicalize(&workspace)?.abs();
+    std::fs::write(cwd.join("public.txt"), "public ok\n")?;
+    // Elevated setup requires root read access, including PowerShell's runtime.
+    let file_system_sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            FileSystemAccessMode::Read,
+        ),
+        FileSystemSandboxEntry::new(cwd.clone().into(), FileSystemAccessMode::Write),
+    ]);
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
+    let env = HashMap::from([
+        (
+            "USERPROFILE".to_string(),
+            fake_profile.to_string_lossy().into_owned(),
+        ),
+        (
+            "SystemRoot".to_string(),
+            std::env::var("SystemRoot").context("Windows PowerShell requires SystemRoot")?,
+        ),
+    ]);
+    // Provision and refresh synchronously so USERPROFILE is restored before any await.
+    {
+        let _user_profile_guard = EnvVarGuard::set("USERPROFILE", fake_profile.as_os_str());
+        codex_core::windows_sandbox::prepare_elevated_sandbox(
+            &permission_profile,
+            std::slice::from_ref(&cwd),
+            cwd.as_path(),
+            &env,
+            codex_home.path(),
+        )?;
+    }
+
+    let expected = format!("CWD={}\nPUBLIC=public ok", cwd.as_path().display());
+    let mut attempts = 0;
+    loop {
+        let output = process_exec_tool_call(
+            ExecParams {
+                command: [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    r#"$ErrorActionPreference = 'Stop'
+Write-Output ('CWD=' + (Get-Location).ProviderPath)
+Write-Output ('PUBLIC=' + (Get-Content -LiteralPath .\public.txt -Raw).Trim())"#,
+                ]
+                .map(str::to_owned)
+                .into(),
+                cwd: cwd.clone(),
+                expiration: 30_000.into(),
+                capture_policy: ExecCapturePolicy::ShellTool,
+                env: env.clone(),
+                network: None,
+                network_environment_id: None,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                windows_sandbox_level: WindowsSandboxLevel::Elevated,
+                justification: None,
+                arg0: None,
+            },
+            &permission_profile,
+            &cwd,
+            std::slice::from_ref(&cwd),
+            &None,
+            /*codex_self_exe*/ &None,
+            /*use_legacy_landlock*/ false,
+            /*stdout_stream*/ None,
+        )
+        .await?;
+        if output.exit_code == 0
+            && output
+                .stdout
+                .text
+                .trim()
+                .replace("\r\n", "\n")
+                .eq_ignore_ascii_case(&expected)
+        {
+            return Ok(());
+        }
+        attempts += 1;
+        assert!(
+            attempts < 5,
+            "PowerShell should preserve cwd and read .\\public.txt: {output:?}"
+        );
+        // The async read-ACL helper briefly uses a temporary startup junction.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(codex_home)]
 async fn windows_elevated_unified_exec_enforces_large_recursive_deny_reads() -> anyhow::Result<()> {
+    let _account_guard = WindowsSandboxAccountTestGuard::acquire()?;
     let codex_home =
         codex_home_for_windows_sandbox_test("windows-elevated-tool-runtime-deny-read-codex-home")?;
     let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
@@ -823,5 +968,157 @@ async fn windows_elevated_unified_exec_enforces_large_recursive_deny_reads() -> 
         "exec_command leaked exact-path-denied file contents: {output:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(codex_home)]
+async fn windows_elevated_approved_git_pull_preserves_deny_read() -> anyhow::Result<()> {
+    use EventMsg::ExecApprovalRequest;
+    use EventMsg::ExecCommandEnd;
+    use EventMsg::TurnComplete;
+
+    let _account_guard = WindowsSandboxAccountTestGuard::acquire()?;
+    let codex_home = codex_home_for_windows_sandbox_test("windows-elevated-git-pull-deny-read")?;
+    let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
+    stage_windows_sandbox_helpers()?;
+    let home = dunce::canonicalize(codex_home.path())?.abs();
+    let builder = test_codex()
+        .with_windows_cmd_shell()
+        .with_config(move |config| {
+            config.codex_home = home;
+            config.set_windows_elevated_sandbox_enabled(true);
+            config.prefer_mxc = false;
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::User;
+            config.features.enable(Feature::UnifiedExec).unwrap();
+            let mut filesystem = FileSystemSandboxPolicy::workspace_write(
+                &[],
+                /*exclude_tmpdir_env_var*/ true,
+                /*exclude_slash_tmp*/ true,
+            );
+            filesystem.entries.extend(
+                [
+                    config.cwd.join("exact-secret.txt").into(),
+                    FileSystemPath::GlobPattern {
+                        pattern: "**/*.env".into(),
+                    },
+                ]
+                .map(|path| FileSystemSandboxEntry::new(path, FileSystemAccessMode::Deny)),
+            );
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::from_runtime_permissions(
+                    &filesystem,
+                    NetworkSandboxPolicy::Restricted,
+                ))
+                .unwrap();
+        })
+        .with_workspace_setup(|cwd, _fs| async move {
+            std::fs::write(cwd.join("exact-secret.txt"), "exact secret")?;
+            std::fs::write(cwd.join("secret.env"), "glob secret")?;
+            Ok(())
+        });
+    let harness = TestCodexHarness::with_builder(builder).await?;
+    let git = |cwd: &Path, args: &[&str]| -> anyhow::Result<String> {
+        let output = Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
+            .current_dir(cwd)
+            .args(args)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    };
+    let upstream = TempDir::new()?;
+    let upstream = upstream.path();
+    let upstream_path = upstream.to_str().context("UTF-8 upstream path")?;
+    let cwd = harness.cwd();
+    let read = |name| std::fs::read_to_string(cwd.join(name));
+    let init = ["init", "--initial-branch=main"];
+    let commit = ["commit", "-am", "fixture"];
+    git(upstream, &init)?;
+    git(upstream, &["config", "user.name", "Codex Test"])?;
+    git(upstream, &["config", "user.email", "codex@test.com"])?;
+    std::fs::write(upstream.join("tracked.txt"), "before\n")?;
+    git(upstream, &["add", "tracked.txt"])?;
+    git(upstream, &commit)?;
+    git(cwd, &init)?;
+    git(cwd, &["pull", "-q", "--ff-only", upstream_path, "main"])?;
+    let fetch_head = cwd.join(".git/FETCH_HEAD");
+    std::fs::remove_file(&fetch_head)?;
+    std::fs::write(upstream.join("tracked.txt"), "after\n")?;
+    git(upstream, &commit)?;
+    let expected = git(upstream, &["rev-parse", "HEAD"])?;
+    let bundle = cwd.join("upstream.bundle");
+    let bundle_path = bundle.to_str().context("UTF-8 bundle path")?;
+    git(upstream, &["bundle", "create", bundle_path, "--all"])?;
+
+    let args = json!({"cmd": concat!(
+        "git pull --quiet --ff-only .\\upstream.bundle main || exit /b 10 & ",
+        "type tracked.txt >NUL || exit /b 11 & ",
+        "type exact-secret.txt >NUL 2>NUL && exit /b 12 & ",
+        "type secret.env >NUL 2>NUL && exit /b 13 & ",
+        "echo git-and-denials-ok>git-and-denials-ok.txt || exit /b 14 & exit /b 0"
+    ), "sandbox_permissions": "require_escalated",
+        "justification": "Can I pull the fixture repository?",
+        "yield_time_ms": 30_000, "tty": false, "login": false,
+    });
+    let call_id = "git-pull";
+    core_test_support::responses::mount_function_call_agent_response(
+        harness.server(),
+        call_id,
+        &args.to_string(),
+        "exec_command",
+    )
+    .await;
+    let codex = &harness.test().codex;
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "pull the fixture repository".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let approval = wait_for_event(codex, |event| {
+        matches!(event, ExecApprovalRequest(_) | TurnComplete(_))
+    })
+    .await;
+    let ExecApprovalRequest(approval) = approval else {
+        anyhow::bail!("expected approval before git ran: {approval:?}");
+    };
+    assert_eq!(approval.call_id, call_id);
+    assert!(!fetch_head.exists());
+    assert!(!cwd.join("git-and-denials-ok.txt").exists());
+    assert_eq!(read("tracked.txt")?.trim(), "before");
+    codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: None,
+            decision: ReviewDecision::Approved,
+        })
+        .await?;
+    let mut process_end = None;
+    let mut turn_completed = false;
+    while process_end.is_none() || !turn_completed {
+        match wait_for_event_with_timeout(codex, |_| true, Duration::from_secs(120)).await {
+            ExecCommandEnd(event) if event.call_id == call_id => process_end = Some(event),
+            TurnComplete(_) => turn_completed = true,
+            ExecApprovalRequest(request) => {
+                anyhow::bail!("unexpected additional Git approval: {request:?}")
+            }
+            _ => {}
+        }
+    }
+    let result = process_end.expect("approved Git process should finish");
+    let output = &result.aggregated_output;
+    assert_eq!(result.exit_code, 0, "sandbox output: {output}");
+    assert_eq!(read("git-and-denials-ok.txt")?.trim(), "git-and-denials-ok");
+    assert!(read(".git/FETCH_HEAD")?.starts_with(&expected));
+    assert_eq!(read("tracked.txt")?.trim(), "after");
+    assert_eq!(read("exact-secret.txt")?, "exact secret");
+    assert_eq!(read("secret.env")?, "glob secret");
     Ok(())
 }

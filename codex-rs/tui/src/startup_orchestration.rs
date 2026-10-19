@@ -23,6 +23,19 @@ pub(super) async fn run_main_inner(
             "--add-dir is not supported with --remote. Configure additional workspace roots on the server.",
         ));
     }
+    #[cfg(windows)]
+    let elevated_warning = if explicit_remote_endpoint.is_none()
+        && !cli.no_daemon
+        && !cli.agents_overview
+        && codex_app_server_daemon::is_elevated().map_err(std::io::Error::other)?
+    {
+        cli.no_daemon = true;
+        Some(daemon_startup::ELEVATED_LAUNCH_WARNING)
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let elevated_warning: Option<&str> = None;
     let strict_config = cli.strict_config;
     if cli.shared.worktree {
         if explicit_remote_endpoint.is_some() {
@@ -276,15 +289,11 @@ pub(super) async fn run_main_inner(
         bootstrap_config,
         config_cwd,
         mut screen,
+        local_settings,
     } = presentation;
     screen.use_alt_screen = determine_alt_screen_mode(
         cli.no_alt_screen,
-        bootstrap_config
-            .config_toml
-            .tui
-            .as_ref()
-            .map(|tui| tui.alternate_screen)
-            .unwrap_or_default(),
+        local_settings.tui.alternate_screen,
         initialized_terminal.terminal_app_over_ssh,
     );
     screen.transcript_mode = crate::transcript_mode::TranscriptMode::resolve(
@@ -451,7 +460,10 @@ pub(super) async fn run_main_inner(
     if app_server_target.uses_embedded_network_policy() {
         embedded_network_policy.activate(&mut config);
     }
-    startup_draft.apply_config(&config);
+    startup_draft.apply_settings(
+        &crate::local_settings::LocalSettings::from(&config),
+        config.cwd.as_path(),
+    );
 
     let mut cloud_config_bundle = if workload_identity_selected {
         cloud_config_bundle
@@ -486,7 +498,10 @@ pub(super) async fn run_main_inner(
         if app_server_target.uses_embedded_network_policy() {
             embedded_network_policy.activate(&mut config);
         }
-        startup_draft.apply_config(&config);
+        startup_draft.apply_settings(
+            &crate::local_settings::LocalSettings::from(&config),
+            config.cwd.as_path(),
+        );
         Some(worktree)
     } else {
         None
@@ -588,15 +603,18 @@ pub(super) async fn run_main_inner(
     if app_server_target.uses_embedded_network_policy() {
         embedded_network_policy.activate(&mut config);
     }
-    let daemon_startup_warning = compatibility_warning.or_else(|| {
-        daemon_exclusion
+    let daemon_startup_warning = elevated_warning
+        .map(str::to_string)
+        .or(compatibility_warning)
+        .or_else(|| {
+            daemon_exclusion
             .filter(|_| auto_start_daemon)
             .map(|reason| {
                 format!(
                     "Running without the shared background server: {reason} requires embedded mode."
                 )
             })
-    });
+        });
     #[cfg(target_os = "macos")]
     let local_runtime_paths = local_runtime_paths.with_allowed_symlinked_codex_home(
         codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
@@ -658,6 +676,7 @@ pub(super) async fn run_main_inner(
     let selection_reason = match (&app_server_target, daemon_exclusion) {
         (AppServerTarget::Remote { .. }, _) => "explicit_remote",
         _ if cli.agents_overview => "agents",
+        _ if elevated_warning.is_some() => "elevated_windows",
         (_, Some("--no-daemon")) => "explicit_no_daemon",
         (_, Some(_)) => "incompatible_option",
         _ if auto_start_daemon => "auto_start",

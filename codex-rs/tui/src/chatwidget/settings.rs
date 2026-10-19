@@ -5,6 +5,28 @@ use crate::app_event::AppEvent;
 use crate::chatwidget::rate_limits::RATE_LIMIT_SWITCH_PROMPT_VIEW_ID;
 
 impl ChatWidget {
+    pub(crate) fn set_daybreak_enabled(&mut self, enabled: bool) {
+        self.daybreak_enabled = enabled && self.config.features.enabled(Feature::CliDaybreak);
+        self.bottom_pane
+            .set_daybreak_command_description(self.daybreak_command_description());
+    }
+
+    pub(super) fn daybreak_command_description(&self) -> Option<&'static str> {
+        if !self.config.features.enabled(Feature::CliDaybreak) {
+            return None;
+        }
+        if self.daybreak_enabled {
+            Some("Disable broader access for cybersecurity work")
+        } else if !self.has_chatgpt_account || self.config.model_provider_id != "openai" {
+            None
+        } else {
+            match crate::daybreak::availability(&self.model_catalog.models) {
+                Some(true) => Some("Enable broader access for cybersecurity work"),
+                Some(false) => Some("Learn about broader access for cybersecurity work"),
+                None => Some("Manage broader access for cybersecurity work"),
+            }
+        }
+    }
     /// Set the approval policy in the widget's config copy.
     pub(crate) fn set_approval_policy(&mut self, policy: AskForApproval) {
         if let Err(err) = self
@@ -31,6 +53,7 @@ impl ChatWidget {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn set_permission_profile_with_active_profile(
         &mut self,
         profile: PermissionProfile,
@@ -76,6 +99,10 @@ impl ChatWidget {
             );
         }
         let enabled = self.config.features.enabled(feature);
+        if feature == Feature::CliDaybreak {
+            self.set_daybreak_enabled(self.daybreak_enabled);
+            self.refresh_status_surfaces();
+        }
         if feature == Feature::FastMode {
             self.refresh_effective_service_tier();
             self.sync_service_tier_commands();
@@ -231,6 +258,7 @@ impl ChatWidget {
         self.status_account_display = status_account_display;
         self.plan_type = plan_type;
         self.has_chatgpt_account = has_chatgpt_account;
+        self.set_daybreak_enabled(self.daybreak_enabled);
         self.has_codex_backend_auth = has_codex_backend_auth;
         self.bottom_pane
             .set_connectors_enabled(self.connectors_enabled());
@@ -449,9 +477,17 @@ impl ChatWidget {
         self.apply_thread_settings_cwd(settings.cwd.clone());
         self.config.model_provider_id = settings.model_provider.clone();
         self.set_service_tier(settings.service_tier.clone());
-        self.set_approval_policy(settings.approval_policy);
+        if let Err(err) = self
+            .config
+            .permissions
+            .approval_policy
+            .set(settings.approval_policy.to_core())
+        {
+            tracing::warn!(%err, "failed to sync approval_policy from ThreadSettingsUpdated");
+            self.config.permissions.approval_policy =
+                Constrained::allow_only(settings.approval_policy.to_core());
+        }
         self.set_approvals_reviewer(settings.approvals_reviewer.to_core());
-        self.config.personality = settings.personality;
 
         let permission_profile = PermissionProfile::from_legacy_sandbox_policy_for_cwd(
             &settings.sandbox_policy.to_core(),
@@ -705,7 +741,6 @@ impl ChatWidget {
                 /*summary*/ None,
                 /*service_tier*/ None,
                 Some(self.effective_collaboration_mode()),
-                /*personality*/ None,
             ),
         });
     }
