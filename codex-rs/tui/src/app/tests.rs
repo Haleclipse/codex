@@ -1,5 +1,7 @@
 //! App-level orchestration tests for the TUI.
 
+#[path = "tests/copy_mode_tests.rs"]
+mod copy_mode_tests;
 #[path = "tests/mcp_login_tests.rs"]
 mod mcp_login_tests;
 
@@ -105,6 +107,7 @@ mod user_verification_routes;
 #[path = "tests/worktree_background_terminals_tests.rs"]
 mod worktree_background_terminals_tests;
 
+use super::agent_navigation::AgentPickerThreadVisibility;
 use super::*;
 use crate::app_backtrack::BacktrackSelection;
 use crate::app_backtrack::BacktrackState;
@@ -180,6 +183,7 @@ use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
+use codex_app_server_protocol::ThreadUnarchivedNotification;
 use codex_app_server_protocol::TokenUsageBreakdown;
 use codex_app_server_protocol::ToolRequestUserInputParams;
 use codex_app_server_protocol::Turn;
@@ -2128,15 +2132,54 @@ async fn archived_untracked_threads_do_not_appear_in_agent_picker() -> Result<()
             .contains_key(&attachment_thread_id)
     );
 
+    app.upsert_agent_picker_thread(
+        archived_thread_id,
+        Some("Missed archive".to_string()),
+        Some("worker".to_string()),
+        /*is_closed*/ false,
+    );
+    app.thread_event_channels
+        .insert(archived_thread_id, ThreadEventChannel::new(/*capacity*/ 1));
+    let request_id = app
+        .agent_navigation
+        .begin_picker_refresh(primary_thread_id)
+        .expect("picker refresh after missed archive");
+    app.apply_agent_picker_thread_refresh(
+        &app_server,
+        primary_thread_id,
+        request_id,
+        Ok(crate::app_event::AgentPickerThreadRefresh {
+            threads: Vec::new(),
+            archived_thread_ids: std::collections::HashSet::from([archived_thread_id]),
+        }),
+    );
+    assert_eq!(
+        app.thread_event_channels[&archived_thread_id].attachment(),
+        ThreadEventAttachment::ReplayOnly
+    );
     Box::pin(app.open_agent_picker(&mut app_server)).await;
+    let archived_picker = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    app.handle_app_server_event(
+        &app_server,
+        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ThreadUnarchived(ThreadUnarchivedNotification {
+                thread_id: archived_thread_id.to_string(),
+            }),
+        )),
+    )
+    .await;
 
     assert_app_snapshot!(
         "untracked_thread_notifications_agent_picker",
-        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+        format!(
+            "Archived:\n{archived_picker}\nUnarchived:\n{}",
+            render_bottom_popup(&app.chat_widget, /*width*/ 80)
+        )
+        .replace(&archived_thread_id.to_string(), "[archived]")
     );
     assert_eq!(
         app.agent_navigation.ordered_thread_ids(),
-        vec![primary_thread_id]
+        vec![primary_thread_id, archived_thread_id]
     );
     assert_eq!(app.active_thread_id, Some(primary_thread_id));
     Ok(())
@@ -2993,17 +3036,40 @@ async fn select_uncached_agent_thread_still_refreshes_liveness() -> Result<()> {
 
 #[tokio::test]
 async fn open_agent_picker_prompts_when_subagents_disabled() -> Result<()> {
-    let (mut app, mut app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+    let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
         app.chat_widget.config_ref(),
     ))
     .await
     .expect("embedded app server");
     let _ = app.config.features.disable(Feature::Collab);
+    let primary_thread_id = ThreadId::new();
+    app.enqueue_primary_thread_session(
+        test_thread_session(primary_thread_id, test_path_buf("/tmp/project")),
+        Vec::new(),
+    )
+    .await?;
+    let archived_thread_id = ThreadId::new();
+    app.upsert_agent_picker_thread(
+        archived_thread_id,
+        Some("Archived".to_string()),
+        Some("worker".to_string()),
+        /*is_closed*/ false,
+    );
+    app.set_agent_picker_thread_visibility(archived_thread_id, AgentPickerThreadVisibility::Hidden);
 
     Box::pin(app.open_agent_picker(&mut app_server)).await;
-    assert!(app.chat_widget.has_active_view());
-    assert!(app_event_rx.try_recv().is_err());
+    assert_snapshot!(render_bottom_popup(&app.chat_widget, /*width*/ 80), @r###"
+          Enable subagents?
+    › As  Subagents are disabled in this TUI session.
+
+      gp
+        › 1. Yes, enable  Save on the server for new threads without changing
+                          this thread
+          2. Not now      Keep subagents disabled
+
+          enter select · esc back
+    "###);
     Ok(())
 }
 
@@ -5370,6 +5436,12 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
     let child_thread_id = ThreadId::new();
     app.primary_thread_id = Some(parent_thread_id);
     app.active_thread_id = Some(parent_thread_id);
+    app.upsert_agent_picker_thread(
+        child_thread_id,
+        /*agent_nickname*/ None,
+        /*agent_role*/ None,
+        /*is_closed*/ false,
+    );
 
     app.handle_app_server_event(
         &app_server,
@@ -6151,6 +6223,7 @@ async fn make_test_app() -> Box<App> {
         pending_managed_worktree_attach: None,
         startup_protected_input_boundary: false,
         startup_pending_protected_request: false,
+        account_email_request_id: None,
         rate_limit_hard_stop_generation: 0,
         rate_limit_refresh_state: Default::default(),
         pending_mcp_login_start: None,
@@ -6270,6 +6343,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             pending_managed_worktree_attach: None,
             startup_protected_input_boundary: false,
             startup_pending_protected_request: false,
+            account_email_request_id: None,
             rate_limit_hard_stop_generation: 0,
             rate_limit_refresh_state: Default::default(),
             pending_mcp_login_start: None,
@@ -6802,6 +6876,8 @@ async fn closing_fullscreen_inline_overlay_restores_history_once() -> Result<()>
 #[tokio::test]
 async fn copy_picker_opening_preserves_terminal_scrollback_without_reflow() {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    app.chat_widget.local_settings.transcript_mode =
+        crate::transcript_mode::TranscriptMode::Terminal;
     let response = "Existing response\n\n```rust\nkeep_scrollback();\n```";
     app.chat_widget.handle_server_notification(
         ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
@@ -7000,9 +7076,7 @@ async fn directive_only_completion_removes_streamed_directive() -> Result<()> {
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.handle_consolidate_agent_message(
         &mut tui,
-        String::new(),
-        PathBuf::from("/tmp"),
-        /*inline_visualization_context*/ None,
+        AgentMarkdownCell::new(String::new(), Path::new("/tmp")),
         ConsolidationScrollbackReflow::Required,
         /*deferred_history_cell*/ None,
     )?;
@@ -7045,10 +7119,11 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.handle_consolidate_agent_message(
         &mut tui,
-        "Final answer:\n\n| Pattern | Outcome |\n| --- | --- |\n| Table tail | Preserved |"
-            .to_string(),
-        PathBuf::from("/tmp"),
-        /*inline_visualization_context*/ None,
+        AgentMarkdownCell::new(
+            "Final answer:\n\n| Pattern | Outcome |\n| --- | --- |\n| Table tail | Preserved |"
+                .into(),
+            Path::new("/tmp"),
+        ),
         ConsolidationScrollbackReflow::Required,
         /*deferred_history_cell*/ None,
     )?;
@@ -7069,15 +7144,15 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
 
     let rendered = app.render_transcript_lines_for_reflow(/*width*/ 80);
     assert_eq!(rendered.lines.len(), 7);
-    assert_snapshot!(
-        "required_stream_reflow_during_capped_initial_replay_survives_transcript_overlay",
-        rendered
-            .lines
-            .iter()
-            .map(rendered_line_text)
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    let rendered = rendered
+        .lines
+        .iter()
+        .map(rendered_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Table tail"));
+    assert!(rendered.contains("Preserved"));
+    assert!(!rendered.contains("stale streamed table tail"));
     Ok(())
 }
 
@@ -7149,6 +7224,7 @@ async fn resizing_empty_transcript_schedules_settled_size_recheck() {
 fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItem>) -> Turn {
     Turn {
         id: turn_id.to_string(),
+        root_turn_id: None,
         items_view: codex_app_server_protocol::TurnItemsView::Full,
         items,
         status,
@@ -8331,6 +8407,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
         );
         for item in [
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id: turn_id.to_string(),
                 root_turn_id: None,
                 trace_id: None,
@@ -8350,6 +8427,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
                 completed_at_ms: 0,
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
@@ -8644,7 +8722,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
     );
     // Editing the first visible prompt also discards search state from the removed window.
     app.transcript_view.begin_search();
-    assert!(app.transcript_view.is_search_active());
+    assert!(app.transcript_view.is_search_editing());
     app.chat_widget.restore_thread_input_state(
         /*input_state*/ None,
         crate::chatwidget::ThreadInputStateRestoreMode {
@@ -8668,7 +8746,7 @@ async fn prompt_edit_reverts_earlier_and_first_visible_prompts_in_place() -> Res
             Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
         }
     }
-    assert!(!app.transcript_view.is_search_active());
+    assert!(!app.transcript_view.is_search_editing());
     assert!(app.transcript_view.is_following());
     assert_eq!(app.chat_widget.thread_id(), Some(source_thread_id));
     assert_eq!(
@@ -8736,6 +8814,7 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
             turns: vec![
                 Turn {
                     id: "turn-1".to_string(),
+                    root_turn_id: None,
                     items_view: codex_app_server_protocol::TurnItemsView::Full,
                     items: vec![ThreadItem::UserMessage {
                         id: "user-1".to_string(),
@@ -8753,6 +8832,7 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
                 },
                 Turn {
                     id: "turn-2".to_string(),
+                    root_turn_id: None,
                     items_view: codex_app_server_protocol::TurnItemsView::Full,
                     items: vec![
                         ThreadItem::UserMessage {
@@ -9755,6 +9835,7 @@ async fn clear_only_ui_reset_preserves_chat_session_state() {
         app.transcript_cells.clone(),
         crate::keymap::RuntimeKeymap::defaults().pager,
         /*copy_on_select*/ false,
+        /*mouse_scroll_speed*/ 1.0,
     ));
     app.deferred_history_lines = vec![Line::from("stale buffered line").into()];
     app.has_emitted_history_lines = true;

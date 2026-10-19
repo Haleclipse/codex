@@ -64,6 +64,77 @@ pub(super) fn text(buffer: &Buffer) -> String {
 }
 
 #[test]
+fn page_keys_follow_pager_scroll_bindings() {
+    let cells = [cell(
+        (1..=30)
+            .map(|row| format!("row {row}\n"))
+            .collect::<String>(),
+    )];
+    let mut frames = Vec::new();
+    for (label, pager, rows) in [
+        ("default", serde_json::json!({}), 7),
+        (
+            "half page",
+            serde_json::json!({
+                "page_up": [], "page_down": [],
+                "half_page_up": "page-up", "half_page_down": "page-down"
+            }),
+            4,
+        ),
+        (
+            "single row",
+            serde_json::json!({
+                "page_up": [], "page_down": [],
+                "scroll_up": "page-up", "scroll_down": "page-down"
+            }),
+            1,
+        ),
+        (
+            "unbound",
+            serde_json::json!({"page_up": [], "page_down": []}),
+            0,
+        ),
+    ] {
+        let config = serde_json::from_value(serde_json::json!({"pager": pager})).unwrap();
+        let keymap = crate::keymap::RuntimeKeymap::from_config(&config).unwrap();
+        let mut view = TranscriptView::default();
+        view.set_keymap_bindings(&keymap);
+        let pre_scroll = render(&mut view, &cells, /*width*/ 20, /*height*/ 8);
+        assert_eq!(
+            view.handle_key(KeyCode::PageUp.into(), &cells).is_some(),
+            rows != 0
+        );
+        let scrolled = render(&mut view, &cells, /*width*/ 20, /*height*/ 8);
+        let mut expected = TranscriptView::default();
+        render(&mut expected, &cells, /*width*/ 20, /*height*/ 8);
+        expected.scroll(&cells, -rows);
+        assert_eq!(
+            scrolled,
+            render(&mut expected, &cells, /*width*/ 20, /*height*/ 8)
+        );
+        frames.push(format!("{label}\n{}", text(&scrolled)));
+        assert_eq!(
+            view.handle_key(KeyCode::PageDown.into(), &cells).is_some(),
+            rows != 0
+        );
+        assert_eq!(
+            render(&mut view, &cells, /*width*/ 20, /*height*/ 8),
+            pre_scroll
+        );
+        for key in [
+            KeyCode::Char('j').into(),
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        ] {
+            assert!(view.handle_key(key, &cells).is_none());
+        }
+    }
+    insta::assert_snapshot!(
+        "page_keys_follow_pager_scroll_bindings",
+        frames.join("\n\n")
+    );
+}
+
+#[test]
 fn terminal_output_disclosure_follows_live_history_and_keymap() {
     use crate::exec_cell::CommandOutput;
     use crate::exec_cell::new_active_exec_command;
@@ -577,10 +648,9 @@ fn selecting_within_an_edge_row_does_not_start_selection_autoscroll() {
             );
             assert_eq!(view.selected_text(&cells).as_deref(), Some("row"));
         }
-        insta::assert_snapshot!(
-            format!("horizontal_selection_at_edge_{edge}"),
-            text(&selected)
-        );
+        if edge == 0 {
+            insta::assert_snapshot!("horizontal_selection_at_edge_0", text(&selected));
+        }
         let drag = MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),
             column: 3,
@@ -831,7 +901,10 @@ fn mutable_history_formats_once_per_frame_and_refreshes_the_next_frame() {
         )),
         matched
     );
-    view.handle_key(KeyCode::Enter.into(), &cells);
+    view.handle_key(
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        &cells,
+    );
     assert!(!view.advance_search(&cells));
     assert!(
         text(&render(

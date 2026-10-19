@@ -10,6 +10,7 @@ const _: () = assert!(
 );
 
 mod audit;
+mod delegated_preview;
 mod extract;
 pub mod log_db;
 mod migrations;
@@ -39,6 +40,7 @@ pub use sqlite::SqliteConfig;
 
 pub use audit::ThreadStateAuditRow;
 pub use audit::read_thread_state_audit_rows;
+pub use delegated_preview::delegated_output_preview;
 pub use extract::GUARDIAN_THREAD_PREVIEW;
 pub use extract::GUARDIAN_THREAD_TITLE;
 /// Low-level storage engine: useful for focused tests.
@@ -62,6 +64,9 @@ pub use model::Stage1JobClaimOutcome;
 pub use model::Stage1Output;
 pub use model::Stage1StartupClaimParams;
 pub use model::ThreadAttachment;
+pub use model::ThreadAttachmentArchiveFilter;
+pub use model::ThreadAttachmentOwner;
+pub use model::ThreadAttachmentOwnerPage;
 pub use model::ThreadAttachmentPage;
 pub use model::ThreadGoal;
 pub use model::ThreadGoalStatus;

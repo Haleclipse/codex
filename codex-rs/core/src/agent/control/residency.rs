@@ -6,7 +6,9 @@ use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
+use codex_protocol::error::AgentErrorContext;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrKind;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -119,7 +121,8 @@ impl V2Residency {
             {
                 return Err(CodexErr::new(CodexErrorDetails::AgentLimitReached {
                     max_threads: capacity,
-                }));
+                })
+                .with_agent_context(AgentErrorContext::ResidencyCapacity));
             }
         }
     }
@@ -182,17 +185,38 @@ impl V2Residency {
             // must keep delivery excluded and capacity reserved through registry removal.
             let manager = Arc::clone(manager);
             let residency = Arc::clone(self);
-            let teardown = membership.clone().into_teardown_guard();
+            let teardown = membership
+                .clone()
+                .into_teardown_guard("resident_eviction", Some(candidate_thread_id));
             let eviction = tokio::spawn(async move {
                 let _residency_guard = residency_guard;
                 candidate_thread.ensure_rollout_materialized().await;
                 if let Err(err) = candidate_thread.shutdown_and_wait().await {
+                    teardown
+                        .record_shutdown_failure("stop_resident", CodexErrKind::from(&err).into());
                     warn!(
                         "failed to shut down v2 resident thread before unloading {candidate_thread_id}: {err}"
                     );
                     teardown.complete();
                     return false;
                 }
+                // The submission loop has stopped and the residency guard excludes senders.
+                // Preserve unread queue-only mail before dropping the session that held it.
+                let mail = candidate_thread
+                    .session
+                    .input_queue
+                    .drain_mailbox()
+                    .await
+                    .into_iter()
+                    .map(|mail| mail.communication)
+                    .collect();
+                // A concurrent tree shutdown deliberately discards its unread mail.
+                let _ = candidate_thread
+                    .session
+                    .services
+                    .local_agent_runtime
+                    .mailboxes
+                    .enqueue(candidate_thread_id, /*id*/ None, mail);
                 let environments = candidate_thread.environment_selections().await;
                 let mut threads = manager.threads.write().await;
                 if threads
@@ -276,7 +300,12 @@ async fn is_unloadable(thread: &CodexThread) -> bool {
         thread.agent_status().await,
         AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
     ) && thread.session.active_turn.lock().await.is_none()
-        && !thread.session.input_queue.has_pending_mailbox_items().await
+        && !thread.session.has_outstanding_durable_sleep()
+        && !thread
+            .session
+            .input_queue
+            .has_trigger_turn_mailbox_items()
+            .await
 }
 
 #[cfg(test)]

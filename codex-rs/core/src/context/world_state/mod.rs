@@ -1,5 +1,6 @@
 mod agents_md;
 mod apps_instructions;
+mod base_instructions;
 mod collaboration_mode;
 mod compact_permissions;
 mod context_window_guidance;
@@ -15,8 +16,9 @@ mod persistent_mode;
 mod plugins_instructions;
 mod realtime;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 mod tools;
+mod top_level_tools;
 
 use crate::context::ContextualUserFragment;
 use codex_extension_api::PreviousWorldStateSection;
@@ -38,6 +40,7 @@ use std::fmt;
 
 pub(crate) use agents_md::AgentsMdState;
 pub(crate) use apps_instructions::AppsInstructionsState;
+pub(crate) use base_instructions::BaseInstructionsState;
 pub(crate) use collaboration_mode::CollaborationModeState;
 pub(crate) use compact_permissions::CompactPermissionsState;
 pub(crate) use context_window_guidance::ContextWindowGuidanceState;
@@ -55,8 +58,99 @@ pub(crate) use persistent_mode::PersistentModeState;
 pub(crate) use plugins_instructions::PluginsInstructionsState;
 pub(crate) use realtime::RealtimeState;
 pub(crate) use tools::ToolsState;
+pub(crate) use top_level_tools::TopLevelToolsState;
 
-pub(crate) type SectionTransition<S = Value> = (Option<S>, Option<Box<dyn ContextualUserFragment>>);
+/// One contribution to model context and its placement policy.
+pub(crate) struct WorldStateUpdate {
+    pub(crate) placement: Placement,
+    pub(crate) content: WorldStateUpdateContent,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// A separate item placed at the front when assembling initial context.
+    Prefix,
+    Standalone,
+    Mergeable,
+}
+
+pub(crate) enum WorldStateUpdateContent {
+    Fragment(Box<dyn ContextualUserFragment>),
+    Item(Box<ResponseItem>),
+}
+
+impl WorldStateUpdate {
+    pub(crate) fn fragment(fragment: impl ContextualUserFragment + 'static) -> Self {
+        Self::boxed_fragment(Box::new(fragment))
+    }
+
+    pub(crate) fn boxed_fragment(fragment: Box<dyn ContextualUserFragment>) -> Self {
+        Self {
+            placement: Placement::Mergeable,
+            content: WorldStateUpdateContent::Fragment(fragment),
+        }
+    }
+
+    pub(crate) fn optional_boxed_fragment(
+        fragment: Option<Box<dyn ContextualUserFragment>>,
+    ) -> Vec<Self> {
+        fragment.into_iter().map(Self::boxed_fragment).collect()
+    }
+
+    pub(crate) fn optional_standalone_boxed_fragment(
+        fragment: Option<Box<dyn ContextualUserFragment>>,
+    ) -> Vec<Self> {
+        fragment
+            .into_iter()
+            .map(Self::boxed_fragment)
+            .map(Self::standalone)
+            .collect()
+    }
+
+    pub(crate) fn optional_prefix_boxed_fragment(
+        fragment: Option<Box<dyn ContextualUserFragment>>,
+    ) -> Vec<Self> {
+        fragment
+            .into_iter()
+            .map(|fragment| Self {
+                placement: Placement::Prefix,
+                content: WorldStateUpdateContent::Fragment(fragment),
+            })
+            .collect()
+    }
+
+    pub(crate) fn standalone(mut self) -> Self {
+        self.placement = Placement::Standalone;
+        self
+    }
+
+    pub(crate) fn prefix_item(item: ResponseItem) -> Self {
+        Self {
+            placement: Placement::Prefix,
+            content: WorldStateUpdateContent::Item(Box::new(item)),
+        }
+    }
+}
+
+pub(crate) type SectionTransition<S = Value> = (Option<S>, Vec<WorldStateUpdate>);
+
+/// Separates the rendered window prefix from the remaining initial-context updates.
+pub(crate) fn split_prefix_updates(
+    updates: Vec<WorldStateUpdate>,
+) -> (Vec<ResponseItem>, Vec<WorldStateUpdate>) {
+    let mut prefix = Vec::new();
+    let mut context = Vec::new();
+    for update in updates {
+        match update.placement {
+            Placement::Prefix => prefix.push(match update.content {
+                WorldStateUpdateContent::Item(item) => *item,
+                WorldStateUpdateContent::Fragment(fragment) => fragment.into_boxed_response_item(),
+            }),
+            Placement::Standalone | Placement::Mergeable => context.push(update),
+        }
+    }
+    (prefix, context)
+}
 
 trait ErasedWorldStateSection: Send + Sync {
     fn matches_legacy_fragment(&self, role: &str, text: &str) -> bool;
@@ -130,10 +224,10 @@ impl<S: WorldStateSection> ErasedWorldStateSection for S {
             PreviousSectionState::Absent => PreviousSectionState::Absent,
             PreviousSectionState::Unknown => PreviousSectionState::Unknown,
         };
-        let (snapshot, fragment) = WorldStateSection::render_diff(self, previous);
+        let (snapshot, updates) = WorldStateSection::render_diff(self, previous);
         (
             snapshot.map(|snapshot| section_snapshot(self, snapshot).unwrap_or(Value::Null)),
-            fragment,
+            updates,
         )
     }
 }
@@ -164,13 +258,16 @@ impl ErasedWorldStateSection for ExtensionWorldStateSection {
             remove_null_object_fields(&mut snapshot);
             snapshot
         });
-        let fragment = fragment.map(|fragment| {
-            Box::new(WorldStateContextFragment {
-                fragment,
-                content_kind: ContentItemKind(format!("{}.instructions", self.0.id())),
-            }) as _
-        });
-        (snapshot, fragment)
+        let updates = fragment
+            .into_iter()
+            .map(|fragment| {
+                WorldStateUpdate::fragment(WorldStateContextFragment {
+                    fragment,
+                    content_kind: ContentItemKind(format!("{}.instructions", self.0.id())),
+                })
+            })
+            .collect();
+        (snapshot, updates)
     }
 }
 
@@ -248,7 +345,7 @@ pub(crate) trait WorldStateSection: Send + Sync + 'static {
         false
     }
 
-    /// Returns independently optional updates to the snapshot and model context.
+    /// Returns an optional snapshot update and ordered model-context updates.
     /// A missing snapshot leaves the stored comparison state unchanged.
     fn render_diff(
         &self,
@@ -256,12 +353,18 @@ pub(crate) trait WorldStateSection: Send + Sync + 'static {
     ) -> SectionTransition<Self::Snapshot>;
 }
 
-/// Stable fingerprint of a model-visible World State fragment.
+/// Stable fingerprint of model-visible world-state content.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub(crate) struct WorldStateHash(String);
 
 impl WorldStateHash {
+    pub(crate) fn from_json(value: &Value) -> Self {
+        let mut value = value.clone();
+        value.sort_all_objects();
+        Self(format!("{:x}", Sha1::digest(value.to_string().as_bytes())))
+    }
+
     pub(crate) fn from_fragment(fragment: &(impl ContextualUserFragment + ?Sized)) -> Self {
         let mut hasher = Sha1::new();
         hasher.update(b"codex-world-state-fragment-v1\0");
@@ -377,8 +480,8 @@ impl WorldState {
         }
     }
 
-    /// Renders every section as new, without any known previous state.
-    pub(crate) fn render_full(&self) -> (WorldStateSnapshot, Vec<Box<dyn ContextualUserFragment>>) {
+    /// Renders every section as new, preserving update order and placement.
+    pub(crate) fn render_full(&self) -> (WorldStateSnapshot, Vec<WorldStateUpdate>) {
         self.render_with(/*stored*/ None, |_, _| PreviousSectionState::Absent)
     }
 
@@ -387,7 +490,7 @@ impl WorldState {
         &self,
         previous: Option<&WorldStateSnapshot>,
         items: impl IntoIterator<Item = &'a ResponseItem> + Clone,
-    ) -> (WorldStateSnapshot, Vec<Box<dyn ContextualUserFragment>>) {
+    ) -> (WorldStateSnapshot, Vec<WorldStateUpdate>) {
         self.render_with(previous, |id, section| {
             if let Some(previous) = previous.and_then(|previous| previous.sections.get(id)) {
                 if section.has_retained_fragment_matcher()
@@ -409,12 +512,12 @@ impl WorldState {
         &self,
         stored: Option<&WorldStateSnapshot>,
         mut previous: impl FnMut(&str, &dyn ErasedWorldStateSection) -> PreviousSectionState<'a, Value>,
-    ) -> (WorldStateSnapshot, Vec<Box<dyn ContextualUserFragment>>) {
+    ) -> (WorldStateSnapshot, Vec<WorldStateUpdate>) {
         let mut snapshot = WorldStateSnapshot::default();
-        let mut fragments = Vec::new();
+        let mut updates = Vec::new();
         for (id, section) in &self.sections {
             let prior = previous(id, section.as_ref());
-            let (section_snapshot, fragment) = section.render_diff(prior);
+            let (section_snapshot, section_updates) = section.render_diff(prior);
             // A skipped snapshot retains stored state even if history required a fresh render.
             let section_snapshot = section_snapshot.or_else(|| {
                 stored
@@ -428,11 +531,9 @@ impl WorldState {
                     .sections
                     .insert((*id).to_string(), section_snapshot);
             }
-            if let Some(fragment) = fragment {
-                fragments.push(fragment);
-            }
+            updates.extend(section_updates);
         }
-        (snapshot, fragments)
+        (snapshot, updates)
     }
 }
 

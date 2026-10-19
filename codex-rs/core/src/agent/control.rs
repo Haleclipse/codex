@@ -19,7 +19,6 @@ use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadIdGenerator;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_manager::default_thread_id_generator;
-use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
 use crate::turn_timing::now_unix_timestamp_ms;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
@@ -72,6 +71,7 @@ mod execution;
 mod inspection;
 mod interrupt;
 mod legacy;
+mod mailbox;
 mod residency;
 mod resume;
 mod root_handoff;
@@ -142,7 +142,7 @@ impl LocalAgentControl {
             .start_or_steer_turn(TurnInputRequest::user_input(input).on_start(start_options))
             .await
         {
-            Ok(TurnInputSubmission::Started { turn_id }) => Ok(turn_id),
+            Ok(TurnInputSubmission::Started { turn_id, .. }) => Ok(turn_id),
             Ok(TurnInputSubmission::Steered { .. }) => {
                 // MAv1 exposes an opaque `submission_id` to the model. The legacy
                 // `Op::UserInput` path returned a fresh ID for every steer, while the
@@ -260,6 +260,30 @@ impl LocalAgentControl {
     ) -> CodexResult<String> {
         let communication_for_log =
             crate::agent_communication::logging_enabled().then(|| communication.clone());
+        {
+            // Keep unloaded delivery atomic with publication of a reloaded session.
+            let threads = state.threads.read().await;
+            if !communication.trigger_turn && !threads.contains_key(&agent_id) {
+                let _membership = self.runtime.admit_start()?;
+                self.runtime.ensure_agent_known(agent_id)?;
+                let submission_id = uuid::Uuid::now_v7().to_string();
+                self.runtime.mailboxes.enqueue(
+                    agent_id,
+                    Some(submission_id.clone()),
+                    vec![communication],
+                )?;
+                if let Some(communication) = communication_for_log {
+                    crate::agent_communication::emit_agent_communication_send(
+                        &submission_id,
+                        &context,
+                        &communication,
+                        agent_id,
+                    );
+                }
+                return Ok(submission_id);
+            }
+        }
+        // Loaded recipients retain submission ordering with follow-ups and interrupts.
         let (parent_turn_id, root_turn_id) = if communication.trigger_turn {
             (
                 start_options.parent_turn_id.clone(),
@@ -442,7 +466,7 @@ impl LocalAgentControl {
         let Ok(membership) = self.runtime.admit_start() else {
             return;
         };
-        let teardown = membership.into_teardown_guard();
+        let teardown = membership.into_teardown_guard("completion_watcher", Some(child_thread_id));
         let control = self.clone();
         let watcher = async move {
             let status = match control.subscribe_status(child_thread_id).await {

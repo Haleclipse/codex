@@ -45,6 +45,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::ToolName;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ToolResultLogConfig;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrKind;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -123,6 +125,22 @@ pub struct SessionTelemetry {
     pub(crate) metrics_use_metadata_tags: bool,
 }
 
+/// Bounds product SKU attribution before it is used in telemetry dimensions.
+pub fn bounded_product_sku(product_sku: Option<&str>) -> Option<&'static str> {
+    const KNOWN_PRODUCT_SKUS: &[&str] = &["codex"];
+
+    match product_sku {
+        None | Some("") => None,
+        Some(sku) => Some(
+            KNOWN_PRODUCT_SKUS
+                .iter()
+                .copied()
+                .find(|known| *known == sku)
+                .unwrap_or("other"),
+        ),
+    }
+}
+
 impl SessionTelemetry {
     pub fn with_tool_result_log_config(mut self, config: ToolResultLogConfig) -> Self {
         self.tool_result_log_config = config;
@@ -157,18 +175,7 @@ impl SessionTelemetry {
 
     /// Attributes bounded telemetry without turning arbitrary configuration into metric labels.
     pub fn with_product_sku(mut self, product_sku: Option<&str>) -> Self {
-        const KNOWN_PRODUCT_SKUS: &[&str] = &["codex"];
-
-        self.metadata.product_sku = match product_sku {
-            None | Some("") => None,
-            Some(sku) => Some(
-                KNOWN_PRODUCT_SKUS
-                    .iter()
-                    .copied()
-                    .find(|known| *known == sku)
-                    .unwrap_or("other"),
-            ),
-        };
+        self.metadata.product_sku = bounded_product_sku(product_sku);
         self
     }
 
@@ -286,14 +293,34 @@ impl SessionTelemetry {
     pub fn record_multi_agent_spawn_failure(
         &self,
         reason: &'static str,
+        err: &CodexErr,
+        call_id: &str,
+        turn_id: &str,
         fork_mode: &'static str,
         multi_agent_version: &'static str,
     ) {
+        let detail = err.agent_context().map_or("unknown", <&str>::from);
+        let error_kind: &'static str = CodexErrKind::from(err).into();
+        // Only bounded classifications and correlation IDs belong in trace-safe diagnostics.
+        trace_event!(
+            self,
+            event.name = MULTI_AGENT_SPAWN_FAILURE_METRIC,
+            reason,
+            detail,
+            error_kind,
+            call_id,
+            turn_id,
+            fork_mode,
+            multi_agent_version,
+            product_sku = self.metadata.product_sku,
+        );
         let Some(metrics) = &self.metrics else {
             return;
         };
         let mut tags = self.multi_agent_spawn_tags(fork_mode, multi_agent_version);
         tags.push(("reason", reason));
+        tags.push(("detail", detail));
+        tags.push(("error_kind", error_kind));
         let _ = metrics.counter(MULTI_AGENT_SPAWN_FAILURE_METRIC, /*inc*/ 1, &tags);
     }
 

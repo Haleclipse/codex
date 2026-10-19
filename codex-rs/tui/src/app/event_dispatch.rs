@@ -56,6 +56,8 @@ impl App {
                     | AppEvent::CopyWarning(_)
                     | AppEvent::UpdateWarnings { .. }
                     | AppEvent::CopySelection { .. }
+                    | AppEvent::SelectTranscriptCopy { .. }
+                    | AppEvent::TranscriptCopyClosed
                     | AppEvent::ConfirmDaemonUpdate(_)
                     | AppEvent::RunDaemonUpdate(_)
                     | AppEvent::InsertHistoryCell(_)
@@ -65,6 +67,7 @@ impl App {
                     | AppEvent::FinishPromptRevert { .. }
                     | AppEvent::ManagedWorktreeCreated(_)
                     | AppEvent::AgentsOverviewWorktreeCreated(_)
+                    | AppEvent::AgentsOverviewPinToggled { .. }
                     | AppEvent::AppendMessageHistoryEntry { .. }
                     | AppEvent::BeginInitialHistoryReplayBuffer
                     | AppEvent::BeginThreadSwitchHistoryReplayBuffer
@@ -390,6 +393,17 @@ impl App {
                         .set_queue_autosend_suppressed(/*suppressed*/ false);
                     self.chat_widget.maybe_send_next_queued_input();
                 }
+            }
+            AppEvent::TranscriptCopyClosed => {
+                self.chat_widget.maybe_send_next_queued_input();
+            }
+            AppEvent::SelectTranscriptCopy { guard } => {
+                let size = tui.prepare_draw_size()?;
+                self.render_owned_transcript(tui, size)?;
+                if !self.transcript_view.begin_copy_mode(&self.transcript_cells, Some(guard)) {
+                    self.chat_widget.add_info_message("Nothing to copy".into(), /*hint*/ None);
+                }
+                tui.frame_requester().schedule_frame();
             }
             AppEvent::CopySelection { text, label, format } => {
                 let result = tui.clipboard.copy(text, format, tui.frame_requester());
@@ -879,6 +893,7 @@ impl App {
             }
             AppEvent::ConsolidateAgentMessage {
                 source,
+                copy_source,
                 cwd,
                 inline_visualization_context,
                 scrollback_reflow,
@@ -886,9 +901,7 @@ impl App {
             } => {
                 self.handle_consolidate_agent_message(
                     tui,
-                    source,
-                    cwd,
-                    inline_visualization_context,
+                    history_cell::AgentMarkdownCell::new_with_inline_visualizations(source, &cwd, inline_visualization_context).with_copy_source(copy_source),
                     scrollback_reflow,
                     deferred_history_cell,
                 )?;
@@ -1266,6 +1279,12 @@ impl App {
                         suggestion_type: None,
                         elicitation_target: None,
                     });
+            }
+            AppEvent::AccountEmailLoaded { request_id, email } => {
+                if self.account_email_request_id == Some(request_id) {
+                    self.account_email_request_id = None;
+                    self.chat_widget.on_account_email_loaded(email);
+                }
             }
             AppEvent::SecuritySetupLoaded { request_id, identity, notice } => {
                 tracing::debug!(current = request_id == self.chat_widget.security_setup_request_id, "handling security setup notice");
@@ -2804,13 +2823,26 @@ impl App {
                     }
                     Err(error) => {
                         if let Ok(mut state) = self.agents_overview.view_state.lock() {
-                            state.input = name;
+                            state.set_rename_input(&name, &self.keymap);
                             state.rename_target = Some(thread_id);
                         }
                         self.repaint_agents_overview();
                         self.add_agents_overview_error(format!("Failed to rename task: {error}"));
                     }
                 }
+            }
+            AppEvent::ToggleAgentsOverviewPin { thread_id, pinned } => {
+                self.toggle_agents_overview_pin(app_server, thread_id, pinned);
+            }
+            AppEvent::AgentsOverviewPinToggled {
+                request_id,
+                thread_id,
+                pinned,
+                result,
+            } => {
+                self.complete_agents_overview_pin(
+                    app_server, request_id, thread_id, pinned, result,
+                );
             }
             AppEvent::SuggestThreadName {
                 thread_id,
@@ -2884,6 +2916,7 @@ impl App {
                 }
             }
             AppEvent::HideAgentsOverviewThread { thread_id } => {
+                self.prepare_agents_overview_removal(&HashSet::from([thread_id]));
                 self.agents_overview.hidden_threads.insert(thread_id);
                 self.repaint_agents_overview();
             }
@@ -2920,7 +2953,12 @@ impl App {
                 request_id,
                 result,
             } => {
-                self.apply_agent_picker_thread_refresh(primary_thread_id, request_id, result);
+                self.apply_agent_picker_thread_refresh(
+                    app_server,
+                    primary_thread_id,
+                    request_id,
+                    result,
+                );
             }
             AppEvent::SelectAgentThread(thread_id) => {
                 self.select_agent_thread_and_discard_side(tui, app_server, thread_id)
@@ -2952,7 +2990,7 @@ impl App {
                         self.chat_widget.update_skill_enabled(path, enabled);
                     }
                     Err(err) => {
-                        let path_display = path.display();
+                        let path_display = path.inferred_native_path_string();
                         self.chat_widget.add_error_message(format!(
                             "Failed to update skill config for {path_display}: {err}"
                         ));
@@ -3234,6 +3272,9 @@ impl App {
             }
             AppEvent::TerminalTitleSetupCancelled => {
                 self.chat_widget.cancel_terminal_title_setup();
+            }
+            AppEvent::PersistAgentsOverviewGrouping(grouping) => {
+                self.persist_agents_overview_grouping(grouping).await;
             }
             AppEvent::SyntaxThemeSelected { name } => {
                 let edit = crate::legacy_core::config::edit::syntax_theme_edit(&name);

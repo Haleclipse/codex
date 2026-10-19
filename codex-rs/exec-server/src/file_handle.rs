@@ -1,10 +1,19 @@
+//! Connection-scoped file handles with bounded positional reads and writes.
+//! Semaphore permits bound open handles and in-flight opens; table locks never cross an await.
+
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs::File;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 use codex_file_system::FILE_READ_CHUNK_SIZE;
-use tokio::sync::Mutex;
+use codex_file_system::FILE_WRITE_CHUNK_SIZE;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 
 const MAX_OPEN_FILES: usize = 128;
 
@@ -14,32 +23,51 @@ pub(crate) struct FileReadBlock {
     pub(crate) eof: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct FileHandleManager {
-    handles: Arc<Mutex<HashMap<String, Arc<File>>>>,
+    handles: Arc<Mutex<HashMap<String, FileHandleEntry>>>,
+    slots: Arc<Semaphore>,
+}
+
+impl Default for FileHandleManager {
+    fn default() -> Self {
+        Self {
+            handles: Arc::default(),
+            slots: Arc::new(Semaphore::new(MAX_OPEN_FILES)),
+        }
+    }
 }
 
 impl FileHandleManager {
     pub(crate) async fn open(
         &self,
         handle_id: String,
-        file: tokio::fs::File,
+        open_file: impl Future<Output = io::Result<tokio::fs::File>>,
     ) -> io::Result<String> {
-        let file = Arc::new(file.into_std().await);
-        let mut handles = self.handles.lock().await;
-        if handles.contains_key(&handle_id) {
+        if self.lock_handles().contains_key(&handle_id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("file read handle `{handle_id}` already exists"),
+                format!("file handle `{handle_id}` already exists"),
             ));
         }
-        if handles.len() >= MAX_OPEN_FILES {
+        let permit = Arc::clone(&self.slots).try_acquire_owned().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("at most {MAX_OPEN_FILES} file handles may be open per connection"),
+            )
+        })?;
+        let file = Arc::new(open_file.await?.into_std().await);
+        let mut handles = self.lock_handles();
+        let Entry::Vacant(entry) = handles.entry(handle_id.clone()) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("at most {MAX_OPEN_FILES} file reads may be open per connection"),
+                format!("file handle `{handle_id}` already exists"),
             ));
-        }
-        handles.insert(handle_id.clone(), file);
+        };
+        entry.insert(FileHandleEntry {
+            file,
+            _permit: permit,
+        });
         Ok(handle_id)
     }
 
@@ -50,13 +78,7 @@ impl FileHandleManager {
         len: usize,
     ) -> io::Result<FileReadBlock> {
         validate_read_block_len(len)?;
-        let file = {
-            let handles = self.handles.lock().await;
-            handles
-                .get(handle_id)
-                .cloned()
-                .ok_or_else(|| unknown_handle_error(handle_id))?
-        };
+        let file = self.get(handle_id)?;
         let result =
             match tokio::task::spawn_blocking(move || read_block_at(&file, offset, len)).await {
                 Ok(result) => result,
@@ -65,18 +87,96 @@ impl FileHandleManager {
                 ))),
             };
         if result.is_err() {
-            self.close(handle_id).await;
+            self.close(handle_id);
         }
         result
     }
 
-    pub(crate) async fn close(&self, handle_id: &str) {
-        self.handles.lock().await.remove(handle_id);
+    pub(crate) async fn write_block(
+        &self,
+        handle_id: &str,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> io::Result<()> {
+        if !(1..=FILE_WRITE_CHUNK_SIZE).contains(&bytes.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("file write block length must be between 1 and {FILE_WRITE_CHUNK_SIZE}"),
+            ));
+        }
+        // Native file offsets are signed; Windows interprets negative offsets as sentinels.
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .and_then(|end| i64::try_from(end).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file write range exceeds the signed 64-bit file offset limit",
+                )
+            })? as u64;
+        let file = self.get(handle_id)?;
+        tokio::task::spawn_blocking(move || {
+            let mut position = offset;
+            while position < end {
+                let written = (position - offset) as usize;
+                #[cfg(unix)]
+                let result = std::os::unix::fs::FileExt::write_at(
+                    file.as_ref(),
+                    &bytes[written..],
+                    position,
+                );
+                #[cfg(windows)]
+                let result = std::os::windows::fs::FileExt::seek_write(
+                    file.as_ref(),
+                    &bytes[written..],
+                    position,
+                );
+                match result {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write file block",
+                        ));
+                    }
+                    Ok(count) => position += count as u64,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("file write task stopped unexpectedly: {error}"))
+        })?
     }
 
-    pub(crate) async fn close_all(&self) {
-        self.handles.lock().await.clear();
+    fn get(&self, handle_id: &str) -> io::Result<Arc<File>> {
+        self.lock_handles()
+            .get(handle_id)
+            .map(|entry| Arc::clone(&entry.file))
+            .ok_or_else(|| unknown_handle_error(handle_id))
     }
+
+    pub(crate) fn close(&self, handle_id: &str) {
+        self.lock_handles().remove(handle_id);
+    }
+
+    pub(crate) fn close_all(&self) {
+        self.lock_handles().clear();
+    }
+
+    fn lock_handles(&self) -> MutexGuard<'_, HashMap<String, FileHandleEntry>> {
+        self.handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct FileHandleEntry {
+    file: Arc<File>,
+    // Closing an entry releases capacity even if a read or write still holds the file.
+    _permit: OwnedSemaphorePermit,
 }
 
 fn read_block_at(file: &File, offset: u64, len: usize) -> io::Result<FileReadBlock> {
@@ -123,6 +223,10 @@ fn validate_read_block_len(len: usize) -> io::Result<()> {
 fn unknown_handle_error(handle_id: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
-        format!("unknown file read handle `{handle_id}`"),
+        format!("unknown file handle `{handle_id}`"),
     )
 }
+
+#[cfg(test)]
+#[path = "file_handle_tests.rs"]
+mod tests;

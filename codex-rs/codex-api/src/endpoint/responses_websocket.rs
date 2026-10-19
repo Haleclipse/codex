@@ -349,6 +349,8 @@ impl ResponsesWebsocketConnection {
     }
 }
 
+mod connector;
+
 /// Client for connecting to the Responses WebSocket endpoint for one provider.
 pub struct ResponsesWebsocketClient {
     provider: Provider,
@@ -385,12 +387,6 @@ impl ResponsesWebsocketClient {
         Self { provider, auth }
     }
 
-    #[instrument(
-        name = "responses_websocket.connect",
-        level = "info",
-        skip_all,
-        fields(transport = "responses_websocket", api.path = "/responses")
-    )]
     pub async fn connect(
         &self,
         http_client_factory: &HttpClientFactory,
@@ -399,24 +395,16 @@ impl ResponsesWebsocketClient {
         turn_state: Option<Arc<OnceLock<String>>>,
         telemetry: Option<Arc<dyn WebsocketTelemetry>>,
     ) -> Result<ResponsesWebsocketConnection, ApiError> {
-        let ws_url = self
-            .provider
-            .websocket_url_for_path("/responses")
-            .map_err(|err| ApiError::Stream(format!("failed to build websocket URL: {err}")))?;
-
-        let mut headers =
-            merge_request_headers(&self.provider.headers, extra_headers, default_headers);
-        self.auth.add_auth_headers(&mut headers);
-
-        let (stream, _status, server_reasoning_included, server_model) =
-            connect_websocket(ws_url, headers, http_client_factory, turn_state.clone()).await?;
-        Ok(ResponsesWebsocketConnection::new(
-            stream,
-            self.provider.stream_idle_timeout,
-            server_reasoning_included,
-            server_model,
+        let connector = WebSocketConnector::new(http_client_factory)
+            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?;
+        self.connect_with_connector(
+            &connector,
+            extra_headers,
+            default_headers,
+            turn_state,
             telemetry,
-        ))
+        )
+        .await
     }
 
     /// Opens a WebSocket connection long enough to validate the upgrade response.
@@ -442,10 +430,12 @@ impl ResponsesWebsocketClient {
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
         self.auth.add_auth_headers(&mut headers);
 
+        let connector = WebSocketConnector::new(http_client_factory)
+            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?;
         let (mut stream, status, reasoning_included, server_model) = connect_websocket(
             ws_url.clone(),
             headers,
-            http_client_factory,
+            &connector,
             /*turn_state*/ None,
         )
         .await?;
@@ -499,7 +489,7 @@ fn merge_request_headers(
 async fn connect_websocket(
     url: Url,
     headers: HeaderMap,
-    http_client_factory: &HttpClientFactory,
+    connector: &WebSocketConnector,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) -> Result<(WsStream, StatusCode, bool, Option<String>), ApiError> {
     info!("connecting to websocket: {url}");
@@ -510,8 +500,6 @@ async fn connect_websocket(
         .map_err(|err| ApiError::Stream(format!("failed to build websocket request: {err}")))?;
     request.headers_mut().extend(headers);
 
-    let connector = WebSocketConnector::new(http_client_factory)
-        .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?;
     let response = connector.connect(request, websocket_config()).await;
 
     let (stream, response) = match response {
@@ -596,6 +584,8 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
 struct WrappedWebsocketError {
     code: Option<String>,
     message: Option<String>,
+    #[serde(default)]
+    headers: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -628,6 +618,16 @@ fn map_wrapped_websocket_error_event(
         headers,
         ..
     } = event;
+    let retry_after = [
+        error
+            .as_ref()
+            .and_then(|error| error.headers.as_ref())
+            .and_then(Value::as_object),
+        headers.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|headers| RetryAfter::from_headers(&json_headers_to_http_headers(headers)));
 
     if let Some(error) = error.as_ref()
         && let Some(code) = error.code.as_deref()
@@ -644,7 +644,7 @@ fn map_wrapped_websocket_error_event(
                 .message
                 .clone()
                 .unwrap_or_else(|| fallback_message.to_string()),
-            retry_after: None,
+            retry_after,
         });
     }
 
@@ -658,7 +658,7 @@ fn map_wrapped_websocket_error_event(
         url: None,
         headers: headers.as_ref().map(json_headers_to_http_headers),
         body: Some(original_payload),
-        retry_after: None,
+        retry_after,
     }))
 }
 
@@ -945,7 +945,6 @@ mod tests {
     fn direct_serialization_preserves_websocket_request_payload() {
         let api_request = ResponsesApiRequest {
             model: "gpt-test".to_string(),
-            instructions: "Use the available tools.".to_string(),
             input: vec![ResponseItem::Message {
                 id: Some(ResponseItemId::with_suffix("msg", "1")),
                 role: "user".to_string(),
@@ -998,7 +997,7 @@ mod tests {
         let request_text =
             serialize_websocket_request(&request).expect("serialize websocket request");
         assert!(request_text.starts_with(
-            r#"{"type":"response.create","model":"gpt-test","stream":true,"service_tier":"priority","instructions":"Use the available tools.","previous_response_id":"resp-1","input":"#
+            r#"{"type":"response.create","model":"gpt-test","stream":true,"service_tier":"priority","previous_response_id":"resp-1","input":"#
         ));
         let wire_payload =
             serde_json::from_str::<Value>(&request_text).expect("parse websocket request");
@@ -1062,6 +1061,35 @@ mod tests {
         let body = body.expect("expected body");
         assert!(body.contains("usage_limit_reached"));
         assert!(body.contains("The usage limit has been reached"));
+    }
+
+    /// Websocket error advice uses the shared HTTP value validation and duplicate handling.
+    #[tokio::test(start_paused = true)]
+    async fn wrapped_websocket_retry_after_uses_http_header_validation() {
+        for (error_headers, expected_seconds) in [
+            (json!("invalid"), 12),
+            (json!({"retry-after": "\n5\n"}), 12),
+            (json!({"retry-after": "\t5\t"}), 5),
+            (json!({"Retry-After": "5", "retry-after": "30"}), 30),
+        ] {
+            let payload = json!({
+                "type": "error",
+                "status": 429,
+                "error": {"code": "rate_limit_exceeded", "headers": error_headers},
+                "headers": {"retry-after": "12"}
+            })
+            .to_string();
+            let wrapped = parse_wrapped_websocket_error_event(&payload).unwrap();
+            let Some(ApiError::Transport(TransportError::Http { retry_after, .. })) =
+                map_wrapped_websocket_error_event(wrapped, payload)
+            else {
+                panic!("expected a websocket HTTP error");
+            };
+            assert_eq!(
+                retry_after,
+                RetryAfter::from_delay(Duration::from_secs(expected_seconds))
+            );
+        }
     }
 
     #[test]

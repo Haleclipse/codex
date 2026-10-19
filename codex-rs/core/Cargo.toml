@@ -146,6 +146,7 @@ assert_matches = { workspace = true }
 codex-exec-server-test-support = { workspace = true }
 codex-image-generation-extension = { workspace = true }
 codex-home = { workspace = true }
+codex-mcp-extension = { workspace = true }
 codex-otel = { workspace = true }
 codex-test-binary-support = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
@@ -173,6 +174,9 @@ tracing-test = { workspace = true, features = ["no-env-filter"] }
 walkdir = { workspace = true }
 wiremock = { workspace = true }
 zstd = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [package.metadata.cargo-shear]
 ignored = ["openssl-sys"]

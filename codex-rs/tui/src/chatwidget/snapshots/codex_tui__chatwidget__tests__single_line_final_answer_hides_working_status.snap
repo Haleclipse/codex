@@ -8,7 +8,7 @@ expression: normalize_snapshot_paths(terminal.backend().vt100().screen().content
 
 • 1
 
-
-› Ask Codex to do anything
-
-  gpt-5 default · /tmp/project
+────────────────────────────────────────
+❯ Ask Codex to do anything
+────────────────────────────────────────
+   GPT 5 | 󰉋 project |  - · - tokens

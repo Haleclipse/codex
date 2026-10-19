@@ -294,11 +294,12 @@ async fn streamed_question_precedes_reply_across_resume(
         .with_model("gpt-5.4")
         .with_history_mode(ThreadHistoryMode::Paginated)
         .with_config(|config| {
-            config.experimental_thread_store = ThreadStoreConfig::Local;
+            // This fixture retains the question by allowing its response to finish.
             config
                 .features
-                .enable(Feature::GuardianThreadContext)
-                .expect("enable retained context");
+                .disable(Feature::InstantInterrupt)
+                .expect("disable InstantInterrupt feature");
+            config.experimental_thread_store = ThreadStoreConfig::Local;
         })
         .build_with_streaming_server(&server)
         .await?;

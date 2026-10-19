@@ -12,7 +12,7 @@ on:
       - "rust-v*.*.*"
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 # @cometix: use system git for fetching git dependencies — Cargo's built-in
@@ -376,6 +376,12 @@ jobs:
             codex-rs/dist/${{ matrix.target }}/*
 
   release:
+    # Each job checks its channel under this lock; out-of-order builds cannot
+    # roll back GitHub, npm, R2, or the canary branch.
+    concurrency: &release-publication
+      group: rust-release
+      queue: max
+      cancel-in-progress: false
     needs:
       - build
     name: release
@@ -445,7 +451,10 @@ jobs:
 
       - name: Define release name
         id: release_name
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           # Extract the version from the tag name, which is in the format
           # "rust-v0.1.0".
           version="${GITHUB_REF_NAME#rust-v}"
@@ -534,6 +543,7 @@ jobs:
   # July 31, 2025: https://github.blog/changelog/2025-07-31-npm-trusted-publishing-with-oidc-is-generally-available/
   # npm docs: https://docs.npmjs.com/trusted-publishers
   publish-npm:
+    concurrency: *release-publication
     # Publish to npm for stable releases, numbered alphas, and alpha hotfixes.
     if: >-
       ${{

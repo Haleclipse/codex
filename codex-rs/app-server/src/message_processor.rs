@@ -1406,6 +1406,11 @@ impl MessageProcessor {
             ClientRequest::ThreadAttachmentList { params, .. } => {
                 self.thread_processor.thread_attachment_list(params).await
             }
+            ClientRequest::ThreadAttachmentOwnerList { params, .. } => {
+                self.thread_processor
+                    .thread_attachment_owner_list(params)
+                    .await
+            }
             ClientRequest::ThreadAttachmentRemove { params, .. } => {
                 self.thread_processor
                     .thread_attachment_remove(request_id.clone(), params)
@@ -1906,3 +1911,7 @@ mod message_processor_tracing_tests;
 #[cfg(test)]
 #[path = "message_processor_gateway_oauth_tests.rs"]
 mod gateway_oauth_tests;
+
+#[cfg(test)]
+#[path = "message_processor_thread_lifecycle_tests.rs"]
+mod thread_lifecycle_tests;

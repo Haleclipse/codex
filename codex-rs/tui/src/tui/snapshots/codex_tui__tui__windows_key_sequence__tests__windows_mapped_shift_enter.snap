@@ -1,0 +1,13 @@
+---
+source: tui/src/tui/windows_key_sequence_tests.rs
+expression: terminal.backend()
+---
+"────────────────────────────────────────────────────────────"
+"❯ first line                                                "
+"                                                            "
+"  second line [13;2u                                        "
+"                                                            "
+"                                                            "
+"                                                            "
+"────────────────────────────────────────────────────────────"
+"   - · - tokens                                            "

@@ -78,6 +78,8 @@ impl App {
                     task.abort();
                 }
                 self.agents_overview.request_id = None;
+                self.agents_overview.refresh_show_more = false;
+                self.agents_overview.active_refresh_thread_ids.clear();
                 self.agents_overview.refresh_pending = false;
                 self.agents_overview.initialized = false;
                 self.agents_overview.refresh_notifications.clear();
@@ -88,6 +90,13 @@ impl App {
                 self.agents_overview.usage_disabled = false;
                 self.repaint_agents_overview();
                 self.refresh_agents_overview_threads(app_server_client);
+                if let Some(primary_thread_id) = self.primary_thread_id
+                    && !self
+                        .agent_navigation
+                        .queue_picker_refresh(primary_thread_id)
+                {
+                    self.refresh_agent_picker_threads(app_server_client, primary_thread_id);
+                }
             }
             AppServerEvent::ServerNotification(notification) => {
                 let request_resolved = matches!(
@@ -205,6 +214,7 @@ impl App {
 
             return;
         }
+        self.handle_agent_picker_visibility_notification(app_server_client, &notification);
 
         if let ServerNotification::ThreadStarted(started) = &notification
             && let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -349,18 +359,22 @@ impl App {
                             | AuthMode::PersonalAccessToken
                     )
                 );
-                self.chat_widget.update_account_state(
-                    status_account_display_from_auth_mode(
-                        notification.auth_mode,
-                        notification.plan_type,
-                    ),
+                let account_display = status_account_display_from_auth_mode(
+                    notification.auth_mode,
                     notification.plan_type,
-                    notification
-                        .auth_mode
-                        .is_some_and(AuthMode::has_chatgpt_account),
+                );
+                let has_chatgpt_account = notification
+                    .auth_mode
+                    .is_some_and(AuthMode::has_chatgpt_account);
+                self.account_email_request_id = None;
+                self.chat_widget.update_account_state(
+                    account_display,
+                    notification.plan_type,
+                    has_chatgpt_account,
                     has_codex_backend_auth,
                 );
                 if self.chat_widget.has_chatgpt_account() {
+                    self.refresh_account_email(app_server_client);
                     crate::security_setup::prefetch(
                         &self.config,
                         app_server_client,
@@ -448,25 +462,12 @@ impl App {
                 {
                     return;
                 }
-                if self.primary_thread_id.is_some()
-                    && self.primary_thread_id != Some(thread_id)
-                    && !self.thread_event_channels.contains_key(&thread_id)
-                    && self.agent_navigation.get(&thread_id).is_none()
-                    && !self.side_threads.contains_key(&thread_id)
-                    && !matches!(&notification, ServerNotification::McpServerStatusUpdated(_))
-                    && !matches!(
-                        &notification,
-                        ServerNotification::ThreadStarted(started)
-                            if matches!(
-                                &started.thread.source,
-                                SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                                    parent_thread_id,
-                                    ..
-                                }) if self.primary_thread_id == Some(*parent_thread_id)
-                                    || self.thread_event_channels.contains_key(parent_thread_id)
-                                    || self.agent_navigation.get(parent_thread_id).is_some()
-                            )
-                    )
+                let untracked_thread =
+                    self.primary_thread_id.is_some() && !self.owns_thread_for_routing(thread_id);
+                if untracked_thread
+                    && !self
+                        .owns_untracked_notification(app_server_client, thread_id, &notification)
+                        .await
                 {
                     return;
                 }
@@ -744,10 +745,7 @@ impl App {
             else {
                 return;
             };
-            if self.primary_thread_id != Some(parent_thread_id)
-                && !self.thread_event_channels.contains_key(&parent_thread_id)
-                && self.agent_navigation.get(&parent_thread_id).is_none()
-            {
+            if !self.owns_thread_for_routing(parent_thread_id) {
                 if self
                     .agents_overview
                     .dispatched_requests

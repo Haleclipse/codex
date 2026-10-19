@@ -77,6 +77,7 @@ use crate::DeletedProject;
 use crate::ItemPage;
 use crate::ListItemsParams;
 use crate::ListProjectsParams;
+use crate::ListThreadAttachmentThreadsParams;
 use crate::ListThreadAttachmentsParams;
 use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
@@ -105,6 +106,7 @@ use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::StoredThreadSection;
 use crate::StoredThreadSectionsPage;
+use crate::ThreadAttachmentOwnerPage;
 use crate::ThreadAttachmentPage;
 use crate::ThreadMetadataPatch;
 use crate::ThreadOccurrenceSearchPage;
@@ -672,6 +674,15 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { thread_attachments::list_thread_attachments(self, params).await })
     }
 
+    fn list_thread_attachment_threads(
+        &self,
+        params: ListThreadAttachmentThreadsParams,
+    ) -> ThreadStoreFuture<'_, ThreadAttachmentOwnerPage> {
+        Box::pin(
+            async move { thread_attachments::list_thread_attachment_threads(self, params).await },
+        )
+    }
+
     fn remove_thread_attachment(
         &self,
         params: RemoveThreadAttachmentParams,
@@ -802,6 +813,8 @@ impl ThreadStore for LocalThreadStore {
 mod tests {
     #[path = "acquisition_tests.rs"]
     mod acquisition_tests;
+    #[path = "delegated_preview_tests.rs"]
+    mod delegated_preview_tests;
     use std::sync::Arc;
 
     use codex_protocol::ThreadId;
@@ -1064,26 +1077,20 @@ mod tests {
                 root_turn_id: None,
                 disabled_plugin_ids: None,
                 cwd: serde_json::from_value(serde_json::json!(cwd)).expect("absolute cwd"),
-                workspace_roots: None,
-                current_date: None,
-                timezone: None,
                 approval_policy,
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: None,
                 active_permission_profile: None,
-                network: None,
                 file_system_sandbox_policy: None,
                 model: model.to_string(),
                 comp_hash: None,
-                personality: None,
                 collaboration_mode: None,
                 multi_agent_version: None,
-                multi_agent_mode: None,
                 realtime_active: None,
                 cyber_access_program: None,
                 effort: None,
-                summary: ReasoningSummary::Auto,
+                summary: Some(ReasoningSummary::Auto),
             })
         };
 
@@ -1151,6 +1158,7 @@ mod tests {
         live_thread
             .append_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
                 TurnStartedEvent {
+                    turn_attribution: None,
                     turn_id: "turn-1".to_string(),
                     root_turn_id: None,
                     trace_id: None,
@@ -1196,6 +1204,7 @@ mod tests {
                     },
                 )),
                 RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    root_turn_id: None,
                     turn_id: "turn-1".to_string(),
                     started_at: None,
                     last_agent_message: None,

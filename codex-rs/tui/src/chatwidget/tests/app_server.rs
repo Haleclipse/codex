@@ -162,6 +162,7 @@ fn start_safety_buffering_test_turn(
             thread_id: thread_id.to_string(),
             turn: AppServerTurn {
                 id: turn_id.to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -874,6 +875,7 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -921,6 +923,7 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Summary,
                 items: vec![item],
                 status: AppServerTurnStatus::Completed,
@@ -958,6 +961,7 @@ async fn live_app_server_turn_started_sets_feedback_turn_id() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -1344,6 +1348,8 @@ async fn live_app_server_command_output_delta_transcript_snapshot() {
 async fn live_app_server_sub_agent_activity_renders_once() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let activity = AppServerThreadItem::SubAgentActivity {
+        model: None,
+        reasoning_effort: None,
         id: "activity-1".to_string(),
         kind: codex_app_server_protocol::SubAgentActivityKind::Completed,
         agent_thread_id: ThreadId::new().to_string(),
@@ -1538,6 +1544,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -1573,6 +1580,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::Failed,
@@ -1705,6 +1713,7 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -1782,6 +1791,7 @@ async fn live_app_server_server_overloaded_error_renders_error() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -1825,6 +1835,7 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,

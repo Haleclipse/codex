@@ -424,7 +424,11 @@ impl ManagedClientStartup {
             startup_complete.store(true, Ordering::Release);
             outcome
         };
-        originator.scope(startup).in_current_span().boxed().shared()
+        originator
+            .scope(Box::pin(startup))
+            .in_current_span()
+            .boxed()
+            .shared()
     }
 }
 
@@ -667,18 +671,13 @@ pub(crate) async fn list_tools_for_client_uncached(
     server_instructions: Option<&str>,
 ) -> Result<Vec<ToolInfo>> {
     let fetch_start = Instant::now();
-    let protocol_mode = client.protocol_mode();
     let tools = collect_paginated_with_limit("tools/list", timeout, catalog_item_limit, |params| {
         let client = Arc::clone(client);
         async move {
             let response = client
                 .list_tools_with_connector_ids(params, timeout)
                 .await?;
-            let next_cursor = match protocol_mode {
-                McpProtocolMode::Legacy => None,
-                McpProtocolMode::V20260728 => response.next_cursor,
-            };
-            Ok((response.tools, next_cursor))
+            Ok((response.tools, response.next_cursor))
         }
     })
     .await?

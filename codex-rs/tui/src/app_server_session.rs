@@ -13,6 +13,7 @@ pub(crate) mod provider_selection;
 mod provider_selection_tests;
 mod realtime;
 mod rollout_history;
+mod startup_launch;
 mod thread_list;
 mod web_search;
 
@@ -25,6 +26,7 @@ pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
 pub(crate) use history::HistoryHydrationScope;
 pub(crate) use history::INITIAL_HISTORY_TURN_LIMIT;
 pub(crate) use history::thread_items_page_params;
+pub(crate) use startup_launch::StartupLaunchChoices;
 
 use crate::app_event::PermissionProfileSelection;
 use crate::app_event_sender::AppEventSender;
@@ -176,6 +178,11 @@ pub(crate) enum ForkGoalContinuation {
 pub(crate) enum ForkPermissionMode {
     InheritSaved,
     OverrideFromCurrentConfig,
+}
+
+enum EmptyCatalogFallback {
+    Error,
+    ManagedNewThread,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,6 +338,8 @@ pub(crate) struct AppServerSession {
     managed_new_thread_defaults: Option<NewThreadModelDefaults>,
     external_agent_config_import_id: Mutex<Option<String>>,
     dynamic_tool_mcp: Option<Arc<DynamicToolMcpServer>>,
+    pub(crate) worktree_source_config_builder:
+        Option<Box<crate::legacy_core::config::ConfigBuilder>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -435,6 +444,7 @@ impl AppServerSession {
             managed_new_thread_defaults: None,
             external_agent_config_import_id: Mutex::default(),
             dynamic_tool_mcp: None,
+            worktree_source_config_builder: None,
         }
     }
 
@@ -444,17 +454,57 @@ impl AppServerSession {
         app_event_tx: AppEventSender,
         status_updates: tokio::sync::broadcast::Sender<ThreadStatusChangedNotification>,
     ) -> std::io::Result<()> {
-        if self.uses_embedded_app_server() {
+        let worktrees = if !self.uses_remote_workspace()
+            && !config.active_project.is_untrusted()
+            && config.features.enabled(codex_features::Feature::Worktrees)
+        {
+            // Listing a fresh, nonexistent thread is read-only and returns an empty page
+            // on supported stores. Probe before advertising tools or allocating a checkout.
+            let support = self
+                .request_handle()
+                .request_typed::<codex_app_server_protocol::ThreadAttachmentListResponse>(
+                    ClientRequest::ThreadAttachmentList {
+                        request_id: RequestId::String(uuid::Uuid::new_v4().to_string()),
+                        params: codex_app_server_protocol::ThreadAttachmentListParams {
+                            thread_id: uuid::Uuid::new_v4().to_string(),
+                            cursor: None,
+                            limit: Some(1),
+                        },
+                    },
+                )
+                .await;
+            match support {
+                Err(error) => {
+                    tracing::warn!(%error, "managed worktree attachment storage unavailable");
+                    None
+                }
+                Ok(_) => {
+                    match crate::managed_worktree_tools::ManagedWorktreeTools::new(&config).await {
+                        Ok(service) => Some(match self.worktree_source_config_builder.as_deref() {
+                            Some(builder) => service.with_source_config_builder(builder.clone()),
+                            None => service,
+                        }),
+                        Err(error) => {
+                            tracing::warn!(%error, "managed worktree tools unavailable");
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let services = crate::dynamic_tools_mcp::ToolServices {
+            task_tools: !self.uses_embedded_app_server(),
+            worktrees,
+        };
+        if !services.task_tools && services.worktrees.is_none() {
             return Ok(());
         }
-        if config
-            .mcp_servers
-            .get()
-            .contains_key(crate::dynamic_tools::NAMESPACE)
-        {
+        if config.mcp_servers.get().contains_key(services.namespace()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                "a user-configured MCP server already owns the codex_tui namespace",
+                "a user-configured MCP server already owns the TUI tools namespace",
             ));
         }
         let managed_requirement = config
@@ -463,15 +513,12 @@ impl AppServerSession {
             .mcp_servers
             .as_ref()
             .map(|requirements| {
-                requirements
-                    .value
-                    .get(crate::dynamic_tools::NAMESPACE)
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "managed MCP requirements do not permit the TUI task-tools server",
-                        )
-                    })
+                requirements.value.get(services.namespace()).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "managed MCP requirements do not permit the TUI task-tools server",
+                    )
+                })
             })
             .transpose()?;
         let mut thread_start_params = thread_start_params_from_config(
@@ -504,6 +551,7 @@ impl AppServerSession {
                 app_event_tx,
                 status_updates,
                 managed_requirement,
+                services,
             )
             .await?,
         ));
@@ -511,10 +559,10 @@ impl AppServerSession {
     }
 
     pub(crate) fn thread_tool_transport(&self) -> ThreadToolTransport {
-        if self.uses_embedded_app_server() {
-            ThreadToolTransport::Disabled
-        } else if let Some(server) = self.dynamic_tool_mcp.as_ref() {
+        if let Some(server) = self.dynamic_tool_mcp.as_ref() {
             ThreadToolTransport::Mcp(Arc::clone(server))
+        } else if self.uses_embedded_app_server() {
+            ThreadToolTransport::Disabled
         } else {
             ThreadToolTransport::Dynamic
         }
@@ -600,6 +648,19 @@ impl AppServerSession {
         Ok(bootstrap)
     }
 
+    pub(crate) async fn bootstrap_for_new_thread(
+        &mut self,
+        config: &Config,
+    ) -> Result<AppServerBootstrap> {
+        let started_at = Instant::now();
+        let account = self.read_account().await?;
+        let mut bootstrap = self
+            .bootstrap_with_account_inner(config, account, EmptyCatalogFallback::ManagedNewThread)
+            .await?;
+        bootstrap.duration = started_at.elapsed();
+        Ok(bootstrap)
+    }
+
     /// Bootstraps using a previously read account.
     ///
     /// Callers must discard a prefetched account after authentication, server, or provider changes.
@@ -607,6 +668,16 @@ impl AppServerSession {
         &mut self,
         config: &Config,
         account: GetAccountResponse,
+    ) -> Result<AppServerBootstrap> {
+        self.bootstrap_with_account_inner(config, account, EmptyCatalogFallback::Error)
+            .await
+    }
+
+    async fn bootstrap_with_account_inner(
+        &mut self,
+        config: &Config,
+        account: GetAccountResponse,
+        fallback: EmptyCatalogFallback,
     ) -> Result<AppServerBootstrap> {
         let started_at = Instant::now();
         // `hooks/list` holds the global config queue during startup. Submit models and config
@@ -647,15 +718,19 @@ impl AppServerSession {
             },
             async { Ok(crate::collaboration_modes::list(self.request_handle()).await) },
         )?;
-        self.managed_new_thread_defaults = requirements
-            .requirements
-            .and_then(|requirements| requirements.models)
-            .and_then(|models| models.new_thread);
-        let available_models = models
+        let mut available_models = models
             .data
             .into_iter()
             .map(model_preset_from_api_model)
             .collect::<Vec<_>>();
+        crate::service_tier_resolution::constrain_server_service_tiers(
+            &mut available_models,
+            &requirements,
+        );
+        self.managed_new_thread_defaults = requirements
+            .requirements
+            .and_then(|requirements| requirements.models)
+            .and_then(|models| models.new_thread);
         let default_model = config
             .model
             .clone()
@@ -666,6 +741,13 @@ impl AppServerSession {
                     .map(|model| model.model.clone())
             })
             .or_else(|| available_models.first().map(|model| model.model.clone()))
+            .or_else(|| match fallback {
+                EmptyCatalogFallback::Error => None,
+                EmptyCatalogFallback::ManagedNewThread => self
+                    .managed_new_thread_defaults
+                    .as_ref()
+                    .and_then(|defaults| defaults.model.clone()),
+            })
             .wrap_err("No models are available. Set `model` explicitly or check your model catalog configuration.")?;
         self.default_model = Some(default_model.clone());
         self.available_models = available_models.clone();
@@ -800,6 +882,7 @@ impl AppServerSession {
         if self.history_support == ThreadHistorySupport::LegacyOnly {
             params.history_mode = None;
         }
+        self.thread_tool_transport().validate_config(config)?;
         self.thread_tool_transport().configure(&mut params);
         let request_handle = self.request_handle();
         let (response, history_support, task_tools_available) =
@@ -941,6 +1024,7 @@ impl AppServerSession {
         permission_mode: ForkPermissionMode,
         config_source: ForkConfigSource,
     ) -> Result<AppServerStartedThread> {
+        self.thread_tool_transport().validate_config(&config)?;
         let fork_parent = match presentation {
             ForkPresentation::Regular => self
                 .thread_read(thread_id, /*include_turns*/ false)
@@ -1355,6 +1439,8 @@ impl AppServerSession {
                     disabled_plugin_ids: None,
                     thread_id: thread_id.to_string(),
                     turn_trigger: Some("user".to_string()),
+                    parent_turn_id: None,
+                    root_turn_id: None,
                     client_user_message_id: Some(client_user_message_id),
                     input: items,
                     tool_output: None,
@@ -1744,7 +1830,7 @@ pub(crate) async fn start_thread_with_request_handle(
     thread_params_mode: ThreadParamsMode,
     remote_cwd_override: Option<PathBuf>,
     thread_tool_transport: ThreadToolTransport,
-    model_provider_override: Option<String>,
+    launch_choices: StartupLaunchChoices,
 ) -> Result<AppServerStartedThread> {
     let request_id = RequestId::String(format!("startup-thread-start-{}", Uuid::new_v4()));
     let mut params = thread_start_params_from_config(
@@ -1753,7 +1839,8 @@ pub(crate) async fn start_thread_with_request_handle(
         remote_cwd_override.as_deref(),
         /*session_start_source*/ None,
     );
-    params.model_provider = model_provider_override.or(params.model_provider);
+    thread_tool_transport.validate_config(&config)?;
+    launch_choices.configure(&mut params);
     params.daybreak_enabled = (config.daybreak_enabled && !config.ephemeral).then_some(true);
     thread_tool_transport.configure(&mut params);
     let (response, _history_support, task_tools_available) =
@@ -1827,7 +1914,7 @@ pub(crate) fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
                 description: effort.description,
             })
             .collect(),
-        supports_personality: model.supports_personality,
+        supports_personality: false,
         additional_speed_tiers: model.additional_speed_tiers,
         service_tiers: model
             .service_tiers
@@ -1915,8 +2002,8 @@ fn config_request_overrides_from_config(
         &origins,
         &mut overrides,
     );
-    for key in ["model_reasoning_summary", "model_verbosity"] {
-        if origins.get(key).is_some_and(|origin| {
+    let is_launch = |key: &str| {
+        origins.get(key).is_some_and(|origin| {
             matches!(
                 origin.name,
                 ConfigLayerSource::SessionFlags
@@ -1925,9 +2012,18 @@ fn config_request_overrides_from_config(
                         ..
                     }
             )
-        }) {
+        })
+    };
+    for key in ["model_reasoning_summary", "model_verbosity"] {
+        if is_launch(key) {
             overrides.insert(key.to_string(), serde_json::json!(effective[key]));
         }
+    }
+    if is_launch("features.concurrent_reasoning_summaries") {
+        overrides
+            .entry("features".to_string())
+            .or_insert_with(|| serde_json::json!({}))["concurrent_reasoning_summaries"] =
+            serde_json::json!(effective["features"]["concurrent_reasoning_summaries"]);
     }
     if config.bypass_hook_trust {
         overrides.insert("bypass_hook_trust".to_string(), true.into());
@@ -1949,37 +2045,6 @@ fn remove_permission_config_overrides(config: &mut Option<HashMap<String, serde_
     if config.as_ref().is_some_and(HashMap::is_empty) {
         *config = None;
     }
-}
-
-fn new_thread_reasoning_overrides(config: &Config) -> Option<HashMap<String, serde_json::Value>> {
-    let mut overrides = config_request_overrides_from_config(config, ThreadParamsMode::Embedded)
-        .unwrap_or_default();
-    let summary = config
-        .model_reasoning_summary
-        .unwrap_or(codex_protocol::config_types::ReasoningSummary::None);
-    overrides.insert(
-        "model_reasoning_summary".to_string(),
-        serde_json::Value::String(summary.to_string()),
-    );
-    let explicit_feature = config
-        .config_layer_stack
-        .effective_config()
-        .get("features")
-        .and_then(|features| features.get("concurrent_reasoning_summaries"))
-        .and_then(toml::Value::as_bool);
-    let features = overrides
-        .entry("features".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if let Some(features) = features.as_object_mut() {
-        features.insert(
-            "concurrent_reasoning_summaries".to_string(),
-            serde_json::Value::Bool(
-                summary != codex_protocol::config_types::ReasoningSummary::None
-                    && explicit_feature.unwrap_or(/*default*/ false),
-            ),
-        );
-    }
-    Some(overrides)
 }
 
 fn service_tier_override_from_config(config: &Config) -> Option<Option<String>> {
@@ -2114,12 +2179,7 @@ pub(crate) fn thread_start_params_from_config(
         approvals_reviewer: approvals_reviewer_override_from_config(config),
         sandbox,
         permissions,
-        config: match thread_params_mode {
-            ThreadParamsMode::Embedded => new_thread_reasoning_overrides(config),
-            ThreadParamsMode::Remote => {
-                config_request_overrides_from_config(config, thread_params_mode)
-            }
-        },
+        config: config_request_overrides_from_config(config, thread_params_mode),
         ephemeral: Some(config.ephemeral),
         history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
         session_start_source,
@@ -3460,13 +3520,7 @@ mod tests {
             ("model_reasoning_effort".to_string(), string("high")),
             ("bypass_hook_trust".to_string(), true.into()),
         ]);
-        let mut expected_start_config = expected_config.clone();
-        expected_start_config.insert("model_reasoning_summary".to_string(), string("detailed"));
-        expected_start_config.insert(
-            "features".to_string(),
-            serde_json::json!({"concurrent_reasoning_summaries": false}),
-        );
-        assert_eq!(start.config, Some(expected_start_config));
+        assert_eq!(start.config, Some(expected_config.clone()));
         assert_eq!(resume.config, Some(expected_config.clone()));
         assert_eq!(fork.config, Some(expected_config));
     }
@@ -4080,6 +4134,7 @@ mod tests {
                 name: None,
                 turns: vec![Turn {
                     id: "turn-1".to_string(),
+                    root_turn_id: None,
                     items_view: codex_app_server_protocol::TurnItemsView::Full,
                     items: vec![
                         codex_app_server_protocol::ThreadItem::UserMessage {

@@ -1,0 +1,17 @@
+---
+source: tui/src/chatwidget/tests/bedrock_catalog_tests.rs
+expression: "format!(\"Bundled catalog:\\n{bundled_view}\\n\\nCustom catalog:\\n{custom_view}\")"
+---
+Bundled catalog:
+› /ultrafast  The fastest available responses for latency-sensitive work.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /ultrafast
+────────────────────────────────────────────────────────────────────────────────────────────────────
+   us.openai.gpt-6-astra | 󰉋 project |  - · - tokens
+
+Custom catalog:
+› /express  My custom Bedrock tier.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /express
+────────────────────────────────────────────────────────────────────────────────────────────────────
+   us.openai.gpt-6-astra | 󰉋 project |  - · - tokens

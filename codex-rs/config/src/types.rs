@@ -67,6 +67,26 @@ const fn default_enabled() -> bool {
     true
 }
 
+/// Last selected grouping in Agent Command Center.
+#[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentsOverviewGrouping {
+    #[default]
+    Project,
+    Status,
+    Model,
+}
+
+impl AgentsOverviewGrouping {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Status => "status",
+            Self::Model => "model",
+        }
+    }
+}
+
 /// Preferred layout for the resume/fork session picker.
 #[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -861,6 +881,12 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub fullscreen_transcript: bool,
 
+    /// Mouse wheel speed multiplier for transcript scrolling, based on one row per event.
+    /// Defaults to `1.0`. Positive fractional values slow scrolling; values above `1.0` speed it up.
+    #[serde(default, deserialize_with = "crate::tui_mouse_scroll::deserialize")]
+    #[schemars(schema_with = "crate::tui_mouse_scroll::schema")]
+    pub mouse_scroll_speed: Option<f64>,
+
     /// Copy selected transcript text when the mouse button is released.
     /// Defaults to `auto`: enabled except in direct terminals known to forward their native
     /// copy shortcut (Ghostty 1.2+, Kitty on macOS, Windows Terminal, and VS Code on Windows).
@@ -925,6 +951,10 @@ pub struct Tui {
     /// Preferred layout for resume/fork session picker results.
     #[serde(default)]
     pub session_picker_view: Option<SessionPickerViewMode>,
+
+    /// Last selected grouping in Agent Command Center.
+    #[serde(default)]
+    pub agents_overview_grouping: AgentsOverviewGrouping,
 
     /// Working directory to use when resuming or forking a session.
     /// When unset, prompt if the current and session directories differ.

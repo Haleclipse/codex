@@ -5,6 +5,7 @@ mod classification;
 mod config;
 mod conversation;
 mod coverage;
+mod decisions;
 mod extension;
 mod metrics;
 mod observation;

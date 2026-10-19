@@ -14,7 +14,7 @@ use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::hook_mcp_executor::CoreHookMcpExecutor;
-use crate::mcp_tool_call::McpToolApprovalMetadata;
+use crate::mcp_tool_call::McpToolApprovalContext;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
@@ -39,10 +39,10 @@ use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::HookCompletedEvent;
-use codex_protocol::protocol::McpInvocation;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_sandboxing::SandboxType;
 use codex_skills::SkillError;
@@ -52,7 +52,7 @@ use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
 type McpToolApprovalMetadataMap =
-    HashMap<(String, String), std::sync::Weak<(Option<McpInvocation>, McpToolApprovalMetadata)>>;
+    HashMap<(String, String), std::sync::Weak<McpToolApprovalContext>>;
 
 /// Context for an initialized model agent
 ///
@@ -341,9 +341,12 @@ impl SessionConfiguration {
         environment_selections: Vec<TurnEnvironmentSelection>,
     ) -> CodexThreadSettingsOverrides {
         CodexThreadSettingsOverrides {
-            environments: Some(TurnEnvironmentSelections::new(
+            environments: Some(TurnEnvironmentRequests::new(
                 self.legacy_fallback_cwd.clone(),
-                environment_selections,
+                environment_selections
+                    .into_iter()
+                    .map(TurnEnvironmentSelection::into_request)
+                    .collect(),
             )),
             runtime_workspace_roots: Some(self.runtime_workspace_roots.clone()),
             profile_workspace_roots: Some(
@@ -671,6 +674,11 @@ impl Session {
         state.session_configuration.originator.clone()
     }
 
+    pub(crate) async fn dynamic_tools(&self) -> Vec<DynamicToolSpec> {
+        let state = self.state.lock().await;
+        state.session_configuration.dynamic_tools.clone()
+    }
+
     pub(crate) async fn responses_metadata(
         &self,
         step_context: &StepContext,
@@ -978,17 +986,10 @@ impl Session {
             config.current_time_reminder.as_ref(),
             external_time_provider,
         )?;
-        let selected_capability_roots =
-            match thread_extension_init.get::<Vec<SelectedCapabilityRoot>>() {
-                Some(roots) => roots.as_ref().clone(),
-                None => {
-                    let roots = initial_history.get_selected_capability_roots();
-                    if !roots.is_empty() {
-                        thread_extension_init.insert(roots.clone());
-                    }
-                    roots
-                }
-            };
+        let selected_capability_roots = thread_extension_init
+            .get::<Vec<SelectedCapabilityRoot>>()
+            .map(|roots| roots.as_ref().clone())
+            .unwrap_or_default();
         thread_extension_init.insert(codex_extension_api::ThreadOriginator(
             session_configuration.originator.clone(),
         ));
@@ -1837,7 +1838,7 @@ impl Session {
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
                 async_hook_results,
-                input_queue: InputQueue::new(),
+                input_queue: InputQueue::with_controller(thread_id, Arc::clone(&services.agent_control)),
                 services,
                 git_enrichment_policy,
                 fork_persistence,
@@ -1845,15 +1846,13 @@ impl Session {
                 next_internal_sub_id: AtomicU64::new(0),
             });
             if let Some(startup) = &startup {
-                let _ = startup.session.set(Arc::clone(&sess));
+                startup.set_session(Arc::clone(&sess));
             }
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
                 *guard = Arc::downgrade(&sess);
             }
             // Dispatch the SessionConfiguredEvent first and then report any errors.
-            // If resuming, include converted initial messages in the payload so UIs can render them immediately.
-            let initial_messages = initial_history.get_event_msgs();
             let thread_config =
                 session_configuration.thread_config_snapshot(turn_environments.selections());
             let events = std::iter::once(Event {
@@ -1879,7 +1878,6 @@ impl Session {
                     permission_profile: thread_config.permission_profile,
                     active_permission_profile: thread_config.active_permission_profile,
                     reasoning_effort: thread_config.reasoning_effort,
-                    initial_messages,
                     rollout_path,
                 }),
             })

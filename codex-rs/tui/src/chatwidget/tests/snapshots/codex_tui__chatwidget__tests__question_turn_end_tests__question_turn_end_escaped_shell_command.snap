@@ -4,6 +4,9 @@ expression: "normalize_snapshot_paths(render_bottom_popup(&chat, 80))"
 ---
 ────────────────────────────────────────────────────────────────────────────────
 ❯ \!echo partial
+
+  > Which way?
+
   answer
 ────────────────────────────────────────────────────────────────────────────────
    gpt-5.6-sol | 󰉋 project |  - · - tokens

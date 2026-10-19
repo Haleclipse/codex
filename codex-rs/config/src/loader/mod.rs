@@ -45,6 +45,7 @@ use crate::strict_config::config_error_from_ignored_toml_value_fields;
 use crate::strict_config::ignored_config_warning;
 use crate::strict_config::ignored_toml_value_fields;
 use crate::strict_config::unknown_feature_toml_value_field;
+use crate::strict_config::unknown_tui_toml_value_path;
 use crate::thread_config::ThreadConfigContext;
 use crate::thread_config::ThreadConfigLoader;
 use codex_file_system::ExecutorFileSystem;
@@ -653,16 +654,13 @@ fn validate_cli_overrides_strictly(
     base_dir: &Path,
 ) -> io::Result<()> {
     let _guard = AbsolutePathBufGuard::new(base_dir);
-    if let Some(path) = ignored_toml_value_fields::<ConfigToml>(cli_overrides_layer.clone()).first()
-    {
-        let ignored_path = path.join(".");
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown configuration field `{ignored_path}` in -c/--config override"),
-        ));
-    }
-
-    if let Some(ignored_path) = unknown_feature_toml_value_field(cli_overrides_layer) {
+    let ignored_path = ignored_toml_value_fields::<ConfigToml>(cli_overrides_layer.clone())
+        .into_iter()
+        .chain(unknown_tui_toml_value_path(cli_overrides_layer))
+        .next()
+        .map(|path| path.join("."))
+        .or_else(|| unknown_feature_toml_value_field(cli_overrides_layer));
+    if let Some(ignored_path) = ignored_path {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown configuration field `{ignored_path}` in -c/--config override"),
@@ -842,7 +840,12 @@ fn windows_program_data_dir_from_known_folder() -> io::Result<PathBuf> {
     // SAFETY: SHGetKnownFolderPath initializes path_ptr with a CoTaskMem-allocated,
     // null-terminated UTF-16 string on success.
     let hr = unsafe {
-        SHGetKnownFolderPath(&FOLDERID_ProgramData, known_folder_flags, 0, &mut path_ptr)
+        SHGetKnownFolderPath(
+            &FOLDERID_ProgramData,
+            known_folder_flags,
+            std::ptr::null_mut(),
+            &mut path_ptr,
+        )
     };
     if hr != 0 {
         return Err(io::Error::other(format!(

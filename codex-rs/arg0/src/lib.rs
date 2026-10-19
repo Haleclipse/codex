@@ -134,13 +134,8 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
                     Err(_) => std::process::exit(1),
                 };
                 let cwd = cwd.into();
-                let update_file_mode = codex_apply_patch::apply_patch_file_update_mode_from_env();
-                match runtime.block_on(codex_apply_patch::apply_patch_with_options(
+                match runtime.block_on(codex_apply_patch::apply_patch(
                     &patch_arg,
-                    codex_apply_patch::ApplyPatchOptions {
-                        update_file_mode,
-                        ..Default::default()
-                    },
                     &cwd,
                     &mut stdout,
                     &mut stderr,
@@ -622,7 +617,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("missing Windows system root"))?;
         let command_shell = PathBuf::from(system_root).join("System32").join("cmd.exe");
         let executable = executable_directory.join("cmd.exe");
-        fs::copy(&command_shell, &executable)?;
+        codex_utils_cargo_bin::copy_executable(&command_shell, &executable)?;
 
         let batch_path = alias_directory.join("apply_patch.bat");
         let executable_path = super::windows_batch_executable_path(&executable, &alias_directory);

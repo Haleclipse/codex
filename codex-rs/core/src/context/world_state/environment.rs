@@ -1,6 +1,7 @@
 use super::PreviousSectionState;
 use super::SectionTransition;
 use super::WorldStateSection;
+use super::WorldStateUpdate;
 use crate::context::ContextualUserFragment;
 use crate::context::environment_context::FileSystemContext;
 use crate::context::environment_context::NetworkContext;
@@ -189,7 +190,10 @@ impl WorldStateSection for EnvironmentsState {
                 subagents: self.subagents.clone(),
             }) as Box<dyn ContextualUserFragment>
         });
-        (Some(current), fragment)
+        (
+            Some(current),
+            WorldStateUpdate::optional_boxed_fragment(fragment),
+        )
     }
 }
 
@@ -490,7 +494,10 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
     const MAX_TOTAL_ERROR_BYTES: usize = 512;
     let mut remaining_error_bytes = MAX_TOTAL_ERROR_BYTES;
     for environment in &snapshot.environments {
-        if let TurnEnvironmentState::Failed { selection, error } = environment {
+        if let TurnEnvironmentState::Failed {
+            selection, error, ..
+        } = environment
+        {
             let detail = error
                 [..error.floor_char_boundary(remaining_error_bytes.min(MAX_ERROR_BYTES))]
                 .to_string();

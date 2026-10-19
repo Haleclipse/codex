@@ -1,0 +1,8 @@
+---
+source: tui/src/chatwidget/tests/slash_commands.rs
+expression: "normalize_snapshot_paths(render_bottom_popup(&chat, 80))"
+---
+────────────────────────────────────────────────────────────────────────────────
+❯ /ultra
+────────────────────────────────────────────────────────────────────────────────
+   gpt-5.5 | 󰉋 project |  - · - tokens

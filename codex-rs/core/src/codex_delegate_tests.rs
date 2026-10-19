@@ -51,6 +51,7 @@ async fn forward_events_filters_private_events_before_blocked_send_is_cancelled(
         .send(Event {
             id: "full".to_string(),
             msg: EventMsg::TurnAborted(TurnAbortedEvent {
+                root_turn_id: None,
                 turn_id: Some("turn-1".to_string()),
                 started_at: None,
                 reason: TurnAbortReason::Interrupted,
@@ -187,38 +188,47 @@ async fn forward_ops_preserves_submission_trace_context() {
 
 #[tokio::test]
 async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
-    let (parent_session, parent_ctx, _rx_events) =
-        crate::session::tests::make_session_and_context_with_rx().await;
-    let mut config = parent_ctx.config.as_ref().clone();
-    config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
-    let cancel_token = CancellationToken::new();
-    cancel_token.cancel();
-    let parent_environments = parent_ctx.initial_environments.clone();
+    for shutdown_requested in [false, true] {
+        let (parent_session, parent_ctx, _rx_events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        if shutdown_requested {
+            parent_session
+                .services
+                .local_agent_runtime
+                .request_shutdown();
+        }
+        let mut config = parent_ctx.config.as_ref().clone();
+        config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let parent_environments = parent_ctx.initial_environments.clone();
 
-    let result = timeout(
-        Duration::from_secs(/*secs*/ 1),
-        run_codex_thread_interactive(
-            config,
-            Arc::clone(&parent_session.services.auth_manager),
-            Arc::clone(&parent_session.services.models_manager),
-            parent_session,
-            parent_ctx,
-            parent_environments,
-            cancel_token,
-            SubAgentSource::Review,
-            codex_extension_api::SessionIsolation::Inherit,
-            /*initial_history*/ None,
-            crate::session::GitEnrichmentPolicy::Fresh,
-            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
-        ),
-    )
-    .await
-    .expect("cancelled delegate spawn should not hang");
+        let result = timeout(
+            Duration::from_secs(/*secs*/ 1),
+            run_codex_thread_interactive(
+                config,
+                Arc::clone(&parent_session.services.auth_manager),
+                Arc::clone(&parent_session.services.models_manager),
+                parent_session,
+                parent_ctx,
+                parent_environments,
+                cancel_token,
+                SubAgentSource::Review,
+                codex_extension_api::SessionIsolation::Inherit,
+                /*initial_history*/ None,
+                crate::session::GitEnrichmentPolicy::Fresh,
+                codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+            ),
+        )
+        .await
+        .expect("cancelled delegate spawn should not hang");
 
-    assert!(matches!(
-        result,
-        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted)
-    ));
+        let error = result.err().expect("cancelled delegate spawn should fail");
+        assert!(
+            matches!(error.details(), CodexErrorDetails::TurnAborted),
+            "unexpected cancelled delegate spawn error (shutdown_requested={shutdown_requested}): {error}"
+        );
+    }
 }
 
 #[tokio::test]

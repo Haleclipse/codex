@@ -40,6 +40,7 @@ use test_case::test_case;
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::time::timeout;
 use uuid::Uuid;
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::support::FileSystemImplementation;
@@ -473,7 +474,7 @@ async fn file_system_elevated_relative_read_denial_uses_policy_cwd(
     for name in ["codex-windows-sandbox-setup", "codex-command-runner"] {
         let source = codex_utils_cargo_bin::cargo_bin(name)?;
         let destination = resources.join(Path::new(name).with_extension("exe"));
-        if let Err(error) = std::fs::copy(&source, &destination)
+        if let Err(error) = codex_utils_cargo_bin::copy_executable(&source, &destination)
             && !(error.kind() == std::io::ErrorKind::PermissionDenied && destination.is_file())
         {
             return Err(error).with_context(|| format!("stage Windows sandbox helper {name}"));
@@ -653,7 +654,7 @@ fn process_private_desktops() -> Result<BTreeSet<String>> {
     // Native layout: https://github.com/winsiderss/phnt/blob/master/ntpsapi.h
     #[repr(C)]
     struct HandleEntry {
-        handle: isize,
+        handle: HANDLE,
         _handle_count: usize,
         _pointer_count: usize,
         _granted_access: u32,
@@ -664,7 +665,7 @@ fn process_private_desktops() -> Result<BTreeSet<String>> {
     #[link(name = "ntdll")]
     unsafe extern "system" {
         fn NtQueryInformationProcess(
-            process: isize,
+            process: HANDLE,
             class: u32,
             information: *mut c_void,
             length: u32,
@@ -674,7 +675,7 @@ fn process_private_desktops() -> Result<BTreeSet<String>> {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetUserObjectInformationW(
-            object: isize,
+            object: HANDLE,
             index: i32,
             information: *mut c_void,
             length: u32,

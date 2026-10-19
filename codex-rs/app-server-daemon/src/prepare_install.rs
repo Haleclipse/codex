@@ -237,7 +237,9 @@ async fn prepare_from_package(
     anyhow::ensure!(
         package_tree(source, /*destination*/ None)? == digest
             && std::fs::read(stage.path().join("codex-package.json"))? == manifest_bytes
-            && managed_install::executable_identity(&staged_exe).await? == running_identity,
+            && managed_install::executable_identity(&staged_exe)
+                .await?
+                .same_contents(&running_identity),
         "the CLI package changed while preparing the daemon or differs from the running executable"
     );
     let binary_version =
@@ -263,6 +265,9 @@ async fn prepare_from_package(
         if !stage.path().join("codex").exists() {
             std::os::unix::fs::symlink("bin/codex", stage.path().join("codex"))?;
         }
+        #[cfg(windows)]
+        windows::publish_release(stage.path(), &release).await?;
+        #[cfg(not(windows))]
         std::fs::rename(stage.path(), &release)?;
     }
     let standalone = home.join("packages/standalone");

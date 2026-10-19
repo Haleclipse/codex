@@ -6,6 +6,7 @@ pub use heartbeat::Heartbeat;
 pub use heartbeat::UserInputOrigin;
 
 mod compaction_resume_metadata;
+pub use codex_protocol::turn_input::TurnAttribution;
 pub use compaction_resume_metadata::CompactionResumeMetadata;
 pub use compaction_resume_metadata::PreviousTurnSettings;
 pub use compaction_resume_metadata::resume_multi_agent_version;
@@ -420,31 +421,6 @@ impl InitialHistory {
             Self::New | Self::Cleared => &[],
             Self::Resumed(resumed) => &resumed.history,
             Self::Forked(items) => items,
-        }
-    }
-
-    pub fn get_event_msgs(&self) -> Option<Vec<EventMsg>> {
-        match self {
-            Self::New | Self::Cleared => None,
-            Self::Resumed(resumed) => Some(
-                resumed
-                    .history
-                    .iter()
-                    .filter_map(|item| match item {
-                        RolloutItem::EventMsg(event) => Some(event.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            Self::Forked(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|item| match item {
-                        RolloutItem::EventMsg(event) => Some(event.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
         }
     }
 

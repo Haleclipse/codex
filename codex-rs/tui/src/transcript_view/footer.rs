@@ -20,6 +20,17 @@ impl TranscriptView {
         motion: MotionMode,
         latest_navigation: &str,
     ) -> Option<TranscriptFooter> {
+        if let Some(mode) = &self.copy_mode {
+            return Some(TranscriptFooter {
+                text: vec![
+                    Line::from(format!("Copy {}", mode.label.to_lowercase())).bold(),
+                    navigation_line("↑/↓/j/k select · g/G ends · enter copy · esc close"),
+                ]
+                .into(),
+                cursor_column: None,
+                is_interactive: true,
+            });
+        }
         // A mouse-down anchor owns the gesture, but has no text to copy yet. Compare
         // source positions so movement across wrapping or padding is not a selection.
         let has_selected_text = self.selection.as_ref().is_some_and(|selection| {
@@ -66,7 +77,14 @@ impl TranscriptView {
                 is_interactive: true,
             });
         }
-        if self.is_activity_focused() {
+        if self.search.is_reading() && !pending && !self.is_activity_focused() {
+            return Some(TranscriptFooter {
+                text: self.search.status_line(width, self.history).into(),
+                cursor_column: None,
+                is_interactive: false,
+            });
+        }
+        if self.is_activity_focused() && !pending {
             return self.disclosure_footer(width);
         }
         // Selection can pause following without hiding the current final row.
@@ -223,6 +241,10 @@ pub(super) fn navigation_line(navigation: &str) -> Line<'static> {
             " clear selection",
             " copy+↓",
             " previous",
+            " accept",
+            " cancel",
+            " older",
+            " newer",
             " latest",
             " retry",
             " select",

@@ -291,6 +291,7 @@ mod thread_processor_behavior_tests {
         ))];
         let active_turn = Turn {
             id: "live-turn".to_string(),
+            root_turn_id: None,
             items: vec![ThreadItem::UserMessage {
                 id: "live-user-message".to_string(),
                 client_id: None,
@@ -612,6 +613,7 @@ mod thread_processor_behavior_tests {
             requires_openai_auth: false,
             supports_websockets: true,
             supports_standalone_web_search: false,
+            capabilities: None,
             include_internal_metadata: false,
         };
         let config_manager = ConfigManager::new(
@@ -1198,6 +1200,7 @@ mod thread_processor_behavior_tests {
             state.track_current_turn_event(
                 "turn-1",
                 &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                    turn_attribution: None,
                     turn_id: "turn-1".to_string(),
                     root_turn_id: None,
                     trace_id: None,

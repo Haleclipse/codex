@@ -14,6 +14,8 @@ mod auth_storage_originator;
 mod auto_env;
 #[path = "bedrock_gov_cloud_tests.rs"]
 mod bedrock_gov_cloud;
+#[path = "bedrock_service_tier_tests.rs"]
+mod bedrock_service_tier;
 mod bedrock_setup;
 mod client_metadata;
 mod code_mode_host;
@@ -154,6 +156,7 @@ mod thread_start;
 mod thread_status;
 mod thread_timeline;
 mod thread_unarchive;
+mod thread_unload;
 mod thread_unsubscribe;
 mod turn_cost_otel;
 mod turn_interrupt;

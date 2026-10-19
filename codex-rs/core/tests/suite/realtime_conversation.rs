@@ -12,6 +12,7 @@ use codex_core::TurnInputRequest;
 use codex_core::TurnInputSubmission;
 use codex_core::test_support::auth_manager_from_auth;
 use codex_history::InitialHistory;
+use codex_history::ResponseItemEnvelope;
 use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_login::OPENAI_API_KEY_ENV_VAR;
@@ -695,8 +696,7 @@ async fn conversation_websocket_transports_send_codex_headers_without_creating_a
         .thread_manager
         .start_thread(StartThreadOptions {
             thread_source: thread_source.clone(),
-            environments: Some(test.codex.config_snapshot().await.environments.environments),
-            ..StartThreadOptions::new(test.config.clone())
+            ..test.start_thread_options().await
         })
         .await?;
     let codex = &conversation.thread;
@@ -847,8 +847,7 @@ async fn conversation_webrtc_frameless_chatgpt_sends_codex_headers_to_backend(
 
     let mut options = StartThreadOptions {
         thread_source: thread_source.clone(),
-        environments: Some(test.codex.config_snapshot().await.environments.environments),
-        ..StartThreadOptions::new(test.config.clone())
+        ..test.start_thread_options().await
     };
     let conversation = if thread_source == Some(ThreadSource::GuardianReview) {
         options.session_source = Some(SessionSource::Internal(InternalSessionSource::Guardian));
@@ -2238,6 +2237,7 @@ async fn assert_transport_close_tail_flush(
         }
     });
     let test = builder.build(&api_server).await?;
+    test.codex.ensure_rollout_materialized().await;
 
     test.codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
@@ -2288,22 +2288,32 @@ async fn assert_transport_close_tail_flush(
 
     let closed = wait_for_event_match(&test.codex, |msg| match msg {
         EventMsg::RealtimeConversationClosed(closed) => Some(closed.clone()),
+        EventMsg::TurnStarted(_) | EventMsg::ItemStarted(_) | EventMsg::ItemCompleted(_) => {
+            panic!("idle transcript flush must not create an unfinished client turn")
+        }
         _ => None,
     })
     .await;
     assert_eq!(closed.reason.as_deref(), Some("transport_closed"));
-    if flush_transcript_tail_on_session_end {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while response_mock.requests().is_empty() {
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(response_mock.single_request().message_input_texts("user").iter().any(|text| text
-            == "<realtime_delegation>\n  <source>transcript_tail_flush</source>\n  <input>The user just ended their realtime session. Here is the remaining handoff/transcript tail. You probably do not have to do anything; acknowledge the handoff unless the transcript itself asks for something.</input>\n  <transcript_delta>user: transport tail</transcript_delta>\n</realtime_delegation>"));
-    } else {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(response_mock.requests().is_empty());
-    }
+    // Closed must be a history barrier, including when there is no active turn.
+    let history = test.codex.load_history(/*include_archived*/ false).await?;
+    let tails = history.items.iter().filter(|item| {
+        matches!(item, RolloutItem::ResponseItem(ResponseItemEnvelope { item: ResponseItem::Message { role, content, .. }, .. })
+            if role == "user" && content.iter().any(|item| matches!(item,
+                ContentItem::InputText { text } if text.contains("<source>transcript_tail_flush</source>")
+                    && text.contains("user: transport tail"))))
+    }).count();
+    assert_eq!(tails, usize::from(flush_transcript_tail_on_session_end));
+    assert!(response_mock.requests().is_empty());
+
+    test.submit_text_turn("continue in text").await?;
+    let user_texts = response_mock.single_request().message_input_texts("user");
+    assert_eq!(
+        user_texts
+            .iter()
+            .any(|text| text.contains("user: transport tail")),
+        flush_transcript_tail_on_session_end
+    );
 
     realtime_server.shutdown().await;
     Ok(())
@@ -4002,27 +4012,35 @@ async fn realtime_v2_noop_tool_call_returns_empty_function_output_without_respon
     Ok(())
 }
 
+#[test_matrix([None, Some("final_answer"), Some("commentary"), Some("partial_answer")], [false, true])]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conversation_mirrors_assistant_message_text_to_realtime_handoff() -> Result<()> {
+async fn conversation_mirrors_assistant_message_text_to_realtime_handoff(
+    phase: Option<&str>,
+    active_handoff: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let api_server = start_mock_server().await;
+    let mut message = responses::ev_assistant_message("msg_1", "assistant says hi");
+    if let Some(phase) = phase {
+        message["item"]["phase"] = json!(phase);
+    }
     let _response_mock = responses::mount_sse_once(
         &api_server,
         responses::sse(vec![
             responses::ev_response_created("resp_1"),
-            responses::ev_assistant_message("msg_1", "assistant says hi"),
+            message,
             responses::ev_completed("resp_1"),
         ]),
     )
     .await;
 
-    let realtime_server = start_websocket_server(vec![vec![
-        vec![
-            json!({
-                "type": "session.updated",
-                "session": { "id": "sess_1", "instructions": "backend prompt" }
-            }),
+    let mut realtime_events = vec![json!({
+        "type": "session.updated",
+        "session": { "id": "sess_1", "instructions": "backend prompt" }
+    })];
+    if active_handoff {
+        realtime_events.extend([
             json!({
                 "type": "conversation.input_transcript.delta",
                 "delta": "delegate hello"
@@ -4033,10 +4051,9 @@ async fn conversation_mirrors_assistant_message_text_to_realtime_handoff() -> Re
                 "item_id": "item_1",
                 "input_transcript": "delegate hello"
             }),
-        ],
-        vec![],
-    ]])
-    .await;
+        ]);
+    }
+    let realtime_server = start_websocket_server(vec![vec![realtime_events, vec![]]]).await;
 
     let mut builder = test_codex().with_config({
         let realtime_base_url = realtime_server.uri().to_string();
@@ -4045,7 +4062,7 @@ async fn conversation_mirrors_assistant_message_text_to_realtime_handoff() -> Re
             config.realtime.version = RealtimeWsVersion::V1;
         }
     });
-    let test = builder.build(&api_server).await?;
+    let test = builder.build_with_auto_env(&api_server).await?;
 
     test.codex
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
@@ -4085,28 +4102,31 @@ async fn conversation_mirrors_assistant_message_text_to_realtime_handoff() -> Re
     .await;
     assert_eq!(session_updated, "sess_1");
 
-    let _ = wait_for_event_match(&test.codex, |msg| match msg {
-        EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
-            payload: RealtimeEvent::HandoffRequested(handoff),
-        }) if handoff.handoff_id == "handoff_1" => Some(()),
-        _ => None,
-    })
-    .await;
+    if active_handoff {
+        let _ = wait_for_event_match(&test.codex, |msg| match msg {
+            EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+                payload: RealtimeEvent::HandoffRequested(handoff),
+            }) if handoff.handoff_id == "handoff_1" => Some(()),
+            _ => None,
+        })
+        .await;
+    } else {
+        test.codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "hello without a realtime delegation".to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+    }
 
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while tokio::time::Instant::now() < deadline {
-        let connections = realtime_server.connections();
-        if connections.len() == 1 && connections[0].len() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
+    let append = realtime_server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 1)
+        .await;
     let realtime_connections = realtime_server.connections();
     assert_eq!(realtime_connections.len(), 1);
     assert_eq!(realtime_connections[0].len(), 2);
@@ -4114,17 +4134,18 @@ async fn conversation_mirrors_assistant_message_text_to_realtime_handoff() -> Re
         realtime_connections[0][0].body_json()["type"].as_str(),
         Some("session.update")
     );
+    let expected_text = if matches!(phase, Some("commentary" | "partial_answer")) {
+        "assistant says hi"
+    } else {
+        "\"Agent Final Message\":\n\nassistant says hi"
+    };
     assert_eq!(
-        realtime_connections[0][1].body_json()["type"].as_str(),
-        Some("conversation.handoff.append")
-    );
-    assert_eq!(
-        realtime_connections[0][1].body_json()["handoff_id"].as_str(),
-        Some("handoff_1")
-    );
-    assert_eq!(
-        realtime_connections[0][1].body_json()["output_text"].as_str(),
-        Some("\"Agent Final Message\":\n\nassistant says hi")
+        append.body_json(),
+        json!({
+            "type": "conversation.handoff.append",
+            "handoff_id": if active_handoff { "handoff_1" } else { "codex" },
+            "output_text": expected_text,
+        })
     );
 
     realtime_server.shutdown().await;
@@ -4262,8 +4283,12 @@ async fn conversation_relays_only_public_reasoning_as_quiet_status(enabled: bool
     Ok(())
 }
 
+#[test_matrix([None, Some("partial_answer")], [false, true])]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conversation_flushes_assistant_deltas_every_200ms_for_v3_handoff() -> Result<()> {
+async fn conversation_routes_assistant_messages_for_v3_handoff(
+    phase: Option<&str>,
+    streamed: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let initial_commentary_text = "[PRO";
@@ -4272,33 +4297,42 @@ async fn conversation_flushes_assistant_deltas_every_200ms_for_v3_handoff() -> R
     let commentary_text =
         format!("{initial_commentary_text}{first_commentary_delta}{second_commentary_delta}");
     let (gate_commentary_done_tx, gate_commentary_done_rx) = oneshot::channel();
-    let commentary_item_added =
+    let mut commentary_item_added =
         responses::ev_message_item_added("msg_commentary", initial_commentary_text);
-    let commentary_item_done = responses::ev_assistant_message("msg_commentary", &commentary_text);
+    let mut commentary_item_done =
+        responses::ev_assistant_message("msg_commentary", &commentary_text);
+    if let Some(phase) = phase {
+        commentary_item_added["item"]["phase"] = json!(phase);
+        commentary_item_done["item"]["phase"] = json!(phase);
+    }
     let initial_final_text = "[DO";
     let final_delta = "NE]done";
     let final_text = format!("{initial_final_text}{final_delta}");
     let final_item_added = responses::ev_message_item_added("msg_final", initial_final_text);
     let final_item_done = responses::ev_assistant_message("msg_final", &final_text);
-    let response_chunks = vec![
+    let mut response_chunks = vec![StreamingSseChunk {
+        gate: None,
+        body: sse_event(responses::ev_response_created("resp_stream")),
+    }];
+    if streamed {
+        response_chunks.extend([
+            StreamingSseChunk {
+                gate: None,
+                body: sse_event(commentary_item_added),
+            },
+            StreamingSseChunk {
+                gate: None,
+                body: sse_event(responses::ev_output_text_delta(first_commentary_delta)),
+            },
+            StreamingSseChunk {
+                gate: None,
+                body: sse_event(responses::ev_output_text_delta(&second_commentary_delta)),
+            },
+        ]);
+    }
+    response_chunks.extend([
         StreamingSseChunk {
-            gate: None,
-            body: sse_event(responses::ev_response_created("resp_stream")),
-        },
-        StreamingSseChunk {
-            gate: None,
-            body: sse_event(commentary_item_added),
-        },
-        StreamingSseChunk {
-            gate: None,
-            body: sse_event(responses::ev_output_text_delta(first_commentary_delta)),
-        },
-        StreamingSseChunk {
-            gate: None,
-            body: sse_event(responses::ev_output_text_delta(&second_commentary_delta)),
-        },
-        StreamingSseChunk {
-            gate: Some(gate_commentary_done_rx),
+            gate: streamed.then_some(gate_commentary_done_rx),
             body: sse_event(commentary_item_done),
         },
         StreamingSseChunk {
@@ -4317,7 +4351,7 @@ async fn conversation_flushes_assistant_deltas_every_200ms_for_v3_handoff() -> R
             gate: None,
             body: sse_event(responses::ev_completed("resp_stream")),
         },
-    ];
+    ]);
     let (api_server, completions) = start_streaming_sse_server(vec![response_chunks]).await;
 
     let realtime_server = start_websocket_server(vec![vec![
@@ -4400,15 +4434,17 @@ async fn conversation_flushes_assistant_deltas_every_200ms_for_v3_handoff() -> R
     })
     .await;
 
-    let _ = wait_for_event_match(&test.codex, |msg| match msg {
-        EventMsg::AgentMessageContentDelta(event)
-            if event.item_id == "msg_commentary" && event.delta == first_commentary_delta =>
-        {
-            Some(())
-        }
-        _ => None,
-    })
-    .await;
+    if streamed {
+        let _ = wait_for_event_match(&test.codex, |msg| match msg {
+            EventMsg::AgentMessageContentDelta(event)
+                if event.item_id == "msg_commentary" && event.delta == first_commentary_delta =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+    }
     assert_eq!(
         wait_for_websocket_request(
             &realtime_server,
@@ -4420,7 +4456,7 @@ async fn conversation_flushes_assistant_deltas_every_200ms_for_v3_handoff() -> R
         json!({
             "type": "delegation.context.append",
             "delegation_item_id": "delegation_stream",
-            "channel": "commentary",
+            "channel": if phase.is_some() { "speakable" } else { "commentary" },
             "content": [{ "type": "input_text", "text": commentary_text }]
         })
     );
@@ -4467,20 +4503,38 @@ async fn conversation_flushes_assistant_deltas_every_200ms_for_v3_handoff() -> R
     Ok(())
 }
 
+#[test_matrix(["commentary", "partial_answer"], [false, true])]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conversation_handoff_persists_across_item_done_until_turn_complete() -> Result<()> {
+async fn conversation_handoff_persists_across_item_done_until_turn_complete(
+    phase: &str,
+    streamed: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let (gate_second_message_tx, gate_second_message_rx) = oneshot::channel();
     let mut commentary_message = responses::ev_assistant_message("msg-1", "assistant message 1");
-    commentary_message["item"]["phase"] = json!("commentary");
+    commentary_message["item"]["phase"] = json!(phase);
     let mut final_message = responses::ev_assistant_message("msg-2", "assistant message 2");
     final_message["item"]["phase"] = json!("final_answer");
-    let first_chunks = vec![
-        StreamingSseChunk {
-            gate: None,
-            body: sse_event(responses::ev_response_created("resp-1")),
-        },
+    let mut first_chunks = vec![StreamingSseChunk {
+        gate: None,
+        body: sse_event(responses::ev_response_created("resp-1")),
+    }];
+    if streamed {
+        let mut added = responses::ev_message_item_added("msg-1", "");
+        added["item"]["phase"] = json!(phase);
+        first_chunks.extend([
+            StreamingSseChunk {
+                gate: None,
+                body: sse_event(added),
+            },
+            StreamingSseChunk {
+                gate: None,
+                body: sse_event(responses::ev_output_text_delta("assistant message 1")),
+            },
+        ]);
+    }
+    first_chunks.extend([
         StreamingSseChunk {
             gate: None,
             body: sse_event(commentary_message),
@@ -4493,7 +4547,7 @@ async fn conversation_handoff_persists_across_item_done_until_turn_complete() ->
             gate: None,
             body: sse_event(responses::ev_completed("resp-1")),
         },
-    ];
+    ]);
     let (api_server, completions) = start_streaming_sse_server(vec![first_chunks]).await;
 
     let realtime_server = start_websocket_server(vec![vec![
@@ -5073,33 +5127,38 @@ async fn conversation_close_routes_only_remaining_transcript_tail_once() -> Resu
         ],
     )
     .await;
-    let realtime_server = start_websocket_server(vec![vec![
-        vec![
-            json!({
-                "type": "session.updated",
-                "session": { "id": "sess_tail", "instructions": "backend prompt" }
-            }),
-            json!({
-                "type": "conversation.input_transcript.delta",
-                "delta": "already handed off"
-            }),
-            json!({
-                "type": "conversation.handoff.requested",
-                "handoff_id": "handoff_tail",
-                "item_id": "item_tail",
-                "input_transcript": "already handed off"
-            }),
-            json!({
-                "type": "conversation.output_transcript.delta",
-                "delta": "remaining answer"
-            }),
-            json!({
-                "type": "conversation.input_transcript.delta",
-                "delta": "remaining question"
-            }),
+    let realtime_server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
+        requests: vec![
+            vec![
+                json!({
+                    "type": "session.updated",
+                    "session": { "id": "sess_tail", "instructions": "backend prompt" }
+                }),
+                json!({
+                    "type": "conversation.input_transcript.delta",
+                    "delta": "already handed off"
+                }),
+                json!({
+                    "type": "conversation.handoff.requested",
+                    "handoff_id": "handoff_tail",
+                    "item_id": "item_tail",
+                    "input_transcript": "already handed off"
+                }),
+                json!({
+                    "type": "conversation.output_transcript.delta",
+                    "delta": "remaining answer"
+                }),
+                json!({
+                    "type": "conversation.input_transcript.delta",
+                    "delta": "remaining question"
+                }),
+            ],
+            vec![],
         ],
-        vec![],
-    ]])
+        response_headers: Vec::new(),
+        accept_delay: None,
+        close_after_requests: false,
+    }])
     .await;
     let mut builder = test_codex().with_config({
         let realtime_base_url = realtime_server.uri().to_string();
@@ -5143,19 +5202,30 @@ async fn conversation_close_routes_only_remaining_transcript_tail_once() -> Resu
 
     let closed = wait_for_event_match(&test.codex, |msg| match msg {
         EventMsg::RealtimeConversationClosed(closed) => Some(closed.clone()),
+        EventMsg::TurnStarted(_) | EventMsg::ItemStarted(_) | EventMsg::ItemCompleted(_) => {
+            panic!("idle transcript flush must not create an unfinished client turn")
+        }
         _ => None,
     })
     .await;
     assert_eq!(closed.reason.as_deref(), Some("requested"));
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while response_mock.requests().len() < 2 {
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let history = test.codex.load_history(/*include_archived*/ false).await?;
+    let tails = history.items.iter().filter(|item| {
+        matches!(item, RolloutItem::ResponseItem(ResponseItemEnvelope { item: ResponseItem::Message { role, content, .. }, .. })
+            if role == "user" && content.iter().any(|item| matches!(item,
+                ContentItem::InputText { text } if text.contains("<source>transcript_tail_flush</source>")
+                    && text.contains("assistant: remaining answer\nuser: remaining question"))))
+    }).count();
+    assert_eq!(tails, 1);
+    assert_eq!(response_mock.requests().len(), 1);
 
     test.codex.submit(Op::RealtimeConversationClose).await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationClosed(_))
+    })
+    .await;
+    test.submit_text_turn("continue in text").await?;
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
@@ -5581,8 +5651,14 @@ async fn inbound_handoff_request_does_not_block_realtime_event_forwarding() -> R
     Ok(())
 }
 
+#[test_case(false, false; "without_tail")]
+#[test_case(true, false; "with_tail")]
+#[test_case(true, true; "interrupt_after_close")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inbound_handoff_request_updates_realtime_state_during_active_turn() -> Result<()> {
+async fn inbound_handoff_request_updates_realtime_state_during_active_turn(
+    flush_transcript_tail_on_session_end: bool,
+    interrupt: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
@@ -5647,6 +5723,10 @@ async fn inbound_handoff_request_updates_realtime_state_during_active_turn() -> 
                     "item_id": "item_steer",
                     "input_transcript": "steer via realtime"
                 }),
+                json!({
+                    "type": "conversation.input_transcript.delta",
+                    "delta": "final transcript tail"
+                }),
             ],
         ],
         response_headers: Vec::new(),
@@ -5671,7 +5751,7 @@ async fn inbound_handoff_request_updates_realtime_state_during_active_turn() -> 
             text_elements: Vec::new(),
         }]))
         .await?;
-    let TurnInputSubmission::Started { turn_id } = started else {
+    let TurnInputSubmission::Started { turn_id, .. } = started else {
         panic!("expected the text input to start a turn");
     };
 
@@ -5684,7 +5764,7 @@ async fn inbound_handoff_request_updates_realtime_state_during_active_turn() -> 
         .submit(Op::RealtimeConversationStart(ConversationStartParams {
             client_managed_handoffs: false,
             delegation_ack_filler: None,
-            flush_transcript_tail_on_session_end: false,
+            flush_transcript_tail_on_session_end,
             codex_responses_as_items: false,
             codex_response_item_prefix: None,
             codex_response_handoff_mode:
@@ -5752,12 +5832,34 @@ async fn inbound_handoff_request_updates_realtime_state_during_active_turn() -> 
     .await
     .context("steered request did not start")?;
 
-    // End the call while the same text turn is still in flight.
+    // Closed and the persisted tail must not wait for the in-flight model response.
     test.codex.submit(Op::RealtimeConversationClose).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::RealtimeConversationClosed(_))
+    let closed = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RealtimeConversationClosed(closed) => Some(closed.clone()),
+        _ => None,
     })
     .await;
+    assert_eq!(closed.reason.as_deref(), Some("requested"));
+    if flush_transcript_tail_on_session_end {
+        let history = test.codex.load_history(/*include_archived*/ false).await?;
+        assert!(history.items.iter().any(|item| {
+            matches!(item, RolloutItem::ResponseItem(ResponseItemEnvelope {
+                item: ResponseItem::Message { role, content, .. }, ..
+            }) if role == "user" && content.iter().any(|item| matches!(item,
+                ContentItem::InputText { text } if text.contains("user: final transcript tail"))))
+        }));
+    }
+    if interrupt {
+        test.codex.submit(Op::Interrupt).await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnAborted(_))
+        })
+        .await;
+        let _ = second_completed_tx.send(());
+        realtime_server.shutdown().await;
+        api_server.shutdown().await;
+        return Ok(());
+    }
     let steered = test
         .codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -5765,7 +5867,13 @@ async fn inbound_handoff_request_updates_realtime_state_during_active_turn() -> 
             text_elements: Vec::new(),
         }]))
         .await?;
-    assert_eq!(steered, TurnInputSubmission::Steered { turn_id });
+    assert_eq!(
+        steered,
+        TurnInputSubmission::Steered {
+            root_turn_id: turn_id.clone(),
+            turn_id
+        }
+    );
     let _ = second_completed_tx.send(());
     second_completion
         .await
@@ -5811,14 +5919,31 @@ async fn inbound_handoff_request_updates_realtime_state_during_active_turn() -> 
         "<realtime_conversation>\nGive frequent spoken progress updates.\n</realtime_conversation>";
     let end_instructions =
         "<realtime_conversation>\nReturn to normal text updates.\n</realtime_conversation>";
+    assert!(realtime_instructions[0].is_empty());
     assert_eq!(
-        realtime_instructions,
-        vec![
-            vec![],
-            vec![start_instructions.to_string()],
-            vec![start_instructions.to_string(), end_instructions.to_string()],
-        ]
+        realtime_instructions[1],
+        vec![start_instructions.to_string()]
     );
+    assert_eq!(
+        realtime_instructions.last().expect("missing final request"),
+        &vec![start_instructions.to_string(), end_instructions.to_string()]
+    );
+    if flush_transcript_tail_on_session_end {
+        for request in &requests {
+            let body: Value = serde_json::from_slice(request)?;
+            let input = body["input"].as_array().expect("request input array");
+            if let Some(end) = input
+                .iter()
+                .position(|item| item.to_string().contains("Return to normal text updates."))
+            {
+                let tail = input
+                    .iter()
+                    .position(|item| item.to_string().contains("user: final transcript tail"))
+                    .expect("realtime_end must not overtake the tail");
+                assert!(tail < end);
+            }
+        }
+    }
 
     realtime_server.shutdown().await;
     api_server.shutdown().await;

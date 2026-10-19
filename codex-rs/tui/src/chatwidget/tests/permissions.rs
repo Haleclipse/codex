@@ -96,6 +96,7 @@ async fn permission_discovery_discards_stale_results_and_preserves_covering_moda
     chat.handle_key_event(KeyEvent::from(KeyCode::Esc));
     chat.on_permission_profiles_loaded(first, Ok(Discovery::local(&chat.config)));
     assert!(!chat.bottom_pane.has_active_view());
+    chat.permission_discovery = None;
     chat.open_permissions_popup();
     let second = chat.permission_popup_request_id.unwrap();
     chat.on_permission_profiles_loaded(first, Ok(Discovery::local(&chat.config)));
@@ -107,6 +108,7 @@ async fn permission_discovery_discards_stale_results_and_preserves_covering_moda
     chat.on_permission_profiles_loaded(second, Ok(Discovery::local(&chat.config)));
     assert!(!chat.bottom_pane.has_active_view());
 
+    chat.permission_discovery = None;
     chat.open_permissions_popup();
     let request_id = chat.permission_popup_request_id.unwrap();
     chat.bottom_pane.show_selection_view(SelectionViewParams {
@@ -655,6 +657,49 @@ async fn startup_windows_sandbox_prompt_blocks_disallowed_unelevated_fallback() 
         !popup.contains("Use non-admin sandbox"),
         "expected required sandbox prompt to hide non-admin fallback: {popup}"
     );
+}
+
+#[tokio::test]
+async fn windows_sandbox_help_links_keep_complete_wrapped_destinations() {
+    let url = "https://developers.openai.com/codex/windows";
+    for fallback in [false, true] {
+        let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        let preset = builtin_approval_presets()
+            .into_iter()
+            .find(|preset| preset.id == "auto")
+            .unwrap();
+        if fallback {
+            chat.open_windows_sandbox_fallback_prompt(preset, /*profile_selection*/ None);
+        } else {
+            chat.open_windows_sandbox_enable_prompt(preset, /*profile_selection*/ None);
+        }
+        let area = Rect::new(0, 0, 40, 24);
+        let mut buf = Buffer::empty(area);
+        chat.bottom_pane.render(area, &mut buf);
+        let linked = buf
+            .content
+            .iter()
+            .filter(|cell| cell.symbol().contains("\x1b]8;;"))
+            .map(|cell| {
+                assert!(cell.symbol().starts_with(&format!("\x1b]8;;{url}\x07")));
+                crate::terminal_hyperlinks::strip_osc8(cell.symbol())
+            })
+            .collect::<String>();
+        assert_eq!(linked, url);
+        if !fallback {
+            let visible = buf
+                .content
+                .chunks(40)
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| crate::terminal_hyperlinks::strip_osc8(cell.symbol()))
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            insta::assert_snapshot!("windows_sandbox_wrapped_help_url", visible);
+        }
+    }
 }
 
 #[tokio::test]
